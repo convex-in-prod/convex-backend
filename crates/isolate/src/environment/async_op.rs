@@ -27,6 +27,9 @@ pub enum AsyncOpRequest {
         name: String, // setTimeout or setInterval
         until: UnixTimestamp,
     },
+    AbortSignalTimeout {
+        until: UnixTimestamp,
+    },
     StorageStore {
         body_stream: spsc::UnboundedReceiver<anyhow::Result<bytes::Bytes>>,
         content_type: Option<String>,
@@ -48,7 +51,7 @@ impl AsyncOpRequest {
         match self {
             Self::Fetch { .. } => "Fetch",
             Self::ParseMultiPart { .. } => "FormParse",
-            Self::Sleep { .. } => "Sleep",
+            Self::Sleep { .. } | Self::AbortSignalTimeout { .. } => "Sleep",
             Self::StorageStore { .. } | Self::StorageGet { .. } => "Storage",
             Self::SendStream { .. } => "Stream",
         }
@@ -59,6 +62,7 @@ impl AsyncOpRequest {
             Self::Fetch { .. } => "fetch()".to_string(),
             Self::ParseMultiPart { .. } => "formData()".to_string(),
             Self::Sleep { name, .. } => name.to_string(),
+            Self::AbortSignalTimeout { .. } => "AbortSignal.timeout()".to_string(),
             Self::StorageStore { .. } => "storage.store()".to_string(),
             Self::StorageGet { .. } => "storage.get()".to_string(),
             Self::SendStream { .. } => "stream".to_string(),
@@ -94,6 +98,9 @@ impl AsyncOpRequest {
             } => json!({ "contentType": content_type }),
             Self::Sleep { name, until } => json!({
                 "name": name,
+                "untilNanos": until.as_nanos().to_string(),
+            }),
+            Self::AbortSignalTimeout { until } => json!({
                 "untilNanos": until.as_nanos().to_string(),
             }),
             Self::StorageStore {
