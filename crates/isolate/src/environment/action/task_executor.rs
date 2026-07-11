@@ -162,9 +162,9 @@ impl<RT: Runtime> TaskExecutor<RT> {
                 .run_parse_multi_part(content_type, request_stream)
                 .await
                 .map(TaskResponseEnum::ParseMultiPart),
-            TaskRequestEnum::AsyncOp(AsyncOpRequest::Sleep { until, .. }) => {
-                self.run_sleep(until).await.map(TaskResponseEnum::Sleep)
-            },
+            TaskRequestEnum::AsyncOp(
+                AsyncOpRequest::Sleep { until, .. } | AsyncOpRequest::AbortSignalTimeout { until },
+            ) => self.run_sleep(until).await.map(TaskResponseEnum::Sleep),
             TaskRequestEnum::AsyncOp(AsyncOpRequest::StorageStore {
                 body_stream,
                 content_type,

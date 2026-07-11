@@ -41,7 +41,9 @@ struct TaskOrderInner {
 impl TaskOrder {
     pub fn push_running_task(&self, task_request: &TaskRequest) {
         let mut inner = self.inner.lock();
-        if let TaskRequestEnum::AsyncOp(AsyncOpRequest::Sleep { until, .. }) = &task_request.variant
+        if let TaskRequestEnum::AsyncOp(
+            AsyncOpRequest::Sleep { until, .. } | AsyncOpRequest::AbortSignalTimeout { until },
+        ) = &task_request.variant
         {
             inner.tasks.insert(task_request.task_id, *until);
             inner.running_sleeps.insert(*until);

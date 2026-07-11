@@ -35,7 +35,10 @@ pub fn async_op_fetch<'b, P: V8OpProvider<'b>>(
     let arg: HttpRequestV8 = serde_v8::from_v8(&mut provider.scope(), args.get(1))?;
 
     let request = with_argument_error("fetch", || {
-        arg.into_stream(|stream_id| listen_to_stream(provider, stream_id))
+        let signal = arg.signal;
+        let request = arg.into_stream(|stream_id| listen_to_stream(provider, stream_id))?;
+        provider.register_fetch_abort_stream(signal)?;
+        Ok(request)
     })?;
     let response_body_stream_id = provider.create_stream()?;
     provider.start_async_op(

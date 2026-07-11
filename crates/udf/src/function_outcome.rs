@@ -16,10 +16,10 @@ use crate::{
     UdfOutcome,
 };
 
-/// A `FunctionOutcome` represents a successful execution of a developer's
-/// function by our V8 layer before it has had its returns validator run. It
-/// slightly differs from `UdfExecution`, which is what we store in memory for
-/// logs.
+/// A `FunctionOutcome` carries a developer function's execution result without
+/// attesting final application validation. Ordinary V8 actions also validate
+/// returns before cache publication. This differs from `UdfExecution`, which
+/// is what we store in memory for logs.
 #[derive(Clone, Debug)]
 pub enum FunctionOutcome {
     Query(UdfOutcome),
