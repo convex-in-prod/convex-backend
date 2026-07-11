@@ -558,7 +558,8 @@ impl<RT: Runtime> NodeActions<RT> {
                 source_index,
                 http_routes: None,
                 cron_specs: None,
-                reuse_context: false,
+                context_reuse: Default::default(),
+                context_initialization_module: None,
             };
             result.insert(path, module);
         }
