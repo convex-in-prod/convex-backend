@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use common::runtime::UnixTimestamp;
 use deno_core::{
     serde_v8,
     v8::{
@@ -23,22 +24,48 @@ pub fn async_op_sleep<'b, P: V8OpProvider<'b>>(
     let name: String = serde_v8::from_v8(&mut provider.scope(), args.get(1))?;
     let millis: f64 = serde_v8::from_v8(&mut provider.scope(), args.get(2))?;
     let request = sleep_request(provider, name, millis)?;
-    provider.start_async_op(request, resolver)
+    let timer_id: u64 = serde_v8::from_v8(&mut provider.scope(), args.get(3))?;
+    provider.start_timer(request, timer_id, resolver)
+}
+
+pub fn async_op_abort_signal_timeout<'b, P: V8OpProvider<'b>>(
+    provider: &mut P,
+    args: v8::FunctionCallbackArguments,
+    resolver: v8::Global<v8::PromiseResolver>,
+) -> anyhow::Result<()> {
+    let millis: f64 = serde_v8::from_v8(&mut provider.scope(), args.get(1))?;
+    let until = sleep_deadline(provider, millis)?;
+    provider.start_async_op(AsyncOpRequest::AbortSignalTimeout { until }, resolver)
+}
+
+#[convex_macro::v8_op]
+pub fn op_cancel_timer<'b, P: V8OpProvider<'b>>(
+    provider: &mut P,
+    timer_id: u64,
+) -> anyhow::Result<()> {
+    provider.cancel_timer(timer_id)
 }
 
 pub fn sleep_request<P: OpProvider>(
     provider: &mut P,
     name: String,
-    mut millis: f64,
+    millis: f64,
 ) -> anyhow::Result<AsyncOpRequest> {
+    let until = sleep_deadline(provider, millis)?;
+    Ok(AsyncOpRequest::Sleep { name, until })
+}
+
+fn sleep_deadline<P: OpProvider>(
+    provider: &mut P,
+    mut millis: f64,
+) -> anyhow::Result<UnixTimestamp> {
     // Negative, infinite and NaN delays fire immediately, as in browsers.
     if millis < 0.0 || !millis.is_finite() {
         millis = 0.0;
     }
     let duration = Duration::from_millis(millis as u64);
 
-    let until = provider.unix_timestamp()? + duration;
-    Ok(AsyncOpRequest::Sleep { name, until })
+    Ok(provider.unix_timestamp()? + duration)
 }
 
 #[convex_macro::op]

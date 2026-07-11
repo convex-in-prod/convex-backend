@@ -59,6 +59,9 @@ impl TaskRequestEnum {
                 TaskType::ParseMultiPart
             },
             TaskRequestEnum::AsyncOp(AsyncOpRequest::Sleep { .. }) => TaskType::Sleep,
+            TaskRequestEnum::AsyncOp(AsyncOpRequest::AbortSignalTimeout { .. }) => {
+                TaskType::AbortSignalTimeout
+            },
             TaskRequestEnum::AsyncOp(AsyncOpRequest::StorageStore { .. }) => TaskType::StorageStore,
             TaskRequestEnum::AsyncOp(AsyncOpRequest::StorageGet { .. }) => TaskType::StorageGet,
             TaskRequestEnum::AsyncOp(AsyncOpRequest::SendStream { .. }) => TaskType::SendStream,
@@ -85,6 +88,7 @@ pub enum TaskType {
     Fetch,
     ParseMultiPart,
     Sleep,
+    AbortSignalTimeout,
     StorageStore,
     StorageGet,
     SendStream,
@@ -110,6 +114,7 @@ impl TaskType {
             TaskType::SendStream => "ReadableStream".to_string(),
             // Sleeps cannot actually be dangling, but we handle it just in case.
             TaskType::Sleep => "setTimeout".to_string(),
+            TaskType::AbortSignalTimeout => "AbortSignal.timeout".to_string(),
         }
     }
 }

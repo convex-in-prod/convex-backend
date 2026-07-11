@@ -78,6 +78,19 @@ pub trait JsEnvironment<RT: Runtime>: 'static {
         resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()>;
 
+    fn start_timer(
+        &mut self,
+        request: AsyncOpRequest,
+        _timer_id: u64,
+        resolver: Self::AsyncResolver,
+    ) -> anyhow::Result<()> {
+        self.start_async_op(request, resolver)
+    }
+
+    fn cancel_timer(&mut self, _timer_id: u64) -> anyhow::Result<()> {
+        anyhow::bail!("Timer cancellation is not supported in this environment")
+    }
+
     // The memory allocated by the environment itself.
     fn environment_heap_size(&self) -> usize {
         0

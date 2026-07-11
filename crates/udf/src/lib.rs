@@ -6,6 +6,7 @@ mod action_outcome;
 mod client;
 pub mod deployment_jwt;
 pub mod environment;
+pub mod execution_observation;
 mod function_outcome;
 pub mod helpers;
 mod http_action;

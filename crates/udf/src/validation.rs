@@ -55,7 +55,10 @@ use model::{
     modules::{
         function_validators::ReturnsValidator,
         module_versions::{
+            parse_context_initialization_module,
             AnalyzedFunction,
+            ContextInitializationModule,
+            ContextReusePolicy,
             Visibility,
         },
         ModuleModel,
@@ -66,7 +69,11 @@ use model::{
 use rand::Rng;
 use roles::RequireDeploymentOp;
 use serde_json::Value as JsonValue;
-use sync_types::types::SerializedArgs;
+use sync_types::{
+    types::SerializedArgs,
+    CanonicalizedModulePath,
+    CanonicalizedUdfPath,
+};
 use value::{
     heap_size::HeapSize,
     serialized_args_ext::SerializedArgsExt,
@@ -83,6 +90,7 @@ use crate::{
         validate_pending_udf_args_size,
         validate_udf_args_size,
     },
+    metrics::log_context_reuse_decision,
     ActionOutcome,
     SyscallTrace,
     UdfOutcome,
@@ -447,15 +455,18 @@ impl VisibilityInfo {
 /// - Checking the args size.
 /// - Checking that the args pass validation.
 ///
-/// This should only be constructed via `ValidatedPathAndArgs::new` to use the
-/// type system to enforce that validation is never skipped.
+/// This should only be constructed by the validation methods below or
+/// deserialized from a trusted function-runner protocol value. Protocol
+/// consumers must still combine its reuse policy with the accompanying
+/// `UdfType`.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ValidatedPathAndArgs {
     path: ResolvedComponentFunctionPath,
     args: SerializedArgs,
     // Not set for system modules.
     npm_version: Option<Version>,
-    reuse_context: bool,
+    context_reuse: ContextReusePolicy,
+    context_initialization_module: Option<ContextInitializationModule>,
 }
 
 impl ValidatedPathAndArgs {
@@ -538,7 +549,8 @@ impl ValidatedPathAndArgs {
                     path,
                     args,
                     npm_version: None,
-                    reuse_context: false,
+                    context_reuse: ContextReusePolicy::default(),
+                    context_initialization_module: None,
                 },
                 ReturnsValidator::Unvalidated,
                 visibility_info,
@@ -626,7 +638,8 @@ impl ValidatedPathAndArgs {
             pending_args_policy,
             analyzed_function,
             udf_version,
-            analyzed_module.reuse_context,
+            analyzed_module.context_reuse,
+            analyzed_module.context_initialization_module.clone(),
         )? {
             Ok((validated_udf_path_and_args, visibility_info)) => Ok(Ok((
                 validated_udf_path_and_args,
@@ -646,7 +659,8 @@ impl ValidatedPathAndArgs {
         pending_args_policy: PendingArgsPolicy,
         analyzed_function: AnalyzedFunction,
         version: Version,
-        reuse_context: bool,
+        context_reuse: ContextReusePolicy,
+        context_initialization_module: Option<ContextInitializationModule>,
     ) -> anyhow::Result<Result<(ValidatedPathAndArgs, VisibilityInfo), JsError>> {
         let visibility_info = VisibilityInfo {
             visibility: analyzed_function.visibility.clone(),
@@ -718,12 +732,17 @@ impl ValidatedPathAndArgs {
             ))));
         }
 
+        let reuse_context_enabled = context_reuse.allows(expected_udf_type);
+        if !context_reuse.is_empty() {
+            log_context_reuse_decision(expected_udf_type, reuse_context_enabled);
+        }
         Ok(Ok((
             ValidatedPathAndArgs {
                 path,
                 args,
                 npm_version: Some(version),
-                reuse_context,
+                context_reuse,
+                context_initialization_module,
             },
             visibility_info,
         )))
@@ -759,6 +778,9 @@ impl ValidatedPathAndArgs {
             component_path,
             component_id,
             reuse_context,
+            context_reuse,
+            context_initialization_module,
+            context_initialization_modules,
         }: pb::common::ValidatedPathAndArgs,
     ) -> anyhow::Result<Self> {
         let args =
@@ -768,20 +790,383 @@ impl ValidatedPathAndArgs {
             .context("Missing component_path in proto")?
             .try_into()
             .context("Invalid component path in proto")?;
+        let udf_path: CanonicalizedUdfPath = path.context("Missing udf_path")?.parse()?;
+        let is_system_module = udf_path.is_system();
+        let context_reuse = context_reuse
+            .map(context_reuse_policy_from_proto)
+            .unwrap_or_else(|| {
+                if reuse_context.unwrap_or(false) {
+                    ContextReusePolicy::database()
+                } else {
+                    ContextReusePolicy::default()
+                }
+            });
+        anyhow::ensure!(
+            context_initialization_module.is_none() || context_initialization_modules.is_none(),
+            ErrorMetadata::bad_request(
+                "InvalidContextInitializationModule",
+                "Conflicting context initialization modules"
+            )
+        );
+        let initializer = if is_system_module {
+            None
+        } else if let Some(modules) = context_initialization_modules {
+            Some(ContextInitializationModule::separate(
+                modules.version,
+                modules.database.as_deref(),
+                modules.action.as_deref(),
+            )?)
+        } else {
+            context_initialization_module
+                .as_deref()
+                .map(parse_context_initialization_module)
+                .transpose()?
+                .map(ContextInitializationModule::Legacy)
+        };
+        if let Some(initializer) = &initializer {
+            initializer.validate(context_reuse)?;
+        }
         Ok(Self {
             path: ResolvedComponentFunctionPath {
                 component,
-                udf_path: path.context("Missing udf_path")?.parse()?,
+                udf_path,
                 component_path,
             },
             args,
             npm_version: npm_version.map(|v| Version::parse(&v)).transpose()?,
-            reuse_context: reuse_context.unwrap_or(false),
+            // System modules are not analyzed and must never receive reuse
+            // authority from a protocol marker, even on a trusted decode path.
+            context_reuse: if is_system_module {
+                ContextReusePolicy::default()
+            } else {
+                context_reuse
+            },
+            context_initialization_module: initializer,
         })
     }
 
-    pub fn reuse_context(&self) -> bool {
-        self.reuse_context
+    pub fn reuse_context(&self, udf_type: UdfType) -> bool {
+        // Check the type again because `from_proto` reconstructs this value without
+        // passing through `new_inner`.
+        self.context_reuse.allows(udf_type)
+    }
+
+    pub fn context_initialization_module(
+        &self,
+        udf_type: UdfType,
+    ) -> Option<&CanonicalizedModulePath> {
+        // Grouping never grants reuse permission. HTTP routes retain their
+        // separate initialization and response-stream lifecycle.
+        if matches!(
+            udf_type,
+            UdfType::Query | UdfType::Mutation | UdfType::Action
+        ) && self.reuse_context(udf_type)
+        {
+            self.context_initialization_module
+                .as_ref()
+                .and_then(|module| module.for_type(udf_type))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::{
+        components::{
+            ComponentId,
+            ComponentPath,
+            ResolvedComponentFunctionPath,
+        },
+        types::UdfType,
+    };
+    use errors::ErrorMetadataAnyhowExt;
+    use sync_types::types::SerializedArgs;
+
+    use super::{
+        ContextInitializationModule,
+        ContextReusePolicy,
+        ValidatedHttpPath,
+        ValidatedPathAndArgs,
+    };
+
+    fn marked_path_and_args() -> ValidatedPathAndArgs {
+        ValidatedPathAndArgs {
+            path: ResolvedComponentFunctionPath {
+                component: ComponentId::Root,
+                udf_path: "mixed.js:function".parse().expect("invalid test UDF path"),
+                component_path: ComponentPath::root(),
+            },
+            args: SerializedArgs::from_args(vec![]).expect("invalid test arguments"),
+            npm_version: None,
+            context_reuse: ContextReusePolicy::database(),
+            context_initialization_module: None,
+        }
+    }
+
+    #[test]
+    fn protocol_reuse_policy_preserves_legacy_database_compatibility() {
+        let proto: pb::common::ValidatedPathAndArgs = marked_path_and_args()
+            .try_into()
+            .expect("failed to serialize test path and arguments");
+        assert_eq!(proto.reuse_context, Some(true));
+        assert!(proto.context_reuse.is_some());
+
+        let path_and_args = ValidatedPathAndArgs::from_proto(proto)
+            .expect("failed to deserialize test path and arguments");
+        assert!(path_and_args.reuse_context(UdfType::Query));
+        assert!(path_and_args.reuse_context(UdfType::Mutation));
+        assert!(!path_and_args.reuse_context(UdfType::Action));
+        assert!(!path_and_args.reuse_context(UdfType::HttpAction));
+    }
+
+    #[test]
+    fn typed_protocol_policy_overrides_legacy_database_marker() {
+        let mut proto: pb::common::ValidatedPathAndArgs = marked_path_and_args()
+            .try_into()
+            .expect("failed to serialize test path and arguments");
+        proto.context_reuse = Some(pb::common::ContextReusePolicy {
+            queries: Some(false),
+            mutations: Some(false),
+            actions: Some(false),
+            http_actions: Some(false),
+        });
+
+        let path_and_args =
+            ValidatedPathAndArgs::from_proto(proto).expect("failed to deserialize typed policy");
+        assert!(!path_and_args.reuse_context(UdfType::Query));
+        assert!(!path_and_args.reuse_context(UdfType::Mutation));
+        assert!(!path_and_args.reuse_context(UdfType::Action));
+        assert!(!path_and_args.reuse_context(UdfType::HttpAction));
+    }
+
+    #[test]
+    fn grouped_context_protocol_keeps_type_and_system_boundaries() -> anyhow::Result<()> {
+        let mut value = marked_path_and_args();
+        value.context_initialization_module = Some(ContextInitializationModule::Legacy(
+            "_deps/init.js".parse()?,
+        ));
+        value.context_reuse.mutations = false;
+        value.context_reuse.actions = true;
+        value.context_reuse.http_actions = true;
+        let proto: pb::common::ValidatedPathAndArgs = value.try_into()?;
+        let decoded = ValidatedPathAndArgs::from_proto(proto.clone())?;
+        assert_eq!(
+            decoded
+                .context_initialization_module(UdfType::Query)
+                .map(|p| p.as_str()),
+            Some("_deps/init.js")
+        );
+        assert_eq!(
+            decoded
+                .context_initialization_module(UdfType::Action)
+                .map(|p| p.as_str()),
+            Some("_deps/init.js")
+        );
+        for udf_type in [UdfType::Mutation, UdfType::HttpAction] {
+            assert!(decoded.context_initialization_module(udf_type).is_none());
+        }
+        let mut system = proto.clone();
+        system.path = Some("_system/internal.js:run".to_owned());
+        assert!(ValidatedPathAndArgs::from_proto(system)?
+            .context_initialization_module(UdfType::Query)
+            .is_none());
+        for invalid in [
+            "entry.js",
+            "_system/internal.js",
+            "_deps/init",
+            "_deps/init.ts",
+            "_deps/../entry.js",
+            "_deps//init.js",
+            "_deps/./init.js",
+            "_deps/init.js/",
+            "actions/_deps/init.js",
+        ] {
+            let mut malformed = proto.clone();
+            malformed.context_initialization_module = Some(invalid.to_owned());
+            let error = ValidatedPathAndArgs::from_proto(malformed)
+                .err()
+                .expect("Malformed initializer path was accepted");
+            assert!(error.is_bad_request(), "{invalid}");
+            assert_eq!(error.short_msg(), "InvalidContextInitializationModule");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn split_context_protocol_selects_roots_and_downgrades_without_cross_kind_fallback(
+    ) -> anyhow::Result<()> {
+        for action in [Some("_deps/actions.js"), None] {
+            let mut value = marked_path_and_args();
+            value.context_reuse.actions = true;
+            value.context_initialization_module = Some(ContextInitializationModule::separate(
+                2,
+                Some("_deps/db.js"),
+                action,
+            )?);
+            let proto: pb::common::ValidatedPathAndArgs = value.try_into()?;
+            assert!(proto.context_initialization_module.is_none());
+            let decoded = ValidatedPathAndArgs::from_proto(proto.clone())?;
+            for kind in [UdfType::Query, UdfType::Mutation] {
+                assert_eq!(
+                    decoded
+                        .context_initialization_module(kind)
+                        .map(|p| p.as_str()),
+                    Some("_deps/db.js")
+                );
+            }
+            assert_eq!(
+                decoded
+                    .context_initialization_module(UdfType::Action)
+                    .map(|p| p.as_str()),
+                action
+            );
+            assert!(decoded
+                .context_initialization_module(UdfType::HttpAction)
+                .is_none());
+            // Old readers drop unknown field 9. Field 8 must stay absent so an
+            // action never loads the database group's additional wrappers.
+            let mut old_reader = proto.clone();
+            old_reader.context_initialization_modules = None;
+            let legacy = ValidatedPathAndArgs::from_proto(old_reader)?;
+            for kind in [UdfType::Query, UdfType::Mutation, UdfType::Action] {
+                assert!(legacy.reuse_context(kind));
+                assert!(legacy.context_initialization_module(kind).is_none());
+            }
+            let mut conflict = proto.clone();
+            conflict.context_initialization_module = Some("_deps/legacy.js".to_owned());
+            assert!(ValidatedPathAndArgs::from_proto(conflict).is_err());
+            let mut system = proto;
+            system.path = Some("_system/internal.js:run".to_owned());
+            let system = ValidatedPathAndArgs::from_proto(system)?;
+            assert!(!system.reuse_context(UdfType::Action));
+            assert!(system
+                .context_initialization_module(UdfType::Query)
+                .is_none());
+        }
+        for (version, database, action) in [
+            (1, Some("_deps/db.js"), None),
+            (2, None, None),
+            (2, Some("entry.js"), None),
+            (2, Some("_deps/db.js"), Some("_deps/../actions.js")),
+            // The base policy grants no action permission.
+            (2, None, Some("_deps/actions.js")),
+        ] {
+            let mut proto: pb::common::ValidatedPathAndArgs = marked_path_and_args().try_into()?;
+            proto.context_initialization_modules = Some(pb::common::ContextInitializationModules {
+                version,
+                database: database.map(str::to_owned),
+                action: action.map(str::to_owned),
+            });
+            assert!(ValidatedPathAndArgs::from_proto(proto).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn http_protocol_reuse_bit_is_cleared() {
+        let proto = pb::common::ValidatedHttpPath {
+            path: Some("http.js:default".to_string()),
+            component_path: Some(ComponentPath::root().into()),
+            component_id: ComponentId::Root.serialize_to_string(),
+            npm_version: None,
+            reuse_context: Some(true),
+            context_reuse: None,
+        };
+        let validated_path =
+            ValidatedHttpPath::from_proto(proto).expect("failed to deserialize test HTTP path");
+        let proto: pb::common::ValidatedHttpPath = validated_path
+            .try_into()
+            .expect("failed to serialize test HTTP path");
+        assert_eq!(proto.reuse_context, Some(false));
+        let context_reuse = proto.context_reuse.expect("missing typed reuse policy");
+        assert_eq!(context_reuse.queries, Some(false));
+        assert_eq!(context_reuse.mutations, Some(false));
+        assert_eq!(context_reuse.actions, Some(false));
+        assert_eq!(context_reuse.http_actions, Some(false));
+    }
+
+    #[test]
+    fn typed_http_protocol_policy_round_trips() {
+        let http_path = ValidatedHttpPath {
+            path: ResolvedComponentFunctionPath {
+                component: ComponentId::Root,
+                udf_path: "http.js:default".parse().expect("invalid test HTTP path"),
+                component_path: ComponentPath::root(),
+            },
+            npm_version: None,
+            context_reuse: ContextReusePolicy {
+                http_actions: true,
+                ..ContextReusePolicy::default()
+            },
+        };
+        let proto: pb::common::ValidatedHttpPath = http_path
+            .try_into()
+            .expect("failed to serialize typed HTTP policy");
+        assert_eq!(proto.reuse_context, Some(false));
+        assert_eq!(
+            proto
+                .context_reuse
+                .as_ref()
+                .and_then(|policy| policy.http_actions),
+            Some(true)
+        );
+
+        let http_path =
+            ValidatedHttpPath::from_proto(proto).expect("failed to deserialize typed HTTP policy");
+        assert!(http_path.reuse_context(UdfType::HttpAction));
+        assert!(!http_path.reuse_context(UdfType::Action));
+    }
+
+    #[test]
+    fn system_protocol_paths_cannot_enable_context_reuse() {
+        let mut udf_proto: pb::common::ValidatedPathAndArgs = marked_path_and_args()
+            .try_into()
+            .expect("failed to serialize test UDF path");
+        udf_proto.path = Some("_system/internal.js:default".to_string());
+        udf_proto.reuse_context = Some(true);
+        udf_proto.context_reuse = Some(pb::common::ContextReusePolicy {
+            queries: Some(true),
+            mutations: Some(true),
+            actions: Some(true),
+            http_actions: Some(true),
+        });
+        let path_and_args = ValidatedPathAndArgs::from_proto(udf_proto)
+            .expect("failed to deserialize system UDF path");
+        assert!(!path_and_args.reuse_context(UdfType::Query));
+        assert!(!path_and_args.reuse_context(UdfType::Mutation));
+        assert!(!path_and_args.reuse_context(UdfType::Action));
+        assert!(!path_and_args.reuse_context(UdfType::HttpAction));
+
+        let http_proto = pb::common::ValidatedHttpPath {
+            path: Some("_system/http.js:default".to_string()),
+            component_path: Some(ComponentPath::root().into()),
+            component_id: ComponentId::Root.serialize_to_string(),
+            npm_version: None,
+            reuse_context: Some(true),
+            context_reuse: Some(pb::common::ContextReusePolicy {
+                queries: Some(true),
+                mutations: Some(true),
+                actions: Some(true),
+                http_actions: Some(true),
+            }),
+        };
+        let http_path = ValidatedHttpPath::from_proto(http_proto)
+            .expect("failed to deserialize system HTTP path");
+        assert!(!http_path.reuse_context(UdfType::HttpAction));
+    }
+
+    #[test]
+    fn mixed_protocol_policy_preserves_legacy_database_permission() {
+        let mut path_and_args = marked_path_and_args();
+        path_and_args.context_reuse.actions = true;
+        path_and_args.context_reuse.http_actions = true;
+
+        let proto: pb::common::ValidatedPathAndArgs = path_and_args
+            .try_into()
+            .expect("failed to serialize mixed reuse policy");
+        assert_eq!(proto.reuse_context, Some(true));
     }
 }
 
@@ -793,9 +1178,28 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
             path,
             args,
             npm_version,
-            reuse_context,
+            context_reuse,
+            context_initialization_module,
         }: ValidatedPathAndArgs,
     ) -> anyhow::Result<Self> {
+        if let Some(initializer) = &context_initialization_module {
+            initializer.validate(context_reuse)?;
+        }
+        let (context_initialization_module, context_initialization_modules) =
+            match context_initialization_module {
+                None => (None, None),
+                Some(ContextInitializationModule::Legacy(path)) => {
+                    (Some(path.as_str().to_owned()), None)
+                },
+                Some(ContextInitializationModule::Separate { database, action }) => (
+                    None,
+                    Some(pb::common::ContextInitializationModules {
+                        version: 2,
+                        database: database.map(|path| path.as_str().to_owned()),
+                        action: action.map(|path| path.as_str().to_owned()),
+                    }),
+                ),
+            };
         let args = args.get().as_bytes().to_vec();
         let component_path = Some(path.component_path.into());
         Ok(Self {
@@ -804,20 +1208,41 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
             npm_version: npm_version.map(|v| v.to_string()),
             component_path,
             component_id: path.component.serialize_to_string(),
-            reuse_context: Some(reuse_context),
+            reuse_context: Some(context_reuse.allows_legacy_database_reuse()),
+            context_reuse: Some(context_reuse_policy_to_proto(context_reuse)),
+            context_initialization_module,
+            context_initialization_modules,
         })
+    }
+}
+
+fn context_reuse_policy_to_proto(policy: ContextReusePolicy) -> pb::common::ContextReusePolicy {
+    pb::common::ContextReusePolicy {
+        queries: Some(policy.queries),
+        mutations: Some(policy.mutations),
+        actions: Some(policy.actions),
+        http_actions: Some(policy.http_actions),
+    }
+}
+
+fn context_reuse_policy_from_proto(policy: pb::common::ContextReusePolicy) -> ContextReusePolicy {
+    ContextReusePolicy {
+        queries: policy.queries.unwrap_or(false),
+        mutations: policy.mutations.unwrap_or(false),
+        actions: policy.actions.unwrap_or(false),
+        http_actions: policy.http_actions.unwrap_or(false),
     }
 }
 
 /// A UDF path that has been validated to be an HTTP route.
 ///
-/// This should only be constructed via `ValidatedHttpRoute::try_from` to use
-/// the type system to enforce that validation is never skipped.
+/// This should only be constructed by `ValidatedHttpPath::new` or deserialized
+/// from a trusted function-runner protocol value.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct ValidatedHttpPath {
     path: ResolvedComponentFunctionPath,
     npm_version: Option<Version>,
-    reuse_context: bool,
+    context_reuse: ContextReusePolicy,
 }
 
 impl ValidatedHttpPath {
@@ -851,14 +1276,32 @@ impl ValidatedHttpPath {
             Ok(udf_version) => udf_version,
             Err(e) => return Ok(Err(e)),
         };
-        let module = ModuleModel::new(tx)
-            .get_metadata_for_function_by_id(&path)
-            .await?;
+        let context_reuse = if path.udf_path.is_system() {
+            // System modules do not have analyzed application metadata and must
+            // never inherit reuse permissions from a legacy protocol marker.
+            ContextReusePolicy::default()
+        } else {
+            ModuleModel::new(tx)
+                .get_metadata_for_function_by_id(&path)
+                .await?
+                .and_then(|module| {
+                    module
+                        .analyze_result
+                        .as_ref()
+                        .map(|module| module.context_reuse)
+                })
+                .context("missing analyze_result")?
+        };
+        if !context_reuse.is_empty() {
+            log_context_reuse_decision(
+                UdfType::HttpAction,
+                context_reuse.allows(UdfType::HttpAction),
+            );
+        }
         Ok(Ok(ValidatedHttpPath {
             path,
             npm_version: Some(udf_version),
-            reuse_context: module
-                .is_some_and(|m| m.analyze_result.as_ref().is_some_and(|a| a.reuse_context)),
+            context_reuse,
         }))
     }
 
@@ -870,13 +1313,20 @@ impl ValidatedHttpPath {
         &self.path
     }
 
+    pub fn reuse_context(&self, udf_type: UdfType) -> bool {
+        // HTTP paths are reconstructed from a trusted protocol message, so use
+        // the typed policy and the actual request kind at the scheduler boundary.
+        self.context_reuse.allows(udf_type)
+    }
+
     pub fn from_proto(
         pb::common::ValidatedHttpPath {
             path,
             component_path,
             component_id,
             npm_version,
-            reuse_context,
+            reuse_context: _,
+            context_reuse,
         }: pb::common::ValidatedHttpPath,
     ) -> anyhow::Result<Self> {
         let component = ComponentId::deserialize_from_string(component_id.as_deref())?;
@@ -884,14 +1334,25 @@ impl ValidatedHttpPath {
             .context("Missing component_path in proto")?
             .try_into()
             .context("Invalid component path in proto")?;
+        let udf_path: CanonicalizedUdfPath = path.context("Missing udf_path")?.parse()?;
+        let is_system_module = udf_path.is_system();
+        let context_reuse = context_reuse
+            .map(context_reuse_policy_from_proto)
+            .unwrap_or_default();
         Ok(Self {
             path: ResolvedComponentFunctionPath {
                 component,
-                udf_path: path.context("Missing udf_path")?.parse()?,
+                udf_path,
                 component_path,
             },
             npm_version: npm_version.map(|v| Version::parse(&v)).transpose()?,
-            reuse_context: reuse_context.unwrap_or(false),
+            // System HTTP modules have no analyzed application metadata. Do
+            // not let a trusted protocol value opt them into context reuse.
+            context_reuse: if is_system_module {
+                ContextReusePolicy::default()
+            } else {
+                context_reuse
+            },
         })
     }
 }
@@ -903,7 +1364,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
         ValidatedHttpPath {
             path,
             npm_version,
-            reuse_context,
+            context_reuse,
         }: ValidatedHttpPath,
     ) -> anyhow::Result<Self> {
         let component_path = Some(path.component_path.into());
@@ -912,7 +1373,10 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
             npm_version: npm_version.map(|v| v.to_string()),
             component_path,
             component_id: path.component.serialize_to_string(),
-            reuse_context: Some(reuse_context),
+            // Keep this legacy database marker clear. HTTP action reuse is
+            // carried by the typed policy field.
+            reuse_context: Some(false),
+            context_reuse: Some(context_reuse_policy_to_proto(context_reuse)),
         })
     }
 }
@@ -1045,6 +1509,41 @@ impl ValidatedUdfOutcome {
     }
 }
 
+/// The return validator and table mapping must come from the same validation
+/// transaction, even when execution runs against a later database snapshot.
+#[derive(Clone)]
+pub struct ActionReturnValidation {
+    pub returns_validator: ReturnsValidator,
+    pub table_mapping: NamespacedTableMapping,
+}
+
+impl ActionOutcome {
+    pub fn validate_return_value(
+        &mut self,
+        returns_validator: &ReturnsValidator,
+        table_mapping: &NamespacedTableMapping,
+    ) -> anyhow::Result<()> {
+        if returns_validator.needs_validation()
+            && let Ok(json_packed_value) = &self.result
+        {
+            let output = json_packed_value.unpack().map_err(|e| {
+                e.wrap_error_message(|msg| {
+                    format!(
+                        "Action {} return value invalid: {msg}",
+                        self.path.debug_str()
+                    )
+                })
+            })?;
+            if let Some(js_err) =
+                returns_validator.check_output(&output, table_mapping, virtual_system_mapping())
+            {
+                self.result = Err(js_err);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatedActionOutcome {
     pub path: CanonicalizedComponentFunctionPath,
@@ -1064,11 +1563,14 @@ pub struct ValidatedActionOutcome {
 
 impl ValidatedActionOutcome {
     pub fn new(
-        outcome: ActionOutcome,
+        mut outcome: ActionOutcome,
         returns_validator: ReturnsValidator,
         table_mapping: &NamespacedTableMapping,
     ) -> Self {
-        let mut validated = ValidatedActionOutcome {
+        if let Err(mut error) = outcome.validate_return_value(&returns_validator, table_mapping) {
+            report_error_sync(&mut error);
+        }
+        ValidatedActionOutcome {
             path: outcome.path,
             arguments: outcome.arguments,
             identity: outcome.identity,
@@ -1078,34 +1580,7 @@ impl ValidatedActionOutcome {
             udf_server_version: outcome.udf_server_version,
             mutation_queue_length: None,
             user_execution_time: outcome.user_execution_time,
-        };
-
-        if returns_validator.needs_validation()
-            && let Ok(json_packed_value) = &validated.result
-        {
-            match json_packed_value.unpack() {
-                Ok(output) => {
-                    if let Some(js_err) = returns_validator.check_output(
-                        &output,
-                        table_mapping,
-                        virtual_system_mapping(),
-                    ) {
-                        validated.result = Err(js_err);
-                    }
-                },
-                Err(e) => {
-                    let mut e = e.wrap_error_message(|msg| {
-                        format!(
-                            "Action {} return value invalid: {msg}",
-                            validated.path.debug_str(),
-                        )
-                    });
-                    report_error_sync(&mut e);
-                },
-            }
         }
-
-        validated
     }
 
     pub fn from_error(

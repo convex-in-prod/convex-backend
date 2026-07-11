@@ -109,7 +109,9 @@ use self::{
         op_text_encoder_normalize_label,
     },
     time::{
+        async_op_abort_signal_timeout,
         async_op_sleep,
+        op_cancel_timer,
         op_now_call,
         op_performance_now_call,
         op_performance_time_origin_call,
@@ -152,7 +154,17 @@ pub trait V8OpProvider<'b>: OpProvider {
         resolver: v8::Global<v8::PromiseResolver>,
     ) -> anyhow::Result<()>;
 
+    fn start_timer(
+        &mut self,
+        request: AsyncOpRequest,
+        timer_id: u64,
+        resolver: v8::Global<v8::PromiseResolver>,
+    ) -> anyhow::Result<()>;
+
+    fn cancel_timer(&mut self, timer_id: u64) -> anyhow::Result<()>;
+
     fn create_stream(&mut self) -> anyhow::Result<Uuid>;
+    fn register_fetch_abort_stream(&mut self, stream_id: Uuid) -> anyhow::Result<()>;
     fn extend_stream(
         &mut self,
         id: Uuid,
@@ -263,6 +275,25 @@ impl<'a, 's: 'a, 'i, RT: Runtime, E: V8IsolateEnvironment<RT>> V8OpProvider<'i>
 
     fn create_stream(&mut self) -> anyhow::Result<Uuid> {
         self.state_mut()?.create_stream()
+    }
+
+    fn register_fetch_abort_stream(&mut self, stream_id: Uuid) -> anyhow::Result<()> {
+        self.state_mut()?.register_fetch_abort_stream(stream_id)
+    }
+
+    fn start_timer(
+        &mut self,
+        request: AsyncOpRequest,
+        timer_id: u64,
+        resolver: v8::Global<v8::PromiseResolver>,
+    ) -> anyhow::Result<()> {
+        self.state_mut()?
+            .environment
+            .start_timer(request, timer_id, resolver)
+    }
+
+    fn cancel_timer(&mut self, timer_id: u64) -> anyhow::Result<()> {
+        self.state_mut()?.environment.cancel_timer(timer_id)
     }
 
     fn extend_stream(
@@ -408,6 +439,7 @@ op_table! {
         "validateReturns" => op_validate_returns,
     },
     v8: {
+        "cancelTimer" => op_cancel_timer,
         "throwUncatchableDeveloperError" => op_throw_uncatchable_developer_error,
         "console/message" => op_console_message,
         "console/trace" => op_console_trace,
@@ -469,6 +501,7 @@ pub fn start_async_op<'b, P: V8OpProvider<'b>>(
         "fetch" => async_op_fetch(provider, args, resolver.clone())?,
         "form/parseMultiPart" => async_op_parse_multi_part(provider, args, resolver.clone())?,
         "sleep" => async_op_sleep(provider, args, resolver.clone())?,
+        "abortSignalTimeout" => async_op_abort_signal_timeout(provider, args, resolver.clone())?,
         "storage/store" => async_op_storage_store(provider, args, resolver.clone())?,
         "storage/get" => async_op_storage_get(provider, args, resolver.clone())?,
         "stream/readPart" => async_op_stream_read_part(provider, args, resolver.clone())?,

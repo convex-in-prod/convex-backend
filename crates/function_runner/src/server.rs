@@ -96,6 +96,7 @@ use tokio::sync::{
 };
 use udf::{
     validation::{
+        ActionReturnValidation,
         ValidatedHttpPath,
         ValidatedPathAndArgs,
     },
@@ -145,9 +146,19 @@ pub struct RunRequestArgs {
 }
 
 #[derive(Clone)]
-pub struct FunctionMetadata {
-    pub path_and_args: ValidatedPathAndArgs,
-    pub journal: QueryJournal,
+pub enum FunctionMetadata {
+    Query {
+        path_and_args: ValidatedPathAndArgs,
+        journal: QueryJournal,
+    },
+    Mutation {
+        path_and_args: ValidatedPathAndArgs,
+        journal: QueryJournal,
+    },
+    Action {
+        path_and_args: ValidatedPathAndArgs,
+        return_validation: ActionReturnValidation,
+    },
 }
 
 pub struct HttpActionMetadata {
@@ -381,10 +392,12 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
 
         match udf_type {
             UdfType::Query | UdfType::Mutation => {
-                let FunctionMetadata {
-                    path_and_args,
-                    journal,
-                } = function_metadata.context("Missing function metadata for query or mutation")?;
+                let (path_and_args, journal) = match function_metadata
+                    .context("Missing function metadata for query or mutation")? {
+                    FunctionMetadata::Query { path_and_args, journal }
+                    | FunctionMetadata::Mutation { path_and_args, journal } => (path_and_args, journal),
+                    FunctionMetadata::Action { .. } => anyhow::bail!("Function metadata does not match {udf_type}"),
+                };
                 // Initialize the UDF's RNG from some high-quality entropy. As with
                 // `unix_timestamp` below, the UDF is only deterministic modulo this
                 // system-generated input.
@@ -422,14 +435,23 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 ))
             },
             UdfType::Action => {
-                let FunctionMetadata { path_and_args, .. } =
-                    function_metadata.context("Missing function metadata for action")?;
+                let (path_and_args, return_validation) =
+                    match function_metadata.context("Missing function metadata for action")? {
+                        FunctionMetadata::Action {
+                            path_and_args,
+                            return_validation,
+                        } => (path_and_args, return_validation),
+                        FunctionMetadata::Query { .. } | FunctionMetadata::Mutation { .. } => {
+                            anyhow::bail!("Function metadata does not match {udf_type}")
+                        },
+                    };
                 let log_line_sender =
                     log_line_sender.context("Missing log line sender for action")?;
                 let outcome = self
                     .isolate_client
                     .execute_action(
                         path_and_args,
+                        return_validation,
                         transaction,
                         action_callbacks,
                         fetch_client,

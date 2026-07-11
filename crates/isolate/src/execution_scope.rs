@@ -40,7 +40,10 @@ use model::modules::{
     },
 };
 use serde_json::Value as JsonValue;
-use sync_types::module_path::InvalidModulePathError;
+use sync_types::{
+    module_path::InvalidModulePathError,
+    CanonicalizedModulePath,
+};
 use value::heap_size::HeapSize;
 
 use crate::{
@@ -48,6 +51,7 @@ use crate::{
     bundled_js::system_udf_file,
     context_local_state::GetContextSlot,
     environment::{
+        helpers::module_loader::module_specifier_from_path,
         ModuleCodeCacheResult,
         SyscallProvider,
         V8IsolateEnvironment,
@@ -296,6 +300,42 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
             return Ok(Err(self.format_traceback(e)?));
         }
         Ok(Ok(r))
+    }
+
+    pub async fn eval_context_entry(
+        &mut self,
+        udf_type: UdfType,
+        entry: &ModuleSpecifier,
+        initialization_module: Option<&CanonicalizedModulePath>,
+        is_reused: bool,
+        timeout: &mut Timeout<RT>,
+    ) -> anyhow::Result<Result<v8::Local<'s, v8::Module>, JsError>> {
+        let Some(initialization_module) = initialization_module else {
+            return self.eval_user_module(udf_type, false, entry, timeout).await;
+        };
+        if !is_reused {
+            // Capture every group member in the cold initialization read set.
+            // Loading a new member on a warm hit would evade invalidation.
+            let initializer = module_specifier_from_path(initialization_module)?;
+            if let Err(error) = self
+                .eval_user_module(udf_type, false, &initializer, timeout)
+                .await?
+            {
+                return Ok(Err(error));
+            }
+        }
+        let module_id =
+            self.module_map()
+                .get_by_name(entry)
+                .context(ErrorMetadata::bad_request(
+                    "InvalidContextInitializationModule",
+                    "Context initialization module did not load the requested entry",
+                ))?;
+        let module = self
+            .module_map()
+            .handle_by_id(module_id)
+            .context("Missing initialized entry module")?;
+        Ok(Ok(v8::Local::new(self.v8_scope, module)))
     }
 
     pub async fn eval_user_module(
