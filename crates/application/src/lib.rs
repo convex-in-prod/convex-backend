@@ -451,6 +451,7 @@ pub mod integrations;
 pub mod log_visibility;
 mod metrics;
 pub mod redaction;
+mod runtime_diagnostics;
 mod s3_export_worker;
 pub mod scheduled_jobs;
 mod schema_worker;

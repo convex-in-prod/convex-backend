@@ -2,7 +2,7 @@
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html
 
 import { throwNotImplementedMethodError } from "./helpers";
-import { performAsyncOp } from "./syscall";
+import { performAsyncOp, performOp } from "./syscall";
 
 const ACTIVE_TIMERS = new Map();
 
@@ -25,11 +25,12 @@ const setInterval = (
 };
 
 const clearTimeout = (id: number) => {
-  ACTIVE_TIMERS.delete(id);
+  if (ACTIVE_TIMERS.delete(id)) {
+    // Drop the request-owned resolver as well as the callback's JS registration.
+    performOp("cancelTimer", id);
+  }
 };
-const clearInterval = (id: number) => {
-  ACTIVE_TIMERS.delete(id);
-};
+const clearInterval = clearTimeout;
 
 const timerInitialization = (
   name: string,
@@ -74,7 +75,7 @@ const runAfterTimeout = (
 ) => {
   const startTime = Date.now();
   ACTIVE_TIMERS.set(timerKey, startTime + timeoutMs);
-  void performAsyncOp("sleep", name, timeoutMs).then(() => {
+  void performAsyncOp("sleep", name, timeoutMs, timerKey).then(() => {
     // TODO(CX-4534) Wait until any invocations of this algorithm,
     // that started before this one, and whose milliseconds is equal to or less
     // than this one's, have completed.

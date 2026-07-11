@@ -183,6 +183,7 @@ use udf::{
     environment::system_env_vars,
     validation::{
         validate_schedule_args,
+        ActionReturnValidation,
         PendingArgsPolicy,
         ValidatedActionOutcome,
         ValidatedPathAndArgs,
@@ -241,6 +242,10 @@ use crate::{
         ActionCompletion,
         FunctionExecutionLog,
         OutstandingFunctionState,
+    },
+    runtime_diagnostics::{
+        AttemptOutcome,
+        RuntimeDiagnostic,
     },
     source_map_cache::SourceMapCache,
     ActionError,
@@ -371,9 +376,16 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 udf_type,
                 context,
                 None,
-                Some(FunctionMetadata {
-                    journal,
-                    path_and_args,
+                Some(match udf_type {
+                    UdfType::Query => FunctionMetadata::Query {
+                        journal,
+                        path_and_args,
+                    },
+                    UdfType::Mutation => FunctionMetadata::Mutation {
+                        journal,
+                        path_and_args,
+                    },
+                    _ => anyhow::bail!("Invalid database UDF type"),
                 }),
                 None,
                 scheduler_dependency,
@@ -389,6 +401,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         &self,
         tx: Transaction<RT>,
         path_and_args: ValidatedPathAndArgs,
+        return_validation: ActionReturnValidation,
         log_line_sender: mpsc::UnboundedSender<LogLine>,
         context: ExecutionContext,
         permit_timeout: PermitTimeout,
@@ -410,9 +423,9 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 UdfType::Action,
                 context,
                 Some(log_line_sender),
-                Some(FunctionMetadata {
-                    journal: QueryJournal::new(),
+                Some(FunctionMetadata::Action {
                     path_and_args,
+                    return_validation,
                 }),
                 None,
                 scheduler_dependency,
@@ -483,16 +496,37 @@ impl<RT: Runtime> FunctionRouter<RT> {
             .in_memory_indexes
             .in_memory_indexes_last_modified();
 
+        let mut diagnostic = if udf_type == UdfType::Query {
+            RuntimeDiagnostic::start(&context, udf_type, 0, || match &function_metadata {
+                Some(FunctionMetadata::Query { path_and_args, .. }) => {
+                    let path = path_and_args.path();
+                    format!("{}:{}", path.component_path, path.udf_path)
+                },
+                Some(FunctionMetadata::Mutation { .. } | FunctionMetadata::Action { .. })
+                | None => unreachable!("query execution has no query metadata"),
+            })
+        } else {
+            None
+        };
         let timer = function_run_timer(udf_type);
-        let (function_tx, outcome, usage_stats) = self
-            .function_runner
-            .run_function(
+        let execution = isolate::execution_observation::observe(
+            self.function_runner.run_function(
                 udf_type,
                 udf_runtime,
                 tx.identity().clone(),
                 tx.begin_timestamp(),
                 FunctionWrites {
-                    updates: tx.writes().as_flat()?.coalesced_writes().cloned().collect(),
+                    updates: tx
+                        .writes()
+                        .as_flat()
+                        .inspect_err(|_| {
+                            if let Some(diagnostic) = &mut diagnostic {
+                                diagnostic.outcome = AttemptOutcome::SystemError;
+                            }
+                        })?
+                        .coalesced_writes()
+                        .cloned()
+                        .collect(),
                 },
                 log_line_sender,
                 function_metadata,
@@ -501,8 +535,17 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 in_memory_index_last_modified,
                 context,
                 scheduler_dependency,
-            )
-            .await?;
+            ),
+            diagnostic.as_ref().map(RuntimeDiagnostic::task),
+        )
+        .await;
+        if let Some(diagnostic) = &mut diagnostic {
+            // Execution can return a developer error or an unavailable route
+            // inside Ok. Keep system failure until its result and transaction
+            // have both been checked.
+            diagnostic.outcome = AttemptOutcome::SystemError;
+        }
+        let (function_tx, outcome, usage_stats) = execution?;
         timer.finish();
         drop(permit);
 
@@ -533,6 +576,20 @@ impl<RT: Runtime> FunctionRouter<RT> {
             None
         };
 
+        if let Some(diagnostic) = &mut diagnostic {
+            diagnostic.outcome = match &outcome {
+                FunctionOutcome::Query(outcome) => {
+                    if outcome.result.is_ok() {
+                        AttemptOutcome::Completed
+                    } else {
+                        AttemptOutcome::DeveloperError
+                    }
+                },
+                FunctionOutcome::Mutation(_)
+                | FunctionOutcome::Action(_)
+                | FunctionOutcome::HttpAction(_) => AttemptOutcome::SystemError,
+            };
+        }
         Ok((tx, outcome))
     }
 }
@@ -1060,13 +1117,23 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             // Note that we use different context for every mutation attempt.
             // This so every JS function run gets a different executionId.
             let context = ExecutionContext::new(request_context.clone(), &caller);
+            let mut diagnostic =
+                RuntimeDiagnostic::start(&context, UdfType::Mutation, mutation_retry_count, || {
+                    let path = path.clone().debug_into_component_path();
+                    format!("{}:{}", path.component, path.udf_path)
+                });
 
             let start = self.runtime.monotonic_now();
             let permit = self.acquire_mutation_permit(scheduler_dependency).await;
             let mut tx = self
                 .database
                 .begin_with_usage(identity.clone(), usage_tracker.clone())
-                .await?;
+                .await
+                .inspect_err(|_| {
+                    if let Some(diagnostic) = &mut diagnostic {
+                        diagnostic.outcome = AttemptOutcome::SystemError;
+                    }
+                })?;
             let pause_client = self.runtime.pause_client();
             pause_client.wait("retry_mutation_loop_start").await;
             let identity = tx.inert_identity();
@@ -1074,21 +1141,32 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             // Committed mutations can be replayed even if permit acquisition failed.
             if let Some(result) = self
                 .check_mutation_status(&mut tx, &mutation_identifier)
-                .await?
+                .await
+                .inspect_err(|_| {
+                    if let Some(diagnostic) = &mut diagnostic {
+                        diagnostic.outcome = AttemptOutcome::SystemError;
+                    }
+                })?
             {
+                if let Some(diagnostic) = &mut diagnostic {
+                    diagnostic.outcome = AttemptOutcome::AlreadyCommitted;
+                }
                 return Ok(result);
             }
 
-            let result: Result<(Transaction<RT>, ValidatedUdfOutcome), anyhow::Error> = self
-                .run_mutation_no_udf_log(
-                    tx,
-                    permit,
-                    path.clone(),
-                    arguments.clone(),
-                    caller.allowed_visibility(),
-                    context.clone(),
-                    mutation_queue_length,
-                    scheduler_dependency,
+            let result: Result<(Transaction<RT>, ValidatedUdfOutcome), anyhow::Error> =
+                isolate::execution_observation::observe(
+                    self.run_mutation_no_udf_log(
+                        tx,
+                        permit,
+                        path.clone(),
+                        arguments.clone(),
+                        caller.allowed_visibility(),
+                        context.clone(),
+                        mutation_queue_length,
+                        scheduler_dependency,
+                    ),
+                    diagnostic.as_ref().map(RuntimeDiagnostic::task),
                 )
                 .await;
             let (mut tx, mut outcome) = match result {
@@ -1098,11 +1176,19 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         && (backoff.failures() as usize) < *UDF_EXECUTOR_OCC_MAX_RETRIES
                     {
                         let sleep = backoff.fail(&mut self.runtime.rng());
+                        if let Some(diagnostic) = &mut diagnostic {
+                            diagnostic.outcome = AttemptOutcome::WriteLimitRetry;
+                            diagnostic.selected_backoff = Some(sleep);
+                        }
                         tracing::warn!(
                             "Write throughput limit exceeded, retrying {write_source:?} after \
                              {sleep:?}",
                         );
+                        let backoff_started = Instant::now();
                         self.runtime.wait(sleep).await;
+                        if let Some(diagnostic) = &mut diagnostic {
+                            diagnostic.elapsed_backoff = Some(backoff_started.elapsed());
+                        }
                         continue;
                     }
                     let file_storage_error = match e.short_msg() {
@@ -1116,13 +1202,24 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         log_mutation_file_storage_failure(short_msg, retry);
                         if retry {
                             let sleep = file_storage_backoff.fail(&mut self.runtime.rng());
+                            if let Some(diagnostic) = &mut diagnostic {
+                                diagnostic.outcome = AttemptOutcome::FileStorageRetry;
+                                diagnostic.selected_backoff = Some(sleep);
+                            }
                             tracing::warn!(
                                 "File storage failed ({e:#}), retrying {write_source:?} after \
                                  {sleep:?}",
                             );
+                            let backoff_started = Instant::now();
                             self.runtime.wait(sleep).await;
+                            if let Some(diagnostic) = &mut diagnostic {
+                                diagnostic.elapsed_backoff = Some(backoff_started.elapsed());
+                            }
                             continue;
                         }
+                    }
+                    if let Some(diagnostic) = &mut diagnostic {
+                        diagnostic.outcome = AttemptOutcome::SystemError;
                     }
                     self.function_log
                         .log_mutation_system_error(
@@ -1144,7 +1241,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             // Save a CommittedMutation object so we won't rerun this mutation if
             // successful.
             self.write_mutation_status(&mut tx, &mutation_identifier, &outcome)
-                .await?;
+                .await
+                .inspect_err(|_| {
+                    if let Some(diagnostic) = &mut diagnostic {
+                        diagnostic.outcome = AttemptOutcome::SystemError;
+                    }
+                })?;
 
             let stats = tx.take_stats();
             let execution_time = start.elapsed();
@@ -1154,6 +1256,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 // If it's an error inside the UDF, log the failed execution and return the
                 // developer error.
                 Err(ref error) => {
+                    if let Some(diagnostic) = &mut diagnostic {
+                        diagnostic.outcome = AttemptOutcome::DeveloperError;
+                    }
                     drop(tx);
                     self.function_log
                         .log_mutation(
@@ -1177,17 +1282,34 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             // Attempt to commit the transaction and log an error if commit failed,
             // even if it was an OCC error. We may decide later to suppress OCC
             // errors from the log.
-            let result = match self.database.commit(tx, write_source.clone()).await {
+            let commit_started = Instant::now();
+            let committed = self.database.commit(tx, write_source.clone()).await;
+            if let Some(diagnostic) = &mut diagnostic {
+                diagnostic.commit = Some(commit_started.elapsed());
+                diagnostic.outcome = if committed.is_ok() {
+                    AttemptOutcome::Completed
+                } else {
+                    AttemptOutcome::SystemError
+                };
+            }
+            let result = match committed {
                 Ok(ts) => Ok(MutationReturn {
                     // The commit timestamp is known now, so unresolved commit
                     // timestamps in the return value resolve to it, matching
                     // the committer's resolution of the transaction's writes.
-                    value: value.resolve_commit_ts(i64::from(ts))?,
+                    value: value.resolve_commit_ts(i64::from(ts)).inspect_err(|_| {
+                        if let Some(diagnostic) = &mut diagnostic {
+                            diagnostic.outcome = AttemptOutcome::SystemError;
+                        }
+                    })?,
                     log_lines,
                     ts,
                 }),
                 Err(e) => {
                     if e.is_deterministic_user_error() {
+                        if let Some(diagnostic) = &mut diagnostic {
+                            diagnostic.outcome = AttemptOutcome::DeveloperError;
+                        }
                         let js_error = JsError::from_error(e);
                         outcome.result = Err(js_error.clone());
                         Err(MutationError {
@@ -1199,15 +1321,27 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                             && (backoff.failures() as usize) < *UDF_EXECUTOR_OCC_MAX_RETRIES
                         {
                             let sleep = backoff.fail(&mut self.runtime.rng());
+                            if let Some(diagnostic) = &mut diagnostic {
+                                diagnostic.outcome = AttemptOutcome::OccRetry;
+                                diagnostic.selected_backoff = Some(sleep);
+                            }
                             tracing::warn!(
                                 "Optimistic concurrency control failed ({e}), retrying \
                                  {write_source:?} after {sleep:?}",
                             );
+                            let backoff_started = Instant::now();
                             self.runtime.wait(sleep).await;
+                            if let Some(diagnostic) = &mut diagnostic {
+                                diagnostic.elapsed_backoff = Some(backoff_started.elapsed());
+                            }
                             if let Some(write_ts_raw) = e.occ_write_ts()
                                 && let Ok(write_ts) = Timestamp::try_from(write_ts_raw)
                             {
+                                let conflict_started = Instant::now();
                                 self.database.wait_for_write_ts(write_ts).await;
+                                if let Some(diagnostic) = &mut diagnostic {
+                                    diagnostic.conflict_wait = Some(conflict_started.elapsed());
+                                }
                             }
                             self.function_log
                                 .log_mutation_occ_error(
@@ -1526,8 +1660,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         wait_for_permit: bool,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<ActionCompletion> {
-        let result = self
-            .run_action_inner(
+        let mut diagnostic =
+            RuntimeDiagnostic::start(&context, UdfType::Action, 0, || format!("{path:?}"));
+        let result = isolate::execution_observation::observe(
+            self.run_action_inner(
                 path,
                 arguments,
                 identity,
@@ -1536,8 +1672,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 context,
                 permit_timeout,
                 scheduler_dependency,
-            )
-            .await;
+            ),
+            diagnostic.as_ref().map(RuntimeDiagnostic::task),
+        )
+        .await;
+        if let Some(diagnostic) = &mut diagnostic {
+            diagnostic.outcome = match &result {
+                Ok(completion) if completion.outcome.result.is_ok() => AttemptOutcome::Completed,
+                Ok(_) => AttemptOutcome::DeveloperError,
+                Err(_) => AttemptOutcome::SystemError,
+            };
+        }
         match result.as_ref() {
             Ok(completion) => {
                 let result = if completion.outcome.result.is_ok() {
@@ -1642,6 +1787,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     .execute_action(
                         tx,
                         path_and_args,
+                        ActionReturnValidation {
+                            returns_validator: returns_validator.clone(),
+                            table_mapping: table_mapping.clone(),
+                        },
                         log_line_sender,
                         context.clone(),
                         permit_timeout,
@@ -1667,6 +1816,8 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     .try_into()
                     .unwrap();
 
+                // The worker checks this snapshot before cache publication, but
+                // FunctionOutcome remains an unvalidated transport contract.
                 let validated_outcome_result = outcome_result.map(|outcome| {
                     ValidatedActionOutcome::new(outcome, returns_validator, &table_mapping)
                 });
@@ -2420,7 +2571,6 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
         args: SerializedArgs,
         context: ExecutionContext,
     ) -> anyhow::Result<FunctionResult> {
-        let _tx = self.database.begin(identity.clone()).await?;
         let result = self
             .run_action_with_scheduler_dependency(
                 RequestContext::new(context.request_id, context.request_metadata),
