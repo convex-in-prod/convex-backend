@@ -47,7 +47,7 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_HEALTH_CHECK_ATTEMPTS: u32 = 50;
 
 pub struct LocalNodeExecutor {
-    inner: Arc<Mutex<Option<InnerLocalNodeExecutor>>>,
+    inner: Arc<Mutex<Option<Arc<InnerLocalNodeExecutor>>>>,
     config: LocalNodeExecutorConfig,
 }
 
@@ -237,6 +237,18 @@ impl LocalNodeExecutor {
             }
         }
     }
+
+    async fn remove_inner_if_current(&self, expected: &Arc<InnerLocalNodeExecutor>) {
+        let mut inner = self.inner.lock().await;
+        if inner
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            // A late response from an old generation must not remove the replacement
+            // process or its tempdir.
+            inner.take();
+        }
+    }
 }
 
 #[async_trait]
@@ -250,18 +262,18 @@ impl NodeExecutor for LocalNodeExecutor {
         request: ExecutorRequest,
         log_line_sender: mpsc::UnboundedSender<LogLine>,
     ) -> anyhow::Result<InvokeResponse> {
-        let client = {
+        let inner = {
             let mut inner = self.inner.lock().await;
             if inner.is_none() {
-                *inner = Some(
+                *inner = Some(Arc::new(
                     InnerLocalNodeExecutor::new(&self.config)
                         .await
                         .context("Failed to create inner local node executor")?,
-                )
+                ))
             }
-            let inner = inner.as_ref().unwrap();
-            inner.client.clone()
+            inner.as_ref().unwrap().clone()
         };
+        let client = inner.client.clone();
         let request_json = JsonValue::try_from(request)?;
 
         let response_result = client
@@ -280,9 +292,9 @@ impl NodeExecutor for LocalNodeExecutor {
                     });
                 } else if e.is_connect() {
                     // Connection error likely means the Node server crashed (e.g., OOM).
-                    // Drop the dead server so it will be restarted on next invoke.
+                    // Remove this generation so the next invoke can start a replacement.
                     tracing::warn!("Node server connection failed, dropping server: {e}");
-                    self.inner.lock().await.take();
+                    self.remove_inner_if_current(&inner).await;
                     return Err(anyhow::anyhow!(e).context("Node server request failed"));
                 } else {
                     return Err(anyhow::anyhow!(e).context("Node server request failed"));
@@ -312,8 +324,8 @@ impl NodeExecutor for LocalNodeExecutor {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
                 {
-                    // Drop the server if it claims to be exiting.
-                    self.inner.lock().await.take();
+                    // Remove this generation if it claims to be exiting.
+                    self.remove_inner_if_current(&inner).await;
                 }
                 Ok(InvokeResponse {
                     response: payload,
