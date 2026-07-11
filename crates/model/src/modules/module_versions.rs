@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::Context;
 use async_lru::async_lru::SizedValue;
 use common::{
     http::RoutedHttpPath,
@@ -89,6 +90,76 @@ impl SizedValue for FullModuleSource {
     }
 }
 
+/// Per-module permissions for retaining an initialized V8 context between
+/// executions. The policy is deliberately separate from the cache: the same
+/// cache can hold contexts for several execution kinds, but it must never
+/// infer permission from cache presence or from a request's wire type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextReusePolicy {
+    /// Allow query executions to retain their initialized context.
+    #[serde(default)]
+    pub queries: bool,
+    /// Allow mutation executions to retain their initialized context.
+    #[serde(default)]
+    pub mutations: bool,
+    /// Allow ordinary Convex-runtime action executions to retain their
+    /// initialized context.
+    #[serde(default)]
+    pub actions: bool,
+    /// Allow HTTP action executions to retain their initialized context.
+    #[serde(default)]
+    pub http_actions: bool,
+}
+
+impl ContextReusePolicy {
+    pub const fn database() -> Self {
+        Self {
+            queries: true,
+            mutations: true,
+            actions: false,
+            http_actions: false,
+        }
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        !self.queries && !self.mutations && !self.actions && !self.http_actions
+    }
+
+    /// Project this policy onto the legacy boolean without granting either
+    /// database kind more authority than the typed policy.
+    pub const fn allows_legacy_database_reuse(&self) -> bool {
+        self.queries && self.mutations
+    }
+
+    pub const fn allows(self, udf_type: UdfType) -> bool {
+        match udf_type {
+            UdfType::Query => self.queries,
+            UdfType::Mutation => self.mutations,
+            UdfType::Action => self.actions,
+            UdfType::HttpAction => self.http_actions,
+        }
+    }
+}
+
+pub fn parse_context_initialization_module(path: &str) -> anyhow::Result<CanonicalizedModulePath> {
+    let invalid_path = ErrorMetadata::bad_request(
+        "InvalidContextInitializationModule",
+        "Context initialization module must be a canonical _deps module path",
+    );
+    let module: CanonicalizedModulePath = path.parse().context(invalid_path.clone())?;
+    // ModulePath preserves redundant separators and `.` segments, and its
+    // dependency predicate also accepts the legacy actions/_deps directory.
+    // This cache identity must name the canonical root-level dependency path.
+    anyhow::ensure!(
+        path.starts_with("_deps/")
+            && module.as_str() == path
+            && path.split('/').all(|part| !matches!(part, "" | ".")),
+        invalid_path
+    );
+    Ok(module)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AnalyzedModule {
     pub functions: WithHeapSize<Vec<AnalyzedFunction>>,
@@ -96,12 +167,14 @@ pub struct AnalyzedModule {
     pub cron_specs: Option<WithHeapSize<BTreeMap<CronIdentifier, CronSpec>>>,
     /// Index of the module's original source in the source map.
     pub source_index: Option<u32>,
-    /// Whether to keep around the JS context after running a function from this
-    /// module. If true, state will non-deterministically leak from UDF to UDF
-    /// (e.g. on the global object or module attributes).
-    ///
-    /// This is experimental for now and the reuse isn't guaranteed to happen.
-    pub reuse_context: bool,
+    /// Whether this module requests experimental JS context reuse for each
+    /// supported execution kind. When reuse occurs, state can
+    /// non-deterministically leak between executions (e.g. on the global
+    /// object or module attributes).
+    pub context_reuse: ContextReusePolicy,
+    /// A fixed import root for grouped database contexts. Omission keeps
+    /// per-entry reuse; the root does not grant any execution-kind permission.
+    pub context_initialization_module: Option<CanonicalizedModulePath>,
 }
 
 impl HeapSize for AnalyzedModule {
@@ -110,6 +183,10 @@ impl HeapSize for AnalyzedModule {
             + self.http_routes.heap_size()
             + self.cron_specs.heap_size()
             + self.source_index.heap_size()
+            + self
+                .context_initialization_module
+                .as_ref()
+                .map_or(0, |path| path.as_str().len())
     }
 }
 
@@ -120,6 +197,15 @@ pub struct SerializedAnalyzedModule {
     http_routes: Option<Vec<SerializedAnalyzedHttpRoute>>,
     cron_specs: Option<Vec<SerializedNamedCronSpec>>,
     source_mapped: Option<SerializedMappedModule>,
+    // Keep this optional so an explicitly supplied all-false policy is not
+    // confused with an omitted typed field during rolling compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_reuse: Option<ContextReusePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_initialization_module: Option<String>,
+    // Keep the old field for rolling protocol compatibility. Older backends
+    // ignore `contextReuse`, while newer backends decode this field as the
+    // legacy database policy when the typed field is absent.
     #[serde(default)]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     reuse_context: bool,
@@ -149,7 +235,11 @@ impl TryFrom<AnalyzedModule> for SerializedAnalyzedModule {
                 .map(|specs| specs.into_iter().map(TryFrom::try_from).try_collect())
                 .transpose()?,
             source_mapped,
-            reuse_context: m.reuse_context,
+            context_reuse: Some(m.context_reuse),
+            context_initialization_module: m
+                .context_initialization_module
+                .map(|path| path.as_str().to_owned()),
+            reuse_context: m.context_reuse.allows_legacy_database_reuse(),
         })
     }
 }
@@ -178,7 +268,18 @@ impl TryFrom<SerializedAnalyzedModule> for AnalyzedModule {
             source_index: m
                 .source_mapped
                 .and_then(|mapped_module| mapped_module.source_index),
-            reuse_context: m.reuse_context,
+            context_reuse: m.context_reuse.unwrap_or_else(|| {
+                if m.reuse_context {
+                    ContextReusePolicy::database()
+                } else {
+                    ContextReusePolicy::default()
+                }
+            }),
+            context_initialization_module: m
+                .context_initialization_module
+                .as_deref()
+                .map(parse_context_initialization_module)
+                .transpose()?,
         })
     }
 }
@@ -572,5 +673,110 @@ impl TryFrom<AnalyzedModule> for SerializedMappedModule {
                 .map(|specs| specs.into_iter().map(TryFrom::try_from).try_collect())
                 .transpose()?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serialized_module(json: serde_json::Value) -> SerializedAnalyzedModule {
+        serde_json::from_value(json).expect("invalid serialized analyzed module")
+    }
+
+    fn empty_serialized_module_with_reuse_fields(
+        context_reuse: Option<serde_json::Value>,
+        reuse_context: Option<bool>,
+    ) -> serde_json::Value {
+        let mut module = serde_json::json!({
+            "functions": [],
+            "httpRoutes": null,
+            "cronSpecs": null,
+            "sourceMapped": null,
+        });
+        if let Some(context_reuse) = context_reuse {
+            module["contextReuse"] = context_reuse;
+        }
+        if let Some(reuse_context) = reuse_context {
+            module["reuseContext"] = reuse_context.into();
+        }
+        module
+    }
+
+    #[test]
+    fn typed_empty_policy_overrides_legacy_database_policy() {
+        let serialized = serialized_module(empty_serialized_module_with_reuse_fields(
+            Some(serde_json::json!({
+                "queries": false,
+                "mutations": false,
+                "actions": false,
+                "httpActions": false,
+            })),
+            Some(true),
+        ));
+        let analyzed = AnalyzedModule::try_from(serialized).expect("failed to decode module");
+        assert_eq!(analyzed.context_reuse, ContextReusePolicy::default());
+    }
+
+    #[test]
+    fn absent_typed_policy_keeps_legacy_database_compatibility() {
+        let serialized =
+            serialized_module(empty_serialized_module_with_reuse_fields(None, Some(true)));
+        let analyzed = AnalyzedModule::try_from(serialized).expect("failed to decode module");
+        assert_eq!(analyzed.context_reuse, ContextReusePolicy::database());
+    }
+
+    #[test]
+    fn explicit_empty_policy_is_serialized_for_rolling_compatibility() {
+        let serialized = SerializedAnalyzedModule::try_from(AnalyzedModule::default())
+            .expect("failed to encode module");
+        let value = serde_json::to_value(serialized).expect("failed to serialize module");
+        assert_eq!(
+            value.get("contextReuse"),
+            Some(&serde_json::json!({
+                "queries": false,
+                "mutations": false,
+                "actions": false,
+                "httpActions": false,
+            }))
+        );
+        assert!(value.get("reuseContext").is_none());
+    }
+
+    #[test]
+    fn typed_action_policy_round_trips_without_legacy_database_permission() {
+        let analyzed = AnalyzedModule {
+            context_reuse: ContextReusePolicy {
+                actions: true,
+                http_actions: true,
+                ..ContextReusePolicy::default()
+            },
+            ..AnalyzedModule::default()
+        };
+        let serialized =
+            SerializedAnalyzedModule::try_from(analyzed.clone()).expect("failed to encode module");
+        let value = serde_json::to_value(&serialized).expect("failed to serialize module");
+        assert!(value.get("reuseContext").is_none());
+        assert_eq!(AnalyzedModule::try_from(serialized).unwrap(), analyzed);
+    }
+
+    #[test]
+    fn mixed_policy_preserves_legacy_database_permission() {
+        let analyzed = AnalyzedModule {
+            context_reuse: ContextReusePolicy {
+                queries: true,
+                mutations: true,
+                actions: true,
+                http_actions: true,
+            },
+            ..AnalyzedModule::default()
+        };
+        let serialized =
+            SerializedAnalyzedModule::try_from(analyzed).expect("failed to encode module");
+        let value = serde_json::to_value(serialized).expect("failed to serialize module");
+        assert_eq!(
+            value.get("reuseContext"),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 }
