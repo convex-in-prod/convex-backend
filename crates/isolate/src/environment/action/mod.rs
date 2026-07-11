@@ -21,6 +21,7 @@ use std::{
 use anyhow::anyhow;
 use common::{
     components::{
+        CanonicalizedComponentModulePath,
         ComponentId,
         ComponentPath,
     },
@@ -34,6 +35,7 @@ use common::{
     knobs::{
         FUNCTION_MAX_ARGS_SIZE,
         FUNCTION_MAX_RESULT_SIZE,
+        REUSE_HTTP_ACTION_CONTEXTS,
         V8_ACTION_SYSTEM_TIMEOUT,
         V8_ACTION_USER_TIMEOUT,
     },
@@ -223,6 +225,7 @@ pub struct ActionEnvironment<RT: Runtime> {
     total_log_lines: usize,
     log_line_sender: mpsc::UnboundedSender<LogLine>,
     http_response_streamer: Option<HttpActionResponseStreamer>,
+    http_action_had_execution_error: bool,
 
     rt: RT,
 
@@ -242,10 +245,7 @@ pub struct ActionEnvironment<RT: Runtime> {
 
 impl<RT: Runtime> Drop for ActionEnvironment<RT> {
     fn drop(&mut self) {
-        self.pending_task_sender.close();
-        if let Some(mut running_tasks) = self.running_tasks.take() {
-            running_tasks.shutdown();
-        }
+        self.shutdown_task_executor();
     }
 }
 
@@ -305,6 +305,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             total_log_lines: 0,
             log_line_sender,
             http_response_streamer,
+            http_action_had_execution_error: false,
 
             next_task_id: TaskId(0),
             pending_task_sender,
@@ -354,16 +355,59 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         anyhow::ensure!(component_function_path.component == self.phase.component());
         let udf_path = &component_function_path.udf_path;
 
-        let (handle, state, mut timeout) =
+        let (handle, mut state, mut timeout) =
             isolate.start_request(context_cache, permit, self).await?;
         if let Some(tx) = function_started {
             _ = tx.send(());
         }
         scope!(let handle_scope, isolate.isolate());
-        let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
-        let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
-
-        let mut isolate_context = RequestScope::new(context_scope, handle.clone(), state, true)?;
+        let reusable_module_path = CanonicalizedComponentModulePath {
+            component: component_function_path.component,
+            module_path: udf_path.module().clone(),
+        };
+        let mut context_scope;
+        let mut reused_http_action_context = false;
+        let reused_context = if *REUSE_HTTP_ACTION_CONTEXTS
+            && let Some((context, module_map, read_set)) =
+                context_cache.take_http_action_context(&reusable_module_path)
+        {
+            // Cached HTTP action contexts keep evaluated JS modules. Validate the
+            // initialization reads so deploys, env var changes, and resource changes
+            // force a fresh context instead of serving stale code.
+            if state
+                .environment
+                .phase
+                .validate_context_read_set(&read_set)
+                .await?
+            {
+                Some((context, module_map, read_set))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut context_read_set = None;
+        let mut isolate_context = if let Some((context, module_map, read_set)) = reused_context {
+            reused_http_action_context = true;
+            context_read_set = Some(read_set);
+            let v8_context = v8::Local::new(handle_scope, context);
+            context_scope = v8::ContextScope::new(handle_scope, v8_context);
+            RequestScope::with_existing_context(
+                &mut context_scope,
+                handle.clone(),
+                state,
+                true,
+                module_map,
+            )
+        } else {
+            if *REUSE_HTTP_ACTION_CONTEXTS {
+                state.environment.phase.snoop_reads()?;
+            }
+            let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
+            context_scope = v8::ContextScope::new(handle_scope, v8_context);
+            RequestScope::new(&mut context_scope, handle.clone(), state, true)?
+        };
 
         let request_head = request.head.clone();
 
@@ -375,15 +419,43 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             request,
         )
         .await;
-        // Override the returned result if we hit a termination error.
-        let termination_error = handle.take_termination_error(&format!("http action: {udf_path}"));
-
+        {
+            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
+            scope.state_mut()?.environment.shutdown_task_executor();
+        }
         // Perform a microtask checkpoint one last time before taking the environment
         // to ensure the microtask queue is empty. Otherwise, JS from this request may
         // leak to a subsequent one on isolate reuse.
         isolate_context.checkpoint();
         *isolate_clean = true;
 
+        // Check termination after the final checkpoint because that checkpoint can run
+        // user microtasks and invoke native functions.
+        let termination_error = handle.take_termination_error(&format!("http action: {udf_path}"));
+        let clean_termination = matches!(&termination_error, Ok(Ok(..)));
+        let has_pending_request_work = if *REUSE_HTTP_ACTION_CONTEXTS {
+            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
+            !scope
+                .pending_unhandled_promise_rejections()
+                .exceptions
+                .is_empty()
+                || !scope.pending_dynamic_imports_mut().imports.is_empty()
+                || scope.state()?.has_pending_stream_work_for_context_reuse()
+        } else {
+            false
+        };
+
+        let candidate_module_map = if *REUSE_HTTP_ACTION_CONTEXTS {
+            isolate_context.take_module_map()
+        } else {
+            None
+        };
+        let candidate_v8_context = if *REUSE_HTTP_ACTION_CONTEXTS {
+            let v8_scope = isolate_context.scope();
+            Some(v8::Global::new(v8_scope, v8_scope.get_current_context()))
+        } else {
+            None
+        };
         self = isolate_context.take_environment();
         let execution_time = timeout.into_function_execution_time(UdfType::HttpAction);
         let http_response_streamer = self
@@ -409,6 +481,34 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                 result = Err(e);
             },
         }
+        // A streamed response can still leave request-owned task promises, streams,
+        // dynamic imports, unhandled rejections, or a termination that was converted
+        // into an HTTP stream outcome. Do not cache that context while its Rust state
+        // is being dropped.
+        let can_save_http_action_context = *REUSE_HTTP_ACTION_CONTEXTS
+            && clean_termination
+            && !has_pending_request_work
+            && !self.has_pending_task_promises()
+            && !self.http_action_had_execution_error
+            && matches!(&result, Ok((_, HttpActionResult::Streamed)));
+        let candidate_context_read_set = if can_save_http_action_context {
+            match context_read_set.take() {
+                Some(read_set) => Some(read_set),
+                None => self.phase.take_context_read_set()?,
+            }
+        } else {
+            None
+        };
+        let reusable_context = match (
+            candidate_module_map,
+            candidate_v8_context,
+            candidate_context_read_set,
+        ) {
+            (Some(module_map), Some(v8_context), Some(read_set)) => {
+                Some((module_map, v8_context, read_set))
+            },
+            _ => None,
+        };
         let user_execution_time = execution_time.elapsed;
         self.add_warnings_to_log_lines_http_action(execution_time, total_bytes_sent)?;
         let (route, result) = result?;
@@ -422,6 +522,20 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             http_module_path.npm_version().clone(),
             user_execution_time,
         );
+        // Do not publish the context until every fallible request-finalization step
+        // has succeeded. A caller that receives an error must never leave a warmed
+        // context behind from that request.
+        if let Some((module_map, v8_context, read_set)) = reusable_context {
+            if reused_http_action_context {
+                tracing::debug!("Reusing HTTP action context for {reusable_module_path:?}");
+            }
+            context_cache.save_http_action_context(
+                reusable_module_path,
+                v8_context,
+                module_map,
+                read_set,
+            );
+        }
         Ok(outcome)
     }
 
@@ -575,7 +689,9 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         };
         let sender_closed =
             Box::pin(futures::stream::once(sender_closed_fut).filter_map(|_| async move { None }));
-        let stream_id = state.create_request_stream()?;
+        // The abort signal is not the HTTP request body. Registering it as the
+        // request stream would replace the body byte counter used in OOM errors.
+        let stream_id = state.create_http_action_abort_stream()?;
         state
             .environment
             .send_stream(stream_id, Some(sender_closed));
@@ -631,6 +747,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                     return Ok(());
                 }
                 if streamer.total_bytes_sent() + b.len() > HTTP_ACTION_BODY_LIMIT {
+                    environment.http_action_had_execution_error = true;
                     let e = JsError::from_message(format!(
                         "HttpResponseTooLarge: HTTP actions support responses up to {}",
                         HTTP_ACTION_BODY_LIMIT.format_size(BINARY)
@@ -649,13 +766,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                     let _ = streamer.send_part(HttpActionResponsePart::BodyChunk(b))?;
                 }
             },
-            Err(e) => environment.trace_system(SystemWarning {
-                level: LogLevel::Error,
-                messages: vec![e.to_string()],
-                system_log_metadata: SystemLogMetadata {
-                    code: "error:httpAction".to_string(),
-                },
-            })?,
+            Err(e) => {
+                // Once streaming starts, run_inner reports later handler and body
+                // stream failures through this callback and otherwise returns success.
+                // Preserve the failure for the context reuse eligibility check.
+                environment.http_action_had_execution_error = true;
+                environment.trace_system(SystemWarning {
+                    level: LogLevel::Error,
+                    messages: vec![e.to_string()],
+                    system_log_metadata: SystemLogMetadata {
+                        code: "error:httpAction".to_string(),
+                    },
+                })?
+            },
         };
         Ok(())
     }
@@ -706,6 +829,10 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         )
         .await;
 
+        {
+            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
+            scope.state_mut()?.environment.shutdown_task_executor();
+        }
         // Perform a microtask checkpoint one last time before taking the environment
         // to ensure the microtask queue is empty. Otherwise, JS from this request may
         // leak to a subsequent one on isolate reuse.
@@ -1207,13 +1334,6 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             timeout.permit = Some(permit);
             handle.check_terminated()?;
         };
-        // Drain all remaining async syscalls that are not sleeps in case the
-        // developer forgot to await them.
-        let environment = &mut scope.state_mut()?.environment;
-        environment.pending_task_sender.close();
-        if let Some(mut running_tasks) = environment.running_tasks.take() {
-            running_tasks.shutdown();
-        }
         Ok(result)
     }
 
@@ -1320,6 +1440,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         counts
     }
 
+    fn has_pending_task_promises(&self) -> bool {
+        // Include sleeps. They are not developer-warning-worthy dangling ops, but
+        // their JS promises still belong to this request for context reuse.
+        !self.task_promise_resolvers.is_empty()
+    }
+
+    fn shutdown_task_executor(&mut self) {
+        self.pending_task_sender.close();
+        if let Some(mut running_tasks) = self.running_tasks.take() {
+            running_tasks.shutdown();
+        }
+    }
+
     fn start_task(
         &mut self,
         request: TaskRequestEnum,
@@ -1329,13 +1462,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         let task_id = self.next_task_id.increment();
         self.task_promise_resolvers
             .insert(task_id, (resolver, request.to_type()));
-        self.pending_task_sender
+        if self
+            .pending_task_sender
             .send(TaskRequest {
                 task_id,
                 variant: request,
                 parent_trace: EncodedSpan::from_parent(),
             })
-            .expect("TaskExecutor went away?");
+            .is_err()
+        {
+            let removed = self.task_promise_resolvers.remove(&task_id);
+            anyhow::ensure!(removed.is_some(), "Task promise resolver disappeared");
+            anyhow::bail!("TaskExecutor went away?");
+        }
         Ok(())
     }
 
@@ -1409,15 +1548,13 @@ impl<RT: Runtime> SyscallProvider<RT> for ActionEnvironment<RT> {
         anyhow::bail!("get_all_table_mappings unsupported in actions")
     }
 
-    // We lookup all modules' sources upfront when initializing the action
-    // environment, so this function always returns immediately.
     async fn lookup_source(
         &mut self,
         path: &str,
         timeout: &mut Timeout<RT>,
     ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>> {
         let user_module_path: ModulePath = path.parse()?;
-        let result = self.phase.get_module(&user_module_path, timeout)?;
+        let result = self.phase.get_module(&user_module_path, timeout).await?;
         Ok(result)
     }
 

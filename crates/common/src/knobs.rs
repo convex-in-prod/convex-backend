@@ -961,6 +961,13 @@ pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS",
 /// heap.
 pub static REUSE_ISOLATES: LazyLock<bool> = LazyLock::new(|| env_config("REUSE_ISOLATES", true));
 
+/// If true, HTTP actions may reuse a V8 context with an already-evaluated HTTP
+/// router module. This is off by default because it preserves module-level JS
+/// state across HTTP action requests. See patches/reuse_http_action_contexts.md
+/// for the self-hosted tradeoff.
+pub static REUSE_HTTP_ACTION_CONTEXTS: LazyLock<bool> =
+    LazyLock::new(|| env_config("REUSE_HTTP_ACTION_CONTEXTS", false));
+
 /// Duration in seconds before an idle isolate is recreated
 pub static ISOLATE_IDLE_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_IDLE_TIMEOUT_SECONDS", 600)));

@@ -1,4 +1,3 @@
-use ::metrics::IntoLabel;
 use astral_future::AstralBody;
 use common::{
     self,
@@ -19,7 +18,6 @@ use common::{
     execution_context::ExecutionContext,
     knobs::ISOLATE_MAX_USER_HEAP_SIZE,
 };
-use fastrace::local::LocalSpan;
 use futures::{
     future::{
         self,
@@ -123,7 +121,6 @@ use database::{
     BiggestDocumentWrites,
     FunctionExecutionSize,
     Transaction,
-    TransactionReadSet,
     OVER_LIMIT_HELP,
 };
 use deno_core::{
@@ -485,7 +482,7 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
     ) -> anyhow::Result<Option<ContextReadSet>> {
         let read_set = self.phase.finish_snoop()?;
         Ok(if should_capture {
-            capture_context_read_set(read_set, self.phase.tx_mut()?).await?
+            ContextCache::capture_context_read_set(read_set, self.phase.tx_mut()?).await?
         } else {
             None
         })
@@ -1508,71 +1505,6 @@ pub fn add_warnings_to_log_lines(
 impl<RT: Runtime> ValidateContext for DatabaseUdfSyscallProvider<RT> {
     #[fastrace::trace]
     async fn validate_reused_context(&mut self, read_set: &ContextReadSet) -> anyhow::Result<bool> {
-        let mut reusable = scopeguard::guard(false, |reusable| {
-            LocalSpan::add_property(|| ("reuse_success", reusable.as_label()));
-        });
-        let tx = self.phase.tx_mut()?;
-        for (namespace, tablet_index_name, table_name, intervals, hash) in &read_set.range_hashes {
-            let tablet = *tablet_index_name.table();
-            if !tx.table_mapping().tablet_id_exists(tablet) {
-                return Ok(false);
-            }
-            let (new_namespace, _, new_table_name) =
-                tx.table_mapping().get_table_metadata(tablet)?;
-            anyhow::ensure!(namespace == new_namespace, "{tablet} changed namespace?");
-            anyhow::ensure!(table_name == new_table_name, "{tablet} changed name?");
-            let Some(new_hash) = tx
-                .hash_index_interval_no_deps(tablet_index_name, table_name, intervals)
-                .await?
-            else {
-                return Ok(false);
-            };
-            if new_hash != *hash {
-                return Ok(false);
-            }
-        }
-        *reusable = true;
-        // All hashes match, so make sure to merge the saved read set into `tx`
-        tx.apply_reads(read_set.read_set.clone());
-        Ok(true)
+        ContextCache::validate_and_apply_context_read_set(self.phase.tx_mut()?, read_set).await
     }
-}
-
-#[fastrace::trace]
-async fn capture_context_read_set<RT: Runtime>(
-    read_set: TransactionReadSet,
-    tx: &mut Transaction<RT>,
-) -> anyhow::Result<Option<ContextReadSet>> {
-    anyhow::ensure!(
-        read_set.read_set().iter_search().count() == 0,
-        "searches can't be done during init"
-    );
-    let mut range_hashes = vec![];
-    for (tablet_index_name, reads) in read_set.read_set().iter_indexed() {
-        let &(namespace, _table_number, ref table_name) = tx
-            .table_mapping()
-            .get_table_metadata(*tablet_index_name.table())?;
-        anyhow::ensure!(
-            table_name.is_system(),
-            "context init read non-system table {table_name}?"
-        );
-        let table_name = table_name.clone();
-        let Some(hash) = tx
-            .hash_index_interval_no_deps(tablet_index_name, &table_name, &reads.intervals)
-            .await?
-        else {
-            return Ok(None);
-        };
-        range_hashes.push((
-            namespace,
-            tablet_index_name.clone(),
-            table_name,
-            reads.intervals.clone(),
-            hash,
-        ));
-    }
-    Ok(Some(ContextReadSet {
-        read_set,
-        range_hashes,
-    }))
 }
