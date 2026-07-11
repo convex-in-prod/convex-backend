@@ -2,16 +2,40 @@
 
 ## Development workflow
 
-```sh
-# When a change is ready
-just lint-rust <package>
-cargo test -p <package>
-cargo test -p <package> "test_name" # for a specific test or test group
-```
+Install the repository-pinned tools and JavaScript workspace dependencies once.
+`mise` must satisfy the `min_version` in `mise.toml`. Isolate builds invoke the
+pinned `pnpm` and `turbo` binaries from `scripts/node_modules`; install those
+before the workspace packages so a missing tool does not surface later as a
+Cargo build-script failure.
 
 ```sh
-# Before committing or presenting the output
-just format-rust
+mise install --locked protoc
+npm ci --prefix scripts
+just install-js
+```
+
+Use `scripts/run_cargo.sh` so build scripts can find the pinned `protoc` without
+making `mise` install unrelated repository tools. The workspace Cargo
+configuration supplies the target-specific GCC 15 workaround required when
+bundled RocksDB 8.10 is compiled on Linux, and the wrapper supplies installed
+Clang resource headers to bindgen when the distro library cannot locate them.
+Do not rediscover or repeat ad hoc `CXXFLAGS` or `BINDGEN_EXTRA_CLANG_ARGS`
+prefixes at each call site.
+
+```sh
+# When a change is ready
+scripts/run_cargo.sh clippy -p <package> --all-targets
+scripts/run_cargo.sh test -p <package>
+scripts/run_cargo.sh test -p <package> "test_name" # for a specific test or test group
+```
+
+Before package-wide formatting, check whether the clean upstream tree is already
+normalized by its pinned formatter. If it is not, format only intentionally
+changed files and verify that the changed-file set did not expand:
+
+```sh
+rustfmt --edition 2024 --config skip_children=true <changed-file.rs>...
+rustfmt --edition 2024 --config skip_children=true --check <changed-file.rs>...
 ```
 
 ## Rust style

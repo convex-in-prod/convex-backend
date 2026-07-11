@@ -11,6 +11,33 @@ Build the backend from scratch by running:
 docker build -t convex-backend -f self-hosted/docker-build/Dockerfile.backend .
 ```
 
+The backend build uses Cargo's `release` profile by default. Select another
+built-in or custom workspace profile with `CARGO_BUILD_PROFILE`:
+
+```sh
+docker build \
+  -t convex-backend \
+  -f self-hosted/docker-build/Dockerfile.backend \
+  --build-arg CARGO_BUILD_PROFILE=slim-release \
+  .
+```
+
+Ordinary optimized images retain available function symbols in
+`/convex/convex-local-backend.debug` before packaging strips the executable.
+This companion is optional for runtime use and required only when requesting
+native profile attribution from a stripped executable. For source lines and
+inline-call information as well, request Cargo debuginfo and disable both
+Cargo's strip setting and the Dockerfile's final strip pass:
+
+```sh
+docker build \
+  -t convex-backend \
+  -f self-hosted/docker-build/Dockerfile.backend \
+  --build-arg CARGO_PROFILE_RELEASE_DEBUG=1 \
+  --build-arg CARGO_PROFILE_RELEASE_STRIP=none \
+  .
+```
+
 Build the dashboard from scratch by running:
 
 ```sh
