@@ -131,6 +131,7 @@ use crate::{
         import_start_upload,
         import_upload_part,
         perform_import,
+        repair_failed_import_from_checkpoints,
     },
     storage::{
         storage_get,
@@ -479,6 +480,10 @@ where
         .route("/import/upload_part", post(import_upload_part))
         .route("/import/finish_upload", post(import_finish_upload))
         .route("/perform_import", post(perform_import))
+        .route(
+            "/repair_failed_import_from_checkpoints",
+            post(repair_failed_import_from_checkpoints),
+        )
         .route("/cancel_import", post(cancel_import))
 }
 
