@@ -91,6 +91,34 @@ indexes following [these instructions](./advanced/s3_storage.md).
 You should now be able to use the self-hosted backend. Read on for alternative
 hosting options for production workloads.
 
+## Native profiling symbols in locally built images
+
+`docker-build/Dockerfile.backend` retains `/convex/convex-local-backend.debug`
+when a native symbol table is available, before packaging strips the executable.
+This GNU debug companion preserves the optimized linker's function names without
+enabling debug compilation or changing optimization. Packaging adds a GNU debug
+link when possible; both files preserve the linker's GNU build ID. Copy both
+from the exact image being profiled and keep them together for offline tools. A source revision or image
+tag is not sufficient to match a separately rebuilt binary to samples.
+
+Existing Cargo profile and Docker `debug` settings still control compilation
+and executable stripping. The companion contains any debug information already
+emitted, but ordinary release builds provide function names without source
+lines or inline frames. An existing `.dwp` file is also copied into the image;
+keep it when using split debug information. Profiles that strip the native
+symbol table in Cargo (`strip = "symbols"`) still build normally, without a
+companion. `strip = "debuginfo"` retains function names. The companion is needed
+only for native profile attribution, never for building or running an image.
+If companion extraction fails, packaging reports that attribution is unavailable
+and continues. Offline tools must check the executable and companion identities
+when native attribution is requested.
+
+The extra image storage is the symbol table and any emitted debug information;
+the companion does not retain executable code pages or load into the running
+process. Dependency compilation and cache settings remain unchanged. Previously
+stripped images cannot recover symbols through repackaging; they need a retained
+companion with the matching build ID.
+
 ## Convex Auth
 
 If you're using Convex Auth, follow the
