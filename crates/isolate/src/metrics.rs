@@ -39,9 +39,88 @@ use prometheus::VMHistogram;
 
 use crate::{
     client::NO_AVAILABLE_WORKERS,
+    context_cache::{
+        ContextCacheClearReason,
+        MissRetention,
+        MissWorkerSelection,
+        ReusableContextKind,
+    },
     module_map::ModulesRegistered,
     IsolateHeapStats,
 };
+
+fn reusable_context_kind_label(context_kind: ReusableContextKind) -> &'static str {
+    match context_kind {
+        ReusableContextKind::DatabaseUdf => "database_udf",
+        ReusableContextKind::Action => "action",
+        ReusableContextKind::HttpAction => "http_action",
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContextCacheOperation {
+    Save,
+    Take,
+    RejectPoolCapacity,
+    RejectFrequency,
+    RejectMemoryPressure,
+}
+
+fn context_cache_operation_label(operation: ContextCacheOperation) -> &'static str {
+    match operation {
+        ContextCacheOperation::Save => "save",
+        ContextCacheOperation::Take => "take",
+        ContextCacheOperation::RejectPoolCapacity => "reject_pool_capacity",
+        ContextCacheOperation::RejectFrequency => "reject_frequency",
+        ContextCacheOperation::RejectMemoryPressure => "reject_memory_pressure",
+    }
+}
+
+fn context_cache_clear_reason_label(reason: ContextCacheClearReason) -> &'static str {
+    match reason {
+        ContextCacheClearReason::ProtectedReplacement => "protected_replacement",
+        ContextCacheClearReason::ProbationaryRejection => "probationary_rejection",
+        ContextCacheClearReason::PoolCapacityReplacement => "pool_capacity_replacement",
+        ContextCacheClearReason::DuplicateReplacement => "duplicate_replacement",
+        ContextCacheClearReason::MemoryPressure => "memory_pressure",
+        ContextCacheClearReason::CgroupMemoryPressure => "cgroup_memory_pressure",
+        ContextCacheClearReason::AppDefinitionEvaluation => "app_definition_evaluation",
+        ContextCacheClearReason::CacheDrop => "cache_drop",
+    }
+}
+
+register_convex_histogram!(
+    ISOLATE_CONTEXT_CACHE_EVICTION_ACCESS_AGE_TOTAL,
+    "Cache insertions since the evicted context was last returned to this isolate",
+    &["context_kind", "reason"]
+);
+register_convex_histogram!(
+    ISOLATE_CONTEXT_CACHE_EVICTION_FREQUENCY_TOTAL,
+    "Aged local access count of an evicted context",
+    &["context_kind", "reason"]
+);
+
+pub(crate) fn log_context_cache_eviction_age(
+    kind: ReusableContextKind,
+    reason: ContextCacheClearReason,
+    age: u64,
+    frequency: u16,
+) {
+    let labels = vec![
+        StaticMetricLabel::new("context_kind", reusable_context_kind_label(kind)),
+        StaticMetricLabel::new("reason", context_cache_clear_reason_label(reason)),
+    ];
+    log_distribution_with_labels(
+        &ISOLATE_CONTEXT_CACHE_EVICTION_ACCESS_AGE_TOTAL,
+        age as f64,
+        labels.clone(),
+    );
+    log_distribution_with_labels(
+        &ISOLATE_CONTEXT_CACHE_EVICTION_FREQUENCY_TOTAL,
+        frequency as f64,
+        labels,
+    );
+}
 
 // `client_id` is unbounded and a client that disconnects stops updating this
 // gauge, leaving a stale frozen value, so evict label sets that go idle.
@@ -107,6 +186,131 @@ pub fn log_scheduler_request_dispatched(name: &'static str, scheduler_class: &'s
         &ISOLATE_SCHEDULER_REQUESTS_DISPATCHED_TOTAL,
         1,
         scheduler_class_labels(name, scheduler_class),
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_SCHEDULER_CONTEXT_AFFINITY_TOTAL,
+    "Number of reusable-context-eligible worker selections accepted by a worker channel, by \
+     affinity outcome",
+    &["pool_name", "context_kind", "outcome"],
+    std::time::Duration::MAX,
+);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchedulerContextAffinityOutcome {
+    Hit,
+    RetentionCapacity,
+    SameClientWorker,
+    NewWorker,
+    StolenWorker,
+}
+
+impl SchedulerContextAffinityOutcome {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::RetentionCapacity => "retention_capacity",
+            Self::SameClientWorker => "same_client_worker",
+            Self::NewWorker => "new_worker",
+            Self::StolenWorker => "stolen_worker",
+        }
+    }
+}
+
+pub(crate) fn log_scheduler_context_affinity(
+    name: &'static str,
+    context_kind: ReusableContextKind,
+    outcome: SchedulerContextAffinityOutcome,
+) {
+    log_counter_with_labels(
+        &ISOLATE_SCHEDULER_CONTEXT_AFFINITY_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("context_kind", reusable_context_kind_label(context_kind)),
+            StaticMetricLabel::new("outcome", outcome.metric_label()),
+        ],
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_SCHEDULER_CONTEXT_MISS_TOTAL,
+    "Idle-affinity misses distinguish a mirrored resident on a busy worker, an in-flight key, and \
+     no observed affinity; in-flight initialization need not yet be reusable",
+    &["pool_name", "context_kind", "outcome"]
+);
+
+pub(crate) fn log_scheduler_context_miss(
+    name: &'static str,
+    kind: ReusableContextKind,
+    in_flight: bool,
+    resident_on_busy_worker: bool,
+) {
+    log_counter_with_labels(
+        &ISOLATE_SCHEDULER_CONTEXT_MISS_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("context_kind", reusable_context_kind_label(kind)),
+            StaticMetricLabel::new(
+                "outcome",
+                if resident_on_busy_worker {
+                    "resident_on_busy_worker"
+                } else if in_flight {
+                    "key_in_flight"
+                } else {
+                    "no_idle_affinity"
+                },
+            ),
+        ],
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_SCHEDULER_CONTEXT_MISS_PLACEMENT_TOTAL,
+    "Accepted same-client idle context misses by selected and best observed retention capacity; \
+     observations are hints and do not reserve ownership or guarantee a successful save",
+    &[
+        "pool_name",
+        "context_kind",
+        "policy",
+        "selected_retention",
+        "best_retention"
+    ],
+    Duration::MAX,
+);
+
+pub(crate) fn log_scheduler_context_miss_placement(
+    name: &'static str,
+    kind: ReusableContextKind,
+    selection: MissWorkerSelection,
+) {
+    let retention_label = |retention| match retention {
+        MissRetention::Unavailable => "unavailable",
+        MissRetention::ReplaceProbationary => "replace_probationary",
+        MissRetention::Grow => "grow",
+    };
+    log_counter_with_labels(
+        &ISOLATE_SCHEDULER_CONTEXT_MISS_PLACEMENT_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("context_kind", reusable_context_kind_label(kind)),
+            StaticMetricLabel::new(
+                "policy",
+                if selection.capacity_placement {
+                    "capacity"
+                } else {
+                    "mru"
+                },
+            ),
+            StaticMetricLabel::new(
+                "selected_retention",
+                retention_label(selection.selected_retention),
+            ),
+            StaticMetricLabel::new("best_retention", retention_label(selection.best_retention)),
+        ],
     );
 }
 
@@ -602,6 +806,70 @@ pub fn finish_service_request_timer(timer: StatusTimer, status: RequestStatus) {
         },
         RequestStatus::SystemError => (),
     };
+}
+
+const CONTROL_PLANE_REQUEST_KINDS: [&str; 5] = [
+    "analyze",
+    "evaluate_schema",
+    "evaluate_auth_config",
+    "evaluate_app_definitions",
+    "evaluate_component_initializer",
+];
+
+register_convex_counter!(
+    ISOLATE_CONTROL_PLANE_REQUESTS_TOTAL,
+    "Number of isolate control-plane evaluation requests started",
+    &["pool_name", "request_kind"],
+    std::time::Duration::MAX,
+);
+register_convex_gauge!(
+    ISOLATE_CONTROL_PLANE_REQUESTS_IN_FLIGHT_INFO,
+    "Current isolate control-plane evaluation requests",
+    &["pool_name", "request_kind"],
+);
+
+pub(crate) fn initialize_control_plane_request_metrics(pool_name: &'static str) {
+    for request_kind in CONTROL_PLANE_REQUEST_KINDS {
+        let labels = vec![
+            StaticMetricLabel::new("pool_name", pool_name),
+            StaticMetricLabel::new("request_kind", request_kind),
+        ];
+        log_counter_with_labels(&ISOLATE_CONTROL_PLANE_REQUESTS_TOTAL, 0, labels.clone());
+        log_gauge_with_labels(&ISOLATE_CONTROL_PLANE_REQUESTS_IN_FLIGHT_INFO, 0.0, labels);
+    }
+}
+
+pub(crate) struct ControlPlaneRequestGuard {
+    pool_name: &'static str,
+    request_kind: &'static str,
+}
+
+impl ControlPlaneRequestGuard {
+    pub(crate) fn new(pool_name: &'static str, request_kind: &'static str) -> Self {
+        let labels = vec![
+            StaticMetricLabel::new("pool_name", pool_name),
+            StaticMetricLabel::new("request_kind", request_kind),
+        ];
+        log_counter_with_labels(&ISOLATE_CONTROL_PLANE_REQUESTS_TOTAL, 1, labels.clone());
+        add_to_gauge_with_labels(&ISOLATE_CONTROL_PLANE_REQUESTS_IN_FLIGHT_INFO, 1.0, labels);
+        Self {
+            pool_name,
+            request_kind,
+        }
+    }
+}
+
+impl Drop for ControlPlaneRequestGuard {
+    fn drop(&mut self) {
+        subtract_from_gauge_with_labels(
+            &ISOLATE_CONTROL_PLANE_REQUESTS_IN_FLIGHT_INFO,
+            1.0,
+            vec![
+                StaticMetricLabel::new("pool_name", self.pool_name),
+                StaticMetricLabel::new("request_kind", self.request_kind),
+            ],
+        );
+    }
 }
 
 register_convex_histogram!(
@@ -1194,7 +1462,7 @@ pub fn log_user_function_execution_time(udf_type: UdfType, execution_time: Durat
 
 register_convex_counter!(
     REUSABLE_CONTEXT_INIT_TOTAL,
-    "Number of times we initialized a reusable context",
+    "Number of UDF and action attempts entering reusable-context initialization",
     &["udf_type", "reused"],
 );
 
@@ -1219,6 +1487,185 @@ pub fn log_normalize_id_old_format(format: &'static str) {
         &NORMALIZE_ID_OLD_FORMAT_TOTAL,
         1,
         vec![StaticMetricLabel::new("format", format)],
+    );
+}
+
+register_convex_counter!(
+    DATABASE_UDF_CONTEXT_REUSE_LOOKUP_TOTAL,
+    "Number of reusable database UDF context lookups by outcome",
+    &["udf_type", "outcome"],
+    std::time::Duration::MAX,
+);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DatabaseUdfContextReuseLookupOutcome {
+    NotFound,
+    ValidationFailed,
+    ValidationError,
+    Hit,
+}
+
+impl DatabaseUdfContextReuseLookupOutcome {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::ValidationFailed => "validation_failed",
+            Self::ValidationError => "validation_error",
+            Self::Hit => "hit",
+        }
+    }
+}
+
+pub(crate) fn log_database_udf_context_reuse_lookup(
+    udf_type: UdfType,
+    outcome: DatabaseUdfContextReuseLookupOutcome,
+) {
+    crate::execution_observation::record_context_lookup(outcome);
+    let udf_type = match udf_type {
+        UdfType::Query => "query",
+        UdfType::Mutation => "mutation",
+        UdfType::Action | UdfType::HttpAction => {
+            unreachable!("database UDF context lookup recorded for an action")
+        },
+    };
+    log_counter_with_labels(
+        &DATABASE_UDF_CONTEXT_REUSE_LOOKUP_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("udf_type", udf_type),
+            StaticMetricLabel::new("outcome", outcome.metric_label()),
+        ],
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_CONTEXT_CACHE_OPERATIONS_TOTAL,
+    "Number of reusable isolate context cache operations",
+    &["context_kind", "operation"],
+    std::time::Duration::MAX,
+);
+
+pub(crate) fn log_context_cache_operation(
+    context_kind: ReusableContextKind,
+    operation: ContextCacheOperation,
+) {
+    log_counter_with_labels(
+        &ISOLATE_CONTEXT_CACHE_OPERATIONS_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("context_kind", reusable_context_kind_label(context_kind)),
+            StaticMetricLabel::new("operation", context_cache_operation_label(operation)),
+        ],
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_CONTEXT_CACHE_CLEARED_TOTAL,
+    "Number of saved reusable isolate contexts cleared by reason",
+    &["context_kind", "reason"],
+    std::time::Duration::MAX,
+);
+
+pub(crate) fn log_context_cache_cleared(
+    context_kind: ReusableContextKind,
+    reason: ContextCacheClearReason,
+) {
+    log_counter_with_labels(
+        &ISOLATE_CONTEXT_CACHE_CLEARED_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("context_kind", reusable_context_kind_label(context_kind)),
+            StaticMetricLabel::new("reason", context_cache_clear_reason_label(reason)),
+        ],
+    );
+}
+
+register_convex_gauge!(
+    ISOLATE_CONTEXT_CACHE_ENTRIES_INFO,
+    "Current number of saved reusable isolate contexts",
+    &["context_kind"],
+);
+
+register_convex_gauge!(
+    ISOLATE_CONTEXT_CACHE_CAPACITY_INFO,
+    "Configured reusable isolate context cache capacity",
+    &["pool_name", "scope"],
+);
+register_convex_gauge!(
+    ISOLATE_CONTEXT_CACHE_OWNED_INFO,
+    "Current reusable isolate contexts owning shared pool capacity, including contexts in flight",
+    &["pool_name"],
+);
+register_convex_gauge!(
+    ISOLATE_MEMORY_CAPACITY_BYTES,
+    "Configured V8 isolate memory capacity before native runtime overhead",
+    &["pool_name", "capacity_kind"],
+);
+
+pub(crate) fn log_context_cache_capacity(pool_name: &'static str, per_isolate: usize, pool: usize) {
+    for (scope, capacity) in [("per_isolate", per_isolate), ("pool", pool)] {
+        log_gauge_with_labels(
+            &ISOLATE_CONTEXT_CACHE_CAPACITY_INFO,
+            capacity as f64,
+            vec![
+                StaticMetricLabel::new("pool_name", pool_name),
+                StaticMetricLabel::new("scope", scope),
+            ],
+        );
+    }
+}
+
+pub(crate) fn log_context_cache_owned(pool_name: &'static str, owned: usize) {
+    log_gauge_with_labels(
+        &ISOLATE_CONTEXT_CACHE_OWNED_INFO,
+        owned as f64,
+        vec![StaticMetricLabel::new("pool_name", pool_name)],
+    );
+}
+
+pub(crate) fn log_isolate_memory_capacity(
+    pool_name: &'static str,
+    heap_per_worker: usize,
+    heap_pool: usize,
+    array_buffer_per_worker: usize,
+    array_buffer_pool: usize,
+) {
+    for (capacity_kind, capacity) in [
+        ("heap_per_worker", heap_per_worker),
+        ("heap_pool", heap_pool),
+        ("array_buffer_per_worker", array_buffer_per_worker),
+        ("array_buffer_pool", array_buffer_pool),
+    ] {
+        log_gauge_with_labels(
+            &ISOLATE_MEMORY_CAPACITY_BYTES,
+            capacity as f64,
+            vec![
+                StaticMetricLabel::new("pool_name", pool_name),
+                StaticMetricLabel::new("capacity_kind", capacity_kind),
+            ],
+        );
+    }
+}
+
+pub(crate) fn log_context_cache_entry_added(context_kind: ReusableContextKind) {
+    add_to_gauge_with_labels(
+        &ISOLATE_CONTEXT_CACHE_ENTRIES_INFO,
+        1.0,
+        vec![StaticMetricLabel::new(
+            "context_kind",
+            reusable_context_kind_label(context_kind),
+        )],
+    );
+}
+
+pub(crate) fn log_context_cache_entry_removed(context_kind: ReusableContextKind) {
+    subtract_from_gauge_with_labels(
+        &ISOLATE_CONTEXT_CACHE_ENTRIES_INFO,
+        1.0,
+        vec![StaticMetricLabel::new(
+            "context_kind",
+            reusable_context_kind_label(context_kind),
+        )],
     );
 }
 

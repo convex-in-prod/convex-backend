@@ -22,6 +22,7 @@ use std::{
 use anyhow::anyhow;
 use common::{
     components::{
+        CanonicalizedComponentModulePath,
         ComponentId,
         ComponentPath,
     },
@@ -149,9 +150,16 @@ use super::{
 use crate::{
     client::{
         ActionRequestParams,
+        CancellationSignal,
         EnvironmentData,
     },
-    context_cache::ContextCache,
+    context_cache::{
+        context_cache_key,
+        ContextCache,
+        ContextReadSet,
+        ReusableContextKind,
+        ReusableContextToken,
+    },
     environment::{
         helpers::{
             module_loader::module_specifier_from_path,
@@ -181,6 +189,7 @@ use crate::{
         log_unawaited_pending_op,
     },
     module_cache::V8ModuleSource,
+    module_map::ModuleMap,
     ops::V8OpProvider,
     request_scope::{
         RequestScope,
@@ -227,6 +236,7 @@ pub struct ActionEnvironment<RT: Runtime> {
     total_log_lines: usize,
     log_line_sender: mpsc::UnboundedSender<LogLine>,
     http_response_streamer: Option<HttpActionResponseStreamer>,
+    http_action_had_execution_error: bool,
 
     rt: RT,
 
@@ -244,12 +254,49 @@ pub struct ActionEnvironment<RT: Runtime> {
     http_action_route: Arc<OnceLock<HttpActionRoute>>,
 }
 
+/// Holds a warmed context outside the cache until the isolate worker has
+/// delivered the result to its caller. If delivery fails, dropping this value
+/// also drops the V8 roots and returns any borrowed cache capacity.
+pub(crate) struct PendingReusableContext {
+    kind: ReusableContextKind,
+    module_path: CanonicalizedComponentModulePath,
+    context: v8::Global<v8::Context>,
+    module_map: ModuleMap,
+    read_set: ContextReadSet,
+    token: Option<ReusableContextToken>,
+}
+
+impl PendingReusableContext {
+    pub(crate) fn publish(self, context_cache: &mut ContextCache) {
+        let Self {
+            kind,
+            module_path,
+            context,
+            module_map,
+            read_set,
+            token,
+        } = self;
+        match kind {
+            ReusableContextKind::Action => {
+                context_cache.save_action_context(module_path, context, module_map, read_set, token)
+            },
+            ReusableContextKind::HttpAction => context_cache.save_http_action_context(
+                module_path,
+                context,
+                module_map,
+                read_set,
+                token,
+            ),
+            ReusableContextKind::DatabaseUdf => {
+                unreachable!("action environment produced a database-UDF context")
+            },
+        }
+    }
+}
+
 impl<RT: Runtime> Drop for ActionEnvironment<RT> {
     fn drop(&mut self) {
-        self.pending_task_sender.close();
-        if let Some(mut running_tasks) = self.running_tasks.take() {
-            running_tasks.shutdown();
-        }
+        self.shutdown_task_executor();
     }
 }
 
@@ -309,6 +356,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             total_log_lines: 0,
             log_line_sender,
             http_response_streamer,
+            http_action_had_execution_error: false,
 
             next_task_id: TaskId(0),
             pending_task_sender,
@@ -339,7 +387,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
 
     #[fastrace::trace]
     pub async fn run_http_action(
-        mut self,
+        self,
         isolate: &mut Isolate<RT>,
         context_cache: &mut ContextCache,
         permit: ConcurrencyPermit,
@@ -348,7 +396,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         routed_path: RoutedHttpPath,
         request: HttpActionRequest,
         function_started: Option<oneshot::Sender<()>>,
-    ) -> anyhow::Result<HttpActionOutcome> {
+    ) -> anyhow::Result<(HttpActionOutcome, Option<PendingReusableContext>)> {
         let start_unix_timestamp = self.rt.unix_timestamp();
 
         // Double check that we correctly initialized `ActionEnvironment` with the right
@@ -357,17 +405,66 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         let component_function_path = http_module_path.path();
         anyhow::ensure!(component_function_path.component == self.phase.component());
         let udf_path = &component_function_path.udf_path;
+        let reuse_context = http_module_path.reuse_context(UdfType::HttpAction);
 
-        let (handle, state, mut timeout) =
+        let (handle, mut state, mut timeout) =
             isolate.start_request(context_cache, permit, self).await?;
         if let Some(tx) = function_started {
             _ = tx.send(());
         }
+        // Declare token ownership before the V8 scopes so failure paths drop the
+        // active context and module roots before returning the pool permit.
+        let mut reusable_context_token = None;
         scope!(let handle_scope, isolate.isolate());
-        let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
-        let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
-
-        let mut isolate_context = RequestScope::new(context_scope, handle.clone(), state, true)?;
+        let reusable_module_path = context_cache_key(component_function_path);
+        let mut context_scope;
+        let mut reused_http_action_context = false;
+        let reused_context = if reuse_context
+            && let Some(taken_context) =
+                context_cache.take_http_action_context(&reusable_module_path)
+        {
+            // Cached HTTP action contexts keep evaluated JS modules. Validate the
+            // initialization reads so deploys, env var changes, and resource changes
+            // force a fresh context instead of serving stale code.
+            if state
+                .environment
+                .phase
+                .validate_context_read_set(taken_context.read_set(), &mut timeout)
+                .await?
+            {
+                Some(taken_context)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if reuse_context {
+            metrics::log_reusable_context_init(UdfType::HttpAction, reused_context.is_some());
+        }
+        let mut context_read_set = None;
+        let mut isolate_context = if let Some(taken_context) = reused_context {
+            let (context, module_map, read_set, token) = taken_context.into_parts();
+            reusable_context_token = Some(token);
+            reused_http_action_context = true;
+            context_read_set = Some(read_set);
+            let v8_context = v8::Local::new(handle_scope, context);
+            context_scope = v8::ContextScope::new(handle_scope, v8_context);
+            RequestScope::with_existing_context(
+                &mut context_scope,
+                handle.clone(),
+                state,
+                true,
+                module_map,
+            )
+        } else {
+            if reuse_context {
+                state.environment.phase.snoop_reads()?;
+            }
+            let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
+            context_scope = v8::ContextScope::new(handle_scope, v8_context);
+            RequestScope::new(&mut context_scope, handle.clone(), state, true)?
+        };
 
         let request_head = request.head.clone();
 
@@ -379,22 +476,53 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             request,
         )
         .await;
-        // Override the returned result if we hit a termination error.
-        let termination_error = handle.take_termination_error(&format!("http action: {udf_path}"));
-
+        {
+            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
+            scope.state_mut()?.environment.shutdown_task_executor();
+        }
         // Perform a microtask checkpoint one last time before taking the environment
         // to ensure the microtask queue is empty. Otherwise, JS from this request may
         // leak to a subsequent one on isolate reuse.
         isolate_context.checkpoint();
         *isolate_clean = true;
 
-        self = isolate_context.take_environment();
+        // Check termination after the final checkpoint because that checkpoint can run
+        // user microtasks and invoke native functions.
+        let termination_error = handle.take_termination_error(&format!("http action: {udf_path}"));
+        let clean_termination = matches!(&termination_error, Ok(Ok(..)));
+        let has_pending_request_work = if reuse_context {
+            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
+            !scope
+                .pending_unhandled_promise_rejections()
+                .exceptions
+                .is_empty()
+                || !scope.pending_dynamic_imports_mut().imports.is_empty()
+                || scope.state()?.has_pending_stream_work_for_context_reuse()
+        } else {
+            false
+        };
+
+        let candidate_module_map = if reuse_context {
+            isolate_context.take_module_map()
+        } else {
+            None
+        };
+        let candidate_v8_context = if reuse_context {
+            let v8_scope = isolate_context.scope();
+            Some(v8::Global::new(v8_scope, v8_scope.get_current_context()))
+        } else {
+            None
+        };
+        // This environment can still own task resolvers on a rejected save.
+        // Keep it local so it drops before the enclosing scopes and cache token.
+        let mut environment = isolate_context.take_environment();
         let execution_time = timeout.into_function_execution_time(UdfType::HttpAction);
-        let http_response_streamer = self
+        let http_response_streamer = environment
             .http_response_streamer
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No HTTP response streamer for HTTP action"))?;
         let total_bytes_sent = http_response_streamer.total_bytes_sent();
+        let response_sender = http_response_streamer.sender.clone();
         match termination_error {
             Ok(Ok(..)) => (),
             Ok(Err(e)) => {
@@ -405,7 +533,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                 if !http_response_streamer.has_started() {
                     result = Ok((route, HttpActionResult::Error(e)));
                 } else {
-                    Self::handle_http_streamed_part(&mut self, Err(e))?;
+                    Self::handle_http_streamed_part(&mut environment, Err(e))?;
                     result = Ok((route, HttpActionResult::Streamed))
                 }
             },
@@ -413,20 +541,77 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                 result = Err(e);
             },
         }
+        // A streamed response can still leave request-owned task promises, streams,
+        // dynamic imports, unhandled rejections, or a termination that was converted
+        // into an HTTP stream outcome. Do not cache that context while its Rust state
+        // is being dropped.
+        let can_save_http_action_context = reuse_context
+            && clean_termination
+            && !has_pending_request_work
+            && !environment.has_pending_task_promises()
+            && !environment.http_action_had_execution_error
+            && !response_sender.is_closed()
+            && matches!(&result, Ok((_, HttpActionResult::Streamed)));
+        let candidate_context_read_set = if can_save_http_action_context {
+            match context_read_set.take() {
+                Some(read_set) => Some(read_set),
+                None => environment.phase.take_context_read_set()?,
+            }
+        } else {
+            None
+        };
+        let reusable_context = if can_save_http_action_context {
+            let module_map = candidate_module_map
+                .ok_or_else(|| anyhow!("Lost ModuleMap for reusable HTTP action context"))?;
+            let v8_context = candidate_v8_context
+                .ok_or_else(|| anyhow!("Lost V8 context for reusable HTTP action context"))?;
+            candidate_context_read_set.map(|read_set| (module_map, v8_context, read_set))
+        } else {
+            None
+        };
         let user_execution_time = execution_time.elapsed;
-        self.add_warnings_to_log_lines_http_action(execution_time, total_bytes_sent)?;
+        environment.add_warnings_to_log_lines_http_action(execution_time, total_bytes_sent)?;
         let (route, result) = result?;
         let outcome = HttpActionOutcome::new(
             route,
             request_head,
-            self.identity.clone().into(),
+            environment.identity.clone().into(),
             start_unix_timestamp,
             result,
-            Some(self.syscall_trace.lock().clone()),
+            Some(environment.syscall_trace.lock().clone()),
             http_module_path.npm_version().clone(),
             user_execution_time,
         );
-        Ok(outcome)
+        let reusable_context = if let Some((module_map, v8_context, read_set)) = reusable_context {
+            // The response receiver can close during warning/result finalization.
+            // Keep the token guard live until these final checks complete. Its
+            // declaration order makes rejected candidates drop their V8 scopes
+            // before releasing shared capacity.
+            handle.check_terminated()?;
+            if response_sender.is_closed() {
+                None
+            } else {
+                if reused_http_action_context {
+                    tracing::debug!("Reusing HTTP action context for {reusable_module_path:?}");
+                }
+                assert_eq!(
+                    reusable_context_token.is_some(),
+                    reused_http_action_context,
+                    "HTTP reusable-context token ownership drifted"
+                );
+                Some(PendingReusableContext {
+                    kind: ReusableContextKind::HttpAction,
+                    module_path: reusable_module_path,
+                    context: v8_context,
+                    module_map,
+                    read_set,
+                    token: reusable_context_token.take(),
+                })
+            }
+        } else {
+            None
+        };
+        Ok((outcome, reusable_context))
     }
 
     #[fastrace::trace]
@@ -579,7 +764,9 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         };
         let sender_closed =
             Box::pin(futures::stream::once(sender_closed_fut).filter_map(|_| async move { None }));
-        let stream_id = state.create_request_stream()?;
+        // The abort signal is not the HTTP request body. Registering it as the
+        // request stream would replace the body byte counter used in OOM errors.
+        let stream_id = state.create_http_action_abort_stream()?;
         state
             .environment
             .send_stream(stream_id, Some(sender_closed))?;
@@ -635,6 +822,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                     return Ok(());
                 }
                 if streamer.total_bytes_sent() + b.len() > HTTP_ACTION_BODY_LIMIT {
+                    environment.http_action_had_execution_error = true;
                     let e = JsError::from_message(format!(
                         "HttpResponseTooLarge: HTTP actions support responses up to {}",
                         HTTP_ACTION_BODY_LIMIT.format_size(BINARY)
@@ -653,13 +841,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                     let _ = streamer.send_part(HttpActionResponsePart::BodyChunk(b))?;
                 }
             },
-            Err(e) => environment.trace_system(SystemWarning {
-                level: LogLevel::Error,
-                messages: vec![e.to_string()],
-                system_log_metadata: SystemLogMetadata {
-                    code: "error:httpAction".to_string(),
-                },
-            })?,
+            Err(e) => {
+                // Once streaming starts, run_inner reports later handler and body
+                // stream failures through this callback and otherwise returns success.
+                // Preserve the failure for the context reuse eligibility check.
+                environment.http_action_had_execution_error = true;
+                environment.trace_system(SystemWarning {
+                    level: LogLevel::Error,
+                    messages: vec![e.to_string()],
+                    system_log_metadata: SystemLogMetadata {
+                        code: "error:httpAction".to_string(),
+                    },
+                })?
+            },
         };
         Ok(())
     }
@@ -685,45 +879,106 @@ impl<RT: Runtime> ActionEnvironment<RT> {
 
     #[fastrace::trace]
     pub async fn run_action(
-        mut self,
+        self,
         isolate: &mut Isolate<RT>,
         context_cache: &mut ContextCache,
         permit: ConcurrencyPermit,
         isolate_clean: &mut bool,
         request_params: ActionRequestParams,
-        cancellation: BoxFuture<'_, ()>,
+        cancellation: CancellationSignal,
         function_started: Option<oneshot::Sender<()>>,
-    ) -> anyhow::Result<ActionOutcome> {
+    ) -> anyhow::Result<(ActionOutcome, Option<PendingReusableContext>)> {
         let start_unix_timestamp = self.rt.unix_timestamp();
+        let reuse_context = request_params.path_and_args.reuse_context(UdfType::Action);
 
-        let (handle, state, mut timeout) =
+        let (handle, mut state, mut timeout) =
             isolate.start_request(context_cache, permit, self).await?;
         if let Some(tx) = function_started {
             _ = tx.send(());
         }
+        // Declare token ownership before the V8 scopes so every failure path
+        // drops the cached roots before returning the shared cache permit.
+        let mut reusable_context_token = None;
         scope!(let handle_scope, isolate.isolate());
-        let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
-        let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
-
-        let mut isolate_context = RequestScope::new(context_scope, handle.clone(), state, true)?;
+        let reusable_module_path = context_cache_key(request_params.path_and_args.path());
+        let mut context_scope;
+        let mut context_read_set = None;
+        let reused_context = if reuse_context
+            && let Some(taken_context) = context_cache.take_action_context(&reusable_module_path)
+        {
+            let validation = state
+                .environment
+                .phase
+                .validate_context_read_set(taken_context.read_set(), &mut timeout)
+                .await;
+            crate::execution_observation::record_context_lookup(match &validation {
+                Ok(true) => metrics::DatabaseUdfContextReuseLookupOutcome::Hit,
+                Ok(false) => metrics::DatabaseUdfContextReuseLookupOutcome::ValidationFailed,
+                Err(_) => metrics::DatabaseUdfContextReuseLookupOutcome::ValidationError,
+            });
+            if validation? {
+                Some(taken_context)
+            } else {
+                None
+            }
+        } else {
+            if reuse_context {
+                crate::execution_observation::record_context_lookup(
+                    metrics::DatabaseUdfContextReuseLookupOutcome::NotFound,
+                );
+            }
+            None
+        };
+        crate::execution_observation::record_runtime_reuse(reused_context.is_some());
+        if reuse_context {
+            metrics::log_reusable_context_init(UdfType::Action, reused_context.is_some());
+        }
+        let mut isolate_context = if let Some(taken_context) = reused_context {
+            let (context, module_map, read_set, token) = taken_context.into_parts();
+            reusable_context_token = Some(token);
+            context_read_set = Some(read_set);
+            let v8_context = v8::Local::new(handle_scope, context);
+            context_scope = v8::ContextScope::new(handle_scope, v8_context);
+            RequestScope::with_existing_context(
+                &mut context_scope,
+                handle.clone(),
+                state,
+                true,
+                module_map,
+            )
+        } else {
+            if reuse_context {
+                state.environment.phase.snoop_reads()?;
+            }
+            let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
+            context_scope = v8::ContextScope::new(handle_scope, v8_context);
+            RequestScope::new(&mut context_scope, handle.clone(), state, true)?
+        };
         let mut result = Self::run_action_inner(
             &mut isolate_context,
             &mut timeout,
             request_params.clone(),
-            cancellation,
+            cancellation.cancelled().boxed(),
         )
         .await;
+        crate::execution_observation::set_phase(crate::execution_observation::Phase::Finalization);
 
+        {
+            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
+            scope.state_mut()?.environment.shutdown_task_executor();
+        }
         // Perform a microtask checkpoint one last time before taking the environment
         // to ensure the microtask queue is empty. Otherwise, JS from this request may
         // leak to a subsequent one on isolate reuse.
         isolate_context.checkpoint();
         *isolate_clean = true;
 
-        match handle.take_termination_error(&format!(
+        let termination_error = handle.take_termination_error(&format!(
             "{:?}",
             request_params.path_and_args.path().clone().for_logging()
-        )) {
+        ));
+        let clean_termination = matches!(&termination_error, Ok(Ok(..)));
+        match termination_error {
             Ok(Ok(..)) => (),
             Ok(Err(e)) => {
                 result = Ok(Err(e));
@@ -732,12 +987,59 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                 result = Err(e);
             },
         }
-        self = isolate_context.take_environment();
+        let has_pending_request_work = if reuse_context {
+            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
+            !scope
+                .pending_unhandled_promise_rejections()
+                .exceptions
+                .is_empty()
+                || !scope.pending_dynamic_imports_mut().imports.is_empty()
+                || scope.state()?.has_pending_stream_work_for_context_reuse()
+        } else {
+            false
+        };
+        let candidate_module_map = if reuse_context {
+            isolate_context.take_module_map()
+        } else {
+            None
+        };
+        let candidate_v8_context = if reuse_context {
+            let v8_scope = isolate_context.scope();
+            Some(v8::Global::new(v8_scope, v8_scope.get_current_context()))
+        } else {
+            None
+        };
+        // A failed or canceled action can retain task resolvers. Their roots
+        // must leave before the token, which is declared before the V8 scopes.
+        let mut environment = isolate_context.take_environment();
+        let can_save_action_context = reuse_context
+            && clean_termination
+            && !cancellation.is_cancelled()
+            && !has_pending_request_work
+            && !environment.has_pending_task_promises()
+            && matches!(&result, Ok(Ok(_)));
+        let candidate_context_read_set = if can_save_action_context {
+            match context_read_set.take() {
+                Some(read_set) => Some(read_set),
+                None => environment.phase.take_context_read_set()?,
+            }
+        } else {
+            None
+        };
+        let reusable_context = if can_save_action_context {
+            let module_map = candidate_module_map
+                .ok_or_else(|| anyhow!("Lost ModuleMap for reusable action context"))?;
+            let v8_context = candidate_v8_context
+                .ok_or_else(|| anyhow!("Lost V8 context for reusable action context"))?;
+            candidate_context_read_set.map(|read_set| (module_map, v8_context, read_set))
+        } else {
+            None
+        };
         let execution_time = timeout.into_function_execution_time(UdfType::Action);
         let user_execution_time = execution_time.elapsed;
         let (path, arguments, udf_server_version) = request_params.path_and_args.consume();
         let udf_args = parse_udf_args(&path.udf_path, arguments.clone().into_args()?)?;
-        self.add_warnings_to_log_lines_action(
+        environment.add_warnings_to_log_lines_action(
             execution_time,
             &udf_args,
             result.as_ref().ok().and_then(|r| r.as_ref().ok()),
@@ -746,16 +1048,27 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             path: path.for_logging(),
             arguments,
             unix_timestamp: start_unix_timestamp,
-            identity: self.identity.clone().into(),
+            identity: environment.identity.clone().into(),
             result: match result? {
                 Ok(v) => Ok(JsonPackedValue::pack(v)),
                 Err(e) => Err(e),
             },
-            syscall_trace: self.syscall_trace.lock().clone(),
+            syscall_trace: environment.syscall_trace.lock().clone(),
             udf_server_version,
             user_execution_time: Some(user_execution_time),
         };
-        Ok(outcome)
+        // Fallible finalization must leave the token outside the candidate: on
+        // error, the handle scope still roots the context after its Global drops.
+        let reusable_context =
+            reusable_context.map(|(module_map, context, read_set)| PendingReusableContext {
+                kind: ReusableContextKind::Action,
+                module_path: reusable_module_path,
+                context,
+                module_map,
+                read_set,
+                token: reusable_context_token.take(),
+            });
+        Ok((outcome, reusable_context))
     }
 
     #[fastrace::trace]
@@ -1029,7 +1342,12 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             state.environment.phase.begin_execution()?;
         }
         let global = scope.get_current_context().global(scope);
-        let promise_r = scope.with_try_catch(|s| v8_function.call(s, global.into(), v8_args));
+        crate::execution_observation::set_phase(crate::execution_observation::Phase::Handler);
+        let promise_r = {
+            let _owner =
+                crate::execution_observation::enter(crate::execution_observation::Owner::Guest);
+            scope.with_try_catch(|s| v8_function.call(s, global.into(), v8_args))
+        };
         // If we hit a system error within a syscall, return `Err`, even if JS thinks it
         // returned successfully. The syscall layer uses
         // `scope.terminate_execution()` when we hit a system error, which
@@ -1051,7 +1369,11 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         let result: Result<(), JsError> = loop {
             // Advance the user's promise as far as it can go by draining the microtask
             // queue.
-            scope.perform_microtask_checkpoint();
+            {
+                let _owner =
+                    crate::execution_observation::enter(crate::execution_observation::Owner::Guest);
+                scope.perform_microtask_checkpoint();
+            }
             pump_message_loop(scope);
             scope.record_heap_stats(&handle)?;
             let request_stream_state = scope.state()?.request_stream_state.as_ref();
@@ -1215,13 +1537,6 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             timeout.permit = Some(permit);
             handle.check_terminated()?;
         };
-        // Drain all remaining async syscalls that are not sleeps in case the
-        // developer forgot to await them.
-        let environment = &mut scope.state_mut()?.environment;
-        environment.pending_task_sender.close();
-        if let Some(mut running_tasks) = environment.running_tasks.take() {
-            running_tasks.shutdown();
-        }
         Ok(result)
     }
 
@@ -1328,6 +1643,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         counts
     }
 
+    fn has_pending_task_promises(&self) -> bool {
+        // Include sleeps. They are not developer-warning-worthy dangling ops, but
+        // their JS promises still belong to this request for context reuse.
+        !self.task_promise_resolvers.is_empty()
+    }
+
+    fn shutdown_task_executor(&mut self) {
+        self.pending_task_sender.close();
+        if let Some(mut running_tasks) = self.running_tasks.take() {
+            running_tasks.shutdown();
+        }
+    }
+
     fn start_task(
         &mut self,
         request: TaskRequestEnum,
@@ -1337,17 +1665,20 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         let task_id = self.next_task_id.increment();
         self.task_promise_resolvers
             .insert(task_id, (resolver, request.to_type()));
-        self.pending_task_sender
+        if self
+            .pending_task_sender
             .send(TaskRequest {
                 task_id,
                 variant: request,
                 parent_trace: EncodedSpan::from_parent(),
             })
-            .map_err(|_| {
-                self.task_promise_resolvers.remove(&task_id);
-                anyhow!(ErrorMetadata::operational_internal_server_error())
-                    .context("TaskExecutor went away")
-            })?;
+            .is_err()
+        {
+            let removed = self.task_promise_resolvers.remove(&task_id);
+            anyhow::ensure!(removed.is_some(), "Task promise resolver disappeared");
+            return Err(anyhow!(ErrorMetadata::operational_internal_server_error())
+                .context("TaskExecutor went away"));
+        }
         Ok(())
     }
 
@@ -1423,15 +1754,13 @@ impl<RT: Runtime> OpProvider for ActionEnvironment<RT> {
 }
 
 impl<RT: Runtime> SyscallProvider<RT> for ActionEnvironment<RT> {
-    // We lookup all modules' sources upfront when initializing the action
-    // environment, so this function always returns immediately.
     async fn lookup_source(
         &mut self,
         path: &str,
         timeout: &mut Timeout<RT>,
     ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>> {
         let user_module_path: ModulePath = path.parse()?;
-        let result = self.phase.get_module(&user_module_path, timeout)?;
+        let result = self.phase.get_module(&user_module_path, timeout).await?;
         Ok(result)
     }
 

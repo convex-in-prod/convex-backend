@@ -3,7 +3,6 @@ use common::{
     runtime::Runtime,
     types::UdfType,
 };
-use futures::FutureExt;
 use sync_types::CanonicalizedUdfPath;
 use udf::{
     metrics::is_developer_ok,
@@ -17,7 +16,10 @@ use crate::{
         Request,
         RequestType,
     },
-    context_cache::ContextCache,
+    context_cache::{
+        ContextCache,
+        ContextCacheClearReason,
+    },
     environment::{
         action::ActionEnvironment,
         analyze::AnalyzeEnvironment,
@@ -34,6 +36,7 @@ use crate::{
         finish_service_request_timer,
         record_component_function_path,
         service_request_timer,
+        ControlPlaneRequestGuard,
         RequestStatus,
     },
     ConcurrencyPermit,
@@ -68,10 +71,15 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
     ) -> (String, bool) {
         // Require the layer below to opt into isolate reuse by setting `isolate_clean`.
         let mut isolate_clean = false;
+        let _control_plane_request = inner.control_plane_kind().map(|request_kind| {
+            ControlPlaneRequestGuard::new(self.isolate_config.name, request_kind)
+        });
         let debug_str = match inner {
             RequestType::Udf {
                 request,
-                mut response,
+                execution_observation,
+                cancellation,
+                response,
                 queue_timer,
                 rng_seed,
                 reactor_depth,
@@ -83,25 +91,31 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                 let timer = service_request_timer(&request.udf_type);
                 record_component_function_path(request.path_and_args.path());
                 let udf_path = request.path_and_args.path().udf_path.to_owned();
-                let (environment, args) = DatabaseUdfEnvironment::new(
-                    self.rt.clone(),
-                    request,
-                    reactor_depth,
-                    client_id.clone(),
-                    rng_seed,
-                );
-                let r = environment
-                    .run(
-                        isolate,
-                        context_cache,
-                        permit,
-                        &mut isolate_clean,
-                        response.closed().boxed(),
-                        args,
-                        function_started_sender,
-                        udf_callback,
-                    )
-                    .await;
+                let r = crate::execution_observation::observe(
+                    async {
+                        let (environment, args) = DatabaseUdfEnvironment::new(
+                            self.rt.clone(),
+                            request,
+                            reactor_depth,
+                            client_id.clone(),
+                            rng_seed,
+                        );
+                        environment
+                            .run(
+                                isolate,
+                                context_cache,
+                                permit,
+                                &mut isolate_clean,
+                                cancellation,
+                                args,
+                                function_started_sender,
+                                udf_callback,
+                            )
+                            .await
+                    },
+                    execution_observation,
+                )
+                .await;
                 let status = match &r {
                     Ok((_tx, outcome)) => {
                         if is_developer_ok(outcome) {
@@ -118,7 +132,9 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
             },
             RequestType::Action {
                 request,
-                mut response,
+                execution_observation,
+                cancellation,
+                response,
                 queue_timer,
                 action_callbacks,
                 fetch_client,
@@ -147,20 +163,22 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                     None,
                     request.context,
                 );
-                let r = environment
-                    .run_action(
+                let r = crate::execution_observation::observe(
+                    environment.run_action(
                         isolate,
                         context_cache,
                         permit,
                         &mut isolate_clean,
                         request.params.clone(),
-                        response.closed().boxed(),
+                        cancellation,
                         function_started_sender,
-                    )
-                    .await;
+                    ),
+                    execution_observation,
+                )
+                .await;
 
                 let status = match &r {
-                    Ok(outcome) => {
+                    Ok((outcome, _)) => {
                         if outcome.result.is_ok() {
                             RequestStatus::Success
                         } else {
@@ -170,7 +188,21 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                     Err(_) => RequestStatus::SystemError,
                 };
                 finish_service_request_timer(timer, status);
-                let _ = response.send(r);
+                match r {
+                    Ok((outcome, reusable_context)) => {
+                        if response.send(Ok(outcome)).is_ok()
+                            && let Some(reusable_context) = reusable_context
+                        {
+                            // Publish only after the result is delivered. A
+                            // dropped caller must not leave a warmed context
+                            // behind from an unobserved action.
+                            reusable_context.publish(context_cache);
+                        }
+                    },
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                    },
+                }
                 log_string
             },
             RequestType::Analyze {
@@ -238,7 +270,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                     )
                     .await;
                 let status = match &r {
-                    Ok(outcome) => match outcome.result {
+                    Ok((outcome, _)) => match outcome.result {
                         // Note that the stream could potentially encounter errors later
                         HttpActionResult::Streamed => RequestStatus::Success,
                         HttpActionResult::Error(_) => RequestStatus::DeveloperError,
@@ -246,7 +278,21 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                     Err(_) => RequestStatus::SystemError,
                 };
                 finish_service_request_timer(timer, status);
-                let _ = response.send(r);
+                match r {
+                    Ok((outcome, reusable_context)) => {
+                        if response.send(Ok(outcome)).is_ok()
+                            && let Some(reusable_context) = reusable_context
+                        {
+                            // HTTP responses are already streamed separately;
+                            // this result channel still decides whether the
+                            // warmed context can be published.
+                            reusable_context.publish(context_cache);
+                        }
+                    },
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                    },
+                }
                 log_string
             },
             RequestType::EvaluateSchema {
@@ -299,7 +345,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                 // AppDefinitionEvaluator doesn't use the prewarmed V8 context
                 // because it uses an arbitrary number of contexts. This call is
                 // rare and not particularly latency-sensitive though
-                context_cache.clear();
+                context_cache.clear(ContextCacheClearReason::AppDefinitionEvaluation);
                 let env = AppDefinitionEvaluator::new(
                     app_definition,
                     component_definitions,

@@ -9,6 +9,7 @@ use std::{
     pin::pin,
     sync::{
         atomic::{
+            AtomicBool,
             AtomicUsize,
             Ordering,
         },
@@ -61,11 +62,14 @@ use common::{
         CODEL_QUEUE_CONGESTED_EXPIRATION_MILLIS,
         CODEL_QUEUE_IDLE_EXPIRATION_MILLIS,
         HEAP_WORKER_REPORT_INTERVAL_SECONDS,
+        ISOLATE_CONTEXT_CACHE_MAX_RESIDENTS,
         ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS,
         ISOLATE_CONTROL_PLANE_LANE_ENABLED,
         ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY,
         ISOLATE_DEPENDENCY_WORKER_RESERVE,
         ISOLATE_IDLE_TIMEOUT,
+        ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE,
+        ISOLATE_MAX_HEAP_EXTRA_SIZE,
         ISOLATE_MAX_LIFETIME,
         ISOLATE_MAX_USER_HEAP_SIZE,
         ISOLATE_QUEUE_DELAY_CONTROL_ENABLED,
@@ -79,6 +83,11 @@ use common::{
         V8_THREADS,
     },
     log_lines::LogLine,
+    memory_pressure::MemoryPressureSignal,
+    query_analysis_admission::{
+        QueryAnalysisAdmission,
+        QueryAnalysisPermit,
+    },
     query_journal::QueryJournal,
     runtime::{
         shutdown_and_join,
@@ -127,6 +136,7 @@ use futures::{
         PollNext,
         StreamExt,
     },
+    task::AtomicWaker,
     TryStreamExt as _,
 };
 use itertools::Either;
@@ -175,8 +185,14 @@ use value::identifier::Identifier;
 use crate::{
     concurrency_limiter::ConcurrencyLimiter,
     context_cache::{
+        context_cache_key,
         CachedContexts,
         ContextCache,
+        ContextCacheBudget,
+        MissRetention,
+        MissWorkerSelection,
+        ReusableContextKind,
+        MAX_REUSABLE_CONTEXTS_PER_ISOLATE,
     },
     isolate::{
         Isolate,
@@ -204,6 +220,7 @@ use crate::{
         queue_timer,
         rejected_before_execution_error,
         RejectedBeforeExecutionReason,
+        SchedulerContextAffinityOutcome,
     },
     module_cache::{
         ModuleCache,
@@ -217,6 +234,74 @@ const ISOLATE_QUEUE_METRICS_LOG_FREQUENCY: Duration = Duration::from_secs(1);
 pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
 pub const PAUSE_REQUEST: &str = "pause_request";
 pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
+
+/// Caller-drop signal for one isolate execution tree.
+///
+/// Nested UDF syscalls are unbatched, so same-isolate recursion has one active
+/// descendant chain. Waking the most recently registered frame repolls the
+/// `RecursiveExecutor` tree.
+#[derive(Clone)]
+pub struct CancellationSignal {
+    inner: Arc<CancellationState>,
+}
+
+struct CancellationState {
+    cancelled: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl CancellationSignal {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(CancellationState {
+                cancelled: AtomicBool::new(false),
+                waker: AtomicWaker::new(),
+            }),
+        }
+    }
+
+    fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+        self.inner.waker.wake();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        std::future::poll_fn(|cx| {
+            if self.is_cancelled() {
+                return std::task::Poll::Ready(());
+            }
+            self.inner.waker.register(cx.waker());
+            // Recheck after registration so cancellation between the first load and
+            // waker installation cannot be lost.
+            if self.is_cancelled() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
+struct CancelExecutionOnDrop(Option<CancellationSignal>);
+
+impl CancelExecutionOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelExecutionOnDrop {
+    fn drop(&mut self) {
+        if let Some(signal) = &self.0 {
+            signal.cancel();
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RequestSchedulingProperties {
@@ -577,6 +662,30 @@ fn per_client_worker_capacity(max_workers: usize, max_percent_per_client: usize)
     percentage_capacity.max(1).min(max_workers)
 }
 
+fn context_cache_capacity(
+    max_workers: usize,
+    per_isolate_capacity: usize,
+    configured_capacity: Option<usize>,
+) -> anyhow::Result<usize> {
+    per_isolate_capacity
+        .checked_mul(16)
+        .context("context cache frequency-aging interval overflow")?;
+    let structural_capacity = max_workers
+        .checked_mul(per_isolate_capacity)
+        .context("isolate context cache structural capacity overflow")?;
+    let capacity = configured_capacity.unwrap_or(structural_capacity);
+    anyhow::ensure!(
+        capacity > 0,
+        "ISOLATE_CONTEXT_CACHE_MAX_RESIDENTS must be greater than zero"
+    );
+    anyhow::ensure!(
+        capacity <= structural_capacity,
+        "ISOLATE_CONTEXT_CACHE_MAX_RESIDENTS must not exceed the structural capacity of \
+         {structural_capacity}"
+    );
+    Ok(capacity)
+}
+
 impl ActiveRequestGuard {
     fn new(
         active_workers: Arc<AtomicUsize>,
@@ -680,6 +789,9 @@ pub struct IsolateConfig {
     max_user_timeout: Option<Duration>,
 
     pub(crate) limiter: ConcurrencyLimiter,
+
+    context_cache_budget: Arc<ContextCacheBudget>,
+    memory_pressure: MemoryPressureSignal,
 }
 
 impl IsolateConfig {
@@ -688,7 +800,21 @@ impl IsolateConfig {
             name,
             max_user_timeout: None,
             limiter,
+            context_cache_budget: Arc::new(ContextCacheBudget::new(
+                *MAX_REUSABLE_CONTEXTS_PER_ISOLATE,
+            )),
+            memory_pressure: MemoryPressureSignal::default(),
         }
+    }
+
+    pub fn with_context_cache_budget(
+        mut self,
+        capacity: usize,
+        memory_pressure: MemoryPressureSignal,
+    ) -> Self {
+        self.context_cache_budget = Arc::new(ContextCacheBudget::new(capacity));
+        self.memory_pressure = memory_pressure;
+        self
     }
 }
 
@@ -781,12 +907,42 @@ impl<RT: Runtime> Request<RT> {
             | RequestType::EvaluateAppDefinitions { .. }
             | RequestType::EvaluateComponentInitializer { .. } => return None,
             #[cfg(test)]
-            RequestType::Test { .. } => return None,
+            RequestType::Test { context_module, .. } => return context_module.clone(),
         };
-        Some(CanonicalizedComponentModulePath {
-            component: function_path.component,
-            module_path: function_path.udf_path.module().clone(),
-        })
+        Some(context_cache_key(function_path))
+    }
+
+    pub(crate) fn reusable_context_kind(&self) -> Option<ReusableContextKind> {
+        match &self.inner {
+            RequestType::Udf { request, .. }
+                if request.path_and_args.reuse_context(request.udf_type) =>
+            {
+                Some(ReusableContextKind::DatabaseUdf)
+            },
+            RequestType::Action { request, .. }
+                if request.params.path_and_args.reuse_context(UdfType::Action) =>
+            {
+                Some(ReusableContextKind::Action)
+            },
+            RequestType::HttpAction { request, .. }
+                if request.http_module_path.reuse_context(UdfType::HttpAction) =>
+            {
+                Some(ReusableContextKind::HttpAction)
+            },
+            RequestType::Udf { .. }
+            | RequestType::Action { .. }
+            | RequestType::HttpAction { .. }
+            | RequestType::Analyze { .. }
+            | RequestType::EvaluateSchema { .. }
+            | RequestType::EvaluateAuthConfig { .. }
+            | RequestType::EvaluateAppDefinitions { .. }
+            | RequestType::EvaluateComponentInitializer { .. } => None,
+            #[cfg(test)]
+            RequestType::Test {
+                reuses_database_context,
+                ..
+            } => (*reuses_database_context).then_some(ReusableContextKind::DatabaseUdf),
+        }
     }
 
     fn scheduling_properties(
@@ -820,6 +976,8 @@ impl<RT: Runtime> Request<RT> {
 pub enum RequestType<RT: Runtime> {
     Udf {
         request: UdfRequest<RT>,
+        execution_observation: Option<crate::execution_observation::ObservedTask>,
+        cancellation: CancellationSignal,
         response: oneshot::Sender<anyhow::Result<(Transaction<RT>, FunctionOutcome)>>,
         queue_timer: Timer<VMHistogram>,
         rng_seed: [u8; 32],
@@ -829,6 +987,8 @@ pub enum RequestType<RT: Runtime> {
     },
     Action {
         request: ActionRequest<RT>,
+        execution_observation: Option<crate::execution_observation::ObservedTask>,
+        cancellation: CancellationSignal,
         response: oneshot::Sender<anyhow::Result<ActionOutcome>>,
         queue_timer: Timer<VMHistogram>,
         action_callbacks: Arc<dyn ActionCallbacks>,
@@ -888,6 +1048,8 @@ pub enum RequestType<RT: Runtime> {
         can_block_on_descendant: bool,
         is_isolate_action: bool,
         is_control_plane: bool,
+        reuses_database_context: bool,
+        context_module: Option<CanonicalizedComponentModulePath>,
         fail_worker: bool,
         started: mpsc::UnboundedSender<usize>,
         completion: oneshot::Receiver<()>,
@@ -908,6 +1070,19 @@ impl<RT: Runtime> RequestType<RT> {
             Self::Test {
                 is_control_plane, ..
             } => *is_control_plane,
+        }
+    }
+
+    pub(crate) fn control_plane_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::Analyze { .. } => Some("analyze"),
+            Self::EvaluateSchema { .. } => Some("evaluate_schema"),
+            Self::EvaluateAuthConfig { .. } => Some("evaluate_auth_config"),
+            Self::EvaluateAppDefinitions { .. } => Some("evaluate_app_definitions"),
+            Self::EvaluateComponentInitializer { .. } => Some("evaluate_component_initializer"),
+            Self::Udf { .. } | Self::Action { .. } | Self::HttpAction { .. } => None,
+            #[cfg(test)]
+            Self::Test { .. } => None,
         }
     }
 }
@@ -1134,16 +1309,29 @@ pub struct IsolateClient<RT: Runtime> {
 }
 
 impl<RT: Runtime> IsolateClient<RT> {
+    pub fn preflight_context_cache_capacity(max_isolate_workers: usize) -> anyhow::Result<usize> {
+        // Parse the optional policy at startup instead of failing the scheduler
+        // only when its first reusable miss arrives.
+        let _ = *common::knobs::ISOLATE_CONTEXT_CACHE_CAPACITY_PLACEMENT;
+        anyhow::ensure!(
+            max_isolate_workers > 0,
+            "MAX_ISOLATE_WORKERS must be greater than zero"
+        );
+        context_cache_capacity(
+            max_isolate_workers,
+            *MAX_REUSABLE_CONTEXTS_PER_ISOLATE,
+            *ISOLATE_CONTEXT_CACHE_MAX_RESIDENTS,
+        )
+    }
+
     pub fn new<W: IsolateWorker<RT>>(
         rt: RT,
         max_percent_per_client: usize,
         max_isolate_workers: usize,
         isolate_worker: W,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            max_isolate_workers > 0,
-            "MAX_ISOLATE_WORKERS must be greater than zero"
-        );
+        let configured_context_cache_capacity =
+            Self::preflight_context_cache_capacity(max_isolate_workers)?;
         anyhow::ensure!(
             *ISOLATE_QUEUE_SIZE > 0,
             "ISOLATE_QUEUE_SIZE must be greater than zero"
@@ -1187,9 +1375,39 @@ impl<RT: Runtime> IsolateClient<RT> {
             *ANALYZE_CONCURRENCY,
         )?;
         let delay_control_config = (*ISOLATE_QUEUE_DELAY_CONTROL_ENABLED).then_some(queue_config);
-        let pool_name = isolate_worker.config().name;
+        let heap_per_worker = ISOLATE_MAX_USER_HEAP_SIZE
+            .checked_add(*ISOLATE_MAX_HEAP_EXTRA_SIZE)
+            .context("isolate heap capacity overflow")?;
+        let heap_pool = heap_per_worker
+            .checked_mul(max_isolate_workers)
+            .context("isolate heap pool capacity overflow")?;
+        let array_buffer_pool = ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE
+            .checked_mul(max_isolate_workers)
+            .context("isolate ArrayBuffer pool capacity overflow")?;
+        let isolate_config = isolate_worker.config();
+        let context_cache_capacity = isolate_config.context_cache_budget.capacity();
+        anyhow::ensure!(
+            context_cache_capacity <= configured_context_cache_capacity,
+            "isolate worker context cache budget must not exceed the configured capacity of \
+             {configured_context_cache_capacity}"
+        );
+        let pool_name = isolate_config.name;
         metrics::initialize_capacity_counters(pool_name);
+        metrics::initialize_control_plane_request_metrics(pool_name);
         metrics::log_control_plane_lane_enabled(pool_name, control_plane_lane_enabled);
+        metrics::log_context_cache_capacity(
+            pool_name,
+            *MAX_REUSABLE_CONTEXTS_PER_ISOLATE,
+            context_cache_capacity,
+        );
+        metrics::log_context_cache_owned(pool_name, 0);
+        metrics::log_isolate_memory_capacity(
+            pool_name,
+            heap_per_worker,
+            heap_pool,
+            *ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE,
+            array_buffer_pool,
+        );
 
         initialize_v8();
         // NB: We don't call V8::Dispose or V8::ShutdownPlatform since we just assume a
@@ -1275,7 +1493,11 @@ impl<RT: Runtime> IsolateClient<RT> {
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
         let (tx, rx) = oneshot::channel();
+        let cancellation = CancellationSignal::new();
+        let caller_cancellation = cancellation.clone();
         let request = RequestType::Udf {
+            execution_observation: crate::execution_observation::current()
+                .map(|observer| observer.task(crate::execution_observation::TaskKind::Runtime)),
             request: UdfRequest {
                 path_and_args,
                 udf_type,
@@ -1285,6 +1507,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                 context,
                 environment_data,
             },
+            cancellation,
             response: tx,
             queue_timer: queue_timer(),
             rng_seed,
@@ -1302,7 +1525,13 @@ impl<RT: Runtime> IsolateClient<RT> {
             EncodedSpan::from_parent(),
             scheduler_dependency,
         ))?;
-        let (tx, outcome) = Self::receive_response(rx).await??;
+        let response = pin!(Self::receive_response(rx));
+        // Declare this guard after the pinned response future so cancellation is
+        // published before dropping the receiver when this task is dropped.
+        let cancel_on_drop = CancelExecutionOnDrop(Some(caller_cancellation));
+        let response = response.await;
+        cancel_on_drop.disarm();
+        let (tx, outcome) = response??;
 
         Ok((tx, outcome))
     }
@@ -1322,7 +1551,11 @@ impl<RT: Runtime> IsolateClient<RT> {
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<ActionOutcome> {
         let (tx, rx) = oneshot::channel();
+        let cancellation = CancellationSignal::new();
+        let caller_cancellation = cancellation.clone();
         let request = RequestType::Action {
+            execution_observation: crate::execution_observation::current()
+                .map(|observer| observer.task(crate::execution_observation::TaskKind::Runtime)),
             request: ActionRequest {
                 params: ActionRequestParams { path_and_args },
                 identity: transaction.identity().clone(),
@@ -1330,6 +1563,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                 context,
                 environment_data,
             },
+            cancellation,
             response: tx,
             queue_timer: queue_timer(),
             action_callbacks,
@@ -1343,7 +1577,14 @@ impl<RT: Runtime> IsolateClient<RT> {
             EncodedSpan::from_parent(),
             scheduler_dependency,
         ))?;
-        match Self::receive_response(rx).await? {
+        let response = pin!(Self::receive_response(rx));
+        // Publish cancellation before dropping the receiver when the caller
+        // abandons the action. This also prevents a completed action from
+        // publishing its context after its result became unobservable.
+        let cancel_on_drop = CancelExecutionOnDrop(Some(caller_cancellation));
+        let response = response.await;
+        cancel_on_drop.disarm();
+        match response? {
             Ok(outcome) => Ok(outcome),
             Err(e) => Err(recapture_stacktrace(e).await),
         }
@@ -1754,8 +1995,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
     ) -> anyhow::Result<(Transaction<RT>, NestedUdfOutcome)> {
         let subquery_path = udf_request.path_and_args.path().clone();
         let (tx, rx) = oneshot::channel();
+        let cancellation = CancellationSignal::new();
+        let caller_cancellation = cancellation.clone();
         let request = RequestType::Udf {
+            execution_observation: crate::execution_observation::current()
+                .map(|observer| observer.task(crate::execution_observation::TaskKind::Runtime)),
             request: udf_request,
+            cancellation,
             response: tx,
             queue_timer: queue_timer(),
             rng_seed,
@@ -1777,7 +2023,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
             .ok()
             .context("scheduler shut down")?;
         metrics::log_scheduler_request_enqueued(self.pool_name, scheduling_properties.as_label());
-        let (tx, outcome) = IsolateClient::<RT>::receive_response(rx).await??;
+        let response = pin!(IsolateClient::<RT>::receive_response(rx));
+        // Match `execute_udf`: publish child cancellation before receiver
+        // closure if its parent stops waiting for this separately scheduled UDF.
+        let cancel_on_drop = CancelExecutionOnDrop(Some(caller_cancellation));
+        let response = response.await;
+        cancel_on_drop.disarm();
+        let (tx, outcome) = response??;
         let outcome = match outcome {
             FunctionOutcome::Query(outcome) | FunctionOutcome::Mutation(outcome) => {
                 NestedUdfOutcome {
@@ -1814,6 +2066,15 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
     worker: W,
     /// Vec of channels for sending work to individual workers.
     worker_senders: Vec<mpsc::Sender<IsolateWorkerRequest<RT>>>,
+    active_modules: HashMap<
+        usize,
+        (
+            String,
+            ReusableContextKind,
+            common::components::CanonicalizedComponentModulePath,
+        ),
+    >,
+    active_contexts: HashMap<usize, (String, Arc<CachedContexts>)>,
     /// Map from client_id to stack of workers (implemented with a deque). The
     /// most recently used worker for a given client is at the front of the
     /// deque. These workers were previously used by this client, but may
@@ -1866,6 +2127,13 @@ struct ActiveWorkerState {
     scheduling_properties: RequestSchedulingProperties,
 }
 
+struct WorkerSelection {
+    worker_id: usize,
+    context_affinity: Option<(ReusableContextKind, SchedulerContextAffinityOutcome)>,
+    cached_contexts: Option<Arc<CachedContexts>>,
+    miss_placement: Option<MissWorkerSelection>,
+}
+
 impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
     pub fn new(
         rt: RT,
@@ -1895,6 +2163,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             in_progress_counts_by_client: HashMap::new(),
             in_progress_counts: ActiveRequestCounts::default(),
             active_workers,
+            active_modules: HashMap::new(),
+            active_contexts: HashMap::new(),
             available_workers: HashMap::new(),
             max_workers,
             base_worker_capacity,
@@ -1911,6 +2181,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
         completed_worker: ActiveWorkerState,
         info: IdleWorkerInfo,
     ) {
+        self.active_modules.remove(&completed_worker.worker_id);
+        self.active_contexts.remove(&completed_worker.worker_id);
         let new_count = match self
             .in_progress_counts_by_client
             .remove_entry(&completed_worker.client_id)
@@ -2165,8 +2437,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                     let dispatch_state = self.state_snapshot();
                     let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
                         && dispatch_state.dependency_dispatch_uses_reserve();
-                    let worker_id = match self.get_worker(&request, &dispatch_state) {
-                        Ok(worker_id) => worker_id,
+                    let WorkerSelection {
+                        worker_id,
+                        context_affinity,
+                        cached_contexts,
+                        miss_placement,
+                    } = match self.get_worker(&request, &dispatch_state) {
+                        Ok(selection) => selection,
                         Err(reason) => {
                             metrics::log_scheduler_request_rejected(
                                 self.worker.config().name,
@@ -2189,6 +2466,28 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                         self.worker.config().name,
                         scheduling_properties,
                     );
+                    let active_module = context_affinity.and_then(|(kind, _)| {
+                        request
+                            .module()
+                            .map(|module| (request.client_id.clone(), kind, module))
+                    });
+                    // Busy-cache scans only explain eligible misses. Exact hits and fresh
+                    // requests must not contend on every active worker's mirror lock.
+                    let miss_observation = context_affinity
+                        .filter(|(_, outcome)| *outcome != SchedulerContextAffinityOutcome::Hit)
+                        .map(|(kind, _)| {
+                            let module_in_flight = active_module
+                                .as_ref()
+                                .is_some_and(|key| {
+                                    self.active_modules.values().any(|active| active == key)
+                                });
+                            let resident_on_busy_worker =
+                                self.active_contexts.values().any(|(client, cache)| {
+                                    client == &request.client_id
+                                        && cache.can_serve_request(&request)
+                                });
+                            (kind, module_in_flight, resident_on_busy_worker)
+                        });
                     if self.worker_senders[worker_id]
                         .try_send(IsolateWorkerRequest {
                             request,
@@ -2205,6 +2504,44 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                             self.worker.config().name
                         );
                         return;
+                    }
+                    if let Some(key) = active_module {
+                        assert!(
+                            self.active_modules.insert(worker_id, key).is_none(),
+                            "idle worker still has active module affinity"
+                        );
+                    }
+                    if let Some(cache) = cached_contexts {
+                        assert!(
+                            self.active_contexts
+                                .insert(worker_id, (client_id.clone(), cache))
+                                .is_none(),
+                            "idle worker still has active cache metadata"
+                        );
+                    }
+                    if let Some((context_kind, module_in_flight, resident_on_busy_worker)) =
+                        miss_observation
+                    {
+                        metrics::log_scheduler_context_miss(
+                            self.worker.config().name,
+                            context_kind,
+                            module_in_flight,
+                            resident_on_busy_worker,
+                        );
+                    }
+                    if let Some((context_kind, outcome)) = context_affinity {
+                        metrics::log_scheduler_context_affinity(
+                            self.worker.config().name,
+                            context_kind,
+                            outcome,
+                        );
+                        if let Some(placement) = miss_placement {
+                            metrics::log_scheduler_context_miss_placement(
+                                self.worker.config().name,
+                                context_kind,
+                                placement,
+                            );
+                        }
                     }
                     if let Some((lane, sojourn)) = dispatch_sojourn {
                         metrics::log_isolate_queue_sojourn(
@@ -2274,16 +2611,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                 _ = &mut report_stats => {
                     let heap_stats = self.aggregate_heap_stats();
                     log_aggregated_heap_stats(&heap_stats);
+                    metrics::log_context_cache_owned(
+                        self.worker.config().name,
+                        self.worker.config().context_cache_budget.owned_contexts(),
+                    );
                     report_stats = self.rt.wait(*HEAP_WORKER_REPORT_INTERVAL_SECONDS);
                 },
             }
         }
     }
 
-    /// Find a worker for the given `client_id`.`
+    /// Find a worker for the request's client.
     /// Returns an error if no worker can be allocated for this client.
     ///
-    /// Note that the returned worker id is removed from the
+    /// Note that the selected worker is removed from the
     /// `self.available_workers` state, so the caller is responsible for using
     /// the worker and returning it back to `self.available_workers` after it is
     /// done.
@@ -2291,7 +2632,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
         &mut self,
         request: &Request<RT>,
         state: &SchedulerStateSnapshot,
-    ) -> Result<usize, RejectedBeforeExecutionReason> {
+    ) -> Result<WorkerSelection, RejectedBeforeExecutionReason> {
         let client_id = request.client_id.as_str();
         let eligibility = state.request_eligibility(
             request.scheduling_properties(self.control_plane_lane_enabled),
@@ -2304,28 +2645,68 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             );
             return Err(reason);
         }
+        let reusable_context_kind = request.reusable_context_kind();
         // Try to find an existing worker for this client.
         if let Some((client_id, mut workers)) = self.available_workers.remove_entry(client_id) {
-            // If there is a worker with an appropriate reusable context, pick that one
-            // first.
-            // This skips workers with inapplicable reused contexts.
-            // TODO: just promote the saved context's module path into the hashmap key.
-            let worker = workers
-                .extract_if(.., |worker| {
-                    worker.info.cached_contexts.can_serve_request(request)
+            let mut miss_placement = None;
+            // Affinity improves hit rate, but an unrelated resident is no longer a
+            // reason to allocate another isolate. The bounded cache and independent
+            // fresh context let any idle same-client worker absorb the miss, so new
+            // workers continue to represent request concurrency rather than key
+            // diversity.
+            let (worker, outcome) = reusable_context_kind
+                .and_then(|_| {
+                    workers
+                        .extract_if(.., |worker| {
+                            worker.info.cached_contexts.can_serve_request(request)
+                        })
+                        .next()
+                        .map(|worker| (worker, SchedulerContextAffinityOutcome::Hit))
                 })
-                .next();
+                .or_else(|| {
+                    if reusable_context_kind.is_none() {
+                        return None;
+                    }
+                    let config = self.worker.config();
+                    let pressure = config.memory_pressure.is_active();
+                    let placement = CachedContexts::select_miss_worker(
+                        workers.iter().enumerate().map(|(position, worker)| {
+                            (position, worker.info.cached_contexts.as_ref())
+                        }),
+                        &config.context_cache_budget,
+                        pressure,
+                        *common::knobs::ISOLATE_CONTEXT_CACHE_CAPACITY_PLACEMENT,
+                    )?;
+                    let outcome = if placement.capacity_placement
+                        && placement.selected_retention != MissRetention::Unavailable
+                    {
+                        SchedulerContextAffinityOutcome::RetentionCapacity
+                    } else {
+                        SchedulerContextAffinityOutcome::SameClientWorker
+                    };
+                    miss_placement = Some(placement);
+                    Some((
+                        workers
+                            .remove(placement.position)
+                            .expect("selected idle worker disappeared"),
+                        outcome,
+                    ))
+                })
+                .unwrap_or_else(|| {
+                    let worker = workers
+                        .pop_front()
+                        .expect("available worker map contained an empty same-client list");
+                    (worker, SchedulerContextAffinityOutcome::SameClientWorker)
+                });
             if !workers.is_empty() {
                 self.available_workers.insert(client_id, workers);
             }
-            if let Some(worker) = worker {
-                return Ok(worker.worker_id);
-            }
-            // Otherwise all the workers have cached contexts for other modules
-            // that we don't want to clobber; try to assign a new worker
-            // instead.
-            // It's possible that one of our own workers will end up being the
-            // least-recently-used one.
+            return Ok(WorkerSelection {
+                worker_id: worker.worker_id,
+                context_affinity: reusable_context_kind.map(|context_kind| (context_kind, outcome)),
+                cached_contexts: Some(worker.info.cached_contexts),
+                miss_placement,
+            });
         }
         // If we've recently started up and haven't yet created `max_workers` threads,
         // create a new worker instead of "stealing" some other client's worker.
@@ -2346,7 +2727,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                 self.worker.config().name,
                 self.worker_senders.len() - 1
             );
-            return Ok(self.worker_senders.len() - 1);
+            return Ok(WorkerSelection {
+                worker_id: self.worker_senders.len() - 1,
+                cached_contexts: None,
+                miss_placement: None,
+                context_affinity: reusable_context_kind
+                    .map(|context_kind| (context_kind, SchedulerContextAffinityOutcome::NewWorker)),
+            });
         }
         // No existing worker for this client and we've already started the max number
         // of workers -- just grab the least recently used worker. This worker is least
@@ -2370,13 +2757,21 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             .pop_back()
             .expect("Available worker map should never contain an empty list");
         log_worker_stolen(worker.last_used_ts.elapsed());
+        let context_affinity = reusable_context_kind
+            .map(|context_kind| (context_kind, SchedulerContextAffinityOutcome::StolenWorker));
         if workers.is_empty() {
             // This variable shadowing drops the mutable reference to
             // `self.available_workers`.
             let key = key.clone();
             self.available_workers.remove(&key);
         }
-        Ok(worker.worker_id)
+        Ok(WorkerSelection {
+            worker_id: worker.worker_id,
+            context_affinity,
+            // A reassigned isolate discards the prior client contexts.
+            cached_contexts: None,
+            miss_placement: None,
+        })
     }
 
     fn aggregate_heap_stats(&self) -> IsolateHeapStats {
@@ -2421,6 +2816,7 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
             max_user_timeout, ..
         } = self.config();
         let mut reqs = std::pin::pin!(ReceiverStream::new(reqs).peekable());
+        let mut memory_pressure = self.config().memory_pressure.subscribe();
         let mut ready: Option<(oneshot::Sender<_>, ActiveRequestGuard)> = None;
         'recreate_isolate: loop {
             let mut last_client_id: Option<String> = None;
@@ -2431,9 +2827,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                 *ISOLATE_MAX_USER_HEAP_SIZE,
             );
             isolate.set_heap_stats_handle(heap_stats.clone());
-            let mut context_cache = ContextCache::new();
+            // Rust drops locals in reverse declaration order. Declare the cache
+            // after the isolate so its mirror and V8 globals are cleared first.
+            let mut context_cache = ContextCache::with_budget(
+                self.config().context_cache_budget.clone(),
+                self.config().memory_pressure.clone(),
+            );
             heap_stats.store(isolate.heap_stats());
             loop {
+                isolate.set_cgroup_memory_pressure(&mut context_cache, *memory_pressure.borrow());
                 context_cache.prepare(isolate.isolate());
                 // Check again whether the isolate has enough free heap memory
                 // before starting the next request
@@ -2453,6 +2855,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                     });
                 }
                 tokio::select! {
+                    biased;
+                    pressure = memory_pressure.changed() => {
+                        pressure.expect("memory-pressure controller dropped while isolate worker is running");
+                        isolate.set_cgroup_memory_pressure(
+                            &mut context_cache,
+                            *memory_pressure.borrow(),
+                        );
+                        heap_stats.store(isolate.heap_stats());
+                    },
                     // If the isolate isn't "tainted", no need to wait for the idle timeout.
                     _ = self.rt().wait(*ISOLATE_IDLE_TIMEOUT), if last_client_id.is_some() => {
                         tracing::debug!("Restarting isolate for {last_client_id:?} due to idle timeout");
@@ -2590,6 +3001,7 @@ mod tests {
         collections::{
             BTreeMap,
             HashMap,
+            VecDeque,
         },
         future::Future,
         pin::Pin,
@@ -2609,7 +3021,9 @@ mod tests {
     use ::metrics::IntoLabel as _;
     use common::{
         components::{
+            CanonicalizedComponentModulePath,
             ComponentDefinitionPath,
+            ComponentId,
             ComponentName,
         },
         fastrace_helpers::EncodedSpan,
@@ -2641,14 +3055,18 @@ mod tests {
     };
 
     use super::{
+        context_cache_capacity,
         new_scheduler_queue,
         per_client_worker_capacity,
         validate_control_plane_lane_config,
         wait_for_external_permit,
         worker_rejection_reason,
         ActiveRequestCounts,
+        CancelExecutionOnDrop,
+        CancellationSignal,
         ExternalPermitWaitOutcome,
         IdleWorkerInfo,
+        IdleWorkerState,
         IsolateConfig,
         IsolateWorker,
         IsolateWorkerHandle,
@@ -2663,14 +3081,21 @@ mod tests {
         SharedIsolateScheduler,
     };
     use crate::{
-        context_cache::ContextCache,
+        context_cache::{
+            CachedContexts,
+            ContextCache,
+            ReusableContextKind,
+        },
         isolate::Isolate,
         isolate_queue::{
             IsolateQueueConfig,
             IsolateQueueEligibility,
             IsolateQueueLane,
         },
-        metrics::RejectedBeforeExecutionReason,
+        metrics::{
+            RejectedBeforeExecutionReason,
+            SchedulerContextAffinityOutcome,
+        },
         ConcurrencyLimiter,
         ConcurrencyPermit,
     };
@@ -2765,6 +3190,8 @@ mod tests {
                         can_block_on_descendant: _,
                         is_isolate_action: _,
                         is_control_plane: _,
+                        reuses_database_context: _,
+                        context_module: _,
                         fail_worker,
                         started,
                         completion,
@@ -2875,6 +3302,8 @@ mod tests {
             ),
             is_isolate_action: matches!(kind, TestRequestKind::Action),
             is_control_plane: matches!(kind, TestRequestKind::ControlPlane),
+            reuses_database_context: false,
+            context_module: None,
             fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
             started,
             completion: completion_receiver,
@@ -2996,6 +3425,7 @@ mod tests {
         ) -> Self {
             Self::new_with_policy(
                 rt,
+                "scheduler_test",
                 max_workers,
                 base_worker_capacity,
                 max_independent_actions,
@@ -3025,6 +3455,7 @@ mod tests {
             .unwrap();
             Self::new_with_policy(
                 rt,
+                "scheduler_test",
                 max_workers,
                 base_worker_capacity,
                 max_independent_actions,
@@ -3038,6 +3469,7 @@ mod tests {
         #[allow(clippy::too_many_arguments)]
         fn new_with_policy(
             rt: SchedulerTestRuntime,
+            pool_name: &'static str,
             max_workers: usize,
             base_worker_capacity: usize,
             max_independent_actions: usize,
@@ -3048,7 +3480,7 @@ mod tests {
         ) -> Self {
             let (sender, receiver) = new_scheduler_queue::<_, Request<_>>(
                 rt.clone(),
-                "scheduler_test",
+                pool_name,
                 queue_capacity,
                 max_workers - base_worker_capacity,
                 queue_config,
@@ -3062,6 +3494,7 @@ mod tests {
                 TestIsolateWorker {
                     rt: rt.clone(),
                     config: IsolateConfig::new(pool_name, ConcurrencyLimiter::unlimited()),
+                    analyze_test_control: None,
                 },
                 max_workers,
                 base_worker_capacity,
@@ -3238,6 +3671,20 @@ mod tests {
             max_workers_per_client: 6,
             base_workers_per_client: 5,
         }
+    }
+
+    #[test]
+    fn caller_drop_signal_is_shared_and_guard_can_be_disarmed() {
+        let signal = CancellationSignal::new();
+        let nested_signal = signal.clone();
+
+        CancelExecutionOnDrop(Some(signal.clone())).disarm();
+        assert!(!signal.is_cancelled());
+        assert!(!nested_signal.is_cancelled());
+
+        drop(CancelExecutionOnDrop(Some(signal.clone())));
+        assert!(signal.is_cancelled());
+        assert!(nested_signal.is_cancelled());
     }
 
     #[test]
@@ -3485,6 +3932,16 @@ mod tests {
     }
 
     #[test]
+    fn context_cache_capacity_is_bounded_by_worker_structure() {
+        assert_eq!(context_cache_capacity(56, 6, None).unwrap(), 336);
+        assert_eq!(context_cache_capacity(56, 8, None).unwrap(), 448);
+        assert_eq!(context_cache_capacity(56, 8, Some(224)).unwrap(), 224);
+        assert!(context_cache_capacity(56, 8, Some(0)).is_err());
+        assert!(context_cache_capacity(56, 8, Some(449)).is_err());
+        assert!(context_cache_capacity(usize::MAX, 8, None).is_err());
+    }
+
+    #[test]
     fn per_client_capacity_uses_total_occupancy() {
         let global = ActiveRequestCounts {
             total: 4,
@@ -3513,6 +3970,124 @@ mod tests {
     }
 
     #[test]
+    fn reusable_request_prefers_exact_affinity_and_uses_idle_workers_on_misses() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt);
+        let worker_handles = Arc::new(Mutex::new(Vec::new()));
+        let mut scheduler = SharedIsolateScheduler::new(
+            scheduler_rt.clone(),
+            TestIsolateWorker {
+                rt: scheduler_rt.clone(),
+                config: IsolateConfig::new("scheduler_test", ConcurrencyLimiter::unlimited()),
+            },
+            2,
+            2,
+            1,
+            worker_handles,
+            100,
+            Arc::new(AtomicUsize::new(0)),
+            false,
+        );
+        let (worker_sender, _worker_receiver) = mpsc::channel(1);
+        scheduler.worker_senders.push(worker_sender);
+        let (second_sender, _second_receiver) = mpsc::channel(1);
+        scheduler.worker_senders.push(second_sender);
+        let cached_contexts = CachedContexts::new_for_test([(
+            ReusableContextKind::DatabaseUdf,
+            CanonicalizedComponentModulePath {
+                component: ComponentId::Root,
+                module_path: "unrelated.js".parse().expect("invalid test module path"),
+            },
+        )]);
+        scheduler.available_workers.insert(
+            "deployment".to_string(),
+            VecDeque::from([IdleWorkerState {
+                worker_id: 0,
+                last_used_ts: scheduler_rt.monotonic_now(),
+                info: IdleWorkerInfo { cached_contexts },
+            }]),
+        );
+        let module = CanonicalizedComponentModulePath {
+            component: ComponentId::Root,
+            module_path: "matching.js".parse().unwrap(),
+        };
+        let PendingTestRequest { mut request, .. } =
+            test_request(1, TestRequestKind::Independent, mpsc::unbounded_channel().0);
+        let RequestType::Test {
+            reuses_database_context,
+            context_module,
+            ..
+        } = &mut request.inner
+        else {
+            unreachable!()
+        };
+        *reuses_database_context = true;
+        *context_module = Some(module.clone());
+
+        let state = scheduler.state_snapshot();
+        let selection = scheduler
+            .get_worker(&request, &state)
+            .expect("idle same-client worker was not selected");
+        assert_eq!(selection.worker_id, 0);
+        assert_eq!(
+            selection.context_affinity,
+            Some((
+                ReusableContextKind::DatabaseUdf,
+                if *common::knobs::ISOLATE_CONTEXT_CACHE_CAPACITY_PLACEMENT {
+                    SchedulerContextAffinityOutcome::RetentionCapacity
+                } else {
+                    SchedulerContextAffinityOutcome::SameClientWorker
+                },
+            ))
+        );
+        assert!(selection.miss_placement.is_some());
+
+        scheduler.available_workers.insert(
+            "deployment".to_string(),
+            VecDeque::from([
+                IdleWorkerState {
+                    worker_id: 0,
+                    last_used_ts: scheduler_rt.monotonic_now(),
+                    info: IdleWorkerInfo {
+                        cached_contexts: CachedContexts::new_for_test([]),
+                    },
+                },
+                IdleWorkerState {
+                    worker_id: 1,
+                    last_used_ts: scheduler_rt.monotonic_now(),
+                    info: IdleWorkerInfo {
+                        cached_contexts: CachedContexts::new_for_test([(
+                            ReusableContextKind::DatabaseUdf,
+                            module,
+                        )]),
+                    },
+                },
+            ]),
+        );
+        let state = scheduler.state_snapshot();
+        let selection = scheduler
+            .get_worker(&request, &state)
+            .expect("idle matching worker was not selected");
+        assert_eq!(selection.worker_id, 1);
+        assert_eq!(
+            selection.context_affinity,
+            Some((
+                ReusableContextKind::DatabaseUdf,
+                SchedulerContextAffinityOutcome::Hit,
+            ))
+        );
+        assert!(selection.miss_placement.is_none());
+        assert_eq!(
+            scheduler.available_workers["deployment"]
+                .front()
+                .unwrap()
+                .worker_id,
+            0
+        );
+    }
+
+    #[test]
     fn action_cap_does_not_cap_queries_or_dependency_actions() {
         let active = ActiveRequestCounts {
             total: 3,
@@ -3536,6 +4111,40 @@ mod tests {
             panic!("zero-worker isolate client unexpectedly succeeded")
         };
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn worker_allocation_starts_empty_and_tracks_worker_creation() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("worker_allocation_test", async move {
+            let mut harness = SchedulerHarness::new_with_policy(
+                scheduler_rt,
+                "worker_allocation_test",
+                2,
+                2,
+                2,
+                100,
+                64,
+                None,
+                false,
+            );
+            assert!(harness.worker_handles.lock().is_empty());
+            harness.start();
+
+            let first = harness.enqueue_test(1, TestRequestKind::Independent);
+            assert_eq!(harness.next_started().await, 1);
+            assert_eq!(harness.worker_handles.lock().len(), 1);
+
+            let second = harness.enqueue_test(2, TestRequestKind::Independent);
+            assert_eq!(harness.next_started().await, 2);
+            assert_eq!(harness.worker_handles.lock().len(), 2);
+
+            first.complete().await;
+            second.complete().await;
+            harness.shutdown().await;
+        });
     }
 
     #[test]
@@ -3770,6 +4379,7 @@ mod tests {
                 // ineligible behind A's active request.
                 let mut harness = SchedulerHarness::new_with_policy(
                     scheduler_rt,
+                    "scheduler_test",
                     2,
                     2,
                     2,

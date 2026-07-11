@@ -5,6 +5,7 @@ mod action_callbacks;
 mod action_outcome;
 mod client;
 pub mod environment;
+pub mod execution_observation;
 mod function_outcome;
 pub mod helpers;
 mod http_action;
