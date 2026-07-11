@@ -57,11 +57,13 @@ use model::{
         },
         module_versions::{
             invalid_function_name_error,
+            parse_context_initialization_module,
             AnalyzedFunction,
             AnalyzedHttpRoute,
             AnalyzedHttpRoutes,
             AnalyzedModule,
             AnalyzedSourcePosition,
+            ContextReusePolicy,
             Visibility,
         },
         user_error::{
@@ -448,22 +450,59 @@ impl AnalyzeEnvironment {
                 None
             });
 
-        let reuse_context = module
+        let module_namespace = module
             .get_module_namespace()
             .to_object(&scope)
-            .context("Module namespace wasn't an object?")?
-            .get(
-                &scope,
-                strings::experimental_reuseContext.create(&scope)?.into(),
-            )
-            .is_some_and(|value| value.is_true());
+            .context("Module namespace wasn't an object?")?;
+        let mut context_initialization_module = None;
+        let context_reuse = match module_namespace.get(
+            &scope,
+            strings::experimental_reuseContext.create(&scope)?.into(),
+        ) {
+            // Keep the original boolean marker's meaning for existing apps.
+            Some(value) if value.is_true() => ContextReusePolicy::database(),
+            Some(value) if value.is_object() => {
+                let object = value
+                    .to_object(&scope)
+                    .context("Context reuse policy wasn't an object")?;
+                let initializer = object
+                    .get(&scope, strings::initializationModule.create(&scope)?.into())
+                    .context("Failed to read context initialization module")?;
+                if !initializer.is_undefined() {
+                    anyhow::ensure!(
+                        initializer.is_string(),
+                        ErrorMetadata::bad_request(
+                            "InvalidContextInitializationModule",
+                            "Context initialization module must be a string",
+                        )
+                    );
+                    context_initialization_module = Some(parse_context_initialization_module(
+                        &initializer.to_rust_string_lossy(&scope),
+                    )?);
+                }
+                let property = |name: &'static strings::StaticString| -> anyhow::Result<bool> {
+                    let name = name.create(&scope)?;
+                    Ok(object
+                        .get(&scope, name.into())
+                        .is_some_and(|value| value.is_true()))
+                };
+                ContextReusePolicy {
+                    queries: property(&strings::queries)?,
+                    mutations: property(&strings::mutations)?,
+                    actions: property(&strings::actions)?,
+                    http_actions: property(&strings::httpActions)?,
+                }
+            },
+            _ => ContextReusePolicy::default(),
+        };
 
         Ok(Ok(AnalyzedModule {
             functions,
             http_routes,
             cron_specs,
             source_index,
-            reuse_context,
+            context_reuse,
+            context_initialization_module,
         }))
     }
 }
@@ -1087,4 +1126,75 @@ fn cron_analyze<RT: Runtime>(
     }
 
     Ok(Ok(cron_specs))
+}
+
+#[cfg(test)]
+mod context_reuse_tests {
+    use model::modules::module_versions::{
+        FullModuleSource,
+        ModuleSource,
+    };
+    use runtime::prod::ProdRuntime;
+
+    use super::*;
+    use crate::ConcurrencyLimiter;
+
+    #[test]
+    fn grouped_context_policy_is_analyzed_and_persisted() -> anyhow::Result<()> {
+        crate::client::initialize_v8();
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let modules = Arc::new(BTreeMap::from([(
+                "entry.js".parse()?,
+                Arc::new(V8ModuleSource::new(FullModuleSource {
+                    source: ModuleSource::from(
+                        r#"
+                        export const experimental_reuseContext = {
+                            queries: true, mutations: true,
+                            initializationModule: "_deps/context_init.js"
+                        };
+                    "#,
+                    ),
+                    source_map: None,
+                })),
+            )]));
+            let mut isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
+            let mut contexts = ContextCache::new();
+            let permit = ConcurrencyLimiter::unlimited()
+                .acquire(Arc::new("analysis_test".to_owned()), false)
+                .await;
+            let mut clean = false;
+            let analyzed = AnalyzeEnvironment::analyze(
+                &mut isolate,
+                &mut contexts,
+                permit,
+                &mut clean,
+                UdfConfig {
+                    server_version: semver::Version::new(1, 36, 0),
+                    import_phase_rng_seed: [7; 32],
+                    import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
+                },
+                modules,
+                "entry.js".parse()?,
+                BTreeMap::new(),
+            )
+            .await??;
+            let serialized =
+                model::modules::module_versions::SerializedAnalyzedModule::try_from(analyzed)?;
+            let persisted: model::modules::module_versions::SerializedAnalyzedModule =
+                serde_json::from_value(serde_json::to_value(serialized)?)?;
+            let decoded = AnalyzedModule::try_from(persisted)?;
+            assert_eq!(decoded.context_reuse, ContextReusePolicy::database());
+            assert_eq!(
+                decoded
+                    .context_initialization_module
+                    .as_ref()
+                    .map(|p| p.as_str()),
+                Some("_deps/context_init.js")
+            );
+            assert!(clean);
+            Ok(())
+        })
+    }
 }

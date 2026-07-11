@@ -21,6 +21,7 @@ mod context_local_state;
 pub mod convert_v8;
 pub mod environment;
 pub mod error;
+pub mod execution_observation;
 mod execution_scope;
 pub mod helpers;
 mod http;
