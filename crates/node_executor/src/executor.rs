@@ -696,7 +696,6 @@ pub struct Package {
 
 impl From<Package> for JsonValue {
     fn from(value: Package) -> Self {
-        // TODO: this is missing sha256 field
         json!({
             "uri": value.uri,
             "key": String::from(value.key),
