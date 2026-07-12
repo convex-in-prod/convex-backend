@@ -41,6 +41,7 @@ use common::{
         AttributionClaims,
         FunctionCaller,
         QueryInvocation,
+        SchedulerDependencyClass,
         SessionId,
         SessionRequestSeqNumber,
         UdfIdentifier,
@@ -164,6 +165,7 @@ pub async fn internal_query_post(
     }: ExtractActionIdentity,
     ExtractClientVersion(client_version): ExtractClientVersion,
     ExtractExecutionContext(context): ExtractExecutionContext,
+    ExtractSchedulerDependency(scheduler_dependency): ExtractSchedulerDependency,
     Json(req): Json<NodeCallbackUdfPostRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let path = st
@@ -178,7 +180,7 @@ pub async fn internal_query_post(
         .await?;
     let udf_return = st
         .application
-        .read_only_udf(
+        .read_only_udf_with_scheduler_dependency(
             RequestContext::new(context.request_id, context.request_metadata),
             PublicFunctionPath::Component(path),
             req.args.into_serialized_args()?,
@@ -188,6 +190,7 @@ pub async fn internal_query_post(
                 parent_execution_id: Some(context.execution_id),
             },
             QueryInvocation::Fresh,
+            scheduler_dependency,
         )
         .await?;
     if req.format.is_some() {
@@ -219,6 +222,7 @@ pub async fn internal_mutation_post(
     }: ExtractActionIdentity,
     ExtractClientVersion(client_version): ExtractClientVersion,
     ExtractExecutionContext(context): ExtractExecutionContext,
+    ExtractSchedulerDependency(scheduler_dependency): ExtractSchedulerDependency,
     Json(req): Json<NodeCallbackUdfPostRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let mutation_identifier = req
@@ -237,7 +241,7 @@ pub async fn internal_mutation_post(
         .await?;
     let udf_result = st
         .application
-        .mutation_udf(
+        .mutation_udf_with_scheduler_dependency(
             RequestContext::new(context.request_id, context.request_metadata),
             PublicFunctionPath::Component(path),
             req.args.into_serialized_args()?,
@@ -248,6 +252,7 @@ pub async fn internal_mutation_post(
                 parent_execution_id: Some(context.execution_id),
             },
             None,
+            scheduler_dependency,
         )
         .await?;
     if req.format.is_some() {
@@ -282,6 +287,7 @@ pub async fn internal_action_post(
     }: ExtractActionIdentity,
     ExtractClientVersion(client_version): ExtractClientVersion,
     ExtractExecutionContext(context): ExtractExecutionContext,
+    ExtractSchedulerDependency(scheduler_dependency): ExtractSchedulerDependency,
     Json(req): Json<NodeCallbackUdfPostRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let path = st
@@ -296,7 +302,7 @@ pub async fn internal_action_post(
         .await?;
     let udf_result = st
         .application
-        .action_udf(
+        .action_udf_with_scheduler_dependency(
             RequestContext::new(context.request_id, context.request_metadata),
             PublicFunctionPath::Component(path),
             req.args.into_serialized_args()?,
@@ -305,6 +311,7 @@ pub async fn internal_action_post(
                 parent_scheduled_job: context.parent_scheduled_job,
                 parent_execution_id: Some(context.execution_id),
             },
+            scheduler_dependency,
         )
         .await?;
     if req.format.is_some() {
@@ -729,6 +736,31 @@ impl<S: Sync> FromRequestParts<S> for ExtractActionName {
 }
 
 pub struct ExtractExecutionContext(pub ExecutionContext);
+
+pub struct ExtractSchedulerDependency(pub SchedulerDependencyClass);
+
+impl<T: Sync> FromRequestParts<T> for ExtractSchedulerDependency {
+    type Rejection = HttpResponseError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _st: &T,
+    ) -> Result<Self, Self::Rejection> {
+        let unblocks_ancestor = match parts.headers.get("Convex-Isolate-Worker-Ancestor") {
+            None => false,
+            Some(value) => value
+                .to_str()
+                .context("Convex-Isolate-Worker-Ancestor must be a string")?
+                .parse::<bool>()
+                .context("Convex-Isolate-Worker-Ancestor must be a boolean")?,
+        };
+        Ok(Self(if unblocks_ancestor {
+            SchedulerDependencyClass::UnblocksAncestor
+        } else {
+            SchedulerDependencyClass::Independent
+        }))
+    }
+}
 
 impl<T: Sync> FromRequestParts<T> for ExtractExecutionContext {
     type Rejection = HttpResponseError;

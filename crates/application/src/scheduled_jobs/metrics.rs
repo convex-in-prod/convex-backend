@@ -5,8 +5,10 @@ use metrics::{
     log_counter_with_labels,
     log_distribution,
     log_distribution_with_labels,
+    log_gauge,
     prometheus::VMHistogram,
     register_convex_counter,
+    register_convex_gauge,
     register_convex_histogram,
     StaticMetricLabel,
     Timer,
@@ -63,6 +65,39 @@ register_convex_histogram!(
 );
 pub fn log_num_running_jobs(num_running: usize) {
     log_distribution(&SCHEDULED_JOB_NUM_RUNNING_TOTAL, num_running as f64);
+}
+
+register_convex_gauge!(
+    SCHEDULED_JOB_NUM_RUNNING_INFO,
+    "Current number of executing ordinary scheduled jobs"
+);
+pub fn set_num_running_jobs(num_running: usize) {
+    log_gauge(&SCHEDULED_JOB_NUM_RUNNING_INFO, num_running as f64);
+}
+
+/// Resets process-global occupancy if the executor future is canceled or exits.
+pub struct NumRunningJobsGaugeGuard;
+
+impl Drop for NumRunningJobsGaugeGuard {
+    fn drop(&mut self) {
+        set_num_running_jobs(0);
+    }
+}
+
+pub fn initialize_num_running_jobs() -> NumRunningJobsGaugeGuard {
+    set_num_running_jobs(0);
+    NumRunningJobsGaugeGuard
+}
+
+register_convex_gauge!(
+    SCHEDULED_JOB_EXECUTION_PARALLELISM_INFO,
+    "Effective parallel job limit applied independently to scheduled and cron job execution"
+);
+pub fn log_scheduled_job_execution_parallelism(parallelism: usize) {
+    log_gauge(
+        &SCHEDULED_JOB_EXECUTION_PARALLELISM_INFO,
+        parallelism as f64,
+    );
 }
 
 register_convex_histogram!(
