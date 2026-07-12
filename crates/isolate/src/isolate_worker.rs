@@ -59,6 +59,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
             client_id,
             inner,
             parent_trace: _,
+            scheduler_dependency: _,
         }: Request<RT>,
         permit: ConcurrencyPermit,
     ) -> (String, bool) {
@@ -306,6 +307,10 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                 let r = env.evaluate(context_cache, permit, isolate).await;
                 let _ = response.send(r);
                 "EvaluateAppDefinitions".to_string()
+            },
+            #[cfg(test)]
+            RequestType::Test { .. } => {
+                unreachable!("test requests must use the fake isolate worker")
             },
         };
         if isolate_clean && should_recreate_isolate(isolate, context_cache, &debug_str) {
