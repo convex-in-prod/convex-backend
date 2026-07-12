@@ -24,6 +24,7 @@ pub mod components;
 pub mod coverage;
 pub mod cron;
 pub mod deleted_bitset;
+mod dependency_overflow;
 pub mod document;
 pub mod document_index_keys;
 pub mod erased_slot;
