@@ -134,9 +134,10 @@ impl TryFrom<http::Method> for RoutableMethod {
 pub struct HttpActionRoute {
     pub method: RoutableMethod,
     pub path: String,
-    /// Whether this route was resolved by the JS router's `lookup()`.
-    /// When false, `path` is a fallback from the request URL and should not
-    /// be used as the identifier for usage tracking (to avoid route explosion).
+    /// Whether this is a registered route from analysis or the JS router's
+    /// `lookup()`. When false, `path` is a fallback from the request URL
+    /// and should not be used as the identifier for usage tracking (to
+    /// avoid route explosion).
     pub matched: bool,
 }
 

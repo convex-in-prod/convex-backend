@@ -463,6 +463,11 @@ pub struct AnalyzedHttpRoutes {
     routes: WithHeapSize<Vec<AnalyzedHttpRoute>>,
 }
 
+pub struct HttpPrefixMatch<'a> {
+    pub route: &'a HttpActionRoute,
+    pub suffix: RoutedHttpPath,
+}
+
 impl AnalyzedHttpRoutes {
     pub fn new(routes: Vec<AnalyzedHttpRoute>) -> Self {
         Self {
@@ -470,21 +475,21 @@ impl AnalyzedHttpRoutes {
         }
     }
 
-    pub fn route_exact(&self, path: &str, method: RoutableMethod) -> bool {
-        self.routes.iter().any(|AnalyzedHttpRoute { route, .. }| {
-            if route.path.ends_with('*') {
-                return false;
-            }
-            route.method == method && &route.path[..] == path
-        })
+    pub fn route_exact(&self, path: &str, method: RoutableMethod) -> Option<&HttpActionRoute> {
+        self.routes
+            .iter()
+            .map(|analyzed| &analyzed.route)
+            .find(|route| {
+                !route.path.ends_with('*') && route.method == method && route.path == path
+            })
     }
 
     pub fn route_prefix(
         &self,
         path: &RoutedHttpPath,
         method: RoutableMethod,
-    ) -> Option<RoutedHttpPath> {
-        let mut longest_match: Option<RoutedHttpPath> = None;
+    ) -> Option<HttpPrefixMatch<'_>> {
+        let mut longest_match: Option<HttpPrefixMatch<'_>> = None;
         for AnalyzedHttpRoute { route, .. } in &self.routes {
             if route.method != method {
                 continue;
@@ -499,14 +504,17 @@ impl AnalyzedHttpRoutes {
                 continue;
             };
             let new_match = RoutedHttpPath(format!("/{match_suffix}"));
-            if let Some(ref existing_suffix) = longest_match {
+            if let Some(ref existing_match) = longest_match {
                 // If the existing longest match has a shorter suffix, then it
                 // matches a longer prefix.
-                if existing_suffix.len() < match_suffix.len() {
+                if existing_match.suffix.len() < new_match.len() {
                     continue;
                 }
             }
-            longest_match = Some(new_match);
+            longest_match = Some(HttpPrefixMatch {
+                route,
+                suffix: new_match,
+            });
         }
         longest_match
     }
@@ -573,4 +581,93 @@ impl TryFrom<AnalyzedModule> for SerializedMappedModule {
                 .transpose()?,
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_route_matches_retain_registered_identity() {
+        let routes = AnalyzedHttpRoutes::new(
+            [
+                (RoutableMethod::Get, "/items/latest"),
+                (RoutableMethod::Post, "/items/latest"),
+                (RoutableMethod::Get, "/items/*"),
+                (RoutableMethod::Get, "/session/*"),
+            ]
+            .into_iter()
+            .map(|(method, path)| AnalyzedHttpRoute {
+                route: HttpActionRoute {
+                    method,
+                    path: path.into(),
+                    matched: true,
+                },
+                pos: None,
+            })
+            .collect(),
+        );
+        let get = routes
+            .route_exact("/items/latest", RoutableMethod::Get)
+            .unwrap();
+        let post = routes
+            .route_exact("/items/latest", RoutableMethod::Post)
+            .unwrap();
+        assert_ne!(get, post);
+        assert_eq!(get.path, "/items/latest");
+        assert_eq!(
+            routes.route_exact("/items/latest", "HEAD".parse().unwrap()),
+            Some(get),
+        );
+        let first = routes
+            .route_prefix(&RoutedHttpPath("/items/first".into()), RoutableMethod::Get)
+            .unwrap();
+        let second = routes
+            .route_prefix(&RoutedHttpPath("/items/second".into()), RoutableMethod::Get)
+            .unwrap();
+        assert_eq!(first.route, second.route);
+        assert_eq!(first.route.path, "/items/*");
+        assert_eq!(&first.suffix[..], "/first");
+        assert_eq!(&second.suffix[..], "/second");
+        assert_ne!(get, first.route);
+        assert!(routes
+            .route_exact("/missing", RoutableMethod::Get)
+            .is_none());
+        assert!(routes
+            .route_prefix(&RoutedHttpPath("/missing".into()), RoutableMethod::Get)
+            .is_none());
+        assert!(routes
+            .route_prefix(&RoutedHttpPath("/items/first".into()), RoutableMethod::Post)
+            .is_none());
+    }
+
+    #[test]
+    fn http_route_prefix_uses_the_longest_registered_prefix_in_any_order() {
+        for paths in [["*", "/a/*", "/a//*"], ["/a//*", "/a/*", "*"]] {
+            let routes = AnalyzedHttpRoutes::new(
+                paths
+                    .into_iter()
+                    .map(|path| AnalyzedHttpRoute {
+                        route: HttpActionRoute {
+                            method: RoutableMethod::Get,
+                            path: path.into(),
+                            matched: true,
+                        },
+                        pos: None,
+                    })
+                    .collect(),
+            );
+            let matched = routes
+                .route_prefix(&RoutedHttpPath("/a//item".into()), RoutableMethod::Get)
+                .unwrap();
+            assert_eq!(matched.route.path, "/a//*");
+            assert_eq!(&matched.suffix[..], "/item");
+            let fallback = routes
+                .route_prefix(&RoutedHttpPath("/other".into()), RoutableMethod::Get)
+                .unwrap();
+            assert_eq!(fallback.route.path, "*");
+            assert_eq!(&fallback.suffix[..], "/other");
+        }
+    }
+
 }
