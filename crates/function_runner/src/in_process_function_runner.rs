@@ -46,6 +46,7 @@ use common::{
         IndexId,
         RepeatableTimestamp,
         UdfRuntime,
+        SchedulerDependencyClass,
         UdfType,
     },
 };
@@ -250,6 +251,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
         default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
         in_memory_index_last_modified: BTreeMap<IndexId, Timestamp>,
         context: ExecutionContext,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(
         Option<FunctionFinalTransaction>,
         FunctionOutcome,
@@ -302,6 +304,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
             default_system_env_vars,
             in_memory_index_last_modified,
             context,
+            scheduler_dependency,
             subfunctions_in_same_isolate: *SUBFUNCTIONS_IN_SAME_ISOLATE,
             deployment: self.deployment.clone(),
         };
@@ -382,6 +385,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
             default_system_env_vars,
             in_memory_index_last_modified,
             context,
+            scheduler_dependency: SchedulerDependencyClass::Independent,
             subfunctions_in_same_isolate: *SUBFUNCTIONS_IN_SAME_ISOLATE,
             deployment: self.deployment.clone(),
         };

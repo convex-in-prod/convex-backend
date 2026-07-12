@@ -25,6 +25,7 @@ use common::{
     },
     types::{
         FunctionCaller,
+        HttpActionRoute,
         ModuleEnvironment,
         RoutableMethod,
     },
@@ -66,6 +67,12 @@ use value::sha256::Sha256Digest;
 use super::ApplicationFunctionRunner;
 use crate::function_log::HttpActionStatusCode;
 
+struct RoutedHttpAction {
+    component_path: ComponentPath,
+    routed_path: RoutedHttpPath,
+    http_route: Option<HttpActionRoute>,
+}
+
 impl<RT: Runtime> ApplicationFunctionRunner<RT> {
     #[fastrace::trace]
     pub async fn run_http_action(
@@ -84,21 +91,24 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             .begin_with_usage(identity.clone(), usage_tracker.clone())
             .await?;
 
-        let (component_path, routed_path) =
-            match self.route_http_action(&mut tx, &http_request.head).await? {
-                Some(r) => r,
-                None => {
-                    drop(tx);
-                    let response_parts = udf::HttpActionResponsePart::from_text(
-                        StatusCode::NOT_FOUND,
-                        "This Convex deployment does not have HTTP actions enabled.".to_string(),
-                    );
-                    for part in response_parts {
-                        response_streamer.send_part(part)??;
-                    }
-                    return Ok(udf::HttpActionResult::Streamed);
-                },
-            };
+        let RoutedHttpAction {
+            component_path,
+            routed_path,
+            http_route,
+        } = match self.route_http_action(&mut tx, &http_request.head).await? {
+            Some(r) => r,
+            None => {
+                drop(tx);
+                let response_parts = udf::HttpActionResponsePart::from_text(
+                    StatusCode::NOT_FOUND,
+                    "This Convex deployment does not have HTTP actions enabled.".to_string(),
+                );
+                for part in response_parts {
+                    response_streamer.send_part(part)??;
+                }
+                return Ok(udf::HttpActionResult::Streamed);
+            },
+        };
         let path = CanonicalizedComponentFunctionPath {
             component: component_path,
             udf_path: CanonicalizedUdfPath::new(
@@ -131,6 +141,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     http_response_streamer,
                     http_module_path: validated_path,
                     routed_path,
+                    http_route,
                     http_request,
                 },
                 context.clone(),
@@ -333,7 +344,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         &self,
         tx: &mut Transaction<RT>,
         head: &HttpActionRequestHead,
-    ) -> anyhow::Result<Option<(ComponentPath, RoutedHttpPath)>> {
+    ) -> anyhow::Result<Option<RoutedHttpAction>> {
         let mut model = BootstrapComponentsModel::new(tx);
         let mut current_component_path = ComponentPath::root();
         let mut routed_path = RoutedHttpPath(head.url.path().to_string());
@@ -376,24 +387,28 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             // be the most specific match.
             if let Some(ref effective_path) = http_js_routed_path
                 && let Some(http_routes) = http_routes
-                && http_routes.route_exact(&effective_path[..], method)
+                && let Some(route) = http_routes.route_exact(&effective_path[..], method)
             {
-                return Ok(Some((current_component_path, effective_path.clone())));
+                return Ok(Some(RoutedHttpAction {
+                    component_path: current_component_path,
+                    routed_path: effective_path.clone(),
+                    http_route: Some(route.clone()),
+                }));
             }
 
             // Next, try finding the most specific prefix match from both `http.js`
             // and the component-level mounts.
             enum CurrentMatch<'a> {
-                CurrentHttpJs,
+                CurrentHttpJs(&'a HttpActionRoute),
                 MountedComponent(&'a Reference),
             }
             let mut longest_match = None;
 
             if let Some(ref effective_path) = http_js_routed_path
                 && let Some(http_routes) = http_routes
-                && let Some(match_suffix) = http_routes.route_prefix(effective_path, method)
+                && let Some(matched) = http_routes.route_prefix(effective_path, method)
             {
-                longest_match = Some((match_suffix, CurrentMatch::CurrentHttpJs));
+                longest_match = Some((matched.suffix, CurrentMatch::CurrentHttpJs(matched.route)));
             }
             // http_mounts are not nested under a (possible) App http_prefix - they always
             // use the original routed_path (absolute paths from root)
@@ -405,7 +420,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 if let Some((ref existing_suffix, _)) = longest_match {
                     // If the existing longest match has a shorter suffix, then it
                     // matches a longer prefix.
-                    if existing_suffix.len() < match_suffix.len() {
+                    if existing_suffix.len() < new_match.len() {
                         continue;
                     }
                 }
@@ -419,18 +434,23 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     if let Some(effective_path) = http_js_routed_path
                         && http_routes.is_some()
                     {
-                        return Ok(Some((current_component_path, effective_path)));
+                        return Ok(Some(RoutedHttpAction {
+                            component_path: current_component_path,
+                            routed_path: effective_path,
+                            http_route: None,
+                        }));
                     } else {
                         return Ok(None);
                     }
                 },
-                Some((_, CurrentMatch::CurrentHttpJs)) => {
-                    return Ok(Some((
-                        current_component_path,
+                Some((_, CurrentMatch::CurrentHttpJs(route))) => {
+                    return Ok(Some(RoutedHttpAction {
+                        component_path: current_component_path,
                         // Use the effective (prefix-stripped) path for http.js
-                        http_js_routed_path
+                        routed_path: http_js_routed_path
                             .expect("CurrentHttpJs match requires http_js_routed_path"),
-                    )));
+                        http_route: Some(route.clone()),
+                    }));
                 },
                 Some((match_suffix, CurrentMatch::MountedComponent(reference))) => {
                     let Reference::ChildComponent {

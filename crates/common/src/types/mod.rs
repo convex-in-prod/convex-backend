@@ -87,6 +87,7 @@ pub use functions::{
     FunctionCaller,
     ModuleEnvironment,
     QueryInvocation,
+    SchedulerDependencyClass,
     UdfIdentifier,
     UdfRuntime,
     UdfType,
