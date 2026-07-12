@@ -31,6 +31,7 @@ use common::{
         IndexId,
         RepeatableTimestamp,
         UdfRuntime,
+        SchedulerDependencyClass,
         UdfType,
     },
 };
@@ -98,6 +99,7 @@ pub trait FunctionRunner<RT: Runtime>: Send + Sync + 'static {
         default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
         in_memory_index_last_modified: BTreeMap<IndexId, Timestamp>,
         context: ExecutionContext,
+        scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(
         Option<FunctionFinalTransaction>,
         FunctionOutcome,

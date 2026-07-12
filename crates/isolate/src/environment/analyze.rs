@@ -758,10 +758,10 @@ fn udf_analyze<RT: Runtime>(
 }
 
 /// The `convex/http.js` default export, must be an HTTP router. In addition to
-/// normal module analysis, this module may contain a Vec of
-/// `AnalyzedHttpRoute`s returned by `Router.getRoutes()` which is currently
-/// used only by the dashboard for dispaying HTTP routes. These routes are
-/// publicly accessible at domains like `https://happy-otter-123.convex.site`.
+/// normal module analysis, this module contains the `AnalyzedHttpRoute`s
+/// returned by `Router.getRoutes()`. They drive component routing and
+/// independent-action admission, and supply the dashboard's registered route
+/// list.
 fn http_analyze<RT: Runtime>(
     scope: &mut ExecutionScope<RT, AnalyzeEnvironment>,
     module: &v8::Local<v8::Module>,
