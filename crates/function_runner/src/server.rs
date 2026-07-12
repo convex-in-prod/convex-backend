@@ -38,6 +38,7 @@ use common::{
         DeploymentMetadata,
         IndexId,
         ModuleEnvironment,
+        SchedulerDependencyClass,
         UdfType,
     },
 };
@@ -137,6 +138,7 @@ pub struct RunRequestArgs {
     pub default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
     pub in_memory_index_last_modified: BTreeMap<IndexId, Timestamp>,
     pub context: ExecutionContext,
+    pub scheduler_dependency: SchedulerDependencyClass,
     pub subfunctions_in_same_isolate: bool,
     pub deployment: DeploymentMetadata,
 }
@@ -322,6 +324,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             default_system_env_vars,
             in_memory_index_last_modified,
             context,
+            scheduler_dependency,
             subfunctions_in_same_isolate,
             deployment,
         }: RunRequestArgs,
@@ -398,6 +401,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                         deployment_name,
                         function_started_sender,
                         subfunctions_in_same_isolate,
+                        scheduler_dependency,
                     )
                     .await?;
                 Ok((
@@ -423,6 +427,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                         environment_data,
                         deployment_name,
                         function_started_sender,
+                        scheduler_dependency,
                     )
                     .await?;
                 Ok((
@@ -432,6 +437,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 ))
             },
             UdfType::HttpAction => {
+                anyhow::ensure!(
+                    scheduler_dependency == SchedulerDependencyClass::Independent,
+                    "HTTP actions cannot be dependency-unblocking scheduler requests"
+                );
                 let HttpActionMetadata {
                     http_response_streamer,
                     http_module_path,
