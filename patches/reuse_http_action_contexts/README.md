@@ -295,6 +295,7 @@ exercises the read-set invalidation path.
 Application code should still be correct when contexts are not reused. Context
 reuse is a performance optimization with observable state-retention semantics,
 not a durable in-memory cache API.
+
 ## Interaction with isolate queue delay control
 
 HTTP action context reuse can reduce action initialization time and therefore
