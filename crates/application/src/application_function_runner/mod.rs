@@ -27,6 +27,10 @@ use common::{
         ComponentPath,
         PublicFunctionPath,
     },
+    dependency_overflow::{
+        DependencyOverflowGate,
+        DependencyOverflowPermit,
+    },
     errors::JsError,
     execution_context::{
         ExecutionContext,
@@ -240,14 +244,8 @@ use crate::{
     QueryReturn,
 };
 
-mod dependency_overflow;
 mod http_routing;
 mod metrics;
-
-use self::dependency_overflow::{
-    DependencyOverflowGate,
-    DependencyOverflowPermit,
-};
 
 static BUILD_DEPS_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| Duration::from_secs(600));
 
