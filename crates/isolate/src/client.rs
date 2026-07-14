@@ -9,6 +9,7 @@ use std::{
     pin::pin,
     sync::{
         atomic::{
+            AtomicBool,
             AtomicUsize,
             Ordering,
         },
@@ -127,6 +128,7 @@ use futures::{
         PollNext,
         StreamExt,
     },
+    task::AtomicWaker,
     TryStreamExt as _,
 };
 use itertools::Either;
@@ -175,6 +177,7 @@ use value::identifier::Identifier;
 use crate::{
     concurrency_limiter::ConcurrencyLimiter,
     context_cache::{
+        context_cache_key,
         CachedContexts,
         ContextCache,
     },
@@ -217,6 +220,74 @@ const ISOLATE_QUEUE_METRICS_LOG_FREQUENCY: Duration = Duration::from_secs(1);
 pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
 pub const PAUSE_REQUEST: &str = "pause_request";
 pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
+
+/// Caller-drop signal for one database-UDF execution tree.
+///
+/// Nested UDF syscalls are unbatched, so same-isolate recursion has one active
+/// descendant chain. Waking the most recently registered frame repolls the
+/// `RecursiveExecutor` tree.
+#[derive(Clone)]
+pub struct CancellationSignal {
+    inner: Arc<CancellationState>,
+}
+
+struct CancellationState {
+    cancelled: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl CancellationSignal {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(CancellationState {
+                cancelled: AtomicBool::new(false),
+                waker: AtomicWaker::new(),
+            }),
+        }
+    }
+
+    fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+        self.inner.waker.wake();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        std::future::poll_fn(|cx| {
+            if self.is_cancelled() {
+                return std::task::Poll::Ready(());
+            }
+            self.inner.waker.register(cx.waker());
+            // Recheck after registration so cancellation between the first load and
+            // waker installation cannot be lost.
+            if self.is_cancelled() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
+struct CancelUdfOnDrop(Option<CancellationSignal>);
+
+impl CancelUdfOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelUdfOnDrop {
+    fn drop(&mut self) {
+        if let Some(signal) = &self.0 {
+            signal.cancel();
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RequestSchedulingProperties {
@@ -783,10 +854,7 @@ impl<RT: Runtime> Request<RT> {
             #[cfg(test)]
             RequestType::Test { .. } => return None,
         };
-        Some(CanonicalizedComponentModulePath {
-            component: function_path.component,
-            module_path: function_path.udf_path.module().clone(),
-        })
+        Some(context_cache_key(function_path))
     }
 
     fn scheduling_properties(
@@ -820,6 +888,7 @@ impl<RT: Runtime> Request<RT> {
 pub enum RequestType<RT: Runtime> {
     Udf {
         request: UdfRequest<RT>,
+        cancellation: CancellationSignal,
         response: oneshot::Sender<anyhow::Result<(Transaction<RT>, FunctionOutcome)>>,
         queue_timer: Timer<VMHistogram>,
         rng_seed: [u8; 32],
@@ -1273,6 +1342,8 @@ impl<RT: Runtime> IsolateClient<RT> {
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
         let (tx, rx) = oneshot::channel();
+        let cancellation = CancellationSignal::new();
+        let caller_cancellation = cancellation.clone();
         let request = RequestType::Udf {
             request: UdfRequest {
                 path_and_args,
@@ -1283,6 +1354,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                 context,
                 environment_data,
             },
+            cancellation,
             response: tx,
             queue_timer: queue_timer(),
             rng_seed,
@@ -1300,7 +1372,13 @@ impl<RT: Runtime> IsolateClient<RT> {
             EncodedSpan::from_parent(),
             scheduler_dependency,
         ))?;
-        let (tx, outcome) = Self::receive_response(rx).await??;
+        let response = pin!(Self::receive_response(rx));
+        // Declare this guard after the pinned response future so cancellation is
+        // published before dropping the receiver when this task is dropped.
+        let cancel_on_drop = CancelUdfOnDrop(Some(caller_cancellation));
+        let response = response.await;
+        cancel_on_drop.disarm();
+        let (tx, outcome) = response??;
 
         Ok((tx, outcome))
     }
@@ -1752,8 +1830,11 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
     ) -> anyhow::Result<(Transaction<RT>, NestedUdfOutcome)> {
         let subquery_path = udf_request.path_and_args.path().clone();
         let (tx, rx) = oneshot::channel();
+        let cancellation = CancellationSignal::new();
+        let caller_cancellation = cancellation.clone();
         let request = RequestType::Udf {
             request: udf_request,
+            cancellation,
             response: tx,
             queue_timer: queue_timer(),
             rng_seed,
@@ -1775,7 +1856,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
             .ok()
             .context("scheduler shut down")?;
         metrics::log_scheduler_request_enqueued(self.pool_name, scheduling_properties.as_label());
-        let (tx, outcome) = IsolateClient::<RT>::receive_response(rx).await??;
+        let response = pin!(IsolateClient::<RT>::receive_response(rx));
+        // Match `execute_udf`: publish child cancellation before receiver
+        // closure if its parent stops waiting for this separately scheduled UDF.
+        let cancel_on_drop = CancelUdfOnDrop(Some(caller_cancellation));
+        let response = response.await;
+        cancel_on_drop.disarm();
+        let (tx, outcome) = response??;
         let outcome = match outcome {
             FunctionOutcome::Query(outcome) | FunctionOutcome::Mutation(outcome) => {
                 NestedUdfOutcome {
@@ -2645,6 +2732,8 @@ mod tests {
         wait_for_external_permit,
         worker_rejection_reason,
         ActiveRequestCounts,
+        CancelUdfOnDrop,
+        CancellationSignal,
         ExternalPermitWaitOutcome,
         IdleWorkerInfo,
         IsolateConfig,
@@ -3236,6 +3325,20 @@ mod tests {
             max_workers_per_client: 6,
             base_workers_per_client: 5,
         }
+    }
+
+    #[test]
+    fn caller_drop_signal_is_shared_and_guard_can_be_disarmed() {
+        let signal = CancellationSignal::new();
+        let nested_signal = signal.clone();
+
+        CancelUdfOnDrop(Some(signal.clone())).disarm();
+        assert!(!signal.is_cancelled());
+        assert!(!nested_signal.is_cancelled());
+
+        drop(CancelUdfOnDrop(Some(signal.clone())));
+        assert!(signal.is_cancelled());
+        assert!(nested_signal.is_cancelled());
     }
 
     #[test]

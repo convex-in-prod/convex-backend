@@ -447,8 +447,9 @@ impl VisibilityInfo {
 /// - Checking the args size.
 /// - Checking that the args pass validation.
 ///
-/// This should only be constructed via `ValidatedPathAndArgs::new` to use the
-/// type system to enforce that validation is never skipped.
+/// This should only be constructed by the validation methods below or
+/// deserialized from a trusted function-runner protocol value. Protocol
+/// consumers must still combine its reuse bit with the accompanying `UdfType`.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ValidatedPathAndArgs {
     path: ResolvedComponentFunctionPath,
@@ -456,6 +457,13 @@ pub struct ValidatedPathAndArgs {
     // Not set for system modules.
     npm_version: Option<Version>,
     reuse_context: bool,
+}
+
+fn database_udf_context_reuse_enabled(reuse_context: bool, udf_type: UdfType) -> bool {
+    match udf_type {
+        UdfType::Query | UdfType::Mutation => reuse_context,
+        UdfType::Action | UdfType::HttpAction => false,
+    }
 }
 
 impl ValidatedPathAndArgs {
@@ -723,7 +731,7 @@ impl ValidatedPathAndArgs {
                 path,
                 args,
                 npm_version: Some(version),
-                reuse_context,
+                reuse_context: database_udf_context_reuse_enabled(reuse_context, expected_udf_type),
             },
             visibility_info,
         )))
@@ -780,8 +788,73 @@ impl ValidatedPathAndArgs {
         })
     }
 
-    pub fn reuse_context(&self) -> bool {
-        self.reuse_context
+    pub fn reuse_context(&self, udf_type: UdfType) -> bool {
+        // Check the type again because `from_proto` reconstructs this value without
+        // passing through `new_inner`.
+        database_udf_context_reuse_enabled(self.reuse_context, udf_type)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::{
+        components::{
+            ComponentId,
+            ComponentPath,
+            ResolvedComponentFunctionPath,
+        },
+        types::UdfType,
+    };
+    use sync_types::types::SerializedArgs;
+
+    use super::{
+        ValidatedHttpPath,
+        ValidatedPathAndArgs,
+    };
+
+    fn marked_path_and_args() -> ValidatedPathAndArgs {
+        ValidatedPathAndArgs {
+            path: ResolvedComponentFunctionPath {
+                component: ComponentId::Root,
+                udf_path: "mixed.js:function".parse().expect("invalid test UDF path"),
+                component_path: ComponentPath::root(),
+            },
+            args: SerializedArgs::from_args(vec![]).expect("invalid test arguments"),
+            npm_version: None,
+            reuse_context: true,
+        }
+    }
+
+    #[test]
+    fn protocol_reuse_bit_is_enabled_only_for_database_requests() {
+        let proto: pb::common::ValidatedPathAndArgs = marked_path_and_args()
+            .try_into()
+            .expect("failed to serialize test path and arguments");
+        assert_eq!(proto.reuse_context, Some(true));
+
+        let path_and_args = ValidatedPathAndArgs::from_proto(proto)
+            .expect("failed to deserialize test path and arguments");
+        assert!(path_and_args.reuse_context(UdfType::Query));
+        assert!(path_and_args.reuse_context(UdfType::Mutation));
+        assert!(!path_and_args.reuse_context(UdfType::Action));
+        assert!(!path_and_args.reuse_context(UdfType::HttpAction));
+    }
+
+    #[test]
+    fn http_protocol_reuse_bit_is_cleared() {
+        let proto = pb::common::ValidatedHttpPath {
+            path: Some("http.js:default".to_string()),
+            component_path: Some(ComponentPath::root().into()),
+            component_id: ComponentId::Root.serialize_to_string(),
+            npm_version: None,
+            reuse_context: Some(true),
+        };
+        let validated_path =
+            ValidatedHttpPath::from_proto(proto).expect("failed to deserialize test HTTP path");
+        let proto: pb::common::ValidatedHttpPath = validated_path
+            .try_into()
+            .expect("failed to serialize test HTTP path");
+        assert_eq!(proto.reuse_context, Some(false));
     }
 }
 
@@ -811,13 +884,12 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
 
 /// A UDF path that has been validated to be an HTTP route.
 ///
-/// This should only be constructed via `ValidatedHttpRoute::try_from` to use
-/// the type system to enforce that validation is never skipped.
+/// This should only be constructed by `ValidatedHttpPath::new` or deserialized
+/// from a trusted function-runner protocol value.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct ValidatedHttpPath {
     path: ResolvedComponentFunctionPath,
     npm_version: Option<Version>,
-    reuse_context: bool,
 }
 
 impl ValidatedHttpPath {
@@ -851,14 +923,9 @@ impl ValidatedHttpPath {
             Ok(udf_version) => udf_version,
             Err(e) => return Ok(Err(e)),
         };
-        let module = ModuleModel::new(tx)
-            .get_metadata_for_function_by_id(&path)
-            .await?;
         Ok(Ok(ValidatedHttpPath {
             path,
             npm_version: Some(udf_version),
-            reuse_context: module
-                .is_some_and(|m| m.analyze_result.as_ref().is_some_and(|a| a.reuse_context)),
         }))
     }
 
@@ -876,7 +943,7 @@ impl ValidatedHttpPath {
             component_path,
             component_id,
             npm_version,
-            reuse_context,
+            reuse_context: _,
         }: pb::common::ValidatedHttpPath,
     ) -> anyhow::Result<Self> {
         let component = ComponentId::deserialize_from_string(component_id.as_deref())?;
@@ -891,7 +958,6 @@ impl ValidatedHttpPath {
                 component_path,
             },
             npm_version: npm_version.map(|v| Version::parse(&v)).transpose()?,
-            reuse_context: reuse_context.unwrap_or(false),
         })
     }
 }
@@ -900,11 +966,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
     type Error = anyhow::Error;
 
     fn try_from(
-        ValidatedHttpPath {
-            path,
-            npm_version,
-            reuse_context,
-        }: ValidatedHttpPath,
+        ValidatedHttpPath { path, npm_version }: ValidatedHttpPath,
     ) -> anyhow::Result<Self> {
         let component_path = Some(path.component_path.into());
         Ok(Self {
@@ -912,7 +974,9 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
             npm_version: npm_version.map(|v| v.to_string()),
             component_path,
             component_id: path.component.serialize_to_string(),
-            reuse_context: Some(reuse_context),
+            // This legacy field is not an HTTP-action reuse permission. HTTP
+            // action reuse is controlled locally by REUSE_HTTP_ACTION_CONTEXTS.
+            reuse_context: Some(false),
         })
     }
 }

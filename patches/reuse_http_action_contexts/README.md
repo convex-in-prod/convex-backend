@@ -15,6 +15,11 @@ state, request state, response state, cancellation state, and callback state,
 but it can preserve JavaScript module and global state across HTTP action
 requests that land on the same cached context.
 
+This knob is independent of the database-module
+`experimental_reuseContext` export. The HTTP runtime does not consult the
+legacy reuse bit on `ValidatedHttpPath`, so it cannot opt an HTTP action into
+reuse. The maintained database-UDF patch also serializes that bit as false for HTTP paths.
+
 This note uses "reuse" for the behavior and "cache" for the backend data
 structure that stores a reusable context between requests. A cached context is
 not a user-facing cache API. It is an implementation detail of the isolate

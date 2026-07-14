@@ -96,9 +96,12 @@ pub struct AnalyzedModule {
     pub cron_specs: Option<WithHeapSize<BTreeMap<CronIdentifier, CronSpec>>>,
     /// Index of the module's original source in the source map.
     pub source_index: Option<u32>,
-    /// Whether to keep around the JS context after running a function from this
-    /// module. If true, state will non-deterministically leak from UDF to UDF
-    /// (e.g. on the global object or module attributes).
+    /// Whether this module requests experimental JS context reuse. Effective
+    /// reuse also depends on the function type and runtime-specific policy;
+    /// database queries and mutations may be eligible, while actions and HTTP
+    /// actions are ineligible at the database-UDF boundary. When reuse occurs,
+    /// state can non-deterministically leak between executions (e.g. on the
+    /// global object or module attributes).
     ///
     /// This is experimental for now and the reuse isn't guaranteed to happen.
     pub reuse_context: bool,

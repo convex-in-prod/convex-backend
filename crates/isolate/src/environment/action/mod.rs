@@ -21,7 +21,6 @@ use std::{
 use anyhow::anyhow;
 use common::{
     components::{
-        CanonicalizedComponentModulePath,
         ComponentId,
         ComponentPath,
     },
@@ -150,7 +149,10 @@ use crate::{
         ActionRequestParams,
         EnvironmentData,
     },
-    context_cache::ContextCache,
+    context_cache::{
+        context_cache_key,
+        ContextCache,
+    },
     environment::{
         helpers::{
             module_loader::module_specifier_from_path,
@@ -361,10 +363,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             _ = tx.send(());
         }
         scope!(let handle_scope, isolate.isolate());
-        let reusable_module_path = CanonicalizedComponentModulePath {
-            component: component_function_path.component,
-            module_path: udf_path.module().clone(),
-        };
+        let reusable_module_path = context_cache_key(component_function_path);
         let mut context_scope;
         let mut reused_http_action_context = false;
         let reused_context = if *REUSE_HTTP_ACTION_CONTEXTS

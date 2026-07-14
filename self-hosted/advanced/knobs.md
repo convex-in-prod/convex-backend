@@ -3,10 +3,10 @@
 There is a large number of detailed configuration options in
 [knobs.rs](/crates/common/src/knobs.rs). These options are configurable via
 environment variables. In order to tune your Convex instance at scale for your
-workload, you may need to adjust these knobs. You will have to set these
-environment variables by adding them to your `docker-compose.yml` file. Commonly
-overriden knobs are listed in the `env` section of the
-[`docker-compose.yml`](../docker/docker-compose.yml)
+workload, you may need to adjust these knobs. The stock Compose file passes
+commonly overridden knobs from the host environment or Compose `.env` file.
+Add other variables to the backend service's `environment` section in
+[`docker-compose.yml`](../docker/docker-compose.yml).
 
 ## `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`
 

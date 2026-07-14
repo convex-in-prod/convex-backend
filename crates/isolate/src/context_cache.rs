@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use ::metrics::IntoLabel;
 use common::{
-    components::CanonicalizedComponentModulePath,
+    components::{
+        CanonicalizedComponentModulePath,
+        ResolvedComponentFunctionPath,
+    },
     interval::IntervalSet,
     knobs::REUSE_HTTP_ACTION_CONTEXTS,
     runtime::Runtime,
@@ -82,6 +85,15 @@ pub struct ContextReadSet {
         IntervalSet,
         Sha256Digest,
     )>,
+}
+
+pub(crate) fn context_cache_key(
+    function_path: &ResolvedComponentFunctionPath,
+) -> CanonicalizedComponentModulePath {
+    CanonicalizedComponentModulePath {
+        component: function_path.component,
+        module_path: function_path.udf_path.module().clone(),
+    }
 }
 
 impl ContextCache {
@@ -303,7 +315,9 @@ impl CachedContexts {
     pub fn can_serve_request<RT: Runtime>(&self, request: &Request<RT>) -> bool {
         let this = self.inner.lock();
         match &request.inner {
-            RequestType::Udf { request: inner, .. } if inner.path_and_args.reuse_context() => {
+            RequestType::Udf { request: inner, .. }
+                if inner.path_and_args.reuse_context(inner.udf_type) =>
+            {
                 request.module().is_some_and(|module| {
                     matches!(
                         &this.saved_context,

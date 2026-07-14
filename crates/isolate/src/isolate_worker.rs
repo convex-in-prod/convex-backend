@@ -71,7 +71,8 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
         let debug_str = match inner {
             RequestType::Udf {
                 request,
-                mut response,
+                cancellation,
+                response,
                 queue_timer,
                 rng_seed,
                 reactor_depth,
@@ -96,7 +97,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                         context_cache,
                         permit,
                         &mut isolate_clean,
-                        response.closed().boxed(),
+                        cancellation,
                         args,
                         function_started_sender,
                         udf_callback,
