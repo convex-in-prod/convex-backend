@@ -185,6 +185,7 @@ use crate::{
     metrics::{
         self,
         log_isolate_request_cancelled,
+        DatabaseUdfContextReuseLookupOutcome,
     },
     request_scope::{
         RequestScope,
@@ -1262,14 +1263,39 @@ where
         let module_path = context_cache_key(self.syscall_provider.path());
         let Some((context, module_map, read_set)) = context_cache.take_reused_context(&module_path)
         else {
+            metrics::log_database_udf_context_reuse_lookup(
+                self.syscall_provider.udf_type(),
+                DatabaseUdfContextReuseLookupOutcome::NotFound,
+            );
             return Ok(None);
         };
-        if !self
+        // A found context has one terminal lookup outcome even if the request
+        // transaction cannot validate its saved read set.
+        let validation_result = self
             .syscall_provider
             .validate_reused_context(&read_set)
-            .await?
-        {
-            return Ok(None);
+            .await;
+        match validation_result {
+            Ok(true) => {
+                metrics::log_database_udf_context_reuse_lookup(
+                    self.syscall_provider.udf_type(),
+                    DatabaseUdfContextReuseLookupOutcome::Hit,
+                );
+            },
+            Ok(false) => {
+                metrics::log_database_udf_context_reuse_lookup(
+                    self.syscall_provider.udf_type(),
+                    DatabaseUdfContextReuseLookupOutcome::ValidationFailed,
+                );
+                return Ok(None);
+            },
+            Err(error) => {
+                metrics::log_database_udf_context_reuse_lookup(
+                    self.syscall_provider.udf_type(),
+                    DatabaseUdfContextReuseLookupOutcome::ValidationError,
+                );
+                return Err(error);
+            },
         }
         Ok(Some((context, module_map, read_set)))
     }

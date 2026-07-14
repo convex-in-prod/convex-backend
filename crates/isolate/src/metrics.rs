@@ -40,9 +40,42 @@ use prometheus::VMHistogram;
 
 use crate::{
     client::NO_AVAILABLE_WORKERS,
+    context_cache::{
+        ContextCacheClearReason,
+        ReusableContextKind,
+    },
     module_map::ModulesRegistered,
     IsolateHeapStats,
 };
+
+fn reusable_context_kind_label(context_kind: ReusableContextKind) -> &'static str {
+    match context_kind {
+        ReusableContextKind::DatabaseUdf => "database_udf",
+        ReusableContextKind::HttpAction => "http_action",
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContextCacheOperation {
+    Save,
+    Take,
+}
+
+fn context_cache_operation_label(operation: ContextCacheOperation) -> &'static str {
+    match operation {
+        ContextCacheOperation::Save => "save",
+        ContextCacheOperation::Take => "take",
+    }
+}
+
+fn context_cache_clear_reason_label(reason: ContextCacheClearReason) -> &'static str {
+    match reason {
+        ContextCacheClearReason::FreshContextClobber => "fresh_context_clobber",
+        ContextCacheClearReason::ReusableContextReplacement => "reusable_context_replacement",
+        ContextCacheClearReason::AppDefinitionEvaluation => "app_definition_evaluation",
+        ContextCacheClearReason::CacheDrop => "cache_drop",
+    }
+}
 
 register_convex_histogram!(
     UDF_EXECUTE_SECONDS,
@@ -136,6 +169,49 @@ pub fn log_scheduler_request_dispatched(name: &'static str, scheduler_class: &'s
         &ISOLATE_SCHEDULER_REQUESTS_DISPATCHED_TOTAL,
         1,
         scheduler_class_labels(name, scheduler_class),
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_SCHEDULER_CONTEXT_AFFINITY_TOTAL,
+    "Number of reusable-context-eligible worker selections accepted by a worker channel, by \
+     affinity outcome",
+    &["pool_name", "context_kind", "outcome"],
+    std::time::Duration::MAX,
+);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchedulerContextAffinityOutcome {
+    Hit,
+    EmptyWorker,
+    NewWorker,
+    StolenWorker,
+}
+
+impl SchedulerContextAffinityOutcome {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::EmptyWorker => "empty_worker",
+            Self::NewWorker => "new_worker",
+            Self::StolenWorker => "stolen_worker",
+        }
+    }
+}
+
+pub(crate) fn log_scheduler_context_affinity(
+    name: &'static str,
+    context_kind: ReusableContextKind,
+    outcome: SchedulerContextAffinityOutcome,
+) {
+    log_counter_with_labels(
+        &ISOLATE_SCHEDULER_CONTEXT_AFFINITY_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("pool_name", name),
+            StaticMetricLabel::new("context_kind", reusable_context_kind_label(context_kind)),
+            StaticMetricLabel::new("outcome", outcome.metric_label()),
+        ],
     );
 }
 
@@ -1215,7 +1291,7 @@ pub fn log_user_function_execution_time(udf_type: UdfType, execution_time: Durat
 
 register_convex_counter!(
     REUSABLE_CONTEXT_INIT_TOTAL,
-    "Number of times we initialized a reusable context",
+    "Number of database UDF attempts entering reusable-context initialization",
     &["udf_type", "reused"],
 );
 
@@ -1240,6 +1316,123 @@ pub fn log_normalize_id_old_format(format: &'static str) {
         &NORMALIZE_ID_OLD_FORMAT_TOTAL,
         1,
         vec![StaticMetricLabel::new("format", format)],
+    );
+}
+
+register_convex_counter!(
+    DATABASE_UDF_CONTEXT_REUSE_LOOKUP_TOTAL,
+    "Number of reusable database UDF context lookups by outcome",
+    &["udf_type", "outcome"],
+    std::time::Duration::MAX,
+);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DatabaseUdfContextReuseLookupOutcome {
+    NotFound,
+    ValidationFailed,
+    ValidationError,
+    Hit,
+}
+
+impl DatabaseUdfContextReuseLookupOutcome {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::ValidationFailed => "validation_failed",
+            Self::ValidationError => "validation_error",
+            Self::Hit => "hit",
+        }
+    }
+}
+
+pub(crate) fn log_database_udf_context_reuse_lookup(
+    udf_type: UdfType,
+    outcome: DatabaseUdfContextReuseLookupOutcome,
+) {
+    let udf_type = match udf_type {
+        UdfType::Query => "query",
+        UdfType::Mutation => "mutation",
+        UdfType::Action | UdfType::HttpAction => {
+            unreachable!("database UDF context lookup recorded for an action")
+        },
+    };
+    log_counter_with_labels(
+        &DATABASE_UDF_CONTEXT_REUSE_LOOKUP_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("udf_type", udf_type),
+            StaticMetricLabel::new("outcome", outcome.metric_label()),
+        ],
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_CONTEXT_CACHE_OPERATIONS_TOTAL,
+    "Number of reusable isolate context cache operations",
+    &["context_kind", "operation"],
+    std::time::Duration::MAX,
+);
+
+pub(crate) fn log_context_cache_operation(
+    context_kind: ReusableContextKind,
+    operation: ContextCacheOperation,
+) {
+    log_counter_with_labels(
+        &ISOLATE_CONTEXT_CACHE_OPERATIONS_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("context_kind", reusable_context_kind_label(context_kind)),
+            StaticMetricLabel::new("operation", context_cache_operation_label(operation)),
+        ],
+    );
+}
+
+register_convex_counter!(
+    ISOLATE_CONTEXT_CACHE_CLEARED_TOTAL,
+    "Number of saved reusable isolate contexts cleared by reason",
+    &["context_kind", "reason"],
+    std::time::Duration::MAX,
+);
+
+pub(crate) fn log_context_cache_cleared(
+    context_kind: ReusableContextKind,
+    reason: ContextCacheClearReason,
+) {
+    log_counter_with_labels(
+        &ISOLATE_CONTEXT_CACHE_CLEARED_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("context_kind", reusable_context_kind_label(context_kind)),
+            StaticMetricLabel::new("reason", context_cache_clear_reason_label(reason)),
+        ],
+    );
+}
+
+register_convex_gauge!(
+    ISOLATE_CONTEXT_CACHE_ENTRIES_INFO,
+    "Current number of saved reusable isolate contexts",
+    &["context_kind"],
+);
+
+pub(crate) fn log_context_cache_entry_added(context_kind: ReusableContextKind) {
+    add_to_gauge_with_labels(
+        &ISOLATE_CONTEXT_CACHE_ENTRIES_INFO,
+        1.0,
+        vec![StaticMetricLabel::new(
+            "context_kind",
+            reusable_context_kind_label(context_kind),
+        )],
+    );
+}
+
+pub(crate) fn log_context_cache_entry_removed(context_kind: ReusableContextKind) {
+    subtract_from_gauge_with_labels(
+        &ISOLATE_CONTEXT_CACHE_ENTRIES_INFO,
+        1.0,
+        vec![StaticMetricLabel::new(
+            "context_kind",
+            reusable_context_kind_label(context_kind),
+        )],
     );
 }
 

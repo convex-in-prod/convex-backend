@@ -199,6 +199,23 @@ at the same time. Use at least two workers and a reserve of at least one for
 applications with these call patterns. The reserve is finite; deep chains or
 parallel fanout can still consume every worker and queue entry.
 
+## `REUSE_HTTP_ACTION_CONTEXTS`
+
+Setting `REUSE_HTTP_ACTION_CONTEXTS=true` lets an isolate worker retain a V8
+context for an HTTP action entry module between requests. The default is
+`false`. Reuse preserves JavaScript module and global state, while request,
+response, identity, callback, stream, cancellation, and other Rust-owned state
+remain request-local. Enable it only after reviewing HTTP action modules and
+their imports for request-owned state retained in module globals.
+
+This knob is independent of the database-module `experimental_reuseContext`
+marker. The maintained Docker Compose file passes it to the backend container.
+Its process-local value does not change in a running backend, so changing the
+environment requires a backend restart. See
+[`patches/reuse_http_action_contexts/README.md`](../../patches/reuse_http_action_contexts/README.md)
+for the cache, invalidation, memory, and rollback contract. The bounded cache
+and scheduler signals are documented in
+[`patches/context_reuse_observability/README.md`](../../patches/context_reuse_observability/README.md).
 ## `FUNRUN_ISOLATE_ACTIVE_THREADS`
 
 This caps isolates actively executing JavaScript. `0` means unlimited. A

@@ -76,6 +76,7 @@ use common::{
         ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS,
         ISOLATE_QUEUE_SIZE,
         MAX_ISOLATE_ACTION_WORKERS,
+        REUSE_HTTP_ACTION_CONTEXTS,
         REUSE_ISOLATES,
         V8_THREADS,
     },
@@ -180,6 +181,7 @@ use crate::{
         context_cache_key,
         CachedContexts,
         ContextCache,
+        ReusableContextKind,
     },
     isolate::{
         Isolate,
@@ -207,6 +209,7 @@ use crate::{
         queue_timer,
         rejected_before_execution_error,
         RejectedBeforeExecutionReason,
+        SchedulerContextAffinityOutcome,
     },
     module_cache::{
         ModuleCache,
@@ -857,6 +860,32 @@ impl<RT: Runtime> Request<RT> {
         Some(context_cache_key(function_path))
     }
 
+    pub(crate) fn reusable_context_kind(&self) -> Option<ReusableContextKind> {
+        match &self.inner {
+            RequestType::Udf { request, .. }
+                if request.path_and_args.reuse_context(request.udf_type) =>
+            {
+                Some(ReusableContextKind::DatabaseUdf)
+            },
+            RequestType::HttpAction { .. } if *REUSE_HTTP_ACTION_CONTEXTS => {
+                Some(ReusableContextKind::HttpAction)
+            },
+            RequestType::Udf { .. }
+            | RequestType::Action { .. }
+            | RequestType::HttpAction { .. }
+            | RequestType::Analyze { .. }
+            | RequestType::EvaluateSchema { .. }
+            | RequestType::EvaluateAuthConfig { .. }
+            | RequestType::EvaluateAppDefinitions { .. }
+            | RequestType::EvaluateComponentInitializer { .. } => None,
+            #[cfg(test)]
+            RequestType::Test {
+                reuses_database_context,
+                ..
+            } => (*reuses_database_context).then_some(ReusableContextKind::DatabaseUdf),
+        }
+    }
+
     fn scheduling_properties(
         &self,
         control_plane_lane_enabled: bool,
@@ -957,6 +986,7 @@ pub enum RequestType<RT: Runtime> {
         can_block_on_descendant: bool,
         is_isolate_action: bool,
         is_control_plane: bool,
+        reuses_database_context: bool,
         fail_worker: bool,
         started: mpsc::UnboundedSender<usize>,
         completion: oneshot::Receiver<()>,
@@ -1951,6 +1981,11 @@ struct ActiveWorkerState {
     scheduling_properties: RequestSchedulingProperties,
 }
 
+struct WorkerSelection {
+    worker_id: usize,
+    context_affinity: Option<(ReusableContextKind, SchedulerContextAffinityOutcome)>,
+}
+
 impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
     pub fn new(
         rt: RT,
@@ -2250,8 +2285,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                     let dispatch_state = self.state_snapshot();
                     let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
                         && dispatch_state.dependency_dispatch_uses_reserve();
-                    let worker_id = match self.get_worker(&request, &dispatch_state) {
-                        Ok(worker_id) => worker_id,
+                    let WorkerSelection {
+                        worker_id,
+                        context_affinity,
+                    } = match self.get_worker(&request, &dispatch_state) {
+                        Ok(selection) => selection,
                         Err(reason) => {
                             metrics::log_scheduler_request_rejected(
                                 self.worker.config().name,
@@ -2290,6 +2328,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                             self.worker.config().name
                         );
                         return;
+                    }
+                    if let Some((context_kind, outcome)) = context_affinity {
+                        metrics::log_scheduler_context_affinity(
+                            self.worker.config().name,
+                            context_kind,
+                            outcome,
+                        );
                     }
                     if let Some((lane, sojourn)) = dispatch_sojourn {
                         metrics::log_isolate_queue_sojourn(
@@ -2365,10 +2410,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
         }
     }
 
-    /// Find a worker for the given `client_id`.`
+    /// Find a worker for the request's client.
     /// Returns an error if no worker can be allocated for this client.
     ///
-    /// Note that the returned worker id is removed from the
+    /// Note that the selected worker is removed from the
     /// `self.available_workers` state, so the caller is responsible for using
     /// the worker and returning it back to `self.available_workers` after it is
     /// done.
@@ -2376,7 +2421,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
         &mut self,
         request: &Request<RT>,
         state: &SchedulerStateSnapshot,
-    ) -> Result<usize, RejectedBeforeExecutionReason> {
+    ) -> Result<WorkerSelection, RejectedBeforeExecutionReason> {
         let client_id = request.client_id.as_str();
         let eligibility = state.request_eligibility(
             request.scheduling_properties(self.control_plane_lane_enabled),
@@ -2389,6 +2434,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             );
             return Err(reason);
         }
+        let reusable_context_kind = request.reusable_context_kind();
         // Try to find an existing worker for this client.
         if let Some((client_id, mut workers)) = self.available_workers.remove_entry(client_id) {
             // If there is a worker with an appropriate reusable context, pick that one
@@ -2399,12 +2445,29 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                 .extract_if(.., |worker| {
                     worker.info.cached_contexts.can_serve_request(request)
                 })
-                .next();
+                .next()
+                .map(|worker| (worker, SchedulerContextAffinityOutcome::Hit));
+            // A reusable miss should use an existing same-client worker without
+            // a reusable context before consuming physical capacity or stealing.
+            let worker = worker.or_else(|| {
+                reusable_context_kind.and_then(|_| {
+                    workers
+                        .extract_if(.., |worker| {
+                            worker.info.cached_contexts.has_no_reusable_context()
+                        })
+                        .next()
+                        .map(|worker| (worker, SchedulerContextAffinityOutcome::EmptyWorker))
+                })
+            });
             if !workers.is_empty() {
                 self.available_workers.insert(client_id, workers);
             }
-            if let Some(worker) = worker {
-                return Ok(worker.worker_id);
+            if let Some((worker, outcome)) = worker {
+                return Ok(WorkerSelection {
+                    worker_id: worker.worker_id,
+                    context_affinity: reusable_context_kind
+                        .map(|context_kind| (context_kind, outcome)),
+                });
             }
             // Otherwise all the workers have cached contexts for other modules
             // that we don't want to clobber; try to assign a new worker
@@ -2431,7 +2494,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                 self.worker.config().name,
                 self.worker_senders.len() - 1
             );
-            return Ok(self.worker_senders.len() - 1);
+            return Ok(WorkerSelection {
+                worker_id: self.worker_senders.len() - 1,
+                context_affinity: reusable_context_kind
+                    .map(|context_kind| (context_kind, SchedulerContextAffinityOutcome::NewWorker)),
+            });
         }
         // No existing worker for this client and we've already started the max number
         // of workers -- just grab the least recently used worker. This worker is least
@@ -2455,13 +2522,18 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             .pop_back()
             .expect("Available worker map should never contain an empty list");
         log_worker_stolen(worker.last_used_ts.elapsed());
+        let context_affinity = reusable_context_kind
+            .map(|context_kind| (context_kind, SchedulerContextAffinityOutcome::StolenWorker));
         if workers.is_empty() {
             // This variable shadowing drops the mutable reference to
             // `self.available_workers`.
             let key = key.clone();
             self.available_workers.remove(&key);
         }
-        Ok(worker.worker_id)
+        Ok(WorkerSelection {
+            worker_id: worker.worker_id,
+            context_affinity,
+        })
     }
 
     fn aggregate_heap_stats(&self) -> IsolateHeapStats {
@@ -2516,6 +2588,8 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                 *ISOLATE_MAX_USER_HEAP_SIZE,
             );
             isolate.set_heap_stats_handle(heap_stats.clone());
+            // Rust drops locals in reverse declaration order. Declare the cache
+            // after the isolate so its mirror and V8 globals are cleared first.
             let mut context_cache = ContextCache::new();
             heap_stats.store(isolate.heap_stats());
             loop {
@@ -2675,6 +2749,7 @@ mod tests {
         collections::{
             BTreeMap,
             HashMap,
+            VecDeque,
         },
         future::Future,
         pin::Pin,
@@ -2736,6 +2811,7 @@ mod tests {
         CancellationSignal,
         ExternalPermitWaitOutcome,
         IdleWorkerInfo,
+        IdleWorkerState,
         IsolateConfig,
         IsolateWorker,
         IsolateWorkerHandle,
@@ -2750,14 +2826,20 @@ mod tests {
         SharedIsolateScheduler,
     };
     use crate::{
-        context_cache::ContextCache,
+        context_cache::{
+            ContextCache,
+            ReusableContextKind,
+        },
         isolate::Isolate,
         isolate_queue::{
             IsolateQueueConfig,
             IsolateQueueEligibility,
             IsolateQueueLane,
         },
-        metrics::RejectedBeforeExecutionReason,
+        metrics::{
+            RejectedBeforeExecutionReason,
+            SchedulerContextAffinityOutcome,
+        },
         ConcurrencyLimiter,
         ConcurrencyPermit,
     };
@@ -2852,6 +2934,7 @@ mod tests {
                         can_block_on_descendant: _,
                         is_isolate_action: _,
                         is_control_plane: _,
+                        reuses_database_context: _,
                         fail_worker,
                         started,
                         completion,
@@ -2962,6 +3045,7 @@ mod tests {
             ),
             is_isolate_action: matches!(kind, TestRequestKind::Action),
             is_control_plane: matches!(kind, TestRequestKind::ControlPlane),
+            reuses_database_context: false,
             fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
             started,
             completion: completion_receiver,
@@ -3611,6 +3695,64 @@ mod tests {
         state.max_workers_per_client = 3;
         assert!(!state.can_start_request(properties(false, false, false), "deployment"));
         assert!(!state.can_start_request(properties(true, false, false), "deployment"));
+    }
+
+    #[test]
+    fn reusable_request_prefers_same_client_worker_without_reusable_context() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt);
+        let worker_handles = Arc::new(Mutex::new(Vec::new()));
+        let mut scheduler = SharedIsolateScheduler::new(
+            scheduler_rt.clone(),
+            TestIsolateWorker {
+                rt: scheduler_rt.clone(),
+                config: IsolateConfig::new("scheduler_test", ConcurrencyLimiter::unlimited()),
+            },
+            1,
+            1,
+            1,
+            worker_handles,
+            100,
+            Arc::new(AtomicUsize::new(0)),
+            false,
+        );
+        let (worker_sender, _worker_receiver) = mpsc::channel(1);
+        scheduler.worker_senders.push(worker_sender);
+        let context_cache = ContextCache::new();
+        scheduler.available_workers.insert(
+            "deployment".to_string(),
+            VecDeque::from([IdleWorkerState {
+                worker_id: 0,
+                last_used_ts: scheduler_rt.monotonic_now(),
+                info: IdleWorkerInfo {
+                    cached_contexts: context_cache.cached_contexts().clone(),
+                },
+            }]),
+        );
+        let PendingTestRequest { mut request, .. } =
+            test_request(1, TestRequestKind::Independent, mpsc::unbounded_channel().0);
+        let RequestType::Test {
+            reuses_database_context,
+            ..
+        } = &mut request.inner
+        else {
+            unreachable!()
+        };
+        *reuses_database_context = true;
+
+        let state = scheduler.state_snapshot();
+        let selection = scheduler
+            .get_worker(&request, &state)
+            .expect("same-client worker without a reusable context was not selected");
+        assert_eq!(selection.worker_id, 0);
+        assert_eq!(
+            selection.context_affinity,
+            Some((
+                ReusableContextKind::DatabaseUdf,
+                SchedulerContextAffinityOutcome::EmptyWorker,
+            ))
+        );
     }
 
     #[test]

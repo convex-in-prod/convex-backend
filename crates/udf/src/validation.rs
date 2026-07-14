@@ -83,6 +83,7 @@ use crate::{
         validate_pending_udf_args_size,
         validate_udf_args_size,
     },
+    metrics::log_database_udf_context_reuse_decision,
     ActionOutcome,
     SyscallTrace,
     UdfOutcome,
@@ -726,12 +727,17 @@ impl ValidatedPathAndArgs {
             ))));
         }
 
+        let reuse_context_enabled =
+            database_udf_context_reuse_enabled(reuse_context, expected_udf_type);
+        if reuse_context {
+            log_database_udf_context_reuse_decision(expected_udf_type, reuse_context_enabled);
+        }
         Ok(Ok((
             ValidatedPathAndArgs {
                 path,
                 args,
                 npm_version: Some(version),
-                reuse_context: database_udf_context_reuse_enabled(reuse_context, expected_udf_type),
+                reuse_context: reuse_context_enabled,
             },
             visibility_info,
         )))

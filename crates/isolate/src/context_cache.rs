@@ -7,7 +7,6 @@ use common::{
         ResolvedComponentFunctionPath,
     },
     interval::IntervalSet,
-    knobs::REUSE_HTTP_ACTION_CONTEXTS,
     runtime::Runtime,
     types::TabletIndexName,
 };
@@ -31,11 +30,15 @@ use value::{
 };
 
 use crate::{
-    client::{
-        Request,
-        RequestType,
+    client::Request,
+    metrics::{
+        create_context_timer,
+        log_context_cache_cleared,
+        log_context_cache_entry_added,
+        log_context_cache_entry_removed,
+        log_context_cache_operation,
+        ContextCacheOperation,
     },
-    metrics::create_context_timer,
     module_map::ModuleMap,
 };
 
@@ -53,6 +56,20 @@ enum SavedContext {
         module_map: ModuleMap,
         read_set: ContextReadSet,
     },
+}
+
+impl SavedContext {
+    fn reusable_key(&self) -> Option<(ReusableContextKind, &CanonicalizedComponentModulePath)> {
+        match self {
+            Self::Fresh(_) => None,
+            Self::DatabaseUdf { module_path, .. } => {
+                Some((ReusableContextKind::DatabaseUdf, module_path))
+            },
+            Self::HttpAction { module_path, .. } => {
+                Some((ReusableContextKind::HttpAction, module_path))
+            },
+        }
+    }
 }
 
 pub struct ContextCache {
@@ -74,6 +91,29 @@ struct CachedContextsInner {
 enum CachedContext {
     DatabaseUdf(CanonicalizedComponentModulePath),
     HttpAction(CanonicalizedComponentModulePath),
+}
+
+impl CachedContext {
+    fn reusable_key(&self) -> (ReusableContextKind, &CanonicalizedComponentModulePath) {
+        match self {
+            Self::DatabaseUdf(module_path) => (ReusableContextKind::DatabaseUdf, module_path),
+            Self::HttpAction(module_path) => (ReusableContextKind::HttpAction, module_path),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReusableContextKind {
+    DatabaseUdf,
+    HttpAction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContextCacheClearReason {
+    FreshContextClobber,
+    ReusableContextReplacement,
+    AppDefinitionEvaluation,
+    CacheDrop,
 }
 
 pub struct ContextReadSet {
@@ -116,29 +156,51 @@ impl ContextCache {
         }
     }
 
-    pub(crate) fn has_saved_context(&mut self) -> bool {
+    pub(crate) fn has_saved_reusable_context(&self) -> bool {
         matches!(
             self.saved_context,
             Some(SavedContext::DatabaseUdf { .. } | SavedContext::HttpAction { .. })
         )
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.saved_context = None;
-        self.cached_contexts.inner.lock().saved_context = None;
+    /// Remove the scheduler mirror before moving a V8 context out of the cache.
+    /// The scheduler can retain this mirror while an idle worker recreates its
+    /// isolate, so the order prevents it from advertising a destroyed context.
+    fn take_saved_context(&mut self) -> Option<SavedContext> {
+        let local_key = self
+            .saved_context
+            .as_ref()
+            .and_then(SavedContext::reusable_key);
+        let mut cached_contexts = self.cached_contexts.inner.lock();
+        let advertised_key = cached_contexts
+            .saved_context
+            .as_ref()
+            .map(CachedContext::reusable_key);
+        assert_eq!(local_key, advertised_key, "context cache mirror drifted");
+        cached_contexts.saved_context = None;
+        drop(cached_contexts);
+        self.saved_context.take()
+    }
+
+    pub(crate) fn clear(&mut self, reason: ContextCacheClearReason) {
+        let saved_context = self.take_saved_context();
+        if let Some((context_kind, _)) = saved_context.as_ref().and_then(SavedContext::reusable_key)
+        {
+            log_context_cache_cleared(context_kind, reason);
+            log_context_cache_entry_removed(context_kind);
+        }
     }
 
     pub(crate) fn get_or_create_fresh_context<'s>(
         &mut self,
         scope: &v8::PinScope<'s, '_, ()>,
     ) -> v8::Local<'s, v8::Context> {
-        let saved_context = self.saved_context.take();
-        self.cached_contexts.inner.lock().saved_context = None;
-        if matches!(
-            &saved_context,
-            Some(SavedContext::DatabaseUdf { .. } | SavedContext::HttpAction { .. })
-        ) {
+        let saved_context = self.take_saved_context();
+        if let Some((context_kind, _)) = saved_context.as_ref().and_then(SavedContext::reusable_key)
+        {
             LocalSpan::add_event(Event::new("clobbered_saved_context"));
+            log_context_cache_cleared(context_kind, ContextCacheClearReason::FreshContextClobber);
+            log_context_cache_entry_removed(context_kind);
         }
         if let Some(SavedContext::Fresh(context)) = saved_context {
             v8::Local::new(scope, context)
@@ -154,14 +216,15 @@ impl ContextCache {
         module_map: ModuleMap,
         read_set: ContextReadSet,
     ) {
-        self.saved_context = Some(SavedContext::DatabaseUdf {
-            module_path: module_path.clone(),
-            context,
-            module_map,
-            read_set,
-        });
-        self.cached_contexts.inner.lock().saved_context =
-            Some(CachedContext::DatabaseUdf(module_path));
+        self.save_reusable_context(
+            SavedContext::DatabaseUdf {
+                module_path: module_path.clone(),
+                context,
+                module_map,
+                read_set,
+            },
+            CachedContext::DatabaseUdf(module_path),
+        );
     }
 
     pub(crate) fn save_http_action_context(
@@ -171,14 +234,49 @@ impl ContextCache {
         module_map: ModuleMap,
         read_set: ContextReadSet,
     ) {
-        self.saved_context = Some(SavedContext::HttpAction {
-            module_path: module_path.clone(),
-            context,
-            module_map,
-            read_set,
-        });
-        self.cached_contexts.inner.lock().saved_context =
-            Some(CachedContext::HttpAction(module_path));
+        self.save_reusable_context(
+            SavedContext::HttpAction {
+                module_path: module_path.clone(),
+                context,
+                module_map,
+                read_set,
+            },
+            CachedContext::HttpAction(module_path),
+        );
+    }
+
+    fn save_reusable_context(
+        &mut self,
+        saved_context: SavedContext,
+        cached_context: CachedContext,
+    ) {
+        let context_kind = saved_context
+            .reusable_key()
+            .map(|(context_kind, _)| context_kind)
+            .expect("saved reusable context must have a reusable kind");
+        assert_eq!(
+            saved_context.reusable_key(),
+            Some(cached_context.reusable_key()),
+            "context cache mirror key drifted"
+        );
+        // A same-isolate nested reusable UDF can save while its reusable parent
+        // context is in flight. The parent's later save wins the one cache slot.
+        if self.saved_context.is_some() {
+            self.clear(ContextCacheClearReason::ReusableContextReplacement);
+        }
+        let mut cached_contexts = self.cached_contexts.inner.lock();
+        assert!(
+            cached_contexts.saved_context.is_none(),
+            "saving a reusable context requires an empty cache mirror"
+        );
+        // Publish the mirror only after the owning V8 context is installed.
+        // `take_saved_context` removes the mirror first, so the scheduler never
+        // observes a key whose context has already been moved or destroyed.
+        self.saved_context = Some(saved_context);
+        cached_contexts.saved_context = Some(cached_context);
+        drop(cached_contexts);
+        log_context_cache_entry_added(context_kind);
+        log_context_cache_operation(context_kind, ContextCacheOperation::Save);
     }
 
     pub(crate) fn take_reused_context(
@@ -196,11 +294,15 @@ impl ContextCache {
                 context,
                 module_map,
                 read_set,
-            }) = self.saved_context.take()
+            }) = self.take_saved_context()
             else {
                 unreachable!()
             };
-            self.cached_contexts.inner.lock().saved_context = None;
+            log_context_cache_entry_removed(ReusableContextKind::DatabaseUdf);
+            log_context_cache_operation(
+                ReusableContextKind::DatabaseUdf,
+                ContextCacheOperation::Take,
+            );
             Some((context, module_map, read_set))
         } else {
             None
@@ -222,11 +324,15 @@ impl ContextCache {
                 context,
                 module_map,
                 read_set,
-            }) = self.saved_context.take()
+            }) = self.take_saved_context()
             else {
                 unreachable!()
             };
-            self.cached_contexts.inner.lock().saved_context = None;
+            log_context_cache_entry_removed(ReusableContextKind::HttpAction);
+            log_context_cache_operation(
+                ReusableContextKind::HttpAction,
+                ContextCacheOperation::Take,
+            );
             Some((context, module_map, read_set))
         } else {
             None
@@ -314,28 +420,35 @@ impl ContextCache {
 impl CachedContexts {
     pub fn can_serve_request<RT: Runtime>(&self, request: &Request<RT>) -> bool {
         let this = self.inner.lock();
-        match &request.inner {
-            RequestType::Udf { request: inner, .. }
-                if inner.path_and_args.reuse_context(inner.udf_type) =>
-            {
-                request.module().is_some_and(|module| {
-                    matches!(
-                        &this.saved_context,
-                        Some(CachedContext::DatabaseUdf(saved_module)) if saved_module == &module
-                    )
-                })
-            },
-            RequestType::HttpAction { .. } if *REUSE_HTTP_ACTION_CONTEXTS => {
-                request.module().is_some_and(|module| {
-                    matches!(
-                        &this.saved_context,
-                        Some(CachedContext::HttpAction(saved_module)) if saved_module == &module
-                    )
-                })
-            },
+        match request.reusable_context_kind() {
+            Some(ReusableContextKind::DatabaseUdf) => request.module().is_some_and(|module| {
+                matches!(
+                    &this.saved_context,
+                    Some(CachedContext::DatabaseUdf(saved_module)) if saved_module == &module
+                )
+            }),
+            Some(ReusableContextKind::HttpAction) => request.module().is_some_and(|module| {
+                matches!(
+                    &this.saved_context,
+                    Some(CachedContext::HttpAction(saved_module)) if saved_module == &module
+                )
+            }),
             // Prefer routing other requests to isolates that don't have warmed contexts
-            _ => this.saved_context.is_none(),
+            None => this.saved_context.is_none(),
         }
+    }
+
+    pub(crate) fn has_no_reusable_context(&self) -> bool {
+        self.inner.lock().saved_context.is_none()
+    }
+}
+
+impl Drop for ContextCache {
+    fn drop(&mut self) {
+        // The scheduler holds a clone of `CachedContexts` while a worker is idle, so
+        // the mirror can outlive this cache during isolate recreation. Clear it here
+        // to avoid advertising contexts that were destroyed with the old isolate.
+        self.clear(ContextCacheClearReason::CacheDrop);
     }
 }
 

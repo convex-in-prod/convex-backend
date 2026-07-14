@@ -98,27 +98,34 @@ so creating it does not replace the body stream's byte counter.
 The important semantic change is that JavaScript module and global state can
 persist. A module-level variable set by one request can be visible to a later
 request if that later request runs on the same cached V8 context. Applications
-should not depend on this for correctness, because contexts can be cleared under
-memory pressure, invalidated by deploy or configuration changes, or simply not
-be the one selected by the scheduler. But with this patch enabled, the behavior
-is possible and expected.
+should not depend on this for correctness, because contexts can be clobbered by
+fresh work, invalidated by deploy or configuration changes, destroyed with an
+isolate, or simply not be the one selected by the scheduler. But with this
+patch enabled, the behavior is possible and expected.
 
 ## Cache shape in this patch
 
 The context cache introduced by this patch is local to an isolate worker. It is
 not a single process-global HTTP action context.
 
-Each isolate worker owns a `ContextCache`. HTTP action contexts are cached by
+Each isolate worker owns a `ContextCache`. HTTP action contexts are identified by
 `CanonicalizedComponentModulePath`, which means component plus module path.
 While a request is running, the context is taken out of that worker's cache. If
 the request succeeds and the context is still reusable, it is saved back into
 that same worker's cache.
 
+The cache has one saved context slot per isolate total. The slot can hold a
+fresh prewarmed context or one reusable HTTP-action or database-UDF context, so
+different module identities and the two context kinds compete within one
+isolate. Concurrent requests can still warm matching contexts on separate
+workers.
+
 For a deployment with one HTTP router module and eight isolate workers, the
 normal warm steady state is therefore up to eight cached HTTP action contexts
 for that router module, not one context per URL route and not one global context
 for all workers. If the application uses multiple HTTP modules or components,
-each worker may cache more than one module-path context over time.
+one worker can retain only the most recently saved context occupying its slot;
+other module contexts can remain warm on other workers.
 
 ## Why the key is the module path
 
@@ -238,8 +245,8 @@ state in module globals, move it into the handler scope before enabling this
 knob. In particular, do not retain a request, response, action context, stream,
 or promise from one handler in a module global. If the application intentionally
 uses module globals as an in-process cache, treat that cache as best-effort
-only; isolate recreation, memory pressure, deploys, and scheduler choices can
-all clear or bypass it.
+only; fresh work, low-heap isolate recreation, deploys, and scheduler choices
+can all clear or bypass it.
 
 For the standard self-hosted Docker Compose file, set
 `REUSE_HTTP_ACTION_CONTEXTS=true` in the Compose environment or the `.env` file.
@@ -255,19 +262,15 @@ and detached context count. Per-context attribution is much harder because
 contexts share one isolate heap.
 
 The practical memory guard is therefore isolate-level rather than exact
-per-context accounting. The backend already checks isolate heap availability
-between requests. If the isolate does not have enough available heap and cached
-contexts exist, the context cache is marked under memory pressure and contexts
-are cleared before constructing a fresh context. If memory is still
-insufficient, the isolate is treated as not clean and is recreated.
-
-A matching cached context can still be taken directly while the cache is marked
-under memory pressure; this is the existing behavior shared with reusable
-database-UDF contexts and avoids allocating another V8 context. Therefore,
-memory pressure does not guarantee immediate eviction of a hot HTTP context.
-The isolate heap limit, idle timeout, and maximum lifetime remain the backstops
-for a repeatedly reused context. Operators should not interpret the cache's
-memory-pressure handling as a per-context memory cap.
+per-context accounting. The backend checks isolate heap availability between
+requests. When available heap is below the normal threshold, an already-saved
+reusable context lets the isolate continue so a matching request can use it
+without allocating another realm. A request that needs a fresh realm clobbers
+the saved slot; if it does not publish another reusable context, the next heap
+cleanliness check recreates the isolate. A hot matching context can be
+republished, so low available heap does not guarantee immediate eviction. The
+isolate heap limit, idle timeout, and maximum lifetime remain the backstops for
+a repeatedly reused context. This is not a per-context memory cap.
 
 Operators adopting this patch should treat context reuse as a memory-throughput
 tradeoff. The maximum idle warm state is one saved reusable context per isolate
@@ -287,8 +290,10 @@ and a single-digit MiB retained context size after warmup. That is usually tens
 of MiB of retained heap, not GiBs. Even if the warm context is closer to `10
 MiB`, an eight-worker deployment is around `80 MiB` for the main HTTP router
 context. On a `4 vCPU / 16 GiB` self-hosted server, that is unlikely to be the
-dominant memory term. The risk becomes more meaningful with many separate HTTP
-modules, large import graphs, or top-level in-memory caches.
+dominant memory term. More HTTP modules do not increase the one-slot-per-worker
+maximum, although they can increase cache churn and reduce hit rates. The
+retained-memory risk grows with worker count, the size of the module graphs that
+occupy those slots, and top-level in-memory caches.
 
 The practical operating check is concrete: after enabling the knob, run a warm
 load test for the hot HTTP path and compare p50/p95/p99 latency, HTTP `503`

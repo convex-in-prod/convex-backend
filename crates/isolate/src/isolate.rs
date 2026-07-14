@@ -286,7 +286,7 @@ impl<RT: Runtime> Isolate<RT> {
         let stats = self.v8_isolate.get_heap_statistics();
         log_heap_statistics(&stats);
         if stats.total_available_size() < *ISOLATE_MAX_USER_HEAP_SIZE
-            && !context_cache.has_saved_context()
+            && !context_cache.has_saved_reusable_context()
         {
             self.handle
                 .terminate(IsolateTerminationReason::OutOfMemory.into());

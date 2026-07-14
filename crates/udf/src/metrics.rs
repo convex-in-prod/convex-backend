@@ -1,3 +1,4 @@
+use common::types::UdfType;
 use metrics::{
     log_counter,
     log_counter_with_labels,
@@ -34,6 +35,36 @@ pub(crate) fn log_function_limit_warning(
         ],
     };
     log_counter_with_labels(&FUNCTION_LIMIT_WARNING_TOTAL, 1, labels);
+}
+
+register_convex_counter!(
+    DATABASE_UDF_CONTEXT_REUSE_DECISION_TOTAL,
+    "Number of validated marked database UDF attempts by effective context reuse decision",
+    &["udf_type", "decision"],
+    std::time::Duration::MAX,
+);
+
+pub(crate) fn log_database_udf_context_reuse_decision(
+    udf_type: UdfType,
+    reuse_context_enabled: bool,
+) {
+    let (udf_type, decision) = match (udf_type, reuse_context_enabled) {
+        (UdfType::Query, true) => ("query", "allowed"),
+        (UdfType::Mutation, true) => ("mutation", "allowed"),
+        (UdfType::Action | UdfType::HttpAction, false) => return,
+        (UdfType::Query | UdfType::Mutation, false)
+        | (UdfType::Action | UdfType::HttpAction, true) => {
+            unreachable!("invalid effective database context reuse decision")
+        },
+    };
+    log_counter_with_labels(
+        &DATABASE_UDF_CONTEXT_REUSE_DECISION_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("udf_type", udf_type),
+            StaticMetricLabel::new("decision", decision),
+        ],
+    );
 }
 
 pub fn is_developer_ok(outcome: &FunctionOutcome) -> bool {
