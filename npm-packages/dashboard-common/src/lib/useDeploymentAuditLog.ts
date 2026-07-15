@@ -102,6 +102,40 @@ function processDeploymentEvents(
     .filter((v): v is DeploymentAuditLogEvent => v !== null);
 }
 
+export function useDeploymentMarkers(fromTimestamp: number): number[] {
+  const pushConfig = useDeploymentMarkersForAction(
+    fromTimestamp,
+    "push_config",
+  );
+  const pushConfigWithComponents = useDeploymentMarkersForAction(
+    fromTimestamp,
+    "push_config_with_components",
+  );
+  return [...pushConfig, ...pushConfigWithComponents].sort((a, b) => a - b);
+}
+
+function useDeploymentMarkersForAction(
+  fromTimestamp: number,
+  action: "push_config" | "push_config_with_components",
+): number[] {
+  const { useIsOperationAllowed } = useContext(PermissionsContext);
+  const canViewAuditLog = useIsOperationAllowed("ViewAuditLog");
+  const initialNumItems = 50;
+  const { results, loadMore, status } = usePaginatedQuery(
+    udfs.paginatedDeploymentEvents.listDeploymentMarkers,
+    canViewAuditLog ? { minDate: fromTimestamp, action } : "skip",
+    { initialNumItems },
+  );
+
+  useEffect(() => {
+    if (status === "CanLoadMore") {
+      loadMore(initialNumItems);
+    }
+  }, [loadMore, status]);
+
+  return results;
+}
+
 export function useDeploymentAuditLogs(
   fromTimestamp?: number,
   filters?: {
