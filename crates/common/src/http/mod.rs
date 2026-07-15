@@ -26,6 +26,7 @@ use std::{
 
 use ::metrics::{
     CONVEX_METRICS_REGISTRY,
+    FUNCTION_USAGE_METRICS_REGISTRY,
     SERVER_VERSION_STR,
     SERVICE_NAME,
 };
@@ -80,6 +81,7 @@ use http_body_util::BodyExt;
 use itertools::Itertools;
 use prometheus::{
     PullingGauge,
+    Registry,
     TextEncoder,
 };
 use regex::Regex;
@@ -760,6 +762,10 @@ impl ConvexHttpService {
         Router::new()
             .route("/version", get(move || async move { version }))
             .route("/metrics", get(metrics))
+            .route(
+                "/metrics/function_usage",
+                get(|| async { encode_metrics(&FUNCTION_USAGE_METRICS_REGISTRY) }),
+            )
     }
 
     pub async fn serve<F: Future<Output = ()> + Send + 'static>(
@@ -1557,17 +1563,22 @@ pub fn platform_api_cors() -> CorsLayer {
 /// Note that registered metrics will not show here until recorded at least
 /// once.
 pub async fn metrics() -> Result<impl IntoResponse, HttpResponseError> {
+    let output = encode_metrics(&CONVEX_METRICS_REGISTRY)?;
+    // Idempotent; starts the sweeper on the first infrastructure scrape.
+    ::metrics::spawn_sweep_task(None);
+    Ok(output)
+}
+
+fn encode_metrics(registry: &Registry) -> Result<String, HttpResponseError> {
     if *DISABLE_METRICS_ENDPOINT {
         return Err(anyhow::anyhow!(ErrorMetadata::not_found(
             "MetricsDisabled",
-            "/metrics endpoint disabled"
+            "Metrics endpoints disabled"
         ))
         .into());
     }
-    // Idempotent; starts the sweeper on the first scrape.
-    ::metrics::spawn_sweep_task(None);
     let encoder = TextEncoder::new();
-    let metrics = CONVEX_METRICS_REGISTRY.gather();
+    let metrics = registry.gather();
     let output = encoder
         .encode_to_string(&metrics)
         .map_err(anyhow::Error::from)?;
@@ -1629,6 +1640,91 @@ mod tests {
         StatusCode,
     };
     use crate::dependency_overflow::DependencyOverflowGate;
+
+    #[tokio::test]
+    async fn infrastructure_scrapes_do_not_collect_function_usage() {
+        use std::sync::atomic::{
+            AtomicUsize,
+            Ordering,
+        };
+
+        use ::metrics::{
+            CONVEX_METRICS_REGISTRY,
+            FUNCTION_USAGE_METRICS_REGISTRY,
+        };
+        use prometheus::{
+            IntCounter,
+            PullingGauge,
+        };
+
+        let collections = Arc::new(AtomicUsize::new(0));
+        let observed = collections.clone();
+        let usage = PullingGauge::new(
+            "function_usage_scrape_isolation_test",
+            "Usage collection probe",
+            Box::new(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                7.0
+            }),
+        )
+        .unwrap();
+        let infrastructure = IntCounter::new(
+            "infrastructure_scrape_isolation_test_total",
+            "Infrastructure collection probe",
+        )
+        .unwrap();
+        FUNCTION_USAGE_METRICS_REGISTRY
+            .register(Box::new(usage.clone()))
+            .unwrap();
+        CONVEX_METRICS_REGISTRY
+            .register(Box::new(infrastructure.clone()))
+            .unwrap();
+        let service = super::ConvexHttpService {
+            router: Router::new(),
+            meta_routes_enabled: true,
+            version: "test".into(),
+            service_name: "scrape_isolation_test",
+            _concurrency_gauge: None,
+            _base_concurrency_gauge: None,
+        };
+        let before = collections.load(Ordering::Relaxed);
+        for (path, present, absent) in [
+            (
+                "/metrics",
+                "infrastructure_scrape_isolation_test_total",
+                "function_usage_scrape_isolation_test",
+            ),
+            (
+                "/metrics/function_usage",
+                "function_usage_scrape_isolation_test",
+                "infrastructure_scrape_isolation_test_total",
+            ),
+        ] {
+            let response = service
+                .meta_routes()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(body.contains(present));
+            assert!(!body.contains(absent));
+            if path == "/metrics" {
+                // Filtering after gather would hide the text but still incur collection cost.
+                assert_eq!(collections.load(Ordering::Relaxed), before);
+            }
+        }
+        assert!(collections.load(Ordering::Relaxed) > before);
+        FUNCTION_USAGE_METRICS_REGISTRY
+            .unregister(Box::new(usage))
+            .unwrap();
+        CONVEX_METRICS_REGISTRY
+            .unregister(Box::new(infrastructure))
+            .unwrap();
+    }
 
     #[test]
     fn concurrency_gauges_strip_only_the_matching_executable_prefix() {

@@ -426,6 +426,9 @@ const deploymentAuditLogTable = defineTable(
     generateUploadUrl,
     createDataSync,
   ),
-);
+)
+  .index("by_action_and_creation_time", ["action"])
+  .index("by_member_id_and_creation_time", ["member_id"])
+  .index("by_action_and_member_id_and_creation_time", ["action", "member_id"]);
 
 export default deploymentAuditLogTable;

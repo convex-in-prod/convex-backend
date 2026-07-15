@@ -440,6 +440,7 @@ pub mod deployment_state;
 mod execute_query_timestamp;
 mod exports;
 pub mod function_log;
+mod function_usage_metrics;
 pub mod log_streaming;
 pub mod log_visibility;
 mod metrics;
