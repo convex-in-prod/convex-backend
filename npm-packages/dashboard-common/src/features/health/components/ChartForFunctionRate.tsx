@@ -14,8 +14,12 @@ import {
   CartesianGrid,
 } from "recharts";
 import { ChartTooltip } from "@common/elements/ChartTooltip";
-import { useDeploymentAuditLogs } from "@common/lib/useDeploymentAuditLog";
+import { useDeploymentMarkers } from "@common/lib/useDeploymentAuditLog";
 import { timeLabelForMinute, formatNumberCompact } from "@common/lib/format";
+import {
+  formatSchedulerLag,
+  SCHEDULER_LAG_BUCKET_MILLIS,
+} from "@common/lib/appMetrics";
 import { ChartData } from "@common/lib/charts/types";
 import { DeploymentTimes } from "@common/features/health/components/DeploymentTimes";
 import { Button } from "@ui/Button";
@@ -144,20 +148,25 @@ export function ChartForFunctionRate({
   const [shown, setShown] = useState<string | null>(null);
   const [startDate] = useState(new Date(Date.now() - 3600 * 1000));
   const chartRef = useRef<HTMLDivElement>(null);
-  const auditLogs = useDeploymentAuditLogs(startDate.getTime(), {
-    actions: ["push_config", "push_config_with_components"],
-  });
-  const deploysByMinute = auditLogs?.map(
-    (log) => {
-      const creationDate = new Date(log._creationTime);
+  const deploymentMarkers = useDeploymentMarkers(startDate.getTime());
+  const deployments = deploymentMarkers.map((timestamp) => {
+    const creationDate = new Date(timestamp);
+    const bucketedCreationDate =
+      kind === "schedulerStatus"
+        ? new Date(
+            Math.floor(creationDate.getTime() / SCHEDULER_LAG_BUCKET_MILLIS) *
+              SCHEDULER_LAG_BUCKET_MILLIS,
+          )
+        : creationDate;
 
-      return {
-        hour: format(creationDate, "h:mm a"),
-        timestamp: log._creationTime,
-      };
-    },
-    {} as Record<string, { hour: string; timestamp: number }[]>,
-  );
+    return {
+      hour: format(
+        bucketedCreationDate,
+        kind === "schedulerStatus" ? "h:mm:ss a" : "h:mm a",
+      ),
+      timestamp,
+    };
+  });
   return (
     <div className="size-full min-h-52 **:outline-none!">
       <LoadingTransition
@@ -174,7 +183,9 @@ export function ChartForFunctionRate({
       >
         {chartData === null ? (
           <div className="flex h-45 w-full items-center justify-center px-12 text-center text-sm text-content-secondary">
-            {`Data will appear here as your ${kind === "cacheHitRate" ? "queries" : "functions"} are called.`}
+            {`Data will appear here as your ${
+              kind === "cacheHitRate" ? "queries" : "functions"
+            } are called.`}
           </div>
         ) : chartData === undefined ? null : (
           <div ref={chartRef} style={{ width: "99%", height: "99%" }}>
@@ -186,7 +197,7 @@ export function ChartForFunctionRate({
                 }}
               >
                 {/* Show a reference line for each time bucket that had a deployment */}
-                {deploysByMinute?.map(({ hour, timestamp }) => (
+                {deployments?.map(({ hour, timestamp }) => (
                   <ReferenceLine
                     key={timestamp}
                     x={hour}
@@ -211,10 +222,11 @@ export function ChartForFunctionRate({
                     kind === "functionCalls" ||
                     kind === "subscriptionInvalidations"
                       ? formatNumberCompact(value as number)
-                      : kind === "schedulerStatus" ||
-                          kind === "functionConcurrency"
-                        ? value
-                        : `${value.toFixed((value as number) % 1 === 0 ? 0 : 2)}%`
+                      : kind === "schedulerStatus"
+                      ? formatSchedulerLag(value as number)
+                      : kind === "functionConcurrency"
+                      ? value
+                      : `${value.toFixed((value as number) % 1 === 0 ? 0 : 2)}%`
                   }
                   domain={
                     kind !== "schedulerStatus" &&
@@ -276,10 +288,16 @@ export function ChartForFunctionRate({
                             kind === "subscriptionInvalidations" ? (
                               "Other"
                             ) : (
-                              `All${[].length > 1 ? " other" : ""} ${kind === "cacheHitRate" ? "queries" : "functions"}`
+                              `All${
+                                chartData.lineKeys.length > 1 ? " other" : ""
+                              } ${
+                                kind === "cacheHitRate"
+                                  ? "queries"
+                                  : "functions"
+                              }`
                             )
                           ) : kind === "schedulerStatus" ? (
-                            "Lag Time (minutes)"
+                            "Lag Time"
                           ) : kind === "functionConcurrency" ? (
                             line.key
                           ) : kind === "subscriptionInvalidations" ? (
@@ -306,7 +324,7 @@ export function ChartForFunctionRate({
                       {...props}
                       chartRef={chartRef}
                       content={({ active, payload, label }: any) => {
-                        const deploymentTimes = deploysByMinute
+                        const deploymentTimes = deployments
                           ?.filter((deploy) => deploy.hour === label)
                           .map((deploy) =>
                             format(new Date(deploy.timestamp), "pp"),
@@ -323,8 +341,8 @@ export function ChartForFunctionRate({
                                 a.dataKey === "_rest"
                                   ? 1
                                   : b.dataKey === "_rest"
-                                    ? -1
-                                    : 0,
+                                  ? -1
+                                  : 0,
                               )
                               .map((dataPoint: any) => ({
                                 ...dataPoint,
@@ -335,7 +353,13 @@ export function ChartForFunctionRate({
                                         kind === "subscriptionInvalidations" ? (
                                           "Other"
                                         ) : (
-                                          `All${payload.length > 1 ? " other" : ""} ${kind === "cacheHitRate" ? "queries" : "functions"}`
+                                          `All${
+                                            payload.length > 1 ? " other" : ""
+                                          } ${
+                                            kind === "cacheHitRate"
+                                              ? "queries"
+                                              : "functions"
+                                          }`
                                         )
                                       ) : kind === "schedulerStatus" ? (
                                         "Lag Time"
@@ -356,21 +380,38 @@ export function ChartForFunctionRate({
                                     </div>
                                     <div className="shrink-0 text-right">
                                       {kind === "schedulerStatus"
-                                        ? `${(dataPoint.value as number).toLocaleString()} minutes`
+                                        ? formatSchedulerLag(
+                                            dataPoint.value as number,
+                                          )
                                         : kind === "functionConcurrency" ||
-                                            kind === "functionCalls"
-                                          ? `${formatNumberCompact(dataPoint.value as number)} ${(dataPoint.value as number) === 1 ? "call" : "calls"}`
-                                          : kind === "subscriptionInvalidations"
-                                            ? `${formatNumberCompact(dataPoint.value as number)} ${(dataPoint.value as number) === 1 ? "invalidation" : "invalidations"}`
-                                            : `${(
-                                                dataPoint.value as number
-                                              ).toFixed(
-                                                (dataPoint.value as number) %
-                                                  1 ===
-                                                  0
-                                                  ? 0
-                                                  : 2,
-                                              )}%`}
+                                          kind === "functionCalls"
+                                        ? `${formatNumberCompact(
+                                            dataPoint.value as number,
+                                          )} ${
+                                            kind === "functionConcurrency"
+                                              ? "function"
+                                              : "call"
+                                          }${
+                                            (dataPoint.value as number) === 1
+                                              ? ""
+                                              : "s"
+                                          }`
+                                        : kind === "subscriptionInvalidations"
+                                        ? `${formatNumberCompact(
+                                            dataPoint.value as number,
+                                          )} ${
+                                            (dataPoint.value as number) === 1
+                                              ? "invalidation"
+                                              : "invalidations"
+                                          }`
+                                        : `${(
+                                            dataPoint.value as number
+                                          ).toFixed(
+                                            (dataPoint.value as number) % 1 ===
+                                              0
+                                              ? 0
+                                              : 2,
+                                          )}%`}
                                     </div>
                                   </span>
                                 ),
@@ -380,7 +421,11 @@ export function ChartForFunctionRate({
                                 deploymentTimes={deploymentTimes}
                               />
                             }
-                            label={timeLabelForMinute(label)}
+                            label={
+                              kind === "schedulerStatus"
+                                ? label
+                                : timeLabelForMinute(label)
+                            }
                             showLegend
                           />
                         );

@@ -4,7 +4,21 @@ use std::{
     fs::File,
     io,
     str::FromStr,
-    sync::LazyLock,
+    sync::{
+        atomic::{
+            AtomicBool,
+            AtomicU64,
+            Ordering,
+        },
+        mpsc::{
+            self,
+            Receiver,
+            SyncSender,
+        },
+        Arc,
+        LazyLock,
+    },
+    time::Duration,
 };
 
 use sentry_tracing::EventFilter;
@@ -66,10 +80,139 @@ pub static CONVEX_TRACE_FILE: LazyLock<Option<File>> = LazyLock::new(|| {
     Some(file)
 });
 
-/// Guard object. Hold onto it for as long as you'd like to keep tracing to a
-/// file specified by `CONVEX_TRACE_FILE`
+enum OutputRecord {
+    Bytes { bytes: Vec<u8>, report_loss: bool },
+    Finish,
+}
+
+struct OutputState {
+    sender: SyncSender<OutputRecord>,
+    closing: AtomicBool,
+    dropped: AtomicU64,
+}
+
+#[derive(Clone)]
+struct BufferedWriter {
+    state: Arc<OutputState>,
+    report_loss: bool,
+}
+
+impl<'a> MakeWriter<'a> for BufferedWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+
+    fn make_writer_for(&'a self, metadata: &tracing::Metadata<'_>) -> Self {
+        Self {
+            state: self.state.clone(),
+            // Both stdout and the optional file receive this event. Losing a
+            // summary must not create further summaries in either output.
+            report_loss: metadata.target() != "cmd_util::tracing_output",
+        }
+    }
+}
+
+impl io::Write for BufferedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if !self.state.closing.load(Ordering::Acquire)
+            && self
+                .state
+                .sender
+                .try_send(OutputRecord::Bytes {
+                    bytes: bytes.to_vec(),
+                    report_loss: self.report_loss,
+                })
+                .is_err()
+            && self.report_loss
+        {
+            self.state.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        // The formatter can synchronously report writer errors on stderr.
+        // Diagnostic loss must not move output back onto the caller's thread.
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct OutputGuard {
+    state: Arc<OutputState>,
+    finished: Receiver<()>,
+}
+
+impl Drop for OutputGuard {
+    fn drop(&mut self) {
+        self.state.closing.store(true, Ordering::Release);
+        // A full queue already wakes the worker. A blocked output can outlive this
+        // guard; never log, join, or flush synchronously on this cleanup path.
+        let _ = self.state.sender.try_send(OutputRecord::Finish);
+        let _ = self.finished.recv_timeout(Duration::from_secs(1));
+    }
+}
+
+fn buffered_writer(
+    mut output: impl io::Write + Send + 'static,
+    name: &'static str,
+    capacity: usize,
+) -> (BufferedWriter, OutputGuard) {
+    let (sender, receiver) = mpsc::sync_channel(capacity);
+    let state = Arc::new(OutputState {
+        sender,
+        closing: AtomicBool::new(false),
+        dropped: AtomicU64::new(0),
+    });
+    let (finished_tx, finished) = mpsc::sync_channel(1);
+    let worker_state = state.clone();
+    std::thread::Builder::new()
+        .name(format!("tracing-{name}"))
+        .spawn(move || {
+            loop {
+                let record = if worker_state.closing.load(Ordering::Acquire) {
+                    receiver.try_recv().ok()
+                } else {
+                    receiver.recv().ok()
+                };
+                match record {
+                    Some(OutputRecord::Bytes { bytes, report_loss }) => {
+                        if output.write_all(&bytes).and_then(|()| output.flush()).is_err() {
+                            if report_loss {
+                                worker_state.dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            continue;
+                        }
+                        let dropped = worker_state.dropped.swap(0, Ordering::Relaxed);
+                        if dropped > 0 && !worker_state.closing.load(Ordering::Acquire) {
+                            // Report only after output resumes. This event uses the same
+                            // bounded queues; a failed output never recursively reports itself.
+                            tracing::warn!(target: "cmd_util::tracing_output", output = name, dropped, "Tracing output dropped records");
+                        }
+                    },
+                    Some(OutputRecord::Finish) | None => break,
+                }
+            }
+            let _ = finished_tx.send(());
+        })
+        // Logging is initialized before service work starts. Fail visibly at
+        // startup instead of caching an unavailable diagnostic worker forever.
+        .expect("Failed to start tracing output writer");
+    (
+        BufferedWriter {
+            state: state.clone(),
+            report_loss: true,
+        },
+        OutputGuard { state, finished },
+    )
+}
+
+/// Hold for the service lifetime. Shutdown attempts to drain each output for at
+/// most one second; pending records may be lost when an output remains blocked.
 pub struct TracingGuard {
-    _guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    _stdout_guard: Option<OutputGuard>,
+    _file_guard: Option<OutputGuard>,
 }
 
 /// Call this from scripts at startup.
@@ -81,7 +224,10 @@ pub fn config_tool() -> TracingGuard {
 /// Call this from services at startup.
 #[must_use]
 pub fn config_service() -> TracingGuard {
-    config_tracing(io::stdout, Level::INFO)
+    let (writer, stdout_guard) = buffered_writer(io::stdout(), "stdout", 256);
+    let mut guard = config_tracing(writer, Level::INFO);
+    guard._stdout_guard = Some(stdout_guard);
+    guard
 }
 
 fn config_tracing<W>(writer: W, level: Level) -> TracingGuard
@@ -115,7 +261,13 @@ where
     layers.push(sentry_layer.boxed());
 
     let guard = if let Some(ref file) = *CONVEX_TRACE_FILE {
-        let (file_writer, guard) = tracing_appender::non_blocking(file);
+        // Preserve the existing optional file buffer, but use bounded cleanup:
+        // the appender's guard prints to stdout if its shutdown queue is full.
+        let (file_writer, guard) = buffered_writer(
+            file,
+            "file",
+            tracing_appender::non_blocking::DEFAULT_BUFFERED_LINES_LIMIT,
+        );
         let file_writer_layer = tracing_subscriber::fmt::layer()
             .with_writer(file_writer)
             .with_filter(
@@ -131,7 +283,10 @@ where
     };
     tracing_subscriber::registry().with(layers).init();
 
-    TracingGuard { _guard: guard }
+    TracingGuard {
+        _stdout_guard: None,
+        _file_guard: guard,
+    }
 }
 
 pub fn config_test() {
