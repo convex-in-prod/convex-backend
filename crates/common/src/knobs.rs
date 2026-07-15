@@ -82,6 +82,11 @@ fn env_config_optional_usize_strict(name: &str) -> Option<usize> {
     value
 }
 
+fn env_config_optional_usize_strict_nonzero(name: &str) -> Option<usize> {
+    env_config_optional_usize_strict(name)
+        .map(|value| validate_usize_strict_nonzero(name, value).unwrap_or_else(|e| panic!("{e}")))
+}
+
 fn env_config_duration_millis_strict(name: &str, default: usize) -> Duration {
     let millis = env_config_usize_strict(name, default)
         .try_into()
@@ -1183,6 +1188,68 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
     )
 });
 
+/// Maximum concurrent degradable root reactive-query cache-miss leaders.
+/// Absence disables degradable admission. A configured cap must leave at
+/// least one shared-base slot at the application, isolate-worker, and finite
+/// active-JavaScript gates.
+pub static APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: LazyLock<Option<usize>> =
+    LazyLock::new(|| {
+        let capacity = env_config_optional_usize_strict_nonzero(
+            "APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS",
+        );
+        if let Some(capacity) = capacity {
+            validate_degradable_query_leader_capacity(
+                capacity,
+                *APPLICATION_MAX_CONCURRENT_QUERIES,
+                *MAX_ISOLATE_WORKERS,
+                *ISOLATE_DEPENDENCY_WORKER_RESERVE,
+                *FUNRUN_ISOLATE_ACTIVE_THREADS,
+            )
+            .unwrap_or_else(|e| {
+                panic!("Invalid APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: {e}")
+            });
+        }
+        capacity
+    });
+
+fn validate_degradable_query_leader_capacity(
+    capacity: usize,
+    application_query_capacity: usize,
+    isolate_worker_capacity: usize,
+    dependency_reserve: usize,
+    active_javascript_capacity: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(capacity > 0, "the cap must be greater than zero");
+    anyhow::ensure!(
+        capacity <= tokio::sync::Semaphore::MAX_PERMITS,
+        "the cap must not exceed the semaphore permit limit"
+    );
+    anyhow::ensure!(
+        dependency_reserve < isolate_worker_capacity,
+        "ISOLATE_DEPENDENCY_WORKER_RESERVE must be smaller than MAX_ISOLATE_WORKERS"
+    );
+    let application_reserve = dependency_reserve.min(application_query_capacity.saturating_sub(1));
+    let application_shared_base = application_query_capacity - application_reserve;
+    anyhow::ensure!(
+        capacity < application_shared_base,
+        "the cap must be smaller than the application query shared-base capacity \
+         ({application_shared_base})"
+    );
+    let isolate_shared_base = isolate_worker_capacity - dependency_reserve;
+    anyhow::ensure!(
+        capacity < isolate_shared_base,
+        "the cap must be smaller than the isolate shared-base capacity ({isolate_shared_base})"
+    );
+    if active_javascript_capacity > 0 {
+        anyhow::ensure!(
+            capacity < active_javascript_capacity,
+            "the cap must be smaller than FUNRUN_ISOLATE_ACTIVE_THREADS \
+             ({active_javascript_capacity})"
+        );
+    }
+    Ok(())
+}
+
 /// The maximum number of mutations that can be run concurrently by an
 /// application.
 ///
@@ -2185,5 +2252,16 @@ mod strict_capacity_tests {
         assert!(
             validate_usize_strict_nonzero("CAP", tokio::sync::Semaphore::MAX_PERMITS + 1).is_err()
         );
+    }
+
+    #[test]
+    fn degradable_query_capacity_leaves_each_finite_shared_base() {
+        assert!(validate_degradable_query_leader_capacity(4, 16, 300, 1, 8).is_ok());
+        assert!(validate_degradable_query_leader_capacity(4, 16, 300, 1, 0).is_ok());
+        assert!(validate_degradable_query_leader_capacity(0, 16, 300, 1, 8).is_err());
+        assert!(validate_degradable_query_leader_capacity(15, 16, 300, 1, 20).is_err());
+        assert!(validate_degradable_query_leader_capacity(299, 512, 300, 1, 512).is_err());
+        assert!(validate_degradable_query_leader_capacity(8, 16, 300, 1, 8).is_err());
+        assert!(validate_degradable_query_leader_capacity(1, 16, 1, 1, 8).is_err());
     }
 }
