@@ -53,10 +53,18 @@ pub fn log_scheduled_job_failure(e: &anyhow::Error, prev_failures: u32) {
 
 register_convex_histogram!(
     SCHEDULED_JOB_EXECUTION_LAG_SECONDS,
-    "Schedule job execution lag"
+    "Rate-limited ready-queue lag sample in seconds for ordinary scheduled jobs"
 );
 pub fn log_scheduled_job_execution_lag(lag: Duration) {
     log_distribution(&SCHEDULED_JOB_EXECUTION_LAG_SECONDS, lag.as_secs_f64());
+}
+
+register_convex_histogram!(
+    SCHEDULED_JOB_ADMISSION_LAG_SECONDS,
+    "Seconds from an ordinary scheduled job's target time to each scheduler admission attempt"
+);
+pub fn log_scheduled_job_admission_lag(lag: Duration) {
+    log_distribution(&SCHEDULED_JOB_ADMISSION_LAG_SECONDS, lag.as_secs_f64());
 }
 
 register_convex_histogram!(
