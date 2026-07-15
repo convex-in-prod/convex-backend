@@ -83,7 +83,13 @@ pub static SERVICE_NAME: LazyLock<String> = LazyLock::new(|| {
         .replace('-', "_")
 });
 
-pub static CONVEX_METRICS_REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
+pub static CONVEX_METRICS_REGISTRY: LazyLock<Registry> = LazyLock::new(new_registry);
+
+// Frequent infrastructure scrapes must not gather the per-function usage
+// matrix.
+pub static FUNCTION_USAGE_METRICS_REGISTRY: LazyLock<Registry> = LazyLock::new(new_registry);
+
+fn new_registry() -> Registry {
     let labels = env::var("CONVEX_SITE").ok().map(|instance_name| {
         [("instance_name".to_owned(), instance_name)]
             .into_iter()
@@ -91,7 +97,7 @@ pub static CONVEX_METRICS_REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     });
     Registry::new_custom(Some(SERVICE_NAME.clone()), labels)
         .expect("Failed to initialize Prometheus metrics registry")
-});
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct MetricName(&'static str);

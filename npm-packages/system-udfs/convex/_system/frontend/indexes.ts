@@ -4,7 +4,7 @@ import { decodeId, encodeId } from "id-encoding";
 import { DataModel, Doc, Id } from "../../_generated/dataModel";
 import { GenericDatabaseReader } from "convex/server";
 
-async function getTableId(
+export async function getTableId(
   db: GenericDatabaseReader<DataModel>,
   tableName: string,
   tableNamespace: string | null,
