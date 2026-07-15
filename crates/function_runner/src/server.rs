@@ -34,6 +34,7 @@ use common::{
     },
     schemas::DatabaseSchema,
     types::{
+        ActiveJavascriptClass,
         ConvexOrigin,
         DeploymentMetadata,
         HttpActionRoute,
@@ -150,6 +151,7 @@ pub enum FunctionMetadata {
     Query {
         path_and_args: ValidatedPathAndArgs,
         journal: QueryJournal,
+        active_javascript_class: ActiveJavascriptClass,
     },
     Mutation {
         path_and_args: ValidatedPathAndArgs,
@@ -391,6 +393,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         };
 
         match udf_type {
+<<<<<<< HEAD
             UdfType::Query | UdfType::Mutation | UdfType::Init => {
                 let (path_and_args, journal) = match function_metadata
                     .context("Missing function metadata for query or mutation")?
@@ -405,6 +408,37 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                     } => (path_and_args, journal),
                     FunctionMetadata::Action { .. } => {
                         anyhow::bail!("Function metadata does not match {udf_type}")
+=======
+            UdfType::Query | UdfType::Mutation => {
+                let function_metadata =
+                    function_metadata.context("Missing function metadata for query or mutation")?;
+                let (path_and_args, journal, active_javascript_class) = match udf_type {
+                    UdfType::Query => match function_metadata {
+                        FunctionMetadata::Query {
+                            path_and_args,
+                            journal,
+                            active_javascript_class,
+                        } => (path_and_args, journal, active_javascript_class),
+                        FunctionMetadata::Mutation { .. } | FunctionMetadata::Action { .. } => {
+                            anyhow::bail!("Function metadata does not match {udf_type}")
+                        },
+                    },
+                    UdfType::Mutation => match function_metadata {
+                        FunctionMetadata::Mutation {
+                            path_and_args,
+                            journal,
+                        } => (
+                            path_and_args,
+                            journal,
+                            ActiveJavascriptClass::Protected,
+                        ),
+                        FunctionMetadata::Query { .. } | FunctionMetadata::Action { .. } => {
+                            anyhow::bail!("Function metadata does not match {udf_type}")
+                        },
+                    },
+                    UdfType::Action | UdfType::HttpAction => {
+                        unreachable!("outer match restricts this arm to queries and mutations")
+>>>>>>> 30a5c199e (sync: add degradable query backpressure)
                     },
                 };
                 // Initialize the UDF's RNG from some high-quality entropy. As with
@@ -428,6 +462,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                         function_started_sender,
                         subfunctions_in_same_isolate,
                         scheduler_dependency,
+                        active_javascript_class,
                     )
                     .await?;
                 if matches!(&outcome, FunctionOutcome::Mutation(o) if o.result.is_err()) {

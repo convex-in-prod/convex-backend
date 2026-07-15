@@ -83,6 +83,7 @@ pub use environment_variables::{
 };
 pub use file_storage::StorageUuid;
 pub use functions::{
+    ActiveJavascriptClass,
     AllowedVisibility,
     FunctionCaller,
     ModuleEnvironment,
