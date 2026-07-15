@@ -1837,7 +1837,14 @@ async fn read_page_from_query<RT: Runtime>(
             },
             Err(e) => {
                 if e.is_pagination_limit() {
-                    page_status = Some(QueryPageStatus::SplitRequired);
+                    // An initial page can advance through its continuation cursor,
+                    // even when large rows leave no usable split cursor. A bounded
+                    // page must split to preserve every row in its existing range.
+                    page_status = Some(if has_end_cursor {
+                        QueryPageStatus::SplitRequired
+                    } else {
+                        QueryPageStatus::SplitRecommended
+                    });
                     if query.cursor().is_none() {
                         // Intentionally drop ErrorMetadata because this should
                         // be impossible, so we want to throw a system error instead.

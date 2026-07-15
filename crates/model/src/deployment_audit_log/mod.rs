@@ -54,6 +54,9 @@ pub const DEPLOYMENT_AUDIT_LOG_TABLE: TableName = TableName::const_new("_deploym
 pub static ACTION_FIELD: LazyLock<FieldPath> =
     LazyLock::new(|| "action".parse().expect("invalid action field"));
 
+pub static MEMBER_ID_FIELD: LazyLock<FieldPath> =
+    LazyLock::new(|| "member_id".parse().expect("invalid member_id field"));
+
 /// By action, then creation time. Lets callers that only care about a single
 /// action (e.g. the usage-limit worker priming from `usage_limit_exceeded`
 /// events) scan just that action's entries instead of every audit log event.
@@ -66,6 +69,24 @@ pub static AUDIT_LOG_INDEX_BY_ACTION: LazyLock<SystemIndex<DeploymentAuditLogsTa
         .unwrap()
     });
 
+pub static AUDIT_LOG_INDEX_BY_MEMBER: LazyLock<SystemIndex<DeploymentAuditLogsTable>> =
+    LazyLock::new(|| {
+        SystemIndex::new(
+            "by_member_id_and_creation_time",
+            [&MEMBER_ID_FIELD, &CREATION_TIME_FIELD_PATH],
+        )
+        .unwrap()
+    });
+
+pub static AUDIT_LOG_INDEX_BY_ACTION_AND_MEMBER: LazyLock<SystemIndex<DeploymentAuditLogsTable>> =
+    LazyLock::new(|| {
+        SystemIndex::new(
+            "by_action_and_member_id_and_creation_time",
+            [&ACTION_FIELD, &MEMBER_ID_FIELD, &CREATION_TIME_FIELD_PATH],
+        )
+        .unwrap()
+    });
+
 pub struct DeploymentAuditLogsTable;
 impl SystemTable for DeploymentAuditLogsTable {
     type Metadata = DeploymentAuditLogEvent;
@@ -73,7 +94,11 @@ impl SystemTable for DeploymentAuditLogsTable {
     const TABLE_NAME: TableName = DEPLOYMENT_AUDIT_LOG_TABLE;
 
     fn indexes() -> Vec<SystemIndex<Self>> {
-        vec![AUDIT_LOG_INDEX_BY_ACTION.clone()]
+        vec![
+            AUDIT_LOG_INDEX_BY_ACTION.clone(),
+            AUDIT_LOG_INDEX_BY_MEMBER.clone(),
+            AUDIT_LOG_INDEX_BY_ACTION_AND_MEMBER.clone(),
+        ]
     }
 }
 
