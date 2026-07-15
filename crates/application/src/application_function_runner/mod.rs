@@ -46,6 +46,7 @@ use common::{
     knobs::{
         APPLICATION_FUNCTION_RUNNER_ACTION_SEMAPHORE_TIMEOUT,
         APPLICATION_FUNCTION_RUNNER_SEMAPHORE_TIMEOUT,
+        APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS,
         APPLICATION_MAX_CONCURRENT_MUTATIONS,
         APPLICATION_MAX_CONCURRENT_NODE_ACTIONS,
         APPLICATION_MAX_CONCURRENT_QUERIES,
@@ -72,6 +73,7 @@ use common::{
     },
     schemas::DatabaseSchema,
     types::{
+        ActiveJavascriptClass,
         AllowedVisibility,
         AttributedCaller,
         AttributionClaims,
@@ -174,6 +176,7 @@ use storage::Storage;
 use sync_types::{
     types::SerializedArgs,
     CanonicalizedModulePath,
+    QueryWorkloadClass,
 };
 use tokio::{
     select,
@@ -359,6 +362,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         journal: QueryJournal,
         context: ExecutionContext,
         scheduler_dependency: SchedulerDependencyClass,
+        active_javascript_class: ActiveJavascriptClass,
     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
         anyhow::ensure!(udf_type == UdfType::Query || udf_type == UdfType::Mutation);
         anyhow::ensure!(
@@ -376,7 +380,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 context,
                 None,
                 Some(match udf_type {
-                    UdfType::Query => FunctionMetadata::Query { journal, path_and_args },
+                    UdfType::Query => FunctionMetadata::Query { journal, path_and_args, active_javascript_class },
                     UdfType::Mutation => FunctionMetadata::Mutation { journal, path_and_args },
                     _ => anyhow::bail!("Invalid database UDF type"),
                 }),
@@ -828,6 +832,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             function_log.clone(),
             audit_log_client.clone(),
             cache,
+            *APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS,
         );
 
         let node_action_limiter = Limiter::new(
@@ -950,6 +955,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         QueryJournal::new(),
                         context.clone(),
                         SchedulerDependencyClass::Independent,
+                        ActiveJavascriptClass::Protected,
                     )
                     .await?
             },
@@ -1513,6 +1519,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 QueryJournal::new(),
                 context.clone(),
                 scheduler_dependency,
+                ActiveJavascriptClass::Protected,
             )
             .await?;
         let mutation_outcome = match outcome {
@@ -2303,6 +2310,34 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         invocation: QueryInvocation,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<QueryReturn> {
+        self.run_query_at_ts_with_classes(
+            request_context,
+            path,
+            args,
+            identity,
+            ts,
+            journal,
+            caller,
+            invocation,
+            scheduler_dependency,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_query_at_ts_with_classes(
+        &self,
+        request_context: RequestContext,
+        path: PublicFunctionPath,
+        args: SerializedArgs,
+        identity: Identity,
+        ts: Timestamp,
+        journal: Option<QueryJournal>,
+        caller: FunctionCaller,
+        invocation: QueryInvocation,
+        scheduler_dependency: SchedulerDependencyClass,
+        query_workload_class: Option<QueryWorkloadClass>,
+    ) -> anyhow::Result<QueryReturn> {
         let result = self
             .run_query_at_ts_inner(
                 request_context,
@@ -2314,6 +2349,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 caller,
                 invocation,
                 scheduler_dependency,
+                query_workload_class,
             )
             .await;
         match result.as_ref() {
@@ -2347,6 +2383,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         caller: FunctionCaller,
         invocation: QueryInvocation,
         scheduler_dependency: SchedulerDependencyClass,
+        query_workload_class: Option<QueryWorkloadClass>,
     ) -> anyhow::Result<QueryReturn> {
         if path.is_system() && !(identity.is_admin() || identity.is_system()) {
             anyhow::bail!(unauthorized_error("query"));
@@ -2367,6 +2404,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 usage_tracker.clone(),
                 invocation,
                 scheduler_dependency,
+                query_workload_class,
             )
             .await;
 
