@@ -63,16 +63,18 @@ pub(crate) enum IsolateQueueIneligibilityReason {
     PerClientBase,
     IndependentActionCap,
     IndependentActionFunctionCap,
+    ActiveJavascriptClassPending,
 }
 
 impl IsolateQueueIneligibilityReason {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::PhysicalTotal,
         Self::SharedBase,
         Self::PerClientTotal,
         Self::PerClientBase,
         Self::IndependentActionCap,
         Self::IndependentActionFunctionCap,
+        Self::ActiveJavascriptClassPending,
     ];
 
     fn index(self) -> usize {
@@ -82,7 +84,8 @@ impl IsolateQueueIneligibilityReason {
             Self::PerClientTotal => 2,
             Self::PerClientBase => 3,
             Self::IndependentActionCap => 4,
-            Self::IndependentActionFunctionCap => 5,
+            Self::IndependentActionFunctionCap => 6,
+            Self::ActiveJavascriptClassPending => 5,
         }
     }
 
@@ -94,6 +97,7 @@ impl IsolateQueueIneligibilityReason {
             Self::PerClientBase => "per_client_base",
             Self::IndependentActionCap => "independent_action_cap",
             Self::IndependentActionFunctionCap => "independent_action_function_cap",
+            Self::ActiveJavascriptClassPending => "active_javascript_class_pending",
         }
     }
 }
@@ -106,6 +110,7 @@ pub(crate) struct IsolateQueueEligibility {
     pub(crate) per_client_base: bool,
     pub(crate) independent_action_cap: bool,
     pub(crate) independent_action_function_cap: bool,
+    pub(crate) active_javascript_class_pending: bool,
 }
 
 impl IsolateQueueEligibility {
@@ -127,6 +132,9 @@ impl IsolateQueueEligibility {
             IsolateQueueIneligibilityReason::IndependentActionCap => self.independent_action_cap,
             IsolateQueueIneligibilityReason::IndependentActionFunctionCap => {
                 self.independent_action_function_cap
+            },
+            IsolateQueueIneligibilityReason::ActiveJavascriptClassPending => {
+                self.active_javascript_class_pending
             },
         }
     }
@@ -331,7 +339,7 @@ pub(crate) struct IsolateQueueOutput<T> {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct IneligibleCounts([[usize; 6]; 4]);
+struct IneligibleCounts([[usize; 7]; 4]);
 
 impl IneligibleCounts {
     fn increment(&mut self, lane: IsolateQueueLane, eligibility: IsolateQueueEligibility) {
