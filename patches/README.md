@@ -5,9 +5,10 @@ They are operator adoption units, not one all-or-nothing fork. Read the owning e
 a patch, preserve its prerequisites, and verify the effective configuration and metrics after every
 backend replacement.
 
-The current source chain has 14 commits and 12 operator essays. Two commit pairs intentionally share
-one essay: lane-aware queueing with its optional deployment extension, and the backend/client halves
-of degradable reactive-query backpressure.
+The current backend source chain has 13 commits and 13 operator essays, one commit per backend
+adoption unit. Lane-aware queueing and its optional deployment extension are one queue-control
+patch. The matching degradable-query client half is maintained in `convex-js`; it shares the
+protocol and adoption essay but is not another commit in this backend chain.
 
 ## Snapshot and import reliability
 
@@ -46,11 +47,28 @@ of degradable reactive-query backpressure.
 
 ### [Atomic Node executor source packages](atomic_node_executor_source_packages/README.md)
 
-- Purpose: prevent concurrent cold Node actions from observing or deleting partially materialized
-  source-package cache directories.
+- Purpose: publish source and external packages atomically, bound their retained filesystem and
+  stack-root lifetime without deleting active trees, and keep concurrent external-dependency builds
+  private, output-size- and time-bounded, and responsive to the local event-loop watchdog. On Unix,
+  an npm supervisor also attempts to stop its process group if the Node executor generation exits.
 - Prerequisites: none.
 - Activation: automatic in the local Node executor.
-- Rollback: restore upstream only if the incomplete-directory race is otherwise fixed.
+- Rollback: restore upstream only if atomic publication, active package ownership, bounded
+  retirement, direct stack-root lookup, and watchdog-safe dependency building are all replaced.
+
+### [Local Node executor resilience](local_node_executor_resilience/README.md)
+
+- Purpose: retire a selected local Node generation on request/stream timeout, transport failure,
+  a process-declared exit, repeated event-loop health failure, or backend shutdown; bound startup
+  probes and local response streaming; prevent child stdio from bypassing function-log handling;
+  terminate and reap only that direct child; and expose bounded lifecycle and health metrics.
+  Detached descendant process groups, including `build_deps` npm installs, require separate
+  ownership. The atomic-package patch adds best-effort npm process-group containment, but Rust does
+  not wait for descendant exit before removing a generation tempdir.
+- Prerequisites: none for generation recovery; the atomic package patch adds package and stack
+  aggregate metrics to the same health protocol.
+- Activation: automatic in the local Node executor.
+- Rollback: restore the previous backend image if healthy generations are retired unexpectedly.
 
 ## Scheduler, admission, and queueing
 
