@@ -5,7 +5,7 @@ They are operator adoption units, not one all-or-nothing fork. Read the owning e
 a patch, preserve its prerequisites, and verify the effective configuration and metrics after every
 backend replacement.
 
-The current backend source chain has 13 commits and 13 operator essays, one commit per backend
+The current backend source chain has 14 commits and 14 operator essays, one commit per backend
 adoption unit. Lane-aware queueing and its optional deployment extension are one queue-control
 patch. The matching degradable-query client half is maintained in `convex-js`; it shares the
 protocol and adoption essay but is not another commit in this backend chain.
@@ -29,6 +29,19 @@ protocol and adoption essay but is not another commit in this backend chain.
   is complementary but not required once valid checkpoints exist.
 - Activation: only through the privileged repair endpoint; dry-run is the default.
 - Rollback: do not execute a stale plan. There is no generic undo after destructive finalization.
+
+## Schema reliability
+
+### [Isolate schema-validation progress OCC](schema_validation_progress_occ/README.md)
+
+- Purpose: prevent progress checkpoints from repeatedly aborting app writes that fail a pending
+  schema while preserving schema-state fencing, bounded restart/history cleanup, and dashboard
+  progress.
+- Prerequisites: deploy the matching dashboard zero-total guard before the backend, or upgrade the
+  backend and dashboard together.
+- Activation: automatic during schema validation after the coordinated backend/dashboard rollout.
+- Rollback: restore the backend before the dashboard; no data or configuration rollback is
+  required, but the previous backend restores the original contention risk.
 
 ## Build and runtime packaging
 
