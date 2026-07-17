@@ -106,6 +106,19 @@ adoption contract documented in the backend essay.
 - Rollback: restore the previous backend image and remove settings it does not understand; no schema
   or data change is required.
 
+## Schema reliability
+
+### [Isolate schema-validation progress OCC](schema_validation_progress_occ/README.md)
+
+- Purpose: prevent progress checkpoints from repeatedly aborting app writes that fail a pending
+  schema while preserving schema-state fencing, bounded restart/history cleanup, and dashboard
+  progress.
+- Prerequisites: deploy the matching dashboard zero-total guard before the backend, or upgrade the
+  backend and dashboard together.
+- Activation: automatic during schema validation after the coordinated backend/dashboard rollout.
+- Rollback: restore the backend before the dashboard; no data or configuration rollback is
+  required, but the previous backend restores the original contention risk.
+
 ## Build and runtime packaging
 
 ### [Backend build improvements](backend_build_improvements/README.md)

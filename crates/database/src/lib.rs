@@ -171,6 +171,7 @@ pub use self::{
             legacy::{
                 types::SchemaValidationProgressMetadata as LegacySchemaValidationProgressMetadata,
                 SchemaValidationProgressModel,
+                SchemaValidationProgressTable as LegacySchemaValidationProgressTable,
             },
             types::SchemaValidationProgress,
             SchemaValidationProgressTable,
