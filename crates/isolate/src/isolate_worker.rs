@@ -37,6 +37,7 @@ use crate::{
         finish_service_request_timer,
         record_component_function_path,
         service_request_timer,
+        ControlPlaneRequestGuard,
         RequestStatus,
     },
     ConcurrencyPermit,
@@ -71,6 +72,9 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
     ) -> (String, bool) {
         // Require the layer below to opt into isolate reuse by setting `isolate_clean`.
         let mut isolate_clean = false;
+        let _control_plane_request = inner.control_plane_kind().map(|request_kind| {
+            ControlPlaneRequestGuard::new(self.isolate_config.name, request_kind)
+        });
         let debug_str = match inner {
             RequestType::Udf {
                 request,

@@ -4,9 +4,10 @@ This patch adds bounded backend metrics for deciding whether reusable V8
 contexts are being allowed, found, retained, cleared, and selected by the
 isolate scheduler. It is intended for self-hosted operators evaluating database
 UDF context reuse or the separate opt-in HTTP action context reuse patch.
-It also clears stale scheduler mirrors when a cache is destroyed and makes a
-reusable miss prefer a same-client worker without a reusable context before
-allocating or stealing a worker.
+It also clears stale scheduler mirrors when a cache is destroyed. The later
+[`bounded_multi_context_reuse`](../bounded_multi_context_reuse/README.md) patch extends these
+signals for multi-entry admission and changes same-client miss affinity so cache-key diversity does
+not allocate workers.
 
 The patch does not enable context reuse, change the application marker, add a
 module allowlist, or change cache capacity. It adds no application module,
@@ -27,6 +28,10 @@ scheduler metrics therefore use `context_kind={database_udf,http_action}`.
 Database decision and read-set validation metrics remain database-UDF-specific.
 HTTP action context reuse is still controlled only by
 `REUSE_HTTP_ACTION_CONTEXTS`.
+
+When the bounded multi-context patch is also carried, this observability patch's cache-operation,
+clear-reason, capacity, and scheduler-affinity enums must be updated with it. The bounded patch does
+not create module-path labels or a parallel observability system.
 
 Operators carrying only upstream database context reuse can retain the database
 metric paths and omit the HTTP-specific branches when rebasing this patch. No
@@ -118,25 +123,39 @@ fresh initialization-attempt split without duplicating it here.
 
 `isolate_context_cache_operations_total{context_kind,operation}` counts:
 
-- `save`: a reusable context was stored in the isolate's single saved slot;
-- `take`: a saved context was removed for request use.
+- `save`: a reusable context was admitted to its isolate cache;
+- `take`: a resident context was removed for request use;
+- `reject_pool_capacity`: a fresh candidate could not obtain a shared resident token and had no
+  safe local probationary exchange;
+- `reject_frequency`: a returning protected candidate lost admission after same-isolate nested work
+  filled its former cache capacity;
+- `reject_memory_pressure`: cgroup pressure suppressed admission of a new or probationary
+  reusable context, or a returning protected context lost the pressure-limited two-entry
+  competition.
 
 `isolate_context_cache_cleared_total{context_kind,reason}` counts contexts, not
 clear calls. Its reasons are:
 
-- `fresh_context_clobber`: a request that could not use the saved reusable
-  context needed a fresh context and discarded the saved slot;
-- `reusable_context_replacement`: a reusable context finished while another
-  reusable context already occupied the one cache slot. This can happen when a
-  same-isolate nested marked query saves before its marked parent finishes; the
-  parent's later save replaces it;
+- `admission_replacement`: frequency admission replaced a protected resident or rejected a
+  probationary resident;
+- `pool_capacity_replacement`: the pool was full and a new probationary resident directly replaced
+  the cache's sole resident without growing total ownership. When protected residents exist, the
+  displaced probationary resident instead undergoes the normal frequency comparison and the
+  resulting removal uses `admission_replacement`;
+- `duplicate_replacement`: same-isolate nested execution produced the same key while an outer
+  context was in flight, and the returning context removed the duplicate;
+- `memory_pressure`: incremental isolate-heap reclamation evicted the probationary resident or the
+  weakest protected resident;
+- `cgroup_memory_pressure`: the backend-wide cgroup pressure signal removed a reusable resident to
+  converge the isolate on its two strongest protected entries;
 - `app_definition_evaluation`: app-definition evaluation cleared the shared
   context cache before using arbitrary evaluation contexts;
 - `cache_drop`: the owning `ContextCache` was destroyed, normally because its
   isolate worker was recreated or shut down.
 
-Only displaced reusable contexts increment this counter. Clearing or replacing
-a fresh prewarmed context has no `context_kind` and does not increment it.
+Only displaced reusable contexts increment this counter. Dropping the separate empty fresh context
+under pressure has no `context_kind` and does not increment it. A candidate rejected before it
+became resident increments the operation counter but not the clear counter.
 
 Correlate `cache_drop` with `recreate_isolate_total{reason}` when the worker
 records an explicit recreation reason. `cache_drop` also covers ordinary worker
@@ -144,16 +163,29 @@ shutdown and early or unclean request failures that do not emit a recreation
 reason. Propagating recreation state through the cache API would duplicate the
 existing reason metric and make the patch substantially more invasive.
 
-`isolate_context_cache_entries_info{context_kind}` is the current process-wide
-number of saved reusable contexts. A context is subtracted while a request uses
-it and added again only if the request successfully republishes it. The gauge
-does not count a reusable context while it is in flight.
+`isolate_context_cache_entries_info{context_kind}` is the current process-wide number of idle saved
+reusable contexts. A context is subtracted while a request uses it and added again only if the
+request successfully republishes it. The gauge does not count a reusable context while it is in
+flight, although its shared resident-budget token remains owned until the request publishes or
+drops it.
 
-Each isolate has one saved context slot total. A fresh prewarmed context or one
-reusable database-UDF or HTTP-action context can occupy it; database and HTTP
-contexts therefore compete for the slot. Concurrent traffic can still retain
-contexts of either kind on separate workers. Cache insertion, take, clear, and
-destruction update the gauge in paired deltas.
+With the bounded cache patch, each isolate has one probationary plus five protected reusable
+residents by default. The protected count is configurable. Database and HTTP contexts share those
+positions but use distinct keys. The empty fresh context is separate. Cache insertion, take, clear,
+pressure eviction, and destruction update the gauge in paired deltas.
+
+`isolate_context_cache_capacity_info{pool_name,scope}` exposes the configured per-isolate reusable
+capacity and the effective shared pool resident-token capacity. Its `scope` values are
+`per_isolate` and `pool`.
+
+`isolate_context_cache_owned_info{pool_name}` reports reusable contexts that currently own shared
+pool capacity, including contexts in flight. It is sampled with the aggregate isolate-heap report,
+so operation counters and idle-entry occupancy remain the sources for changes between samples.
+
+`isolate_memory_capacity_bytes{pool_name,capacity_kind}` reports the configured V8 capacity used
+for startup planning. Its four `capacity_kind` values are `heap_per_worker`, `heap_pool`,
+`array_buffer_per_worker`, and `array_buffer_pool`. These are configured ceilings before native V8
+and runtime overhead, not current allocation.
 
 The scheduler uses a thread-safe mirror of the saved reusable key. That mirror
 can outlive a worker's `ContextCache` during isolate recreation, so the drop
@@ -166,23 +198,18 @@ otherwise the scheduler could advertise a context that no longer exists.
 records worker selection for a reusable-context-eligible request:
 
 - `hit`: an idle worker for the same client advertised the requested context;
-- `empty_worker`: no matching idle context was available, but an idle worker
-  for the same client advertised no reusable context. Its local slot can still
-  hold a fresh prewarmed context, which the scheduler does not advertise;
-- `new_worker`: no matching context or same-client worker without a reusable
-  context was available, so the scheduler allocated another worker before the
-  physical worker limit was reached;
-- `stolen_worker`: neither same-client option was available and the physical
-  limit was reached, so the scheduler selected an idle least-recently-used
-  worker. It can belong to the same client when that client's idle workers hold
-  inapplicable warm contexts; a client change recreates the isolate before
-  serving the request.
+- `same_client_worker`: no matching idle context was available, so the scheduler selected an
+  ordinary idle worker for the same client. That worker may retain unrelated reusable keys;
+- `new_worker`: no same-client worker was idle, so the scheduler allocated another worker before
+  the physical worker limit was reached;
+- `stolen_worker`: no same-client worker was idle and the physical limit was reached, so the
+  scheduler selected an idle least-recently-used worker. A client change recreates the isolate
+  before serving the request.
 
-The scheduler preserves idle workers with inapplicable warm contexts instead of
-proactively selecting and clobbering them. It first looks for a matching warm
-worker, then for a same-client worker without a reusable context, then allocates
-a worker when physical capacity remains, and otherwise steals the
-least-recently-used idle worker.
+The scheduler first looks for a matching warm worker, then uses any idle same-client worker. It
+allocates a worker only when no same-client worker is idle and physical capacity has not yet been
+created, and otherwise steals the least-recently-used idle worker. Fresh work no longer clobbers
+reusable residents, so unrelated keys are not a reason to create another worker.
 
 This counter describes the scheduler's worker selection, not successful
 read-set validation. For database contexts, only
@@ -199,24 +226,27 @@ selection whose worker channel has already failed, do not increment it.
 The context kind, outcome, operation, reason, UDF type, and decision labels are
 closed sets represented by Rust enums, booleans with exhaustive matches, or
 exhaustive matches over `UdfType`. `pool_name` comes from static isolate
-configuration rather than application input or a closed enum. The current
-production layout has one `funrun` pool.
+configuration rather than application input or a closed enum. The maintained self-hosted layout
+has one `funrun` pool.
 
-In the maintained module-wide and HTTP composition, the expected normal maximum
-with that one pool is 30 counter series plus two gauge series before standard
-process and resource labels:
+In the maintained module-wide, HTTP, and bounded-cache composition, the expected normal maximum
+with one pool is 42 counter series plus nine gauge series before standard process and resource
+labels:
 
 - two effective decision combinations;
 - eight database lookup combinations across two UDF types;
-- four cache operation combinations;
-- eight cache-clear combinations;
+- ten cache operation combinations;
+- fourteen cache-clear combinations;
 - two occupancy gauges;
-- at most eight scheduler pool, context-kind, and outcome combinations in the
-  current pool layout.
+- two capacity gauges for the current pool;
+- one owned-context gauge for the current pool;
+- four isolate-memory capacity gauges for the current pool;
+- at most eight scheduler pool, context-kind, and outcome combinations in the current pool layout.
 
-The five labelled counter vectors explicitly use `Duration::MAX` as their
-eviction TTL. The current-layout hard bound is 30 counter series. Each
-additional statically configured isolate pool can add at most eight scheduler
+The five labelled counter vectors explicitly use `Duration::MAX` as their eviction TTL. The
+current-layout hard bound is 42 counter series. Each additional statically configured isolate pool
+can add at most eight scheduler series
+and seven gauge series: two cache-capacity, one owned-context, and four isolate-memory capacity
 series. These vectors do not register with the inactivity sweeper or add corresponding
 `metrics_evictable_cardinality_info{metric}` and
 `metrics_series_evicted_total{metric}` label sets. The two occupancy gauge
@@ -253,27 +283,26 @@ event, is expected.
 
 ## Operational interpretation
 
-For a marked query rollout, use this funnel:
+For a marked database-UDF rollout, use this funnel:
 
 1. `database_udf_context_reuse_decision_total{decision="allowed"}` confirms
-   that a query attempt passed validation with its marker retained.
+   that a query or mutation attempt passed validation with its marker retained.
 2. `database_udf_context_reuse_lookup_total` separates no saved context,
    invalid initialization reads, validation errors, and validated hits.
 3. `reusable_context_init_total{reused}` confirms fresh versus reused
    initialization for attempts that pass request-environment initialization.
 4. Cache operation, clear, and occupancy metrics explain whether contexts were
    retained between requests.
-5. Scheduler affinity explains whether dispatch found the matching warm worker,
-   used a same-client worker without a reusable context, allocated a worker, or
-   stole an idle worker at physical capacity.
+5. Scheduler affinity explains whether dispatch found the matching warm worker, used another idle
+   same-client worker, allocated a worker, or stole an idle worker at physical capacity.
 6. Existing module-evaluation, latency, query-cache, queue, shedding, heap, and isolate-
    recreation metrics determine whether reuse produced a useful performance
    result without unacceptable memory retention.
 
-For a marked module, query and mutation traffic can both increment
-`decision="allowed"` and produce database lookup and reusable-initialization
-outcomes. Cache and scheduler metrics are intentionally aggregate by context
-kind, so either UDF type in the same deployment can increment those series.
+For a mixed marked module, both query and mutation traffic may increment
+`decision="allowed"` and produce lookup or reusable-initialization outcomes.
+Cache and scheduler metrics are intentionally aggregate by context kind, so
+either UDF type in the same deployment can increment those series.
 
 Ordinary staged canary traffic is sufficient to exercise this funnel. The
 patch does not require a synthetic load generator, a timing-dependent OCC
@@ -284,9 +313,10 @@ workload, or a manual restart procedure.
 The patch adds counter or gauge updates only at validation, reusable-context
 lookup, cache lifecycle, and scheduler-selection boundaries. It adds no
 per-request histogram observations, timers, background tasks, or
-high-cardinality labels. On a reusable miss, worker selection scans the
-remaining same-client idle-worker deque once more to find a worker without a
-reusable context before allocating or stealing a worker.
+high-cardinality labels. On a reusable miss, worker selection scans the same-client idle-worker
+deque once for an exact key, then takes its ordinary most-recent idle fallback. The bounded cache
+performs at most a six-entry key scan and a five-entry victim scan. Exact frequency counters age
+every 96 eligible lookups.
 
 Cache accounting reuses the scheduler mirror lock already acquired for save
 and take. Clear and drop acquire that lock once to remove stale advertisements.
@@ -306,12 +336,12 @@ metrics store. Local exporter visibility alone does not prove collector or
 ingestion correctness.
 
 No schema, data migration, application source change, or new metric-specific
-environment variable is required. The existing metrics endpoint still has to
-be enabled for scraping. Removing the patch removes the instrumentation, the
-drop-time scheduler-mirror cleanup, and the preference for a same-client worker
-without a reusable context on a reusable miss; it does not change the marker or
-clear contexts in an already running process. Restart backend workers after
-rollback if a clean cache baseline is required.
+environment variable is required for the observability patch itself. The bounded-cache companion
+adds its optional resident-cap variable. The existing metrics endpoint still has to be enabled for
+scraping. Removing this patch removes the instrumentation and drop-time scheduler-mirror cleanup;
+removing the bounded-cache patch separately restores its one-slot scheduler policy. Neither change
+alters application markers or clears contexts in an already running process. Restart backend
+workers after rollback if a clean cache baseline is required.
 
 The drop-time mirror cleanup is a generic scheduler-correctness fix, not a
 metric. If upstream supplies equivalent signals and operators stop carrying the
@@ -325,9 +355,8 @@ to backend labels as a debugging shortcut.
 
 ## Verification boundary
 
-Package-scoped Rust formatting, compilation, the focused scheduler regression
-test for a worker without a reusable context, and existing isolate and UDF tests
-cover the changed build and control-flow boundaries. The patch does not add a
+Package-scoped Rust formatting, compilation, the focused same-client scheduler regression, and
+existing isolate and UDF tests cover the changed build and control-flow boundaries. The patch does not add a
 manual fixture or dedicated stress test. Production-shaped verification uses
 ordinary canary traffic and confirms the emitted Prometheus and remote-ingested
 series before relying on them for rollout decisions.

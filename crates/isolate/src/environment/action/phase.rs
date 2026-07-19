@@ -386,11 +386,20 @@ impl<RT: Runtime> ActionPhase<RT> {
     pub async fn validate_context_read_set(
         &mut self,
         read_set: &ContextReadSet,
+        timeout: &mut Timeout<RT>,
     ) -> anyhow::Result<bool> {
         let ActionPreloaded::Created { tx, .. } = &mut self.preloaded else {
             anyhow::bail!("Phase not initialized");
         };
-        ContextCache::validate_and_apply_context_read_set(tx, read_set).await
+        // Validation hashes are initialization work. If the future blocks,
+        // `with_release_permit` releases the active-JavaScript permit and excludes
+        // only that blocked interval from the user timeout.
+        timeout
+            .with_release_permit(
+                PauseReason::UdfInitialize,
+                ContextCache::validate_and_apply_context_read_set(tx, read_set),
+            )
+            .await
     }
 
     pub fn take_context_read_set(&mut self) -> anyhow::Result<Option<ContextReadSet>> {

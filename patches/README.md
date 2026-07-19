@@ -5,10 +5,10 @@ They are operator adoption units, not one all-or-nothing fork. Read the owning e
 a patch, preserve its prerequisites, and verify the effective configuration and metrics after every
 backend replacement.
 
-The current backend source chain has 14 commits and 14 operator essays, one commit per backend
-adoption unit. Lane-aware queueing and its optional deployment extension are one queue-control
-patch. The matching degradable-query client half is maintained in `convex-js`; it shares the
-protocol and adoption essay but is not another commit in this backend chain.
+The maintained backend source chain keeps one commit per operator adoption unit. Lane-aware
+queueing and its optional deployment extension are one queue-control patch. The matching
+degradable-query client half is maintained in `convex-js`; it shares the protocol and adoption essay
+but is not another commit in this backend chain.
 
 ## Snapshot and import reliability
 
@@ -160,12 +160,27 @@ protocol and adoption essay but is not another commit in this backend chain.
 
 ### [Context reuse observability](context_reuse_observability/README.md)
 
-- Purpose: expose bounded allow/suppress, lookup, validation, take/save/clear, affinity, occupancy,
-  and isolate-memory signals.
+- Purpose: expose bounded effective-decision, lookup, validation, take/save/clear, affinity,
+  occupancy, shared ownership/capacity, and isolate-memory signals.
 - Prerequisites: none for metrics; it is most useful with one of the context-reuse patches.
 - Activation: automatic after backend rollout. Absent series can be valid when no matching context
   activity occurred.
 - Rollback: remove the patch; runtime context policy is otherwise unchanged.
+
+### [Bounded multi-context reuse](bounded_multi_context_reuse/README.md)
+
+- Purpose: retain one probationary plus five protected reusable contexts per isolate by default,
+  make the protected count configurable, bound total resident ownership, evict incrementally under
+  isolate-heap pressure, prune to the two strongest protected entries under backend cgroup pressure,
+  and make worker creation follow concurrency instead of cache-key diversity.
+- Prerequisites: backend memory resilience, context-reuse observability, and the relevant
+  database-UDF or HTTP reuse safety patch. Application entry graphs still require source-purity
+  review.
+- Activation: automatic for eligible reusable contexts after backend rollout. The strict
+  `ISOLATE_CONTEXT_CACHE_PROTECTED_RESIDENTS_PER_ISOLATE` knob changes the protected segment, and
+  the optional `ISOLATE_CONTEXT_CACHE_MAX_RESIDENTS` knob can lower the scheduler-pool bound.
+- Rollback: restore the one-slot backend image and restart to destroy multi-entry worker caches; no
+  schema or data rollback is required.
 
 ### [HTTP action context reuse](reuse_http_action_contexts/README.md)
 

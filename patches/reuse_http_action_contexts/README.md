@@ -64,10 +64,22 @@ and are not request-scoped stream work. A decoder deliberately retained in
 module or global state therefore remains usable with the rest of that state;
 one that becomes unreachable is reclaimed with its JavaScript object.
 
-The context is inserted into the cache only after all fallible request
+The context is inserted into the cache only after all fallible isolate-local
 finalization, including warning emission and result extraction, has completed.
-A request that returns a system error therefore cannot leave its candidate
-context in the cache even if JavaScript execution itself completed cleanly.
+The save path rechecks termination and whether its response receiver has closed
+immediately before insertion. An isolate-local system error or visible receiver
+closure therefore cannot leave its candidate context in the cache even if
+JavaScript execution itself completed cleanly.
+
+The standard in-process function runner forwards an inner isolate response
+stream to the external response stream. Its inner receiver can remain open
+while the external client has already disconnected, and the forwarding select
+can observe successful isolate completion before it observes that disconnect.
+The isolate-local receiver check prevents publication when that closure is
+visible before the save fence. A disconnect observed only after clean isolate
+completion is an external delivery outcome and does not retract the context;
+one racing after the local check is likewise post-linearization. Application
+module-state purity remains required in every deployment.
 
 Termination is checked after the final microtask checkpoint because that
 checkpoint can still run user code. Error HTTP status codes deliberately written
@@ -99,9 +111,9 @@ The important semantic change is that JavaScript module and global state can
 persist. A module-level variable set by one request can be visible to a later
 request if that later request runs on the same cached V8 context. Applications
 should not depend on this for correctness, because contexts can be clobbered by
-fresh work, invalidated by deploy or configuration changes, destroyed with an
-isolate, or simply not be the one selected by the scheduler. But with this
-patch enabled, the behavior is possible and expected.
+fresh work under the one-slot policy, evicted by bounded-cache admission or pressure, invalidated
+by deploy or configuration changes, destroyed with an isolate, or simply not be the one selected
+by the scheduler. But with this patch enabled, the behavior is possible and expected.
 
 ## Cache shape in this patch
 
@@ -120,12 +132,19 @@ different module identities and the two context kinds compete within one
 isolate. Concurrent requests can still warm matching contexts on separate
 workers.
 
-For a deployment with one HTTP router module and eight isolate workers, the
-normal warm steady state is therefore up to eight cached HTTP action contexts
-for that router module, not one context per URL route and not one global context
-for all workers. If the application uses multiple HTTP modules or components,
-one worker can retain only the most recently saved context occupying its slot;
-other module contexts can remain warm on other workers.
+That is the upstream shape when this HTTP patch stands alone. The optional
+[`bounded_multi_context_reuse`](../bounded_multi_context_reuse/README.md) companion replaces it with
+one probationary plus five protected reusable residents per isolate by default and a separate fresh
+context. `ISOLATE_CONTEXT_CACHE_PROTECTED_RESIDENTS_PER_ISOLATE` changes the protected count. HTTP
+and database keys still share bounded capacity and remain distinct by context kind.
+
+Without the bounded companion, a deployment with one HTTP router module and
+eight isolate workers can retain up to eight cached HTTP action contexts for
+that router module, not one context per URL route and not one global context for
+all workers. Each worker then retains only the most recently saved reusable
+context. With the bounded companion, one worker can retain that router context
+alongside other HTTP or database module keys, subject to admission, pool, and
+heap-pressure eviction.
 
 ## Why the key is the module path
 
@@ -204,10 +223,13 @@ against the current transaction. The core validation helper is
 `ContextCache::validate_and_apply_context_read_set` in
 `crates/isolate/src/context_cache.rs`, and the HTTP action reuse call site is
 `ActionEnvironment::run_http_action` in
-`crates/isolate/src/environment/action/mod.rs`. This does not prove that no
-subtle invalidation bug can exist, which is one reason the behavior remains
-explicit and opt-in, but the main known stale-router failure mode is addressed
-by validating the system metadata reads before reuse.
+`crates/isolate/src/environment/action/mod.rs`. Capture and validation hash work uses
+`UdfInitialize`. When the future blocks, the timeout releases the active-JavaScript permit,
+records the blocked interval as system time, and accounts for permit reacquisition separately. A
+synchronously ready cache path keeps the permit and does not create a pause. This does
+not prove that no subtle invalidation bug can exist, which is one reason the
+behavior remains explicit and opt-in, but the main known stale-router failure
+mode is addressed by validating the system metadata reads before reuse.
 
 ## Why this is not an obvious upstream default
 
@@ -261,23 +283,18 @@ used heap, total heap, available heap, external memory, native context count,
 and detached context count. Per-context attribution is much harder because
 contexts share one isolate heap.
 
-The practical memory guard is therefore isolate-level rather than exact
-per-context accounting. The backend checks isolate heap availability between
-requests. When available heap is below the normal threshold, an already-saved
-reusable context lets the isolate continue so a matching request can use it
-without allocating another realm. A request that needs a fresh realm clobbers
-the saved slot; if it does not publish another reusable context, the next heap
-cleanliness check recreates the isolate. A hot matching context can be
-republished, so low available heap does not guarantee immediate eviction. The
-isolate heap limit, idle timeout, and maximum lifetime remain the backstops for
-a repeatedly reused context. This is not a per-context memory cap.
+The practical memory guard is therefore isolate-level rather than exact per-context accounting. In
+the upstream one-slot composition, a saved reusable context exempts the isolate from immediate
+low-free-heap recreation until fresh work clobbers it. With the bounded-cache companion, pressure
+drops the separate fresh context, then evicts the probationary and weakest protected residents with
+V8 collection between checks. The isolate heap limit, idle timeout, maximum lifetime, and shared
+resident-token budget remain the backstops. This is not a per-context memory cap.
 
 Operators adopting this patch should treat context reuse as a memory-throughput
-tradeoff. The maximum idle warm state is one saved reusable context per isolate
-worker, shared with database-UDF reuse. Increasing isolate worker count can
-therefore increase the number of retained contexts. Multiple hot modules change
-which contexts occupy those worker slots rather than multiplying the per-worker
-slot count. Module graph size and top-level caches should still be measured.
+tradeoff. Without the bounded companion, maximum idle warm state is one saved reusable context per
+isolate worker. With it, the maximum is six per isolate, subject to the lower configured shared
+pool bound that is still shared with database-UDF reuse. Module graph size and top-level caches must
+be measured.
 
 The companion
 [`context_reuse_observability/README.md`](../context_reuse_observability/README.md) patch exposes
@@ -290,10 +307,10 @@ and a single-digit MiB retained context size after warmup. That is usually tens
 of MiB of retained heap, not GiBs. Even if the warm context is closer to `10
 MiB`, an eight-worker deployment is around `80 MiB` for the main HTTP router
 context. On a `4 vCPU / 16 GiB` self-hosted server, that is unlikely to be the
-dominant memory term. More HTTP modules do not increase the one-slot-per-worker
-maximum, although they can increase cache churn and reduce hit rates. The
-retained-memory risk grows with worker count, the size of the module graphs that
-occupy those slots, and top-level in-memory caches.
+dominant memory term under the one-slot policy. The bounded companion deliberately permits more hot
+modules to remain resident, so its capacity and memory telemetry replace that estimate. Retained-
+memory risk grows with worker count, effective pool capacity, module-graph size, and top-level
+in-memory caches.
 
 The practical operating check is concrete: after enabling the knob, run a warm
 load test for the hot HTTP path and compare p50/p95/p99 latency, HTTP `503`

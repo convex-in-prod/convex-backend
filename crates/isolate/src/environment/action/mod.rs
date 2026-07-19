@@ -362,12 +362,15 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         if let Some(tx) = function_started {
             _ = tx.send(());
         }
+        // Declare token ownership before the V8 scopes so failure paths drop the
+        // active context and module roots before returning the pool permit.
+        let mut reusable_context_token = None;
         scope!(let handle_scope, isolate.isolate());
         let reusable_module_path = context_cache_key(component_function_path);
         let mut context_scope;
         let mut reused_http_action_context = false;
         let reused_context = if *REUSE_HTTP_ACTION_CONTEXTS
-            && let Some((context, module_map, read_set)) =
+            && let Some(taken_context) =
                 context_cache.take_http_action_context(&reusable_module_path)
         {
             // Cached HTTP action contexts keep evaluated JS modules. Validate the
@@ -376,10 +379,10 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             if state
                 .environment
                 .phase
-                .validate_context_read_set(&read_set)
+                .validate_context_read_set(taken_context.read_set(), &mut timeout)
                 .await?
             {
-                Some((context, module_map, read_set))
+                Some(taken_context)
             } else {
                 None
             }
@@ -387,7 +390,9 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             None
         };
         let mut context_read_set = None;
-        let mut isolate_context = if let Some((context, module_map, read_set)) = reused_context {
+        let mut isolate_context = if let Some(taken_context) = reused_context {
+            let (context, module_map, read_set, token) = taken_context.into_parts();
+            reusable_context_token = Some(token);
             reused_http_action_context = true;
             context_read_set = Some(read_set);
             let v8_context = v8::Local::new(handle_scope, context);
@@ -462,6 +467,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No HTTP response streamer for HTTP action"))?;
         let total_bytes_sent = http_response_streamer.total_bytes_sent();
+        let response_sender = http_response_streamer.sender.clone();
         match termination_error {
             Ok(Ok(..)) => (),
             Ok(Err(e)) => {
@@ -489,6 +495,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             && !has_pending_request_work
             && !self.has_pending_task_promises()
             && !self.http_action_had_execution_error
+            && !response_sender.is_closed()
             && matches!(&result, Ok((_, HttpActionResult::Streamed)));
         let candidate_context_read_set = if can_save_http_action_context {
             match context_read_set.take() {
@@ -498,15 +505,14 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         } else {
             None
         };
-        let reusable_context = match (
-            candidate_module_map,
-            candidate_v8_context,
-            candidate_context_read_set,
-        ) {
-            (Some(module_map), Some(v8_context), Some(read_set)) => {
-                Some((module_map, v8_context, read_set))
-            },
-            _ => None,
+        let reusable_context = if can_save_http_action_context {
+            let module_map = candidate_module_map
+                .ok_or_else(|| anyhow!("Lost ModuleMap for reusable HTTP action context"))?;
+            let v8_context = candidate_v8_context
+                .ok_or_else(|| anyhow!("Lost V8 context for reusable HTTP action context"))?;
+            candidate_context_read_set.map(|read_set| (module_map, v8_context, read_set))
+        } else {
+            None
         };
         let user_execution_time = execution_time.elapsed;
         self.add_warnings_to_log_lines_http_action(execution_time, total_bytes_sent)?;
@@ -524,15 +530,30 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         // Do not publish the context until every fallible request-finalization step
         // has succeeded. A caller that receives an error must never leave a warmed
         // context behind from that request.
-        if let Some((module_map, v8_context, read_set)) = reusable_context {
+        if let Some(reusable_context) = reusable_context {
+            // The response receiver can close during warning/result finalization.
+            // Keep the token guard live until these final checks complete. Its
+            // declaration order makes rejected candidates drop their V8 scopes
+            // before releasing shared capacity.
+            handle.check_terminated()?;
+            if response_sender.is_closed() {
+                return Ok(outcome);
+            }
             if reused_http_action_context {
                 tracing::debug!("Reusing HTTP action context for {reusable_module_path:?}");
             }
+            assert_eq!(
+                reusable_context_token.is_some(),
+                reused_http_action_context,
+                "HTTP reusable-context token ownership drifted"
+            );
+            let (module_map, v8_context, read_set) = reusable_context;
             context_cache.save_http_action_context(
                 reusable_module_path,
                 v8_context,
                 module_map,
                 read_set,
+                reusable_context_token.take(),
             );
         }
         Ok(outcome)

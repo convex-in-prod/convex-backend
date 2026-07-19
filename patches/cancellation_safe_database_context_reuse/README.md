@@ -69,6 +69,14 @@ check prevents publication. Caller drop after it does not retract a context that
 save boundary. A failed or canceled taken context is discarded because it is absent from the cache
 while executing.
 
+Initialization read-set capture and reused-context validation can perform asynchronous database
+hash work under `UdfInitialize`. When either future blocks, the timeout releases the
+active-JavaScript permit, records the blocked interval as system time, and records permit
+reacquisition separately. A synchronously ready cache path keeps the permit and does not create a
+pause. Lazy non-system module metadata, source-package, and source loading uses the same conditional
+release under `LoadModule`; V8 module compilation and evaluation runs after any reacquisition and
+counts as user time.
+
 The signal does not interrupt synchronous JavaScript from another thread. Such work continues until
 an existing timeout, syscall cancellation point, termination check, or final save check. The
 scheduler discards a request when selection observes a closed response and cancels a selected
