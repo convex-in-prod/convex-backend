@@ -43,6 +43,15 @@ but is not another commit in this backend chain.
 - Rollback: restore the previous backend image. Unsetting the cap also disables pacing, but it
   simultaneously disables degradable-query backpressure.
 
+## Log privacy
+
+### [Redact validator values from external log sinks](validation_error_log_redaction/README.md)
+
+- Purpose: retain validator-error classification without sending rejected arguments, return
+  values, or validator details to durable external log sinks.
+- Prerequisites: none.
+- Activation: automatic after deploying the patched backend image; historical events are unchanged.
+- Rollback: an upstream image without equivalent redaction restores the sensitive-value leak.
 ## Backend memory resilience
 
 ### [Backend memory resilience](backend_memory_resilience/README.md)
