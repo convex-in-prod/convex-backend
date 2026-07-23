@@ -17,6 +17,7 @@ use common::{
         APPLICATION_JSON_CONTENT_TYPE,
     },
     log_streaming::{
+        error_message_for_log_stream,
         LogEvent,
         StructuredLogEvent,
     },
@@ -256,10 +257,11 @@ impl<RT: Runtime> PostHogErrorTrackingIntegration<RT> {
                 .as_ref()
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "unknown".to_string());
+            let error_message = error_message_for_log_stream(error);
 
             let mut exception = json!({
                 "type": "Error",
-                "value": error.message,
+                "value": error_message.clone(),
                 "mechanism": { "handled": false, "type": "generic" },
             });
             if !frames.is_empty() {
@@ -277,7 +279,7 @@ impl<RT: Runtime> PostHogErrorTrackingIntegration<RT> {
                     "$exception_list": [exception],
                     "$exception_level": "error",
                     "$exception_types": ["Error"],
-                    "$exception_values": [error.message],
+                    "$exception_values": [error_message],
                     "$exception_sources": exception_sources,
                     "$exception_functions": exception_functions,
                     "$lib": "convex",
