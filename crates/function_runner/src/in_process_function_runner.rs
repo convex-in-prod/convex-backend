@@ -104,6 +104,7 @@ use crate::{
     server::{
         validate_run_function_result,
         DeploymentStorage,
+        FunctionExecutionStartGate,
         FunctionMetadata,
         FunctionRunnerCore,
         HttpActionMetadata,
@@ -281,6 +282,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
         default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
         in_memory_index_last_modified: BTreeMap<IndexId, Timestamp>,
         context: ExecutionContext,
+        function_execution_start: Option<FunctionExecutionStartGate>,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(
         Option<FunctionFinalTransaction>,
@@ -323,6 +325,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
             fetch_client: self.fetch_client.clone(),
             log_line_sender,
             function_started_sender: None,
+            function_execution_start,
             udf_type,
             identity,
             existing_writes,
