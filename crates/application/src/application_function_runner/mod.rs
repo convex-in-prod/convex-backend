@@ -106,6 +106,8 @@ use file_storage::{
 };
 use function_runner::{
     server::{
+        function_execution_start_barrier,
+        FunctionExecutionStartGate,
         FunctionMetadata,
         HttpActionMetadata,
     },
@@ -218,7 +220,10 @@ use vector::{
     VectorSearch,
 };
 
+pub(crate) use self::metrics::DurableActionSource;
 use self::metrics::{
+    durable_action_admission_timer,
+    durable_action_claim_timer,
     function_waiter_timer,
     log_occ_retries,
     log_outstanding_functions,
@@ -385,6 +390,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                     active_javascript_class,
                 }),
                 None,
+                None,
                 scheduler_dependency,
             )
             .await?;
@@ -401,7 +407,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         log_line_sender: mpsc::UnboundedSender<LogLine>,
         context: ExecutionContext,
         permit_timeout: PermitTimeout,
-        wait_for_permit: bool,
+        function_execution_start: Option<FunctionExecutionStartGate>,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<ActionOutcome> {
         let permit = self
@@ -425,6 +431,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                     active_javascript_class: ActiveJavascriptClass::Protected,
                 }),
                 None,
+                function_execution_start,
                 scheduler_dependency,
             )
             .await?;
@@ -457,6 +464,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 Some(log_line_sender),
                 None,
                 Some(http_action_metadata),
+                None,
                 SchedulerDependencyClass::Independent,
             )
             .await?;
@@ -480,6 +488,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
         function_metadata: Option<FunctionMetadata>,
         http_action_metadata: Option<HttpActionMetadata>,
+        function_execution_start: Option<FunctionExecutionStartGate>,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
         // Read in this transaction so preference changes invalidate cached queries.
@@ -531,6 +540,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 self.default_system_env_vars.clone(),
                 in_memory_index_last_modified,
                 context,
+                function_execution_start,
                 scheduler_dependency,
             ),
             diagnostic.as_ref().map(RuntimeDiagnostic::task),
@@ -1650,7 +1660,140 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         usage_tracking: FunctionUsageTracker,
         context: ExecutionContext,
         permit_timeout: PermitTimeout,
-        wait_for_permit: bool,
+        scheduler_dependency: SchedulerDependencyClass,
+    ) -> anyhow::Result<ActionCompletion> {
+        self.run_action_no_udf_log_with_execution_start(
+            path,
+            arguments,
+            identity,
+            caller,
+            usage_tracking,
+            context,
+            permit_timeout,
+            None,
+            scheduler_dependency,
+        )
+        .await
+    }
+
+    /// Prepares an action, waits until it reaches its environment-specific
+    /// admission boundary, commits the caller-provided durable claim, and only
+    /// then starts user code.
+    #[fastrace::trace]
+    pub(crate) async fn run_action_no_udf_log_after_admission<T>(
+        &self,
+        path: PublicFunctionPath,
+        arguments: SerializedArgs,
+        identity: Identity,
+        caller: FunctionCaller,
+        usage_tracking: FunctionUsageTracker,
+        context: ExecutionContext,
+        permit_timeout: PermitTimeout,
+        scheduler_dependency: SchedulerDependencyClass,
+        source: DurableActionSource,
+        claim: impl std::future::Future<Output = anyhow::Result<Option<T>>>,
+    ) -> anyhow::Result<Option<(ActionCompletion, T)>> {
+        let (mut start_controller, start_gate) = function_execution_start_barrier();
+        let admission_timer = durable_action_admission_timer(source);
+        let mut action_future = Box::pin(self.run_action_no_udf_log_with_execution_start(
+            path,
+            arguments,
+            identity,
+            caller,
+            usage_tracking,
+            context,
+            permit_timeout,
+            Some(start_gate),
+            scheduler_dependency,
+        ));
+
+        let ready_result = select! {
+            biased;
+            result = &mut action_future => {
+                match result {
+                    Err(error) => {
+                        admission_timer.finish_with(error.metric_status_label_value());
+                        return Err(error);
+                    },
+                    Ok(_) => {
+                        admission_timer.finish_with("invariant_violation");
+                        anyhow::bail!("Action completed before reaching its execution start barrier");
+                    },
+                }
+            },
+            result = start_controller.wait_until_ready() => result,
+        };
+        if let Err(start_error) = ready_result {
+            return match action_future.await {
+                Err(error) => {
+                    admission_timer.finish_with(error.metric_status_label_value());
+                    Err(error)
+                },
+                Ok(_) => {
+                    admission_timer.finish_with("invariant_violation");
+                    Err(start_error)
+                },
+            };
+        }
+        admission_timer.finish(true);
+
+        let claim_timer = durable_action_claim_timer(source);
+        // A selected V8 worker can disappear after signaling ready. Keep
+        // observing the prepared execution while the claim is in flight so a
+        // reservation known to be lost is never released. Dropping an already
+        // submitted commit can still have an ambiguous result, which remains on
+        // the conservative at-most-once recovery path.
+        let claim_result = select! {
+            biased;
+            result = &mut action_future => {
+                match result {
+                    Err(error) => {
+                        claim_timer.finish_with("execution_lost");
+                        return Err(error);
+                    },
+                    Ok(_) => {
+                        claim_timer.finish_with("invariant_violation");
+                        anyhow::bail!(
+                            "Action completed while waiting for its durable execution claim"
+                        );
+                    },
+                }
+            },
+            result = claim => result,
+        };
+        let claim = match claim_result {
+            Ok(Some(claim)) => {
+                claim_timer.finish(true);
+                claim
+            },
+            Ok(None) => {
+                claim_timer.finish_with("state_changed");
+                return Ok(None);
+            },
+            Err(error) => {
+                claim_timer.finish_with(error.metric_status_label_value());
+                return Err(error);
+            },
+        };
+
+        // From this point onward the durable claim is visible. If the runtime
+        // disappears before or after this handoff, existing at-most-once recovery
+        // treats the action as possibly started.
+        start_controller.start()?;
+        let completion = action_future.await?;
+        Ok(Some((completion, claim)))
+    }
+
+    async fn run_action_no_udf_log_with_execution_start(
+        &self,
+        path: PublicFunctionPath,
+        arguments: SerializedArgs,
+        identity: Identity,
+        caller: FunctionCaller,
+        usage_tracking: FunctionUsageTracker,
+        context: ExecutionContext,
+        permit_timeout: PermitTimeout,
+        function_execution_start: Option<FunctionExecutionStartGate>,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<ActionCompletion> {
         let mut diagnostic =
@@ -1664,6 +1807,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 usage_tracking,
                 context,
                 permit_timeout,
+                function_execution_start,
                 scheduler_dependency,
             ),
             diagnostic.as_ref().map(RuntimeDiagnostic::task),
@@ -1706,7 +1850,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         usage_tracking: FunctionUsageTracker,
         context: ExecutionContext,
         permit_timeout: PermitTimeout,
-        wait_for_permit: bool,
+        mut function_execution_start: Option<FunctionExecutionStartGate>,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<ActionCompletion> {
         if path.is_system() && !(identity.is_admin() || identity.is_system()) {
@@ -1735,6 +1879,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 (path_and_args, returns_validator)
             },
             Err(js_error) => {
+                if let Some(start_gate) = function_execution_start.take() {
+                    start_gate.wait().await?;
+                }
                 return Ok(ActionCompletion {
                     outcome: ValidatedActionOutcome::from_error(
                         js_error,
@@ -1783,6 +1930,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         log_line_sender,
                         context.clone(),
                         permit_timeout,
+                        function_execution_start,
                         scheduler_dependency,
                     )
                     .boxed();
@@ -1908,6 +2056,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     encoded_parent_trace: EncodedSpan::from_parent().0,
                 };
 
+                if let Some(start_gate) = function_execution_start {
+                    start_gate.wait().await?;
+                }
+
                 let node_outcome_future = self
                     .node_actions
                     .execute(request, log_line_sender, source_maps_callback)
@@ -1972,6 +2124,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 })
             },
             ModuleEnvironment::Invalid => {
+                if let Some(start_gate) = function_execution_start {
+                    start_gate.wait().await?;
+                }
                 Err(anyhow::anyhow!("Attempting to run an invalid function"))
             },
         };
