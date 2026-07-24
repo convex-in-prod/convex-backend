@@ -1,9 +1,11 @@
+use anyhow::Context;
 use async_trait::async_trait;
 use common::{
     runtime::Runtime,
     types::UdfType,
 };
 use sync_types::CanonicalizedUdfPath;
+use tokio::sync::oneshot;
 use udf::{
     metrics::is_developer_ok,
     HttpActionResult,
@@ -53,6 +55,20 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
     pub fn new(rt: RT, isolate_config: IsolateConfig) -> Self {
         Self { rt, isolate_config }
     }
+}
+
+async fn wait_for_function_execution_start(
+    execution_start: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+) -> anyhow::Result<()> {
+    let Some((ready_sender, start_receiver)) = execution_start else {
+        return Ok(());
+    };
+    ready_sender.send(()).map_err(|_| {
+        anyhow::anyhow!("Function execution start controller was dropped before admission")
+    })?;
+    start_receiver
+        .await
+        .context("Function execution start controller was dropped before release")
 }
 
 #[async_trait(?Send)]
@@ -142,77 +158,93 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                 fetch_client,
                 log_line_sender,
                 function_started_sender,
+                function_execution_start,
             } => {
                 drop(queue_timer);
-                let timer = service_request_timer(&UdfType::Action);
                 let path = request.params.path_and_args.path();
-                record_component_function_path(path);
                 let udf_path = path.udf_path.to_owned();
                 let component = path.component.to_owned();
                 let component_path = path.component_path.clone();
                 let log_string = format!("Action: {udf_path:?}");
-                let environment = ActionEnvironment::new(
-                    self.rt.clone(),
-                    component,
-                    udf_path,
-                    component_path,
-                    request.environment_data,
-                    request.identity,
-                    request.transaction,
-                    action_callbacks,
-                    fetch_client,
-                    log_line_sender,
-                    None,
-                    request.context,
-                );
-                let r = crate::execution_observation::observe(
-                    environment.run_action(
-                        isolate,
-                        context_cache,
-                        permit,
-                        &mut isolate_clean,
-                        request.params.clone(),
-                        cancellation.clone(),
-                        function_started_sender,
-                    ),
-                    execution_observation,
-                )
-                .await
-                .and_then(|(mut outcome, reusable_context)| {
-                    // Validate with the caller's snapshot before publishing a reusable context.
-                    outcome.validate_return_value(
-                        &request.return_validation.returns_validator,
-                        &request.return_validation.table_mapping,
-                    )?;
-                    let reusable_context = if outcome.result.is_ok() { reusable_context } else { None };
-                    Ok((outcome, reusable_context))
-                });
-
-                let status = match &r {
-                    Ok((outcome, _)) => {
-                        if outcome.result.is_ok() {
-                            RequestStatus::Success
+                if let Err(error) =
+                    wait_for_function_execution_start(function_execution_start).await
+                {
+                    // No isolate state has been touched. Let the worker return to the
+                    // reusable pool after the canceled reservation releases its permit.
+                    isolate_clean = true;
+                    let _ = response.send(Err(error));
+                } else {
+                    let timer = service_request_timer(&UdfType::Action);
+                    record_component_function_path(path);
+                    let environment = ActionEnvironment::new(
+                        self.rt.clone(),
+                        component,
+                        udf_path,
+                        component_path,
+                        request.environment_data,
+                        request.identity,
+                        request.transaction,
+                        action_callbacks,
+                        fetch_client,
+                        log_line_sender,
+                        None,
+                        request.context,
+                    );
+                    let r = crate::execution_observation::observe(
+                        environment.run_action(
+                            isolate,
+                            context_cache,
+                            permit,
+                            &mut isolate_clean,
+                            request.params.clone(),
+                            cancellation.clone(),
+                            function_started_sender,
+                        ),
+                        execution_observation,
+                    )
+                    .await
+                    .and_then(|(mut outcome, reusable_context)| {
+                        // Use the caller's validation snapshot before allowing a
+                        // successful handler result to authorize cache publication.
+                        outcome.validate_return_value(
+                            &request.return_validation.returns_validator,
+                            &request.return_validation.table_mapping,
+                        )?;
+                        let reusable_context = if outcome.result.is_ok() {
+                            reusable_context
                         } else {
-                            RequestStatus::DeveloperError
-                        }
-                    },
-                    Err(_) => RequestStatus::SystemError,
-                };
-                finish_service_request_timer(timer, status);
-                match r {
-                    Ok((outcome, reusable_context)) => {
-                        if response.send(Ok(outcome)).is_ok()
-                            && !cancellation.is_cancelled()
-                            && let Some(reusable_context) = reusable_context
-                        {
-                            // Caller drop signals cancellation before closing the receiver;
-                            // a successful send alone cannot authorize publication.
-                            reusable_context.publish(context_cache);
-                        }
-                    },
-                    Err(error) => {
-                        let _ = response.send(Err(error));
-                    },
+                            None
+                        };
+                        Ok((outcome, reusable_context))
+                    });
+
+                    let status = match &r {
+                        Ok((outcome, _)) => {
+                            if outcome.result.is_ok() {
+                                RequestStatus::Success
+                            } else {
+                                RequestStatus::DeveloperError
+                            }
+                        },
+                        Err(_) => RequestStatus::SystemError,
+                    };
+                    finish_service_request_timer(timer, status);
+                    match r {
+                        Ok((outcome, reusable_context)) => {
+                            if response.send(Ok(outcome)).is_ok()
+                                && !cancellation.is_cancelled()
+                                && let Some(reusable_context) = reusable_context
+                            {
+                                // Caller drop signals cancellation before closing
+                                // the receiver, so a successful send alone cannot
+                                // authorize publication during that interval.
+                                reusable_context.publish(context_cache);
+                            }
+                        },
+                        Err(error) => {
+                            let _ = response.send(Err(error));
+                        },
+                    }
                 }
                 log_string
             },
@@ -298,7 +330,6 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                 match r {
                     Ok((outcome, reusable_context)) => {
                         if response.send(Ok(outcome)).is_ok()
-                            && !cancellation.is_cancelled()
                             && let Some(reusable_context) = reusable_context
                         {
                             // HTTP responses are already streamed separately;
@@ -421,6 +452,42 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
 
     fn rt(&self) -> &RT {
         &self.rt
+    }
+}
+
+#[cfg(test)]
+mod execution_start_tests {
+    use super::wait_for_function_execution_start;
+
+    #[tokio::test]
+    async fn selected_worker_waits_for_start_release() {
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
+        let wait_task = tokio::spawn(wait_for_function_execution_start(Some((
+            ready_sender,
+            start_receiver,
+        ))));
+
+        ready_receiver.await.unwrap();
+        assert!(!wait_task.is_finished());
+        start_sender.send(()).unwrap();
+        wait_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_worker_cancels_when_start_is_not_released() {
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
+        let wait_task = tokio::spawn(wait_for_function_execution_start(Some((
+            ready_sender,
+            start_receiver,
+        ))));
+
+        ready_receiver.await.unwrap();
+        drop(start_sender);
+
+        let error = wait_task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("dropped before release"));
     }
 }
 
