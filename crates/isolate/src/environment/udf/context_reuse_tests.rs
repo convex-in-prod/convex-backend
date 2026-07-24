@@ -1255,6 +1255,7 @@ fn grouped_action_worker_publishes_only_after_uncancelled_delivery() -> anyhow::
                             fetch_client: Arc::new(common::http::fetch::StaticFetchClient::new()),
                             log_line_sender,
                             function_started_sender: None,
+                            function_execution_start: None,
                         },
                         EncodedSpan::empty(),
                     );

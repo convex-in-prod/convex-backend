@@ -57,6 +57,7 @@ use model::{
     udf_config::types::UdfConfig,
 };
 use server::{
+    FunctionExecutionStartGate,
     FunctionMetadata,
     HttpActionMetadata,
 };
@@ -98,6 +99,7 @@ pub trait FunctionRunner<RT: Runtime>: Send + Sync + 'static {
         default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
         in_memory_index_last_modified: BTreeMap<IndexId, Timestamp>,
         context: ExecutionContext,
+        function_execution_start: Option<FunctionExecutionStartGate>,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(
         Option<FunctionFinalTransaction>,
