@@ -36,6 +36,7 @@ use common::{
         NODE_ACTION_USER_TIMEOUT,
         UDF_CACHE_MAX_SIZE,
     },
+    memory_pressure::MemoryPressureSignal,
     persistence::Persistence,
     runtime::{
         new_rate_limiter,
@@ -104,6 +105,8 @@ pub mod environment_variables;
 pub mod http_actions;
 pub mod integrations;
 pub mod logs;
+#[cfg(target_os = "linux")]
+pub mod memory_metrics;
 pub mod node_action_callbacks;
 pub mod parse;
 pub mod proxy;
@@ -159,6 +162,7 @@ pub async fn make_app(
     zombify_rx: async_broadcast::Receiver<()>,
     preempt_tx: ShutdownSignal,
     build_revision: BuildRevision,
+    memory_reclamation: MemoryPressureSignal,
 ) -> anyhow::Result<LocalAppState> {
     let key_broker = config.key_broker()?;
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
@@ -206,7 +210,13 @@ pub async fn make_app(
         class: DeploymentClass::S16,
     };
     let node_process_timeout = *NODE_ACTION_USER_TIMEOUT + Duration::from_secs(5);
-    let node_executor = Arc::new(LocalNodeExecutor::new(node_process_timeout).await?);
+    let node_executor = Arc::new(
+        LocalNodeExecutor::new_with_memory_pressure(
+            node_process_timeout,
+            memory_reclamation.clone(),
+        )
+        .await?,
+    );
     let node_actions = NodeActions::new(
         node_executor,
         config.convex_origin_url()?,
