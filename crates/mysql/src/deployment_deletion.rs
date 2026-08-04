@@ -43,6 +43,7 @@ use crate::{
         PersistenceDeploymentId,
     },
     ConvexMySqlPool,
+    MySqlConnectionIdTopology,
     MySqlInstanceName,
 };
 
@@ -172,7 +173,10 @@ impl<RT: Runtime> DeploymentDeletionPool<RT> {
             &url,
             *DATABASE_USE_PREPARED_STATEMENTS,
             true, /* require_leader */
-            Some(runtime),
+            runtime,
+            // A cluster URL alone does not establish a shared server connection-ID
+            // namespace. Cancellation must only close this client's transport.
+            MySqlConnectionIdTopology::Untrusted,
         )?);
         Ok(Self {
             pool,
@@ -464,20 +468,18 @@ impl<RT: Runtime> DeploymentDeleter<RT> {
         // The revoked lease excludes valid writers; READ COMMITTED additionally avoids
         // next-key locks blocking unrelated activity around the bounded range.
         let started = Instant::now();
-        let mut tx = conn
+        let rows_deleted = conn
             .transaction(
                 self.pool.cluster_name(),
                 Some(IsolationLevel::ReadCommitted),
+                async |tx| {
+                    tx.exec_iter(&delete_query, delete_params)
+                        .await
+                        .with_context(|| format!("delete {table} range"))
+                },
             )
             .await
-            .with_context(|| format!("begin {table} range deletion"))?;
-        let rows_deleted = tx
-            .exec_iter(&delete_query, delete_params)
-            .await
-            .with_context(|| format!("delete {table} range"))?;
-        tx.commit()
-            .await
-            .with_context(|| format!("commit {table} range deletion"))?;
+            .with_context(|| format!("transact {table} range deletion"))?;
         Ok(TableBatch {
             rows_deleted,
             next_cursor: next_key.map(|key| TableCursor {

@@ -50,6 +50,7 @@ use crate::{
     DeploymentDeletionPool,
     DeploymentDeletionTarget,
     IndexesLogMaintenance,
+    MySqlConnectionIdTopology,
     MySqlOptions,
 };
 
@@ -64,14 +65,17 @@ pub struct ReplicaTarget<RT: Runtime> {
 }
 
 impl<RT: Runtime> ReplicaTarget<RT> {
-    pub fn new(url: &str) -> anyhow::Result<Self> {
+    pub fn new(url: &str, runtime: RT) -> anyhow::Result<Self> {
         let (parsed, db_name) = config::parse_url(url)?;
         Ok(Self {
             pool: Arc::new(ConvexMySqlPool::new(
                 &parsed,
                 *DATABASE_USE_PREPARED_STATEMENTS,
                 true, /* require_leader */
-                None,
+                runtime,
+                // Replica endpoints have their own connection-ID namespace;
+                // the source pool's topology assertion does not cover them.
+                MySqlConnectionIdTopology::Untrusted,
             )?),
             db_name,
             state_table: Default::default(),
