@@ -37,6 +37,7 @@ use crate::{
         PersistenceDeploymentId,
     },
     ConvexMySqlPool,
+    MySqlConnectionIdTopology,
     MySqlInstanceName,
 };
 
@@ -159,7 +160,10 @@ impl<RT: Runtime> DeploymentDeletionPool<RT> {
             &url,
             *DATABASE_USE_PREPARED_STATEMENTS,
             true, /* require_leader */
-            Some(runtime),
+            runtime,
+            // A cluster URL alone does not establish a shared server connection-ID
+            // namespace. Cancellation must only close this client's transport.
+            MySqlConnectionIdTopology::Untrusted,
         )?);
         Ok(Self {
             pool,
