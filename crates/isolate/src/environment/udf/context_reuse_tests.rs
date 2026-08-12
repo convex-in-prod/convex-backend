@@ -169,6 +169,7 @@ impl Fixture {
                 external_deps_package_id: None,
                 package_size: PackageSize::default(),
                 node_version: None,
+                node_executor_pool_topology: Default::default(),
             })
             .await?;
         database
@@ -205,6 +206,7 @@ impl Fixture {
                 None,
                 Some(AnalyzedModule::default()),
                 ModuleEnvironment::Isolate,
+                None,
             )
             .await?;
         self.database

@@ -1,20 +1,25 @@
 # Local Node Executor Resilience
 
 This implementation restores local Node-action liveness when the shared Node
-process stops responding and bounds healthy-generation lifetime when memory or
-non-evictable module identity grows. The upstream local executor uses one Node
-process for the complete deployment. A synchronous loop or event-loop stall in
-one action can therefore stop every unrelated Node action while queries,
-mutations, V8 actions, MySQL, and the backend health endpoint remain available.
-Repeated deployment analysis and execution can also retain ESM module graphs
-for the life of that process even after the corresponding disk-cache entry is
-deleted.
+process stops responding, bounds healthy-generation lifetime when memory or
+non-evictable module identity grows, and replaces healthy generations without
+an admission outage. The upstream local executor uses one Node process for the
+complete deployment. A synchronous loop or event-loop stall in one action can
+therefore stop every unrelated Node action while queries, mutations, V8
+actions, MySQL, and the backend health endpoint remain available. Repeated
+deployment analysis and execution can also retain ESM module graphs for the
+life of that process even after the corresponding disk-cache entry is deleted.
 
 ## Operator view
 
 This is one adoption unit. It includes the Node.js 24 runtime move, generation
-retirement and replacement, proactive healthy-generation limits, and
-first-watchdog-miss evidence. It does not add a Node process pool.
+retirement and hot replacement, proactive healthy-generation limits, and
+first-watchdog-miss evidence. Steady state still uses one process per logical
+executor slot. A healthy replacement temporarily adds one candidate process;
+the old process becomes the temporary extra process after promotion and holds
+that surge allowance until it is reaped. The optional application-declared
+pinned-pool patch reuses this owner once per committed pool and coordinates one
+surge allowance across them.
 
 The repository and self-hosted images pin Node.js 24.18.1. The local executor
 accepts another `v24.*` binary from `PATH` when the exact NVM-managed binary is
@@ -38,6 +43,24 @@ Retirement replaces only the local Node child, not the backend process. Queries,
 mutations, V8 actions, and backend health remain available unless another
 failure affects them. Evidence collection is best effort and cannot delay the
 watchdog or replacement.
+
+Healthy proactive replacement follows a different sequence from unhealthy
+retirement:
+
+1. The current generation continues to accept eligible requests while a
+   candidate starts on its own socket and temporary directory.
+2. The candidate passes startup health checks and prepares the required source
+   and external packages without importing or invoking an application module.
+3. One identity-fenced state transition promotes the candidate and closes old
+   admission.
+4. Requests already assigned to the old generation finish within their
+   existing absolute action deadlines.
+5. The old direct child is terminated and reaped, then the surge allowance is
+   released.
+
+A failed or stale candidate is terminated and reaped while the old generation
+continues serving. Request and watchdog failures still retire the unhealthy
+generation immediately; they do not wait for a candidate.
 
 On Unix, first-miss evidence is automatic. Linux additionally records `/proc`
 process and thread state. Set `LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR` to an
@@ -64,7 +87,7 @@ For an incident:
 1. Confirm a `health_check_failed` generation retirement or consecutive
    watchdog misses.
 2. Read
-   `local_node_executor_first_miss_diagnostics_total{operation,outcome}` to see
+   `local_node_executor_first_miss_diagnostics_total{pool_name,operation,outcome}` to see
    which evidence operations completed.
 3. Match files in the diagnostic directory by generation and timestamp.
 4. Start with `node-first-miss-*.json`, then inspect the CPU profile and Node
@@ -104,64 +127,186 @@ both above the valid function-result and log budgets. A second result is
 rejected immediately, and partial lines use one aggregate byte buffer instead
 of retaining transport-chunk metadata. A malformed shared process therefore
 cannot grow one unterminated protocol line or amplify many tiny protocol
-objects until the backend runs out of memory.
+objects until the backend runs out of memory. A protocol or size failure before
+the terminal stream boundary retires and reaps the selected direct child before
+request ownership is released. If a caller stops collecting streamed log lines,
+the runtime discards later logs but continues consuming the response through
+that same terminal boundary. Dependency builds have no caller-facing log
+consumer, so their receiver is closed from the start and streamed log lines are
+discarded without accumulating in an unbounded channel.
 
-## Generation retirement
+The reusable stream parser applies the same aggregate byte bound independently
+of its transport producer and requires an explicit `InvokeComplete` part. A
+stream ending after a result but before that marker is a protocol failure, not
+evidence of terminal child work.
+
+After the terminal frame, an invalid response `type` or a present non-Boolean
+`exitingProcess` field follows the same identity-fenced retirement and cleanup
+contract. Valid `success` and user `error` payloads keep the generation reusable
+unless `exitingProcess=true` requests retirement.
+
+Non-success HTTP headers alone are not a terminal child-work observation. The
+Rust client consumes an ordinary error body to bounded EOF under the same
+absolute deadline before returning the status. A body timeout, transport
+failure, or size violation starts identity-fenced retirement and returns only
+after confirmed direct-child reaping or an explicit cleanup error. The system
+child's defensive HTTP 409 response instead proves that unknown earlier system
+work is still active, so Rust immediately follows the same retirement contract.
+A cleanup error leaves the exact generation in conservative retiring state;
+callers must not treat that error as terminal child-work observation.
+
+## Generation replacement and retirement
 
 The patch gives every local Node process a monotonic process-local generation
-number. A request retains the exact generation that accepted it. Request
-timeout, response-stream timeout, request transport failure, a response with
-`exitingProcess=true`, or watchdog failure can retire that generation. Backend
-shutdown retires the current generation with `explicit_shutdown` and rejects
-later invocations. A healthy generation also begins graceful retirement when
-its sampled Linux direct-child RSS, age, or lifetime-unique imported
-source-package count reaches the configured threshold.
+number. A request retains the exact generation that accepted it. The logical
+slot owns at most one current generation, one unpromoted candidate, and one
+old draining generation. A candidate accepts no action requests. A draining
+generation accepts no new requests and owns only requests assigned before
+promotion. Candidate and draining ownership are mutually exclusive, so one
+logical slot has at most two direct children during replacement.
 
-Healthy retirement first closes admission while holding the generation-state
-mutex, then starts detached drain completion. The watchdog continues health
-checks while active Rust requests drain, and unhealthy retirement can preempt a
-stuck proactive drain. The current child remains the only child until it has
-been reaped; a waiting request cannot start a replacement while the old child
-is still resident. The RSS threshold is a sampled graceful-retirement trigger
-and planning allowance, not a hard maximum. The child can grow between samples
-and while active requests drain, and the direct-child sample excludes
-descendants.
+Request timeout, response-stream timeout, response protocol failure, request
+transport failure, a response with `exitingProcess=true`, or watchdog failure
+immediately retires the selected unhealthy generation. Backend shutdown retires
+every current, candidate, and draining generation with `explicit_shutdown` and
+rejects later invocations. Cold replacement remains lazy after an unhealthy
+generation is reaped.
 
-Retirement uses `Arc::ptr_eq` while holding the generation slot. A late timeout
-or connection error from an old request cannot remove a replacement. Several
-concurrent failures can request retirement, but only the first request whose
-generation is still current changes the slot and increments the retirement
-counter.
+A healthy generation instead requests hot replacement when its sampled Linux
+direct-child RSS, age, or lifetime-unique imported source-package count reaches
+the configured threshold. A source or effective-environment fingerprint change
+uses the same mechanism when routed pools are present. If the retained package
+authority is already expired at a healthy trigger, no signer is available at
+that boundary: the generation drains without a candidate and the next request
+cold-starts with fresh authority. Otherwise, the current generation continues
+admitting requests that match it while the candidate starts. The RSS threshold
+is a sampled replacement trigger and planning allowance, not a hard maximum.
+The child can grow between samples and while old requests drain, and the
+direct-child sample excludes descendants.
 
-Retirement starts child termination immediately. Request-held references can
-remain alive while old calls unwind, but they do not keep a blocked child
-consuming a CPU core until the ten-minute request timeout. The next invocation
-creates a replacement with a new process, socket, tempdir, module cache, timers,
-listeners, and package state. Replacement remains lazy so an idle deployment
-does not keep creating Node processes. Every spawned executor-server child
-immediately enters a managed owner. If startup is canceled before publication,
-that owner starts termination and transfers the wait to the runtime instead of
-relying only on Tokio's best-effort orphan reaper. Retirement likewise transfers
-termination to a spawned child owner before awaiting it, so canceling the request
-that detected the failure does not cancel termination or reaping. While the
-runtime remains available, child cleanup waits for the exit status, including
-when an operator or the child itself wins the exit race. The replacement-duration
-histogram measures successful process startup after the next invocation; it does
-not include the intentional idle interval before that invocation.
+Every candidate has a new process, socket, temporary directory, client, module
+cache, timers, listeners, package state, and managed child owner. Startup first
+passes the bounded health protocol. It then calls the local preparation
+endpoint with the required source and external package identities. Preparation
+uses the same atomic package download, validation, and publication boundaries
+as execution, but carries no function path or arguments and neither imports nor
+invokes an application module. With the pinned-pool runtime, application
+generations use resident preparation and retain one package owner until the
+child exits; the standalone resilience primitive retains its ordinary warm
+preparation mode. A routine RSS, package-count, or age replacement
+uses the current generation's freshest admitted `Execute` preparation
+descriptor. The pinned-pool runtime routes `Analyze` and `BuildDeps` through a
+separate internal system child, so those requests cannot replace application
+authority. A fingerprint replacement prepares the incoming package.
+
+Retained preparation descriptors carry the signed URL expiration supplied by
+the signing boundary. Routine replacement does not start from an expired
+descriptor and rechecks expiration before candidate child startup and package
+preparation. A generation that has never admitted an `Execute` request can
+rotate after startup health alone. An expired retained descriptor is not
+treated as absence and does not downgrade readiness to health only. Ordinary
+execution URLs are valid for 120 seconds at the application signing boundary,
+leaving one minute beyond bounded cold startup for package acquisition.
+Deployment cutover URL validity derives from the
+configured Node action timeout and the bounded number of sequential pool
+stages. An expired descriptor or missing URL authority cannot establish
+candidate readiness.
+
+After preparation, candidate promotion rechecks the expected current
+generation, transition target, and shutdown state under the generation-state
+mutex. One mutex transition publishes the candidate as current and closes old
+admission. A request can therefore select the old current before promotion or
+the replacement after promotion, but it cannot enter an admission gap or join
+the old generation afterward. The old generation then drains its existing Rust
+requests under the watchdog. It is terminated and reaped when the active count
+reaches zero or when an existing absolute request deadline requires unhealthy
+retirement. There is no additional longer drain deadline.
+
+The surge allowance moves from the candidate owner to the old draining owner at
+promotion and is released only after direct-child reaping is confirmed. A
+candidate startup, health, preparation, or stale-target failure terminates and
+reaps only the candidate. The current generation remains available, and a
+later controller decision can retry routine replacement. The pinned-pool patch
+coordinates the one surge allowance across logical slots. The backend-memory
+patch cancels candidates and immediately terminates draining old generations
+under sustained cgroup pressure.
+
+When the pinned-pool patch is present, its internal system slot reuses this
+direct-child termination and reaping owner. A registered runtime-owned operation
+retains admission through terminal local processing when its caller disappears.
+Normal completion also waits for any unpublished cold-child cleanup owner and
+joins or retries an exact generation already in retirement before releasing
+router admission. A bounded ordinary HTTP error body that reaches EOF is itself
+a terminal request observation and does not require retiring an otherwise
+healthy current generation.
+If the operation task itself is canceled, the router identity-fences retirement
+and reaping of the exact system generation and releases admission only after
+that cleanup is confirmed; unconfirmed cleanup keeps the slot fenced. An
+unwinding task panic follows the same path in builds that permit unwinding, but
+the production release profile aborts the backend before task cleanup can run.
+Shutdown closes new admission, signals the tracked operation, and terminates the
+managed system child without treating either signal as terminal observation.
+Ordinary dependency build completion and timeout wait for npm supervisor closure
+and cleanup; abrupt Node death still provides only best-effort process-group
+signaling, not confirmation that every detached descendant exited.
+
+Retirement and promotion use `Arc::ptr_eq` while holding the generation slot.
+A late timeout, connection error, watchdog observation, candidate completion,
+or drain completion from an old generation cannot remove or close a
+replacement. Several concurrent failures can request retirement, but only the
+first request whose exact generation is still current or draining changes its
+state and increments the retirement counter. Later callers for the same
+retiring generation join its terminal reaping result before releasing their
+request ownership.
+
+Unhealthy retirement starts child termination immediately. Request-held
+references can remain alive while old calls unwind, but they do not keep a
+blocked child consuming a CPU core until the ten-minute request timeout.
+Healthy replacement does not terminate the current child until its candidate
+is ready and promoted. This intentional overlap allows an old in-flight action
+and a new action to execute in different generations. Module-local state is
+therefore rebuildable process state, not durable authority.
+
+Every spawned executor-server child immediately enters a managed owner. If
+candidate startup is canceled before promotion, that owner starts termination
+and transfers the wait to the runtime instead of relying only on Tokio's
+best-effort orphan reaper. Retirement likewise transfers termination to a
+spawned child owner before awaiting it, so canceling the request or coordinator
+task that detected the transition does not cancel termination, reaping, or
+surge ownership. While the runtime remains available, child cleanup waits for
+the exit status, including when an operator or the child itself wins the exit
+race. An unpublished cold start transfers its single-flight startup guard to
+the same child owner. A later cold start cannot begin until detached cleanup
+confirms reaping; task loss or an unconfirmed wait keeps that capacity closed.
+
+If a runtime-owned preparation, promotion, drain, or termination task is
+canceled or unwinds in a build that permits unwinding, it publishes a failed
+transition and wakes generation and surge waiters. In the production release
+profile, a panic aborts the backend before this task-level recovery can run.
 Unexpected child-termination or wait errors contain only the process-local
-generation and bounded operating-system error kind and propagate through
-retirement instead of being hidden by the child owner. Request-driven retirement
-returns the error; detached watchdog and shutdown boundaries emit a fixed
-cleanup-failure log after the generation slot is already absent. Drop cleanup
-retries a failed kill before waiting and falls back to kill-on-drop instead of
-waiting indefinitely on a child whose termination never started. Cleanup
-removes the tempdir only after it confirms direct-child reaping; cancellation,
-runtime teardown, or a wait failure preserves the directory instead. A
-confirmed-reaped tempdir moves to a detached native cleanup thread so recursive
-removal does not occupy an asynchronous worker or keep Tokio runtime shutdown
-waiting for a blocking task. Failure to start that thread preserves the
-directory. A cleanup-thread start or filesystem removal failure emits only a
-fixed cleanup message and bounded operating-system error kind.
+generation and bounded operating-system error kind and propagate through the
+transition instead of being hidden by the child owner.
+An exceptional task loss does not publish that a candidate is absent while its
+identity-fenced transition remains present and may still own an unconfirmed
+child. Candidate state remains present until state removal or cleanup resolves
+that ownership; this preserves conservative capacity evidence instead of
+publishing a false zero.
+Request-driven retirement returns the error; detached watchdog and shutdown
+boundaries emit a fixed cleanup-failure log after admission is already closed.
+Drop cleanup retries a failed kill before waiting. A published child's final
+fallback is kill-on-drop when termination never started. An unpublished cold
+child instead retains its exact child, files, and startup owner while the
+runtime remains available, because unconfirmed cleanup cannot open replacement
+capacity.
+
+Cleanup removes the temporary directory only after it confirms direct-child
+reaping; cancellation, runtime teardown, or a wait failure preserves the
+directory instead. A confirmed-reaped temporary directory moves to a detached
+native cleanup thread so recursive removal does not occupy an asynchronous
+worker or keep Tokio runtime shutdown waiting for a blocking task. Failure to
+start that thread preserves the directory. A cleanup-thread start or filesystem
+removal failure emits only a fixed cleanup message and bounded
+operating-system error kind.
 
 Before supervisor termination, the child owner performs a nonblocking state
 probe. It records whether the child was still running, had already exited, or
@@ -169,31 +314,31 @@ could not be inspected, then records whether the supervisor successfully
 requested the terminating signal and the final reaped exit class. This
 distinguishes a spontaneous child exit from a transport failure followed by
 supervisor-initiated termination. The observation and its metric are emitted
-inside the detached child owner, so cancellation of the request that initiated
+inside the detached child owner, so cancellation of the task that initiated
 retirement cannot remove the completed-termination evidence.
 
-Generation selection, retirement state, and replacement-pending state share one
-mutex. Retirement publishes the absent-generation gauges before releasing that
-mutex, and replacement publishes the new-generation gauges before releasing it.
-A replacement therefore cannot be followed by stale zeroes from the old
-retirement. The active-request gauge is aggregate across current and draining
-generations because old request guards can outlive replacement. It counts Rust
-requests assigned to a generation, not Node HTTP handlers that may continue
-after their Rust future is canceled. Potentially slow child startup uses a
-separate single-flight lock, so late failures from the retired generation can
-inspect the generation slot without waiting for replacement health checks to
-finish. The Node version probe is also kill-on-drop, has a five-second deadline,
-retains at most 1 KiB of standard output, terminates on the first excess chunk,
-and discards standard error. A hung or noisy probe therefore cannot retain the
-single-flight startup lock indefinitely or grow an unbounded output buffer. A
-failed probe exit is rejected even if it wrote a supported-looking version
-string.
+Generation selection, candidate state, draining state, and promotion share one
+mutex. State gauges change under the same identity-fenced transition, so a late
+old-generation cleanup cannot publish stale zeroes for the replacement. The
+active-request gauge is aggregate across current and draining generations. It
+counts Rust requests assigned to a generation, not Node HTTP handlers that may
+continue after their Rust future is canceled. Candidate startup and package
+preparation use a separate single-flight transition owner, so old-generation
+failures can inspect and preempt their generation without waiting for readiness
+work to finish.
 
-`NodeExecutor::shutdown` is a synchronous trait operation. The local
-implementation rejects later invocations immediately and schedules the
-identity-fenced slot transition, child termination, and reaping on the runtime;
-the trait call does not wait for that work to finish. Managed child drop and
-process exit remain the fallbacks if runtime shutdown cancels the task.
+The Node version probe is kill-on-drop, has a five-second deadline, retains at
+most 1 KiB of standard output, terminates on the first excess chunk, and
+discards standard error. A hung or noisy probe therefore cannot retain startup
+ownership indefinitely or grow an unbounded output buffer. A failed probe exit
+is rejected even if it wrote a supported-looking version string.
+
+`NodeExecutor::shutdown` remains a synchronous trait operation. The local
+implementation rejects later invocations immediately and schedules
+identity-fenced candidate cancellation, admission closure, child termination,
+and reaping on the runtime; the trait call does not wait for that work to
+finish. Managed child drop and process exit remain the fallbacks if runtime
+shutdown cancels the task.
 
 ## Event-loop watchdog
 
@@ -224,20 +369,26 @@ The startup health check remains separate. Startup performs up to 50 checks at
 100 ms intervals and uses the same one-second per-check timeout before
 publishing a generation.
 
-After every watchdog observation, proactive trigger precedence in the base patch is direct-child
-RSS, lifetime imported source-package count, then generation age. When the
-[`backend_memory_resilience`](../backend_memory_resilience/README.md) patch is also carried,
-sustained cgroup pressure with a material direct-child RSS sample follows the ordinary RSS check
-and precedes the package and age checks. The watchdog observes pressure transitions independently
-of health and RSS sampling. Clearing pressure resets the continuous-pressure grace, and re-entry
-starts a new grace interval. These checks remain active while the health endpoint is failing.
-Reaching a proactive
-threshold closes admission and starts detached drain completion without
-stopping the watchdog loop. On the terminal watchdog miss, unhealthy retirement
-runs before any new proactive drain and can preempt an existing drain that is
-waiting on a stuck request. A failed Linux RSS read records `failure` and skips
-only the RSS trigger for that iteration. Non-Linux builds record `unsupported`
-and do not enforce an RSS trigger. A successful sample records `success`.
+After every watchdog observation, proactive trigger precedence in the base
+patch is direct-child RSS, lifetime imported source-package count, then
+generation age. These healthy triggers normally request hot replacement. If a
+retained preparation descriptor is expired, the generation instead drains
+without a candidate because no signer is available at that boundary; the next
+request cold-starts with fresh authority. When the
+[`backend_memory_resilience`](../backend_memory_resilience/README.md) patch is
+also carried, an active cgroup-pressure signal suppresses all three healthy
+triggers. After the configured continuous-pressure grace and RSS floor, a
+qualifying current generation instead closes admission and retires without a
+candidate. Pressure also cancels an unpromoted candidate and terminates an old
+generation already draining after promotion. Clearing pressure resets the
+grace, and ordinary healthy replacement decisions resume; re-entry starts a
+new grace interval. The watchdog observes pressure transitions independently
+of health and RSS sampling, and these checks remain active while the health
+endpoint is failing. On the terminal watchdog miss, unhealthy retirement runs
+before any new proactive transition and can preempt a drain waiting on a stuck
+request. A failed Linux RSS read records `failure` and skips only the RSS-based
+decision for that iteration. Non-Linux builds record `unsupported` and do not
+enforce an RSS trigger. A successful sample records `success`.
 
 ## First-miss diagnostics
 
@@ -278,6 +429,14 @@ boundary against action code running in the same process and effective UID.
 
 The patch exports bounded backend metrics:
 
+Every family in this section has a required `pool_name` label. It is `default`
+for the standalone executor without the pinned-pool composition. In the
+composed runtime, the reserved, bounded `_system` value identifies the internal
+system child's lifecycle, health, request, and package metrics. Application
+pool values still come only from validated committed declarations; the internal
+metric value does not change application pool-name validation. The compact list
+below omits that common label.
+
 - `local_node_executor_generation_present_info`;
 - `local_node_executor_generation_starts_total`;
 - `local_node_executor_child_starts_total`;
@@ -288,13 +447,18 @@ The patch exports bounded backend metrics:
 - `local_node_executor_child_terminations_total{reason,state_before,supervisor_kill_requested,exit_class}`;
 - `local_node_executor_replacement_outcomes_total{outcome}`;
 - `local_node_executor_replacement_seconds`;
+- `local_node_executor_candidate_present_info`;
+- `local_node_executor_candidate_preparation_seconds{outcome}`;
 - `local_node_executor_generation_age_seconds`;
 - `local_node_executor_health_check_seconds{phase,outcome}`;
 - `local_node_executor_consecutive_health_misses`;
 - `local_node_executor_waiting_requests`;
 - `local_node_executor_request_starts_total`;
 - `local_node_executor_request_completions_total{outcome}`;
+- `local_node_request_seconds{request_kind,outcome}`;
 - `local_node_executor_active_requests`;
+- `local_node_executor_resident_source_package_owners_info` when the child
+  supplies resident-owner telemetry;
 - `local_node_executor_old_space_limit_bytes`;
 - `local_node_executor_rss_retirement_threshold_bytes`;
 - `local_node_executor_memory_pressure_rss_threshold_bytes`;
@@ -307,18 +471,33 @@ The patch exports bounded backend metrics:
 - `local_node_executor_child_rss_samples_total{outcome}`;
 - `local_node_executor_generation_draining_info`;
 - `local_node_executor_retirement_decisions_total{reason,decision}`;
-- `local_node_executor_imported_source_packages_info`.
+- `local_node_executor_imported_source_packages_info`;
+- `local_node_prepare_seconds{purpose,outcome}` and
+  `local_node_resident_readiness_total{result}`;
+- `local_node_package_acquire_seconds{request_kind,cache_result,outcome}`;
+- `local_node_package_validation_seconds{package_kind,phase,outcome}`;
+- `local_node_package_cleanup_seconds{package_kind,outcome}`;
+- `local_node_package_stage_observations_dropped_total`.
 
-The base retirement reason is one of `request_timeout`, `response_stream_timeout`,
-`connection_error`, `process_exiting`, `health_check_failed`, `rss_limit`, `package_limit`,
-`age_limit`, or `explicit_shutdown`. Backend memory resilience additionally adds
-`cgroup_pressure`. Child exit
-class is one of `success`, `failure`, or `signal`. RSS sampling outcome is one
-of `success`, `failure`, or `unsupported`. A proactive retirement decision is
+The pinned-pool composition additionally emits
+`local_node_system_result_delivery_total{request_kind,outcome}` exactly once
+for each dispatched `analyze` or `build_deps` operation. Its fixed outcomes are
+`delivered`, `caller_abandoned`, and `operation_task_lost`; it carries no
+request, result, error, package, or source data.
+
+The base retirement reason is one of `request_timeout`,
+`response_stream_timeout`, `response_stream_error`, `connection_error`,
+`process_exiting`, `health_check_failed`, `rss_limit`, `package_limit`,
+`age_limit`, or `explicit_shutdown`. Backend memory resilience additionally
+adds `cgroup_pressure`. Child exit class is one of `success`, `failure`, or
+`signal`. RSS sampling outcome is one of `success`, `failure`, or
+`unsupported`. A proactive retirement decision is
 `not_current`, `already_draining`, or `drain_started`. Request outcome is one of
 `success`, `user_error`, `invalid_response`, `request_timeout`,
 `response_stream_timeout`, `connection_error`, `transport_error`,
-`response_stream_error`, `http_error`, `args_too_large`, or `internal_error`.
+`response_stream_error`, `http_error`, `args_too_large`,
+`preparation_failed_before_start`, `generation_lost_before_start`,
+`canceled_before_start`, `canceled_after_dispatch`, or `internal_error`.
 Neither label contains function names, module paths, package keys, request IDs,
 raw errors, or deployment-specific values. Labelled counters are absent until
 the corresponding outcome occurs and can be evicted after inactivity. Operator
@@ -331,7 +510,9 @@ emitted`, not zero.
 The first-miss family uses the fixed operations `diagnostic_directory`,
 `retention`, `diagnostic_report`, `proc_snapshot`, and `cpu_profile` with
 closed outcome sets. Every approved series is initialized to zero from the same
-typed outcome list used for emission, and the family does not expire.
+typed outcome list used for emission when a logical executor is constructed.
+Like other labelled counters, these series use the standard metrics inactivity
+eviction and can disappear after their label set stops receiving updates.
 
 `connection_error` is the bounded generation-retirement reason for local
 request submission and response-body transport failures. Request outcomes keep
@@ -346,16 +527,40 @@ Retirement diagnostics identify request kind as `execute`, `analyze`, or
 `body`, `request`, `other`, or `not_applicable`. Child state is `running`,
 `already_exited`, or `probe_failed`; the supervisor-kill label is boolean and
 final exit class retains the existing `success`, `failure`, or `signal`
-contract. Replacement outcome is `ready`, `startup_failed`, or
-`aborted_shutdown`. None of these metrics use generation as a label.
+contract. Replacement outcome is `promoted`, `startup_failed`, `health_failed`,
+`preparation_failed`, `stale`, `pressure_canceled`, `shutdown_canceled`,
+`task_failed`, `ready`, or `aborted_shutdown`. `promoted` is a successful hot
+promotion; `ready` is a successful lazy cold replacement after the prior
+generation was reaped. `task_failed` is exceptional loss of runtime transition
+ownership, and `aborted_shutdown` discards a cold replacement during shutdown.
+Candidate preparation outcome is `ready`, `failed`, `timed_out`, or `canceled`.
+None of these metrics use generation as a label.
+
+The pinned-pool patch adds `fingerprint_change` with request kind `execute` and
+`topology_change` with request kind `not_applicable`. Their phases are
+`generation_selection` and `topology_reconciliation`; their transport category
+is `not_applicable`. It also adds `system_operation_task_lost` with request kind
+`analyze` or `build_deps`, phase `operation_task`, and transport category
+`not_applicable`, plus the bounded pool-membership and fingerprint-transition
+families described in that patch's essay.
 
 Interpret `local_node_executor_child_rss_bytes` only while
 `local_node_executor_child_rss_telemetry_info` is one. A failed or unsupported
 sample changes freshness to zero but retains the last byte value. Configuration
 gauges are process configuration. Current generation age, RSS freshness,
-draining state, imported package count, and package/cache state reset when the
-generation is removed or replaced. Counters are process-local and require
-reset-aware deltas.
+candidate presence, draining state, imported package count, and package/cache
+state change only at their identity-fenced ownership transitions. Runtime
+gauges with validated `pool_name` labels use inactivity eviction after a pool
+stops updating. Counters are process-local and require reset-aware deltas.
+Hot promotion removes the old generation's package/cache gauge values until the
+candidate's first validated health snapshot. Candidate preparation may already
+have retained packages, so promotion does not report an unmeasured zero.
+Cold publication likewise leaves these gauges absent until the new generation's
+first exported watchdog snapshot; the startup health response negotiates the
+protocol but is not itself exported. Immediate retirement also removes these
+generation-local values: the child may retain packages until direct-child
+reaping completes, so removal must not be represented as a measured empty
+cache.
 
 The waiting gauge covers requests waiting for generation selection or child
 startup. The active gauge covers assigned requests across the current and
@@ -363,6 +568,25 @@ draining generations; the assignment handoff can make one request appear in both
 gauges for a brief interval. Executor-server child starts include failed startup
 processes, while a generation start is recorded only after startup health
 succeeds and the generation is published.
+
+`local_node_request_seconds` starts immediately before the local HTTP dispatch.
+It excludes generation acquisition, resident preparation, and a durable start
+wait. It ends after terminal local response processing and includes any
+exact-generation direct-child retirement that the request path synchronously
+initiates or joins while it remains attached. Dropping the local invocation
+future after dispatch records
+`canceled_after_dispatch` at guard release; any detached retirement owner
+continues independently, so that sample does not claim to include its later
+cleanup. A composed runtime-owned system invocation is not dropped when its
+original caller disappears, so its timer and active system ownership continue
+to the actual terminal boundary. Caller abandonment is recorded only when the
+runtime later attempts terminal result delivery; that observation does not stop
+the timer, release admission, or retire the child. The timer never includes
+detached temporary-directory removal.
+The request start/completion counters and active gauge begin at generation
+assignment. Dropping that ownership before dispatch records
+`canceled_before_start`; because the service interval never began, it does not
+create a `local_node_request_seconds` sample.
 
 When the atomic source-package patch is also present, the Node health response
 supplies aggregate package and stack state. The watchdog exports the aggregate
@@ -373,7 +597,9 @@ gauges and converts process-local event totals into backend counter deltas:
 - `local_node_executor_retained_external_packages_info` and
   `local_node_executor_retained_external_package_bytes`;
 - `local_node_executor_active_source_package_owners_info` and
-  `local_node_executor_registered_stack_roots_info`;
+  `local_node_executor_registered_stack_roots_info`, plus
+  `local_node_executor_resident_source_package_owners_info` when the child
+  supplies resident-owner telemetry;
 - `local_node_executor_imported_source_packages_info`, a monotonic
   generation-lifetime count of source-package roots submitted to Node's dynamic
   importer;
@@ -386,23 +612,45 @@ gauges and converts process-local event totals into backend counter deltas:
   including measured zero-work intervals, and its sum is aggregate stack-format
   seconds.
 
+The child also retains the latest 256 exact package-stage observations with a
+monotonic sequence. Rust exports unseen acquisition, staged/prebuilt validation,
+and retirement-cleanup durations and reports observations overwritten before a
+successful health snapshot. A new child starts a new sequence; Rust never
+subtracts one generation's counters from another. A child retired, replaced,
+or discarded before its next successful health response can lose inner-stage
+observations, while the Rust request and preparation timers still report their
+outer failure.
+
+The legacy `node_executor_download_seconds` family measures complete package
+acquisition through lease ownership, including cache lookup, materialization
+waits, and cache-bound cleanup. It is retained for dashboard compatibility and
+must not be interpreted as network-only download duration.
+
 Without the atomic source-package patch, the health response omits both
 aggregate objects and these package and stack metric families remain absent
 (`not emitted`); unsupported telemetry is not reported as measured zero.
+The earlier complete package aggregate does not contain a resident-owner field.
+Rust accepts that aggregate but leaves the resident-owner gauge absent. A
+present field is exported, while an explicit null or malformed value rejects
+the health observation rather than manufacturing a zero. Presence is negotiated
+at child startup and must remain stable for that generation; a later omission
+fails the health observation instead of silently disabling the gauge.
 
-Generation start and retirement logs contain only the process-local generation
-number, replacement flag and startup duration, bounded retirement reason,
-generation age, active request count, and a boolean indicating whether the
-companion runtime aggregates are supported. Retirement also includes the last
-successfully observed aggregate source-package, external-package, and
-registered-stack-root counts. They do not include the child command, request,
-function, package key, URL, environment, or raw error object.
+Generation start, candidate readiness, promotion, and retirement logs contain
+only the process-local generation number, bounded transition or retirement
+reason, startup or preparation duration, generation age, active request count,
+and a boolean indicating whether the companion runtime aggregates are
+supported. Retirement also includes the last successfully observed aggregate
+source-package, external-package, and registered-stack-root counts. They do not
+include the child command, request, function, package key, URL, environment, or
+raw error object.
 
 Retirement logs also include bounded request kind, phase, transport category,
 and whether a replacement is expected. Completed child-termination logs include
 generation, retirement reason, child state before termination, whether the
-supervisor requested the terminating signal, and final exit class. Replacement
-start, failure, and shutdown-abort logs include the process-local generation it
+supervisor requested the terminating signal, and final exit class. Candidate
+start, preparation, promotion, stale-cancellation, pressure-cancellation,
+failure, and shutdown-cancellation logs include the process-local generation it
 was intended to replace. Raw transport errors, requests, child standard output,
 and child standard error remain excluded.
 
@@ -420,20 +668,27 @@ Focused Rust tests cover:
   output is full;
 - retaining an unpublished generation's private temporary directory until
   detached child cleanup confirms direct-child reaping after startup
-  cancellation, and preserving it when reaping is unconfirmed;
+  cancellation, retaining cold-start capacity through successful cleanup, and
+  preserving the directory when reaping is unconfirmed;
 - reaping a child after an operator wins the termination race;
 - preserving a replacement when an old generation reports a late timeout;
 - collapsing concurrent retirement requests into one slot transition;
+- making duplicate retirement callers join the exact in-progress reaping
+  owner before their request ownership ends;
 - continuing child termination and reaping after the retiring caller is
   canceled;
+- preserving a confirmed direct-child reap when retirement state publication
+  is retried after task loss;
 - classifying transport failures into closed, sanitized categories;
 - distinguishing supervisor termination of a running child from reaping a
   child that had already exited;
 - resetting the watchdog miss count after a valid health response and retiring
   only after the later consecutive-failure threshold;
 - distinguishing an upstream health response with no companion aggregates from
-  a malformed partial or explicit-null aggregate response, and rejecting an
-  invalid cumulative duration at startup;
+  a malformed partial or explicit-null aggregate response, accepting an
+  earlier complete aggregate without resident-owner telemetry while rejecting
+  an explicit-null resident value, and rejecting an invalid cumulative
+  duration at startup;
 - preserving a typed request timeout before response headers and retiring that
   generation;
 - retiring a generation when the local server closes during request submission
@@ -442,21 +697,48 @@ Focused Rust tests cover:
   sending headers;
 - preserving a typed response-stream timeout after headers and retiring that
   generation;
+- retaining request ownership across non-success response bodies, including
+  immediate child retirement for a defensive system-operation overlap response;
+- continuing terminal stream observation after a caller drops its log receiver;
+- rejecting stream exhaustion after a result when no terminal completion marker
+  was observed;
+- keeping a real routed system invocation and later admission owned after its
+  original result receiver is dropped, until the controlled child response
+  reaches terminal processing;
+- retaining system admission through abnormal dispatched-task loss until the
+  exact direct-child generation is reaped, and tracking unfinished dispatch
+  through synchronous shutdown;
+- retaining system admission when normal completion observes an unresolved
+  exact retirement, while releasing it after a terminal ordinary HTTP error
+  without retiring the healthy current generation;
+- retiring and reaping a generation when malformed response data fails before
+  stream completion;
+- retiring and reaping the selected generation when terminal payload validation
+  rejects its `type` or a non-Boolean `exitingProcess` field;
 - rejecting duplicate results and excess decoded response parts without
   retaining them until the stream ends;
 - rejecting negative timing values and inconsistent syscall counts in executor
   responses instead of coercing them into valid metrics;
+- rejecting package-stage snapshots that claim overwritten observations while
+  omitting part of the retained bounded suffix;
 - shutdown retirement and child reaping;
 - inclusive and ordered RSS/package/age retirement decisions, with cgroup-pressure ordering in the
   backend memory-resilience composition;
 - continuous cgroup-pressure grace resetting after pressure clears and re-enters;
 - strict old-space/RSS configuration validation and Linux RSS parsing;
-- graceful admission closure and drain before proactive retirement;
-- unhealthy watchdog retirement preempting a proactive drain blocked by a
-  stuck request;
-- continuing drain and child ownership after the initiating caller is
-  canceled;
-- fencing replacement startup until the retiring direct child is reaped;
+- current-generation admission continuing through candidate startup, health,
+  and package preparation;
+- source and external package preparation without importing or invoking an
+  application module;
+- candidate startup, health, preparation, and stale-target failures preserving
+  the current generation;
+- atomic candidate promotion and old admission closure, with only
+  pre-promotion requests remaining on the draining generation;
+- unhealthy watchdog retirement preempting candidate or draining work blocked
+  by a stuck request;
+- continuing candidate, drain, surge, and child ownership after the initiating
+  caller is canceled;
+- releasing surge capacity only after the extra direct child is reaped;
 - lifetime imported-package counting that begins only at an actual dynamic
   import attempt and survives disk-cache retirement;
 - bounded active-request evidence and one first-miss claim per enabled
@@ -472,8 +754,9 @@ umask.
 
 The package patch owns the Node-side health aggregate, package-lifetime, and
 stack-root tests. The production rollout verifies watchdog health responses,
-generated metrics, child replacement, and successful Node completions with
-ordinary workload rather than a provider fixture.
+generated metrics, candidate package preparation, atomic promotion, old-child
+drain, and successful Node completions with ordinary workload rather than a
+provider fixture.
 
 Run the focused checks:
 
@@ -481,7 +764,8 @@ Run the focused checks:
 cd npm-packages
 mise exec node -- node check-versions.mjs
 cd node-executor
-npm run test -- src/diagnostic_report.test.ts src/main_thread_profiler.test.ts
+npm run test -- src/build_deps.test.ts src/diagnostic_report.test.ts \
+  src/main_thread_profiler.test.ts
 npm run build
 
 cd ../..
@@ -491,6 +775,28 @@ scripts/run_cargo.sh test -p node_executor
 scripts/run_cargo.sh check -p node_executor --all-targets
 scripts/run_cargo.sh clippy -p node_executor --all-targets -- -D warnings
 ```
+
+## Considered alternatives
+
+Retiring every generation before starting its replacement was retained for
+unhealthy processes, actual cgroup pressure, and shutdown but rejected for
+healthy maintenance. It turns age, package-count, ordinary RSS, and fingerprint
+changes into avoidable admission outages.
+
+Startup health alone was rejected as candidate readiness. It proves that the
+event loop responds but does not exercise source or external package
+publication against an empty cache. Invoking an application action or importing
+an entry module for warmup was also rejected because top-level and action code
+can have durable or external effects. The preparation endpoint materializes
+packages without evaluating application code.
+
+Reserving only an estimate of fresh-process RSS was rejected. Package
+preparation and concurrent work can grow the candidate before the old process
+exits. The capacity composition reserves one complete configured generation
+allowance for the surge process.
+
+The transient overlap is not a general process pool. It does not shard ordinary
+traffic or change the steady-state one-process-per-logical-slot contract.
 
 ## Adoption and rollback
 
@@ -513,7 +819,7 @@ On Unix, first-miss diagnostics are automatic. The optional
 `LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR` selects an absolute persistent artifact
 directory. Without it, the executor uses a private temporary path.
 
-Healthy proactive retirement uses these startup knobs:
+Healthy proactive replacement uses these startup knobs:
 
 - `LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB`;
 - `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`;
@@ -530,13 +836,18 @@ below the ordinary RSS retirement threshold. The memory-resilience composition a
 pressure RSS threshold to remain strictly below that ordinary threshold. It passes old space to
 Node with `--max-old-space-size` before the script path. V8 old space excludes
 Buffers, native modules, executable code, allocator retention, and descendant
-processes. No process pool is required.
+processes. No persistent process pool is required. Without a later per-pool
+RSS override, a constrained host must reserve one full
+`LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES` surge allowance in the base configuration.
+The backend-memory and pinned-pool composition uses the largest effective
+default or named-pool allowance when a pool RSS override is configured.
 
 Before production rollout, exercise a blocked main thread in a disposable
 self-hosted environment. Verify one first-miss attempt, continued watchdog
 checks through five misses, direct-child termination and reaping, a healthy
-replacement, private file modes, valid JSON/profile output, and report
-redaction.
+candidate preparing packages before promotion while the old generation still
+serves, old-generation drain, private file modes, valid JSON/profile output,
+and report redaction.
 
 Rollback restores the previous backend and dashboard images and the backend's
 complete tracked capacity environment. Existing artifacts on a persistent
@@ -545,15 +856,16 @@ backend already contains timeout and unhealthy generation retirement, rollback
 removes only the newer healthy RSS/package/age controls, first-miss evidence, and their telemetry;
 it does not rewrite earlier lifecycle history. Rolling back the separate backend memory-resilience
 patch removes its cgroup-pressure input without changing the base Node retirement mechanisms. Timeout
-recycling, unhealthy-watchdog retirement, and healthy proactive retirement
+recycling, unhealthy-watchdog retirement, and healthy proactive replacement
 share the same generation guard and child-termination contract, so carrying an
 unreviewed partial image is not supported.
 
-The patch does not remove the one-process throughput ceiling or isolate
-synchronous Node work across processes. A process pool remains a separate
-measured design after generation recovery and package lifetime are stable. The
-Rust termination boundary owns the direct Node executor child and retains its
-temporary directory through confirmed direct-child reaping. If cleanup is
+The patch does not remove the steady-state one-process throughput ceiling or
+isolate synchronous Node work across persistent processes. Candidate and
+draining overlap exists only for replacement. A throughput process pool remains
+a separate measured design after generation recovery and package lifetime are
+stable. The Rust termination boundary owns each direct Node executor child and
+retains its temporary directory through confirmed direct-child reaping. If cleanup is
 canceled or runtime teardown prevents Rust from confirming that reap, Rust
 preserves the directory instead of removing files from under a possibly live
 direct child. Rust does not create a process group or cgroup for descendants
