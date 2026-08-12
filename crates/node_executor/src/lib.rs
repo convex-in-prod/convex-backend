@@ -6,10 +6,12 @@
 #![feature(slice_split_once)]
 #![feature(coroutines)]
 
+pub mod action_tree;
 mod executor;
 pub mod local;
 mod metrics;
 pub mod noop;
+pub mod routed;
 pub mod source_package;
 
 pub use crate::executor::{
@@ -24,8 +26,13 @@ pub use crate::executor::{
     InvokeResponse,
     NodeActionOutcome,
     NodeActions,
+    NodeAnalyzeAttemptOutcome,
     NodeExecutor,
+    NodeExecutorCutoverReservation,
+    NodeExecutorCutoverTarget,
     NodeExecutorStreamPart,
+    NodeSystemOperationKind,
+    NodeSystemOperationReservation,
     Package,
     ResponsePart,
     SourcePackage,

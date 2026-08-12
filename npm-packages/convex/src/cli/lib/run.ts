@@ -530,6 +530,7 @@ export async function pushToDeployment(
       deploymentName: args.deploymentName,
       verbose: false,
       dryRun: false,
+      forceNodeCutover: false,
       typecheck: args.typecheck,
       typecheckComponents: args.typecheckComponents,
       debug: false,

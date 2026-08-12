@@ -46,6 +46,7 @@ export const startPushResponse = looseObject({
   app: checkedComponent,
 
   schemaChange,
+  nodeExecutorCutoverProtocolVersion: z.number().optional(),
 });
 export type StartPushResponse = z.infer<typeof startPushResponse>;
 

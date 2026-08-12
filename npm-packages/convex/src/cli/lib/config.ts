@@ -666,6 +666,7 @@ export async function configFromProjectConfig(
     ctx,
     dir: baseDir,
     entryPoints: entryPoints.node,
+    nodePoolsByEntryPoint: entryPoints.nodePools,
     generateSourceMaps: true,
     platform: "node",
     chunksFolder: path.join("_deps", "node"),
