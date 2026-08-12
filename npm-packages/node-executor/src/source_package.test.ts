@@ -8,7 +8,16 @@ import { pathToFileURL } from "node:url";
 import AdmZip from "adm-zip";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
-import { prepareSourcePackage } from "./prepare";
+import {
+  prepareSourcePackage,
+  resetResidentSourcePackageForTests,
+} from "./prepare";
+import {
+  ExecutorEnvironment,
+  SystemOperationState,
+  analyze,
+  validateExecutorRole,
+} from "./executor";
 import {
   acquireSourcePackage,
   availableExternalPackages,
@@ -31,6 +40,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.useRealTimers();
+  await resetResidentSourcePackageForTests();
   resetPackageCachesForTests();
   vi.restoreAllMocks();
   if (tmpdir !== undefined) {
@@ -61,7 +71,7 @@ test("preparation publishes source and external packages without evaluating modu
       sha256(externalZip),
     );
 
-    await prepareSourcePackage({ sourcePackage });
+    await prepareSourcePackage({ sourcePackage, mode: "warm" });
 
     expect(availableSourcePackages.has("source-package-key")).toBe(true);
     expect(availableExternalPackages.has("external-package-key")).toBe(true);
@@ -95,6 +105,7 @@ test("preparation rejects extra request and package fields before downloading", 
     await expect(
       prepareSourcePackage({
         sourcePackage,
+        mode: "warm",
         udfPath: "actions/example.js",
       }),
     ).rejects.toThrow();
@@ -107,6 +118,7 @@ test("preparation rejects extra request and package fields before downloading", 
             arguments: [],
           },
         },
+        mode: "warm",
       }),
     ).rejects.toThrow();
 
@@ -160,6 +172,560 @@ test("concurrent package requests share one atomic source and external download"
     );
     expect(server.requestCounts.get("/source.zip")).toBe(1);
     expect(server.requestCounts.get("/external.zip")).toBe(1);
+  } finally {
+    await server.close();
+  }
+});
+
+test.each([1, 32])(
+  "warm source lease acquisition performs no completeness stats for %i modules",
+  async (moduleCount) => {
+    const sourceZip = makeSourceOnlyPackageZip(moduleCount);
+    const server = await startPackageServer({ "/source.zip": sourceZip });
+    try {
+      const sourcePackage = makeSourceOnlyPackage(
+        `${server.baseUrl}/source.zip`,
+        sha256(sourceZip),
+      );
+      const initialLease = await acquireSourcePackage(sourcePackage);
+      await initialLease.release();
+      const validationCount =
+        getPackageCacheStats().packageStageObservations.filter(
+          (observation) => observation.stage === "validation",
+        ).length;
+      const stat = vi.spyOn(fs.promises, "stat");
+      stat.mockClear();
+
+      const lease = await acquireSourcePackage(sourcePackage);
+      try {
+        expect(stat).not.toHaveBeenCalled();
+        const stats = getPackageCacheStats();
+        expect(
+          stats.packageStageObservations.filter(
+            (observation) => observation.stage === "validation",
+          ),
+        ).toHaveLength(validationCount);
+        expect(
+          stats.packageStageObservations.filter(
+            (observation) => observation.stage === "acquire",
+          ),
+        ).toContainEqual(
+          expect.objectContaining({
+            cacheResult: "current_hit",
+            outcome: "success",
+          }),
+        );
+      } finally {
+        await lease.release();
+      }
+    } finally {
+      await server.close();
+    }
+  },
+);
+
+test("acquisition timing retains work across an ownership retry", async () => {
+  const sourceZip = makeSourcePackageZip(null);
+  const server = await startPackageServer({
+    "/source.zip": { body: sourceZip, delayMs: 100 },
+  });
+  const sourcePackage = makeSourceOnlyPackage(
+    `${server.baseUrl}/source.zip`,
+    sha256(sourceZip),
+  );
+  const realGet = availableSourcePackages.get.bind(availableSourcePackages);
+  let hidPublishedPackage = false;
+  const get = vi
+    .spyOn(availableSourcePackages, "get")
+    .mockImplementation((key) => {
+      const localPackage = realGet(key);
+      if (
+        key === sourcePackage.bundled_source.key &&
+        localPackage !== undefined &&
+        !hidPublishedPackage
+      ) {
+        // Force the post-materialization ownership check to retry once. The
+        // separate cache-pressure test exercises the real retirement race.
+        hidPublishedPackage = true;
+        return undefined;
+      }
+      return localPackage;
+    });
+
+  try {
+    const lease = await acquireSourcePackage(sourcePackage);
+    get.mockRestore();
+    try {
+      expect(hidPublishedPackage).toBe(true);
+      const firstSnapshot = getPackageCacheStats();
+      const acquisition = firstSnapshot.packageStageObservations.find(
+        (observation) => observation.stage === "acquire",
+      );
+      expect(acquisition).toMatchObject({
+        cacheResult: "new_materialization",
+        outcome: "success",
+      });
+      if (acquisition === undefined) {
+        throw new Error("Expected an acquisition observation");
+      }
+      const durationMs = acquisition.durationMs;
+      acquisition.durationMs = -1;
+      expect(
+        getPackageCacheStats().packageStageObservations.find(
+          (observation) => observation.sequence === acquisition.sequence,
+        )?.durationMs,
+      ).toBe(durationMs);
+    } finally {
+      await lease.release();
+    }
+  } finally {
+    get.mockRestore();
+    await server.close();
+  }
+});
+
+test("acquisition observations record failures once and remain bounded", async () => {
+  const sourceZip = makeSourcePackageZip(null);
+  const server = await startPackageServer({
+    "/failed-source.zip": { status: 500 },
+    "/source.zip": sourceZip,
+  });
+
+  try {
+    await expect(
+      acquireSourcePackage(
+        makeSourceOnlyPackage(
+          `${server.baseUrl}/failed-source.zip`,
+          sha256(sourceZip),
+          "failed-source-package",
+        ),
+        "request",
+        "analyze",
+      ),
+    ).rejects.toThrow("Failed to fetch package: HTTP 500");
+    expect(
+      getPackageCacheStats().packageStageObservations.filter(
+        (observation) => observation.stage === "acquire",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        requestKind: "analyze",
+        cacheResult: "new_materialization",
+        outcome: "failure",
+      }),
+    ]);
+
+    const sourcePackage = makeSourceOnlyPackage(
+      `${server.baseUrl}/source.zip`,
+      sha256(sourceZip),
+    );
+    for (let index = 0; index < 260; index += 1) {
+      const lease = await acquireSourcePackage(sourcePackage);
+      await lease.release();
+    }
+
+    const boundedStats = getPackageCacheStats();
+    expect(boundedStats.packageStageObservationSequence).toBeGreaterThan(256);
+    expect(boundedStats.packageStageObservations).toHaveLength(256);
+    expect(boundedStats.packageStageObservationsDropped).toBe(
+      boundedStats.packageStageObservationSequence - 256,
+    );
+    expect(boundedStats.packageStageObservations[0]?.sequence).toBe(
+      boundedStats.packageStageObservationsDropped + 1,
+    );
+    expect(
+      boundedStats.packageStageObservations[
+        boundedStats.packageStageObservations.length - 1
+      ]?.sequence,
+    ).toBe(boundedStats.packageStageObservationSequence);
+
+    resetPackageCachesForTests();
+    expect(getPackageCacheStats()).toMatchObject({
+      packageStageObservationSequence: 0,
+      packageStageObservationsDropped: 0,
+      packageStageObservations: [],
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test("resident preparation retains one package owner and reuses identity", async () => {
+  const sourceZip = makeSourcePackageZip();
+  const externalZip = makeExternalDepsZip();
+  const server = await startPackageServer({
+    "/source.zip": sourceZip,
+    "/external.zip": externalZip,
+  });
+  const sourcePackage = makeSourcePackage(
+    `${server.baseUrl}/source.zip`,
+    sha256(sourceZip),
+    `${server.baseUrl}/external.zip`,
+    sha256(externalZip),
+  );
+  let serverClosed = false;
+  try {
+    const results = await Promise.all(
+      Array.from({ length: 16 }, () =>
+        prepareSourcePackage({ sourcePackage, mode: "resident" }),
+      ),
+    );
+    expect(
+      results.filter((result) => result.result === "initialized"),
+    ).toHaveLength(1);
+    expect(results.filter((result) => result.result === "joined")).toHaveLength(
+      15,
+    );
+    expect(getPackageCacheStats()).toMatchObject({
+      activeSourceOwners: 0,
+      residentSourceOwners: 1,
+      retainedExternalPackages: 1,
+    });
+
+    await server.close();
+    serverClosed = true;
+    await expect(
+      prepareSourcePackage({
+        sourcePackage: {
+          ...sourcePackage,
+          uri: "https://packages.invalid/expired.zip",
+          bundled_source: {
+            ...sourcePackage.bundled_source,
+            uri: "https://packages.invalid/expired.zip",
+          },
+          external_deps: {
+            ...sourcePackage.external_deps!,
+            uri: "https://packages.invalid/expired-external.zip",
+          },
+        },
+        mode: "resident",
+      }),
+    ).resolves.toEqual({ residency: "retained", result: "reused" });
+    await expect(
+      prepareSourcePackage({
+        sourcePackage: {
+          ...sourcePackage,
+          bundled_source: {
+            ...sourcePackage.bundled_source,
+            sha256: "different",
+          },
+        },
+        mode: "resident",
+      }),
+    ).rejects.toThrow("Resident source package identity does not match");
+    await expect(
+      prepareSourcePackage({
+        sourcePackage: {
+          ...sourcePackage,
+          external_deps: {
+            ...sourcePackage.external_deps!,
+            sha256: "different",
+          },
+        },
+        mode: "resident",
+      }),
+    ).rejects.toThrow("Resident source package identity does not match");
+  } finally {
+    if (!serverClosed) {
+      await server.close();
+    }
+  }
+});
+
+test("failed resident initialization releases ownership and permits retry", async () => {
+  const sourceZip = makeSourcePackageZip(null);
+  const server = await startPackageServer({ "/source.zip": sourceZip });
+  try {
+    const sourcePackage = makeSourceOnlyPackage(
+      `${server.baseUrl}/source.zip`,
+      sha256(sourceZip),
+    );
+    await expect(
+      prepareSourcePackage({
+        sourcePackage: {
+          ...sourcePackage,
+          uri: `${server.baseUrl}/missing.zip`,
+          bundled_source: {
+            ...sourcePackage.bundled_source,
+            uri: `${server.baseUrl}/missing.zip`,
+          },
+        },
+        mode: "resident",
+      }),
+    ).rejects.toThrow("Failed to fetch package");
+    expect(getPackageCacheStats().residentSourceOwners).toBe(0);
+
+    await expect(
+      prepareSourcePackage({ sourcePackage, mode: "resident" }),
+    ).resolves.toEqual({ residency: "retained", result: "initialized" });
+    expect(getPackageCacheStats().residentSourceOwners).toBe(1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("local executor roles reject requests from the other role", () => {
+  expect(() => validateExecutorRole("system", "execute", false)).toThrow(
+    "System Node executor cannot execute application actions",
+  );
+  expect(() => validateExecutorRole("application", "analyze", false)).toThrow(
+    "Application Node executor cannot run analysis",
+  );
+  expect(() =>
+    validateExecutorRole("application", "build_deps", false),
+  ).toThrow("Application Node executor cannot build dependencies");
+  expect(() =>
+    validateExecutorRole("application", "execute", false),
+  ).not.toThrow();
+  expect(() => validateExecutorRole("system", "analyze", false)).not.toThrow();
+  expect(() =>
+    validateExecutorRole("system", "build_deps", false),
+  ).not.toThrow();
+});
+
+test("system analyses restore the captured baseline environment", async () => {
+  const analysisValue = "CONVEX_NODE_EXECUTOR_ANALYSIS_ENV_TEST";
+  const analysisLeak = "CONVEX_NODE_EXECUTOR_ANALYSIS_LEAK_TEST";
+  const target: { environment: NodeJS.ProcessEnv } = {
+    environment: { PATH: "/bin" },
+  };
+  const environment = new ExecutorEnvironment(target);
+  await environment.runWithEnvironmentVariables(
+    [{ name: analysisValue, value: "first" }],
+    async () => {
+      expect(target.environment[analysisValue]).toBe("first");
+      target.environment[analysisLeak] = "leaked";
+    },
+    true,
+    false,
+  );
+
+  await environment.runWithEnvironmentVariables(
+    [{ name: analysisValue, value: "second" }],
+    async () => {
+      expect(target.environment[analysisValue]).toBe("second");
+      expect(target.environment[analysisLeak]).toBeUndefined();
+    },
+    true,
+    false,
+  );
+  expect(target.environment[analysisValue]).toBeUndefined();
+  expect(target.environment[analysisLeak]).toBeUndefined();
+});
+
+test("system analyses apply environment variables to awaited module imports", async () => {
+  const environmentName = `CONVEX_NODE_EXECUTOR_ANALYSIS_REAL_ENV_${process.pid}`;
+  const expectedName = `${environmentName}_EXPECTED`;
+  const leakName = `${environmentName}_LEAK`;
+  const originalValues = new Map(
+    [environmentName, expectedName, leakName].map((name) => [
+      name,
+      process.env[name],
+    ]),
+  );
+  delete process.env[environmentName];
+  delete process.env[expectedName];
+  delete process.env[leakName];
+
+  const sourceZip = makeSourcePackageZip(
+    null,
+    1,
+    "node",
+    undefined,
+    `
+      await Promise.resolve();
+      if (process.env[${JSON.stringify(environmentName)}] !== process.env[${JSON.stringify(expectedName)}]) {
+        throw new Error("analysis environment was not installed");
+      }
+      if (process.env[${JSON.stringify(leakName)}] !== undefined) {
+        throw new Error("analysis environment leaked from a prior import");
+      }
+      process.env[${JSON.stringify(leakName)}] = "module-local";
+      export const value = 1;
+    `,
+  );
+  const server = await startPackageServer({ "/source.zip": sourceZip });
+
+  try {
+    const sourcePackage = makeSourceOnlyPackage(
+      `${server.baseUrl}/source.zip`,
+      sha256(sourceZip),
+    );
+    for (const value of ["first", "second"]) {
+      const result = await analyze(
+        {
+          type: "analyze",
+          requestId: `analysis-${value}`,
+          sourcePackage,
+          environmentVariables: [
+            { name: environmentName, value },
+            { name: expectedName, value },
+          ],
+        },
+        true,
+      );
+      expect(result.type).toBe("success");
+    }
+    expect(process.env[environmentName]).toBeUndefined();
+    expect(process.env[expectedName]).toBeUndefined();
+    expect(process.env[leakName]).toBeUndefined();
+  } finally {
+    await server.close();
+    for (const [name, value] of originalValues) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+  }
+});
+
+test("dependency builds run from the captured baseline environment", async () => {
+  const buildValue = "CONVEX_NODE_EXECUTOR_BUILD_ENV_TEST";
+  const target: { environment: NodeJS.ProcessEnv } = {
+    environment: { PATH: "/bin" },
+  };
+  const environment = new ExecutorEnvironment(target);
+  target.environment[buildValue] = "contaminated";
+
+  await environment.runWithBaselineEnvironment(async () => {
+    expect(target.environment[buildValue]).toBeUndefined();
+    target.environment[buildValue] = "build-local";
+  });
+
+  expect(target.environment[buildValue]).toBeUndefined();
+});
+
+test("system child defensively rejects overlapping operations", () => {
+  const operations = new SystemOperationState();
+  const release = operations.tryAcquire();
+  expect(release).not.toBeNull();
+  expect(operations.tryAcquire()).toBeNull();
+
+  release?.();
+  expect(operations.tryAcquire()).not.toBeNull();
+});
+
+test("current external cache hits do not stat the published dependency path", async () => {
+  const sourceZip = makeSourcePackageZip();
+  const externalZip = makeExternalDepsZip();
+  const server = await startPackageServer({
+    "/source-a.zip": sourceZip,
+    "/source-b.zip": sourceZip,
+    "/external.zip": externalZip,
+  });
+  try {
+    await maybeDownloadAndLinkPackages(
+      makeSourcePackage(
+        `${server.baseUrl}/source-a.zip`,
+        sha256(sourceZip),
+        `${server.baseUrl}/external.zip`,
+        sha256(externalZip),
+        "source-a",
+        "source-a",
+      ),
+    );
+    const external = availableExternalPackages.get("external-package-key");
+    if (external === undefined) {
+      throw new Error("Expected external package to be cached");
+    }
+    const stat = vi.spyOn(fs.promises, "stat");
+    stat.mockClear();
+
+    await maybeDownloadAndLinkPackages(
+      makeSourcePackage(
+        `${server.baseUrl}/source-b.zip`,
+        sha256(sourceZip),
+        `${server.baseUrl}/external.zip`,
+        sha256(externalZip),
+        "source-b",
+        "source-b",
+      ),
+    );
+
+    expect(
+      stat.mock.calls.some(([filePath]) =>
+        String(filePath).startsWith(external.dir),
+      ),
+    ).toBe(false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("pooled Node environment markers load as Node modules", async () => {
+  const sourceZip = makeSourcePackageZip(null, 1, "node:pool:consumer");
+  const server = await startPackageServer({
+    "/source.zip": sourceZip,
+  });
+
+  try {
+    const local = await maybeDownloadAndLinkPackages(
+      makeSourceOnlyPackage(
+        `${server.baseUrl}/source.zip`,
+        sha256(sourceZip),
+        "pooled-source-package",
+      ),
+    );
+
+    expect(local.modules).toContain("actions/example.js");
+  } finally {
+    await server.close();
+  }
+});
+
+test("source package metadata rejects duplicate module environments", async () => {
+  const sourceZip = makeSourcePackageZip(null, 1, "node", [
+    ["_deps/chunk.js", "node"],
+    ["actions/example.js", "node"],
+    ["actions/example.js", "isolate"],
+  ]);
+  const server = await startPackageServer({
+    "/source.zip": sourceZip,
+  });
+
+  try {
+    await expect(
+      maybeDownloadAndLinkPackages(
+        makeSourceOnlyPackage(
+          `${server.baseUrl}/source.zip`,
+          sha256(sourceZip),
+          "duplicate-environment-source-package",
+        ),
+      ),
+    ).rejects.toThrow(
+      "Source package metadata contains duplicate module environments",
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("source package metadata rejects orphan source maps", async () => {
+  const zip = new AdmZip();
+  zip.addFile(
+    "metadata.json",
+    Buffer.from(JSON.stringify({ modulePaths: ["orphan.js.map"] })),
+  );
+  zip.addFile("modules/orphan.js.map", Buffer.from("{}"));
+  const sourceZip = zip.toBuffer();
+  const server = await startPackageServer({
+    "/source.zip": sourceZip,
+  });
+
+  try {
+    await expect(
+      maybeDownloadAndLinkPackages(
+        makeSourceOnlyPackage(
+          `${server.baseUrl}/source.zip`,
+          sha256(sourceZip),
+          "orphan-source-map-package",
+        ),
+      ),
+    ).rejects.toThrow(
+      "Source package metadata contains a source map for a missing module",
+    );
   } finally {
     await server.close();
   }
@@ -293,6 +859,95 @@ test("local cache bounds preserve active source packages and retire released pac
   }
 });
 
+test("resident ownership protects source and external packages under pressure", async () => {
+  const externalZip = makeExternalDepsZip();
+  const sourceZips = Array.from({ length: 18 }, (_, index) =>
+    makeSourcePackageZip(`external-package-${index}`),
+  );
+  const routes: Record<string, Route> = {};
+  for (let index = 0; index < sourceZips.length; index += 1) {
+    routes[`/source-${index}.zip`] = sourceZips[index];
+    routes[`/external-${index}.zip`] = externalZip;
+  }
+  const server = await startPackageServer(routes);
+  const sourcePackage = (index: number) =>
+    makeSourcePackage(
+      `${server.baseUrl}/source-${index}.zip`,
+      sha256(sourceZips[index]),
+      `${server.baseUrl}/external-${index}.zip`,
+      sha256(externalZip),
+      `deprecated-wrapper-key-${index}`,
+      `source-package-${index}`,
+      `external-package-${index}`,
+    );
+
+  try {
+    const residentLease = await acquireSourcePackage(
+      sourcePackage(0),
+      "resident",
+    );
+    let residentReleased = false;
+    try {
+      const residentSourceDir = residentLease.package.dir;
+      const residentExternal = availableExternalPackages.get(
+        "external-package-0",
+      );
+      if (residentExternal === undefined) {
+        throw new Error("Expected resident external package to be cached");
+      }
+      const residentExternalDir = residentExternal.dir;
+
+      for (let index = 1; index <= 9; index += 1) {
+        const lease = await acquireSourcePackage(sourcePackage(index));
+        await lease.release();
+      }
+
+      expect(availableSourcePackages.get("source-package-0")).toBe(
+        residentLease.package,
+      );
+      expect(availableExternalPackages.get("external-package-0")).toBe(
+        residentExternal,
+      );
+      expect(residentExternal.sourceOwners).toBe(1);
+      expect(
+        fs
+          .statSync(path.join(residentSourceDir, "node_modules/example"))
+          .isDirectory(),
+      ).toBe(true);
+      expect(getPackageCacheStats()).toMatchObject({
+        retainedSourcePackages: 8,
+        retainedExternalPackages: 8,
+        residentSourceOwners: 1,
+        activeSourceOwners: 0,
+      });
+      expect(getPackageCacheStats().retainedSourceBytes).toBeGreaterThanOrEqual(
+        residentLease.package.retainedBytes,
+      );
+      expect(
+        getPackageCacheStats().retainedExternalBytes,
+      ).toBeGreaterThanOrEqual(residentExternal.retainedBytes);
+
+      await residentLease.release();
+      residentReleased = true;
+      for (let index = 10; index < sourceZips.length; index += 1) {
+        const lease = await acquireSourcePackage(sourcePackage(index));
+        await lease.release();
+      }
+
+      expect(availableSourcePackages.has("source-package-0")).toBe(false);
+      expect(availableExternalPackages.has("external-package-0")).toBe(false);
+      expect(fs.existsSync(residentSourceDir)).toBe(false);
+      expect(fs.existsSync(residentExternalDir)).toBe(false);
+    } finally {
+      if (!residentReleased) {
+        await residentLease.release();
+      }
+    }
+  } finally {
+    await server.close();
+  }
+});
+
 test("imported source package count survives disk cache retirement", async () => {
   const sourceZip = makeSourcePackageZip(null);
   const routes = Object.fromEntries(
@@ -395,6 +1050,76 @@ test("byte bounds retire oversized source and external packages after release", 
   }
 });
 
+test("cache enforcement waits for every selected retirement after failure", async () => {
+  const sourceZip = makeSourcePackageZip();
+  const externalZip = makeExternalDepsZip();
+  const server = await startPackageServer({
+    "/source.zip": sourceZip,
+    "/external.zip": externalZip,
+  });
+
+  try {
+    const lease = await acquireSourcePackage(
+      makeSourcePackage(
+        `${server.baseUrl}/source.zip`,
+        sha256(sourceZip),
+        `${server.baseUrl}/external.zip`,
+        sha256(externalZip),
+      ),
+    );
+    const externalPackage = availableExternalPackages.get(
+      "external-package-key",
+    );
+    if (externalPackage === undefined) {
+      throw new Error("Expected external package to be cached");
+    }
+    externalPackage.retainedBytes = 2 * 1024 * 1024 * 1024 + 1;
+
+    let finishExternalRemoval!: () => void;
+    const externalRemoval = new Promise<void>((resolve) => {
+      finishExternalRemoval = resolve;
+    });
+    let markExternalRemovalStarted!: () => void;
+    const externalRemovalStarted = new Promise<void>((resolve) => {
+      markExternalRemovalStarted = resolve;
+    });
+    const realRm = fs.promises.rm;
+    vi.spyOn(fs.promises, "rm").mockImplementation(
+      async (...args: Parameters<typeof fs.promises.rm>) => {
+        const [target] = args;
+        if (target === lease.package.dir) {
+          throw new Error("simulated source retirement failure");
+        }
+        if (target === externalPackage.dir) {
+          markExternalRemovalStarted();
+          await externalRemoval;
+        }
+        await realRm(...args);
+      },
+    );
+
+    let releaseSettled = false;
+    const releaseResult = lease.release().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    void releaseResult.then(() => {
+      releaseSettled = true;
+    });
+    await externalRemovalStarted;
+    await Promise.resolve();
+    const settledBeforeEveryRemoval = releaseSettled;
+    finishExternalRemoval();
+    const error = await releaseResult;
+    expect(settledBeforeEveryRemoval).toBe(false);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("Failed to clean retired packages");
+    expect(fs.existsSync(externalPackage.dir)).toBe(false);
+  } finally {
+    await server.close();
+  }
+});
+
 test("lease acquisition retries when a cache hit retires before ownership", async () => {
   const sourceZip = makeSourcePackageZip(null);
   const routes = Object.fromEntries(
@@ -435,6 +1160,75 @@ test("lease acquisition retries when a cache hit retires before ownership", asyn
       reacquired.release(),
       ...leases.slice(1).map((lease) => lease.release()),
     ]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("source publication retries when an external hit retires before ownership", async () => {
+  const externalZip = makeExternalDepsZip();
+  const linkedSourceZip = makeSourcePackageZip("external-package-key");
+  const sourceOnlyZip = makeSourcePackageZip(null);
+  const server = await startPackageServer({
+    "/failed-source.zip": { status: 500 },
+    "/pending-source.zip": linkedSourceZip,
+    "/source-only.zip": sourceOnlyZip,
+    "/external.zip": externalZip,
+  });
+
+  try {
+    const failedSource = makeSourcePackage(
+      `${server.baseUrl}/failed-source.zip`,
+      sha256(linkedSourceZip),
+      `${server.baseUrl}/external.zip`,
+      sha256(externalZip),
+      "failed-wrapper-key",
+      "failed-source-package",
+    );
+    await expect(maybeDownloadAndLinkPackages(failedSource)).rejects.toThrow(
+      "Failed to fetch package",
+    );
+    const retiredExternal = availableExternalPackages.get(
+      "external-package-key",
+    );
+    if (retiredExternal === undefined) {
+      throw new Error("Expected the successful external download to be cached");
+    }
+
+    const sourceOnlyLease = await acquireSourcePackage(
+      makeSourceOnlyPackage(
+        `${server.baseUrl}/source-only.zip`,
+        sha256(sourceOnlyZip),
+        "source-only-package",
+      ),
+    );
+    // Starting publication and releasing the unrelated lease in the same turn
+    // makes cache enforcement retire the hit before its owner can resume.
+    retiredExternal.retainedBytes = 2 * 1024 * 1024 * 1024 + 1;
+    const pendingPublication = maybeDownloadAndLinkPackages(
+      makeSourcePackage(
+        `${server.baseUrl}/pending-source.zip`,
+        sha256(linkedSourceZip),
+        `${server.baseUrl}/external.zip`,
+        sha256(externalZip),
+        "pending-wrapper-key",
+        "pending-source-package",
+      ),
+    );
+    await sourceOnlyLease.release();
+    const published = await pendingPublication;
+
+    const replacementExternal = availableExternalPackages.get(
+      "external-package-key",
+    );
+    expect(replacementExternal).not.toBe(retiredExternal);
+    expect(replacementExternal?.sourceOwners).toBe(1);
+    expect(server.requestCounts.get("/external.zip")).toBe(2);
+    expect(
+      fs
+        .statSync(path.join(published.dir, "node_modules/example"))
+        .isDirectory(),
+    ).toBe(true);
   } finally {
     await server.close();
   }
@@ -570,7 +1364,7 @@ test("failed source cleanup still enforces external cache bounds", async () => {
   });
   const server = await startPackageServer(routes);
   const realRm = fs.promises.rm;
-  const sourceStagingPrefix = path.join(tmpdir!, "source", ".");
+  const sourceStagingPrefix = `${path.join(tmpdir!, "source")}${path.sep}.`;
   vi.spyOn(fs.promises, "rm").mockImplementation(
     async (...args: Parameters<typeof fs.promises.rm>) => {
       const [target] = args;
@@ -1369,7 +2163,7 @@ test.each([
   ["source map", "modules/actions/example.js.map"],
   ["package json ESM marker", "package.json"],
 ])(
-  "cached source package corruption preserves the published %s path",
+  "current source cache hits do not scan the published %s path",
   async (_, filePath) => {
     const sourceZip = makeSourcePackageZip();
     const externalZip = makeExternalDepsZip();
@@ -1389,10 +2183,9 @@ test.each([
       const firstLocal = await maybeDownloadAndLinkPackages(sourcePackage);
       await fs.promises.rm(path.join(firstLocal.dir, filePath));
 
-      await expect(maybeDownloadAndLinkPackages(sourcePackage)).rejects.toThrow(
-        "Incomplete source package",
-      );
+      const reused = await maybeDownloadAndLinkPackages(sourcePackage);
 
+      expect(reused).toBe(firstLocal);
       expect(fs.existsSync(firstLocal.dir)).toBe(true);
       expect(server.requestCounts.get("/source.zip")).toBe(1);
       expect(server.requestCounts.get("/external.zip")).toBe(1);
@@ -1412,7 +2205,7 @@ test.each([
   },
 );
 
-test("cached external package corruption preserves its published path", async () => {
+test("new source validation detects a missing cached external tree", async () => {
   const sourceZip = makeSourcePackageZip();
   const externalZip = makeExternalDepsZip();
   const server = await startPackageServer({
@@ -1450,7 +2243,7 @@ test("cached external package corruption preserves its published path", async ()
     });
 
     await expect(maybeDownloadAndLinkPackages(sourcePackageB)).rejects.toThrow(
-      "Incomplete external deps package",
+      "Incomplete source package",
     );
 
     expect(fs.existsSync(externalPackage.dir)).toBe(true);
@@ -1547,6 +2340,35 @@ function makeSourcePackageZip(
     "modules/actions/example.js.map",
     Buffer.from('{"version":3,"sources":["example.ts"],"mappings":""}'),
   );
+  return zip.toBuffer();
+}
+
+function makeSourceOnlyPackageZip(moduleCount: number): Buffer {
+  const modulePaths = Array.from(
+    { length: moduleCount },
+    (_, index) => `actions/module_${index}.js`,
+  );
+  const zip = new AdmZip();
+  zip.addFile("modules/", Buffer.alloc(0));
+  zip.addFile("modules/actions/", Buffer.alloc(0));
+  zip.addFile(
+    "metadata.json",
+    Buffer.from(
+      JSON.stringify({
+        modulePaths,
+        moduleEnvironments: modulePaths.map((modulePath) => [
+          modulePath,
+          "node",
+        ]),
+      }),
+    ),
+  );
+  for (const [index, modulePath] of modulePaths.entries()) {
+    zip.addFile(
+      `modules/${modulePath}`,
+      Buffer.from(`export const value = ${index};\n`),
+    );
+  }
   return zip.toBuffer();
 }
 
