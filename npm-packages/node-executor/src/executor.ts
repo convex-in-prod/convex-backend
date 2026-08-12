@@ -51,6 +51,8 @@ const AWS_LAMBDA_EXECUTOR_TYPE = (
 // It must be read at module load time, before invocations replace `process.env`.
 const IS_AWS_LAMBDA = process.env.AWS_LAMBDA_FUNCTION_NAME !== undefined;
 
+export type ExecutorRole = "application" | "system";
+
 const AWS_LAMBDA_FUNCTION_MEMORY_SIZE = parseInt(
   process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE ?? "512",
   10,
@@ -85,58 +87,128 @@ export function setupGlobals(modulePath: string) {
 
 let numInvocations = 0;
 
-async function runWithEnvironmentVariables<T>(
-  envs: EnvironmentVariable[],
-  fn: (envHash: string) => Promise<T>,
-): Promise<T> {
-  const savedEnv = process.env;
+export class ExecutorEnvironment {
+  private readonly baseline: NodeJS.ProcessEnv;
 
-  // AWS Lambda populates a number of environment variables, like Lambda version,
-  // handler name, session, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, etc. We
-  // don't want to expose any of that. Only expose variables that are common
-  // between local Node.js and AWS Lambda.
-  //
-  // Note: This sanitization is for consistency between environments, not for security.
-  // While user code can still access underlying environment variables through
-  // other means, sensitive variables (such as AWS credentials) are protected
-  // through restrictive IAM policies that limit what the Lambda function can do
-  // with those credentials.
-  const allowedEnvs = ["PATH", "PWD", "LANG", "NODE_PATH", "TZ", "UTC"];
-  const sanitized: { [name: string]: string } = {};
-  for (const name of allowedEnvs) {
-    const value = process.env[name];
-    if (value !== undefined) {
-      sanitized[name] = value;
+  constructor(private readonly target: { environment: NodeJS.ProcessEnv }) {
+    this.baseline = { ...target.environment };
+  }
+
+  async runWithEnvironmentVariables<T>(
+    envs: EnvironmentVariable[],
+    fn: (envHash: string) => Promise<T>,
+    restoreBaseline: boolean,
+    restoreSaved: boolean,
+  ): Promise<T> {
+    const savedEnv = this.target.environment;
+
+    // Keep the variables available in both local Node and Lambda execution.
+    // This consistency boundary is not a security boundary.
+    const allowedEnvs = ["PATH", "PWD", "LANG", "NODE_PATH", "TZ", "UTC"];
+    const sanitized: NodeJS.ProcessEnv = {};
+    for (const name of allowedEnvs) {
+      const value = this.target.environment[name];
+      if (value !== undefined) {
+        sanitized[name] = value;
+      }
+    }
+    this.target.environment = sanitized;
+
+    envs.sort((a, b) => a.name.localeCompare(b.name));
+    for (const environmentVariable of envs) {
+      this.target.environment[environmentVariable.name] =
+        environmentVariable.value;
+    }
+    const envHash = createHash("md5")
+      .update(JSON.stringify(envs))
+      .digest("hex");
+
+    try {
+      return await fn(envHash);
+    } finally {
+      if (restoreBaseline) {
+        this.target.environment = { ...this.baseline };
+      } else if (restoreSaved) {
+        this.target.environment = savedEnv;
+      }
     }
   }
-  process.env = sanitized;
 
-  // Set the user defined environment variables
-  envs.sort((a, b) => a.name.localeCompare(b.name));
-  for (const e of envs) {
-    process.env[e.name] = e.value;
-  }
-
-  // Compute a hash based on the user defined environment variables.
-  const envHash = createHash("md5").update(JSON.stringify(envs)).digest("hex");
-
-  try {
-    return await fn(envHash);
-  } finally {
-    // Restore the initial environment when we’re done.
-    // This is helpful to bypass a AWS Lambda bug affecting Node.js 24 where the lambda
-    // would crash when AWS’s own env vars are missing after a second function execution.
-    //
-    // We don’t restore when running in the local Node executor because this one accepts
-    // concurrent requests in the same JavaScript environment.
-    if (IS_AWS_LAMBDA) {
-      process.env = savedEnv;
+  async runWithBaselineEnvironment<T>(fn: () => Promise<T>): Promise<T> {
+    this.target.environment = { ...this.baseline };
+    try {
+      return await fn();
+    } finally {
+      this.target.environment = { ...this.baseline };
     }
   }
 }
 
+const executorEnvironment = new ExecutorEnvironment({
+  get environment() {
+    return process.env;
+  },
+  set environment(environment: NodeJS.ProcessEnv) {
+    process.env = environment;
+  },
+});
+
+async function runWithEnvironmentVariables<T>(
+  envs: EnvironmentVariable[],
+  fn: (envHash: string) => Promise<T>,
+  restoreLocalEnvironment = false,
+): Promise<T> {
+  return await executorEnvironment.runWithEnvironmentVariables(
+    envs,
+    fn,
+    restoreLocalEnvironment,
+    IS_AWS_LAMBDA,
+  );
+}
+
+async function runWithBaselineEnvironment<T>(fn: () => Promise<T>): Promise<T> {
+  return await executorEnvironment.runWithBaselineEnvironment(fn);
+}
+
 export const ogProcessExit = process.exit;
 const processExitSentinel = Symbol("node-executor-process-exit");
+
+type ExecutorRequestType = "execute" | "analyze" | "build_deps";
+
+export function validateExecutorRole(
+  role: ExecutorRole,
+  requestType: ExecutorRequestType,
+  isAwsLambda = IS_AWS_LAMBDA,
+): void {
+  if (requestType === "execute" && role !== "application") {
+    throw new Error("System Node executor cannot execute application actions");
+  }
+  if (requestType === "analyze" && role !== "system" && !isAwsLambda) {
+    throw new Error("Application Node executor cannot run analysis");
+  }
+  if (requestType === "build_deps" && role !== "system" && !isAwsLambda) {
+    throw new Error("Application Node executor cannot build dependencies");
+  }
+}
+
+export class SystemOperationState {
+  private active = false;
+
+  tryAcquire(): (() => void) | null {
+    if (this.active) {
+      return null;
+    }
+    this.active = true;
+    let released = false;
+    return () => {
+      if (released) {
+        throw new Error("System Node executor operation was released twice");
+      }
+      released = true;
+      this.active = false;
+    };
+  }
+}
 
 function unhandledRejectionHandler(
   responseStream: Writable,
@@ -179,6 +251,7 @@ function unhandledRejectionHandler(
 export async function invoke(
   request: ExecuteRequest | AnalyzeRequest | BuildDepsRequest,
   responseStream: Writable,
+  role: ExecutorRole = "application",
 ): Promise<number> {
   process.removeAllListeners("unhandledRejection");
   process.removeAllListeners("uncaughtException");
@@ -236,11 +309,17 @@ export async function invoke(
       return await globalDevConsole.run(devConsole, async () => {
         let result;
         if (request.type === "execute") {
+          validateExecutorRole(role, request.type);
           result = await execute(request);
         } else if (request.type === "analyze") {
-          result = await analyze(request);
+          validateExecutorRole(role, request.type);
+          result = await analyze(request, role === "system");
         } else if (request.type === "build_deps") {
-          result = await buildDeps(request);
+          validateExecutorRole(role, request.type);
+          result =
+            role === "system"
+              ? await runWithBaselineEnvironment(() => buildDeps(request))
+              : await buildDeps(request);
         } else {
           throw new Error("Unknown Node executor request type");
         }
@@ -354,7 +433,11 @@ export async function execute(
   const start = performance.now();
 
   // Download missing packages and do any necessary linking
-  const packageLease = await acquireSourcePackage(request.sourcePackage);
+  const packageLease = await acquireSourcePackage(
+    request.sourcePackage,
+    "request",
+    "execute",
+  );
   const local = packageLease.package;
   try {
     // User libraries can replace this process-global hook. Restore the executor
@@ -568,8 +651,13 @@ export type AnalyzeResponse =
 
 export async function analyze(
   request: AnalyzeRequest,
+  restoreLocalEnvironment = false,
 ): Promise<AnalyzeResponse> {
-  const packageLease = await acquireSourcePackage(request.sourcePackage);
+  const packageLease = await acquireSourcePackage(
+    request.sourcePackage,
+    "request",
+    "analyze",
+  );
   const local = packageLease.package;
   try {
     return await runWithEnvironmentVariables(
@@ -599,6 +687,7 @@ export async function analyze(
 
         return { type: "success", modules };
       },
+      restoreLocalEnvironment,
     );
   } finally {
     await packageLease.release();

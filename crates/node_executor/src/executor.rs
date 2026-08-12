@@ -1,12 +1,23 @@
 use std::{
-    collections::BTreeMap,
+    any::Any,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    fmt::{
+        Display,
+        Formatter,
+    },
     future::Future,
     path::Path,
     sync::{
         Arc,
         LazyLock,
     },
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use anyhow::Context;
@@ -17,13 +28,12 @@ use bytes::{
     BytesMut,
 };
 use common::{
-    backoff::Backoff,
     errors::{
         FrameData,
         JsError,
     },
     execution_context::ExecutionContext,
-    knobs::NODE_ANALYZE_MAX_RETRIES,
+    execution_start::FunctionExecutionStartGate,
     log_lines::{
         run_function_and_collect_log_lines,
         LogLine,
@@ -41,10 +51,7 @@ use common::{
         UdfType,
     },
 };
-use errors::{
-    ErrorMetadata,
-    ErrorMetadataAnyhowExt,
-};
+use errors::ErrorMetadata;
 use futures::{
     FutureExt,
     Stream,
@@ -80,6 +87,7 @@ use model::{
         },
     },
     source_packages::types::{
+        NodeExecutorPoolTopology,
         PackageSize,
         SourcePackageId,
     },
@@ -138,22 +146,196 @@ pub const ARGS_TOO_LARGE_RESPONSE_MESSAGE: &str =
     "Node actions arguments size is too large. The maximum size is 5 MiB. Reduce the size of the \
      arguments or consider using Convex runtime actions instead, which have a 16 MiB limit. See https://docs.convex.dev/functions/runtimes";
 
-const NODE_ANALYZE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-const NODE_ANALYZE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 // The Node console emits at most 257 log parts including its overflow marker,
 // plus one result. Keep headroom for compatible protocol extensions while
 // bounding decoded-object amplification independently of response bytes.
 const MAX_STREAMED_RESPONSE_PARTS: usize = 1024;
+pub(crate) const MAX_STREAMED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[async_trait]
 pub trait NodeExecutor: Sync + Send {
     fn enable(&self) -> anyhow::Result<()>;
+    fn validate_pool_topology(&self, topology: &NodeExecutorPoolTopology) -> anyhow::Result<()>;
+    fn reconcile_pool_topology(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+    ) -> anyhow::Result<()>;
+    fn begin_pool_cutover(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+        _reservation: &mut Option<NodeExecutorCutoverReservation>,
+    ) -> anyhow::Result<()> {
+        self.reconcile_pool_topology(topology, version)
+    }
+    async fn reserve_pool_cutover(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        force: bool,
+    ) -> anyhow::Result<Option<NodeExecutorCutoverReservation>> {
+        self.validate_pool_topology(topology)?;
+        anyhow::ensure!(
+            !force,
+            ErrorMetadata::bad_request(
+                "NodeExecutorCutoverProtocolUnsupported",
+                "This Node executor does not support forced cutover",
+            )
+        );
+        Ok(None)
+    }
+    async fn complete_pool_cutover(
+        &self,
+        _target: NodeExecutorCutoverTarget,
+        _version: common::types::Timestamp,
+        _reservation: Option<NodeExecutorCutoverReservation>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn invoke(
         &self,
         request: ExecutorRequest,
         log_line_sender: mpsc::UnboundedSender<LogLine>,
+        function_execution_start: Option<FunctionExecutionStartGate>,
     ) -> anyhow::Result<InvokeResponse>;
+    async fn acquire_system_operation(
+        &self,
+        _kind: NodeSystemOperationKind,
+    ) -> anyhow::Result<NodeSystemOperationReservation> {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "NodeSystemOperationsUnsupported",
+            "This Node executor does not support isolated system operations",
+        ));
+    }
+    async fn invoke_system(
+        &self,
+        _request: ExecutorRequest,
+        _reservation: NodeSystemOperationReservation,
+        _log_line_sender: mpsc::UnboundedSender<LogLine>,
+    ) -> anyhow::Result<InvokeResponse> {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "NodeSystemOperationsUnsupported",
+            "This Node executor does not support isolated system operations",
+        ));
+    }
     fn shutdown(&self);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeSystemOperationKind {
+    Analyze,
+    BuildDeps,
+}
+
+impl NodeSystemOperationKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Analyze => "analyze",
+            Self::BuildDeps => "build_deps",
+        }
+    }
+
+    fn from_request(request: &ExecutorRequest) -> anyhow::Result<Self> {
+        match request {
+            ExecutorRequest::Analyze(_) => Ok(Self::Analyze),
+            ExecutorRequest::BuildDeps(_) => Ok(Self::BuildDeps),
+            ExecutorRequest::Execute { .. } => {
+                anyhow::bail!("Application execution is not a Node system operation")
+            },
+        }
+    }
+}
+
+pub struct NodeSystemOperationReservation {
+    kind: NodeSystemOperationKind,
+    owner: Box<dyn Any + Send>,
+}
+
+impl NodeSystemOperationReservation {
+    pub(crate) fn new(kind: NodeSystemOperationKind, owner: impl Any + Send) -> Self {
+        Self {
+            kind,
+            owner: Box::new(owner),
+        }
+    }
+
+    pub(crate) fn take_owner<T: Any + Send>(self) -> anyhow::Result<T> {
+        self.owner
+            .downcast::<T>()
+            .map(|owner| *owner)
+            .map_err(|_| anyhow::anyhow!("Node system operation reservation owner is invalid"))
+    }
+
+    pub(crate) fn validate_request(&self, request: &ExecutorRequest) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.kind == NodeSystemOperationKind::from_request(request)?,
+            "Node system operation reservation kind does not match request"
+        );
+        Ok(())
+    }
+}
+
+pub struct NodeExecutorCutoverReservation {
+    pub(crate) permit: Option<crate::local::SurgePermit>,
+    claim: Option<Box<dyn NodeExecutorCutoverClaim>>,
+}
+
+pub(crate) trait NodeExecutorCutoverClaim: Send {
+    fn commit(
+        &mut self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+    ) -> anyhow::Result<()>;
+}
+
+impl NodeExecutorCutoverReservation {
+    #[cfg(test)]
+    pub(crate) fn new(permit: crate::local::SurgePermit) -> Self {
+        Self {
+            permit: Some(permit),
+            claim: None,
+        }
+    }
+
+    pub(crate) fn with_claim(
+        permit: crate::local::SurgePermit,
+        claim: impl NodeExecutorCutoverClaim + 'static,
+    ) -> Self {
+        Self {
+            permit: Some(permit),
+            claim: Some(Box::new(claim)),
+        }
+    }
+
+    pub(crate) fn commit_claim(
+        &mut self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+    ) -> anyhow::Result<()> {
+        match self.claim.as_mut() {
+            Some(claim) => claim.commit(topology, version),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for NodeExecutorCutoverReservation {
+    fn drop(&mut self) {
+        // Restore router recovery ownership before capacity can be admitted to
+        // another deployment on a different runtime thread.
+        drop(self.claim.take());
+        if let Some(permit) = self.permit.take() {
+            permit.release();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct NodeExecutorCutoverTarget {
+    pub topology: NodeExecutorPoolTopology,
+    pub source_package: SourcePackage,
+    pub source_package_id: SourcePackageId,
+    pub environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
 }
 
 pub struct InvokeResponse {
@@ -161,12 +343,21 @@ pub struct InvokeResponse {
     pub aws_request_id: Option<String>,
 }
 
+/// Separates retryable invocation failure from terminal response processing.
+/// The application layer owns retries because each attempt must reacquire
+/// system admission and generate fresh package authority.
+pub enum NodeAnalyzeAttemptOutcome {
+    Completed(Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>),
+    InvocationFailed(anyhow::Error),
+    ResponseFailed(anyhow::Error),
+}
+
 #[derive(Clone)]
 pub struct NodeActions<RT: Runtime> {
     executor: Arc<dyn NodeExecutor>,
     convex_origin: ConvexOrigin,
     user_timeout: Duration,
-    runtime: RT,
+    _runtime: RT,
     deployment: DeploymentMetadata,
 }
 
@@ -225,7 +416,7 @@ impl<RT: Runtime> NodeActions<RT> {
             executor,
             convex_origin,
             user_timeout,
-            runtime,
+            _runtime: runtime,
             deployment,
         }
     }
@@ -234,8 +425,72 @@ impl<RT: Runtime> NodeActions<RT> {
         self.executor.enable()
     }
 
+    pub fn validate_pool_topology(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+    ) -> anyhow::Result<()> {
+        self.executor.validate_pool_topology(topology)
+    }
+
+    pub fn reconcile_pool_topology(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+    ) -> anyhow::Result<()> {
+        self.executor.reconcile_pool_topology(topology, version)
+    }
+
+    pub fn cutover_package_url_validity(&self, topology: &NodeExecutorPoolTopology) -> Duration {
+        let resident_pool_count = 1 + topology.values().collect::<BTreeSet<_>>().len();
+        let sequential_timeout_stages = u32::try_from(2 * resident_pool_count + 2)
+            .expect("Node executor cutover stage count does not fit u32");
+        self.user_timeout
+            .checked_mul(sequential_timeout_stages)
+            .expect("Node executor cutover package URL validity overflow")
+    }
+
+    pub async fn reserve_pool_cutover(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        force: bool,
+    ) -> anyhow::Result<Option<NodeExecutorCutoverReservation>> {
+        self.executor.reserve_pool_cutover(topology, force).await
+    }
+
+    pub fn begin_pool_cutover(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+        reservation: &mut Option<NodeExecutorCutoverReservation>,
+    ) -> anyhow::Result<()> {
+        self.executor
+            .begin_pool_cutover(topology, version, reservation)
+    }
+
+    pub async fn complete_pool_cutover(
+        &self,
+        target: NodeExecutorCutoverTarget,
+        version: common::types::Timestamp,
+        reservation: Option<NodeExecutorCutoverReservation>,
+    ) -> anyhow::Result<()> {
+        self.executor
+            .complete_pool_cutover(target, version, reservation)
+            .await
+    }
+
+    pub fn record_pool_cutover_post_commit_failure(&self) {
+        crate::metrics::log_local_node_deployment_cutover_event("post_commit_failed");
+    }
+
     pub fn shutdown(&self) {
         self.executor.shutdown()
+    }
+
+    pub async fn acquire_system_operation(
+        &self,
+        kind: NodeSystemOperationKind,
+    ) -> anyhow::Result<NodeSystemOperationReservation> {
+        self.executor.acquire_system_operation(kind).await
     }
 
     #[rustfmt::skip]
@@ -243,12 +498,12 @@ impl<RT: Runtime> NodeActions<RT> {
         &self,
         request: ExecuteRequest,
         log_line_sender: mpsc::UnboundedSender<LogLine>,
+        function_execution_start: Option<FunctionExecutionStartGate>,
         source_maps_callback: impl Future<Output = anyhow::Result<
             BTreeMap<CanonicalizedModulePath, SourceMap>>>
             + Send,
     ) -> anyhow::Result<NodeActionOutcome> {
         let path = request.path_and_args.path().clone();
-        let timer = node_executor("execute");
         let request = ExecutorRequest::Execute {
             request,
             backend_address: self.convex_origin.clone(),
@@ -258,10 +513,54 @@ impl<RT: Runtime> NodeActions<RT> {
             timeout: self.user_timeout,
             deployment: self.deployment.clone(),
         };
+        let (function_execution_start, execution_started) =
+            if let Some(function_execution_start) = function_execution_start {
+                let (start_observer, execution_started) = tokio::sync::oneshot::channel();
+                (
+                    Some(function_execution_start.with_start_observer(start_observer)),
+                    Some(execution_started),
+                )
+            } else {
+                (None, None)
+            };
+        let invocation =
+            self.executor
+                .invoke(request, log_line_sender, function_execution_start);
+        tokio::pin!(invocation);
+        let (invoke_response, timer) = if let Some(mut execution_started) = execution_started {
+            tokio::select! {
+                biased;
+                start_result = &mut execution_started => {
+                    let Ok(start_observed) = start_result else {
+                        return match invocation.await {
+                            Err(error) => Err(error),
+                            Ok(_) => Err(anyhow::anyhow!(
+                                "Node invocation completed without observing its execution start"
+                            )),
+                        };
+                    };
+                    let timer = node_executor("execute");
+                    // The gate waits for this diagnostic acknowledgment, so
+                    // the service timer is running before `/invoke` can begin.
+                    // Failed observation must not revoke a released execution.
+                    let _ = start_observed.send(());
+                    (invocation.await?, timer)
+                },
+                response = &mut invocation => {
+                    response?;
+                    anyhow::bail!(
+                        "Node invocation completed before publishing its execution start"
+                    );
+                },
+            }
+        } else {
+            let timer = node_executor("execute");
+            (invocation.await?, timer)
+        };
         let InvokeResponse {
             response,
             aws_request_id,
-        } = self.executor.invoke(request, log_line_sender).await?;
+        } = invoke_response;
         // Executor responses can contain application errors and result data.
         // Keep malformed-protocol errors fixed instead of copying that payload
         // into a thrown error that can reach infrastructure logs.
@@ -332,14 +631,21 @@ impl<RT: Runtime> NodeActions<RT> {
     pub async fn build_deps(
         &self,
         request: BuildDepsRequest,
+        reservation: NodeSystemOperationReservation,
     ) -> anyhow::Result<Result<(Sha256Digest, PackageSize), JsError>> {
         let timer = node_executor("build_deps");
-        let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
+        // Dependency-build logs have no caller-facing consumer. Drop the
+        // receiver immediately so streamed lines are discarded instead of
+        // accumulating in an unbounded channel until the build completes.
+        let (log_line_sender, _) = mpsc::unbounded_channel();
         let request = ExecutorRequest::BuildDeps(request);
         let InvokeResponse {
             response,
             aws_request_id,
-        } = self.executor.invoke(request, log_line_sender).await?;
+        } = self
+            .executor
+            .invoke_system(request, reservation, log_line_sender)
+            .await?;
         let response: BuildDepsResponse = serde_json::from_value(response)
             .map_err(|_| anyhow::anyhow!("Failed to deserialize Node build_deps response"))?;
 
@@ -382,34 +688,19 @@ impl<RT: Runtime> NodeActions<RT> {
     async fn invoke_analyze(
         &self,
         request: AnalyzeRequest,
+        reservation: NodeSystemOperationReservation,
     ) -> anyhow::Result<(InvokeResponse, LogLines)> {
-        let mut backoff = Backoff::new(NODE_ANALYZE_INITIAL_BACKOFF, NODE_ANALYZE_MAX_BACKOFF);
-        let mut retries = 0;
-        loop {
-            let (log_line_sender, log_line_receiver) = mpsc::unbounded_channel();
-            let request = ExecutorRequest::Analyze(request.clone());
-            let (response, log_lines) = run_function_and_collect_log_lines(
-                self.executor.invoke(request, log_line_sender).boxed(),
-                log_line_receiver,
-                |_| {},
-            )
-            .await;
-            match response {
-                Ok(response) => return Ok((response, log_lines)),
-                Err(e) => {
-                    if retries >= *NODE_ANALYZE_MAX_RETRIES || e.is_deterministic_user_error() {
-                        return Err(e);
-                    }
-                    tracing::warn!(
-                        retry = retries + 1,
-                        "Node analyze invocation failed; retrying"
-                    );
-                    retries += 1;
-                    let duration = backoff.fail(&mut self.runtime.rng());
-                    self.runtime.wait(duration).await;
-                },
-            }
-        }
+        let (log_line_sender, log_line_receiver) = mpsc::unbounded_channel();
+        let request = ExecutorRequest::Analyze(request);
+        let (response, log_lines) = run_function_and_collect_log_lines(
+            self.executor
+                .invoke_system(request, reservation, log_line_sender)
+                .boxed(),
+            log_line_receiver,
+            |_| {},
+        )
+        .await;
+        Ok((response?, log_lines))
     }
 
     #[fastrace::trace]
@@ -417,7 +708,8 @@ impl<RT: Runtime> NodeActions<RT> {
         &self,
         request: AnalyzeRequest,
         source_maps: &BTreeMap<CanonicalizedModulePath, SourceMap>,
-    ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
+        reservation: NodeSystemOperationReservation,
+    ) -> anyhow::Result<NodeAnalyzeAttemptOutcome> {
         let timer = node_executor("analyze");
 
         let (
@@ -426,7 +718,17 @@ impl<RT: Runtime> NodeActions<RT> {
                 aws_request_id,
             },
             log_lines,
-        ) = self.invoke_analyze(request).await?;
+        ) = match self.invoke_analyze(request, reservation).await {
+            Ok(response) => response,
+            Err(error)
+                if error
+                    .downcast_ref::<NodeExecutorResponseProtocolError>()
+                    .is_some() =>
+            {
+                return Ok(NodeAnalyzeAttemptOutcome::ResponseFailed(error));
+            },
+            Err(error) => return Ok(NodeAnalyzeAttemptOutcome::InvocationFailed(error)),
+        };
         let response: AnalyzeResponse = serde_json::from_value(response)
             .map_err(|_| anyhow::anyhow!("Failed to deserialize Node analyze response"))?;
         tracing::info!(
@@ -440,7 +742,9 @@ impl<RT: Runtime> NodeActions<RT> {
             AnalyzeResponse::Success { modules } => modules,
             AnalyzeResponse::Error { message, frames } => {
                 let error = construct_js_error(message, "".to_string(), None, frames, source_maps)?;
-                return Ok(Err(append_logs_to_error(error, log_lines)));
+                return Ok(NodeAnalyzeAttemptOutcome::Completed(Err(
+                    append_logs_to_error(error, log_lines),
+                )));
             },
         };
         let mut result = BTreeMap::new();
@@ -480,11 +784,12 @@ impl<RT: Runtime> NodeActions<RT> {
             for f in node_functions {
                 let udf_type = f.udf_type.as_str().parse()?;
                 if udf_type != UdfType::Action {
-                    return Ok(Err(JsError::from_message(format!(
+                    let error = JsError::from_message(format!(
                         "`{}` defined in `{:?}` is a {} function. Only \
                          actions can be defined in Node.js. See https://docs.convex.dev/functions/actions for more details.",
                         f.name, path, udf_type,
-                    ))));
+                    ));
+                    return Ok(NodeAnalyzeAttemptOutcome::Completed(Err(error)));
                 }
                 let args = match f.args {
                     Some(json_args) => match ArgsValidator::try_from(json_args) {
@@ -492,7 +797,9 @@ impl<RT: Runtime> NodeActions<RT> {
                         Err(parse_error) => {
                             let message =
                                 format!("Unable to parse JSON from `exportArgs`:\n{parse_error}");
-                            return Ok(Err(JsError::from_message(message)));
+                            return Ok(NodeAnalyzeAttemptOutcome::Completed(Err(
+                                JsError::from_message(message),
+                            )));
                         },
                     },
                     None => ArgsValidator::Unvalidated,
@@ -559,7 +866,7 @@ impl<RT: Runtime> NodeActions<RT> {
             };
             result.insert(path, module);
         }
-        Ok(Ok(result))
+        Ok(NodeAnalyzeAttemptOutcome::Completed(Ok(result)))
     }
 }
 
@@ -580,6 +887,15 @@ impl ExecutorRequest {
             Self::Execute { .. } => "execute",
             Self::Analyze(_) => "analyze",
             Self::BuildDeps(_) => "build_deps",
+        }
+    }
+
+    pub(crate) fn preparation_source_package(&self) -> Option<SourcePackage> {
+        match self {
+            Self::Execute { request, .. } => Some(request.source_package.clone()),
+            // Analysis packages have not committed and must not become the
+            // readiness target of a later resident-generation rotation.
+            Self::Analyze(_) | Self::BuildDeps(_) => None,
         }
     }
 }
@@ -673,6 +989,12 @@ pub struct SourcePackage {
 
     // Info of external package if external dependencies were specified.
     pub external_deps: Option<Package>,
+
+    // The fetch URIs are short-lived even though the keys and checksums are
+    // stable. Cold preparation and deferred local replacement must not reuse
+    // them after this time; a generation that already retained this identity
+    // can confirm ownership without fetching the expired URLs again.
+    pub download_url_expiration: Instant,
 }
 
 impl From<SourcePackage> for JsonValue {
@@ -722,6 +1044,9 @@ pub struct ExecuteRequest {
 
     pub source_package: SourcePackage,
     pub source_package_id: SourcePackageId,
+    pub node_executor_pool_topology: NodeExecutorPoolTopology,
+    pub topology_version: common::types::Timestamp,
+    pub node_pool: Option<model::config::types::NodeExecutorPoolName>,
     pub user_identity: Option<UserIdentityAttributes>,
     pub auth_header: Option<String>,
     pub environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
@@ -1002,6 +1327,21 @@ fn parse_streamed_response_part(s: &str) -> anyhow::Result<Option<ResponsePart>>
     anyhow::bail!("Invalid part")
 }
 
+#[derive(Debug)]
+pub(crate) struct NodeExecutorResponseProtocolError;
+
+impl Display for NodeExecutorResponseProtocolError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Local Node executor returned a malformed response")
+    }
+}
+
+impl std::error::Error for NodeExecutorResponseProtocolError {}
+
+fn mark_response_protocol_error(error: anyhow::Error) -> anyhow::Error {
+    error.context(NodeExecutorResponseProtocolError)
+}
+
 fn process_streamed_response_line(
     line: &[u8],
     log_line_sender: &mpsc::UnboundedSender<LogLine>,
@@ -1031,7 +1371,13 @@ fn process_streamed_response_part(
         return Ok(());
     };
     match part {
-        ResponsePart::LogLine(log_line) => log_line_sender.send(log_line)?,
+        ResponsePart::LogLine(log_line) => {
+            // The caller can stop collecting logs while a runtime-owned local
+            // operation still owns the child request. Keep consuming through
+            // the transport completion boundary so that operation ownership
+            // cannot end merely because the log receiver disappeared.
+            let _ = log_line_sender.send(log_line);
+        },
         ResponsePart::Result(result) => {
             anyhow::ensure!(
                 result_value.is_none(),
@@ -1071,12 +1417,19 @@ pub async fn handle_node_executor_stream(
     // transport chunk separately would let chunk metadata grow far beyond the
     // response byte limit before the next newline.
     let mut remaining_bytes = BytesMut::new();
+    let mut response_bytes = 0usize;
     let mut result_value = None;
     let mut response_parts = 0;
+    let mut observed_completion = false;
     while let Some(part) = stream.next().await {
         let part = part.with_context(|| "Error in node executor stream")?;
         match part {
             NodeExecutorStreamPart::Chunk(chunk) => {
+                response_bytes = response_bytes
+                    .checked_add(chunk.len())
+                    .filter(|size| *size <= MAX_STREAMED_RESPONSE_BYTES)
+                    .ok_or_else(|| anyhow::anyhow!("Node executor response exceeded size limit"))
+                    .map_err(mark_response_protocol_error)?;
                 remaining_bytes.extend_from_slice(&chunk);
                 while let Some(pos) = memchr::memchr(b'\n', &remaining_bytes) {
                     let line = remaining_bytes.split_to(pos);
@@ -1086,10 +1439,12 @@ pub async fn handle_node_executor_stream(
                         &log_line_sender,
                         &mut result_value,
                         &mut response_parts,
-                    )?;
+                    )
+                    .map_err(mark_response_protocol_error)?;
                 }
             },
             NodeExecutorStreamPart::InvokeComplete(completion) => {
+                observed_completion = true;
                 let error_if_no_result = match completion {
                     InvokeCompletion::ExplicitError(e) => return Ok(Err(e)),
                     InvokeCompletion::ImplicitError(e) => Some(e),
@@ -1107,14 +1462,15 @@ pub async fn handle_node_executor_stream(
                         // Only parsing may defer to the inferred failure;
                         // protocol limits and duplicate results still fail.
                         Err(_) if error_if_no_result.is_some() => None,
-                        Err(error) => return Err(error),
+                        Err(error) => return Err(mark_response_protocol_error(error)),
                     };
                     process_streamed_response_part(
                         part,
                         &log_line_sender,
                         &mut result_value,
                         &mut response_parts,
-                    )?;
+                    )
+                    .map_err(mark_response_protocol_error)?;
                 }
                 if result_value.is_none()
                     && let Some(error) = error_if_no_result
@@ -1125,8 +1481,14 @@ pub async fn handle_node_executor_stream(
             },
         }
     }
+    if !observed_completion {
+        return Err(mark_response_protocol_error(anyhow::anyhow!(
+            "Node executor response ended without a completion marker"
+        )));
+    }
     let payload = result_value
-        .ok_or_else(|| anyhow::anyhow!("Received no result from node executor response"))?;
+        .ok_or_else(|| anyhow::anyhow!("Received no result from node executor response"))
+        .map_err(mark_response_protocol_error)?;
     Ok(Ok(payload))
 }
 
@@ -1336,6 +1698,50 @@ mod tests {
             .await
             .is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn streamed_response_requires_completion_marker() {
+        let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
+        let stream_parts = [Ok(NodeExecutorStreamPart::Chunk(Bytes::from_static(
+            br#"{"type":"success"}
+"#,
+        )))];
+
+        let error =
+            match handle_node_executor_stream(log_line_sender, futures::stream::iter(stream_parts))
+                .await
+            {
+                Ok(_) => panic!("missing completion must be a protocol error"),
+                Err(error) => error,
+            };
+        assert!(error
+            .downcast_ref::<NodeExecutorResponseProtocolError>()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn streamed_response_observes_completion_after_log_receiver_drops() {
+        let stream_parts = [
+            Ok(NodeExecutorStreamPart::Chunk(Bytes::from_static(
+                br#"{"kind":"LogLine","data":{"messages":["test"],"isTruncated":false,"timestamp":0,"level":"INFO"}}
+{"type":"success"}
+"#,
+            ))),
+            Ok(NodeExecutorStreamPart::InvokeComplete(
+                InvokeCompletion::Success,
+            )),
+        ];
+        let (log_line_sender, log_line_receiver) = mpsc::unbounded_channel();
+        drop(log_line_receiver);
+
+        let response =
+            handle_node_executor_stream(log_line_sender, futures::stream::iter(stream_parts))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(response, serde_json::json!({ "type": "success" }));
     }
 
     #[test]
