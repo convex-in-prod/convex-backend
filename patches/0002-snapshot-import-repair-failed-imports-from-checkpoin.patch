@@ -9,17 +9,17 @@ Commit activation, audit logging, and the Failed-to-Completed transition atomica
 ---
  .../src/snapshot_import/confirmation.rs       |   41 +-
  .../snapshot_import/import_file_storage.rs    |   94 +-
- crates/application/src/snapshot_import/mod.rs | 1314 ++++++++++++++++-
+ crates/application/src/snapshot_import/mod.rs | 1316 ++++++++++++++++-
  crates/local_backend/src/router.rs            |    5 +
  crates/local_backend/src/snapshot_import.rs   |   32 +
  crates/model/src/snapshot_imports/mod.rs      |   45 +-
  crates/model/src/snapshot_imports/types.rs    |    3 +
  .../README.md                                 |  278 ++++
- 8 files changed, 1738 insertions(+), 74 deletions(-)
+ 8 files changed, 1737 insertions(+), 77 deletions(-)
  create mode 100644 patches/snapshot_import_checkpoint_repair/README.md
 
 diff --git a/crates/application/src/snapshot_import/confirmation.rs b/crates/application/src/snapshot_import/confirmation.rs
-index 6601c510f9a7f1e6f5e287f66e27b08afec04eeb..aea960e1cf3ddc59a8b11c35d139d954bb910d64 100644
+index 481cca4c22210b0153c228f8b3832b55ca1b2365..2d0df43d6d2b114ddb0a183df6d445fdb5697108 100644
 --- a/crates/application/src/snapshot_import/confirmation.rs
 +++ b/crates/application/src/snapshot_import/confirmation.rs
 @@ -5,7 +5,10 @@ use std::collections::{
@@ -38,12 +38,12 @@ index 6601c510f9a7f1e6f5e287f66e27b08afec04eeb..aea960e1cf3ddc59a8b11c35d139d954
      snapshot_import: ParsedDocument<SnapshotImport>,
  ) -> anyhow::Result<(Vec<String>, bool, Vec<ImportTableCheckpoint>)> {
      let mode = snapshot_import.mode;
--    let (_, import) = executor.parse_import(snapshot_import.id()).await?;
-+    let (initial_schemas, import) = executor.parse_import(snapshot_import.id()).await?;
+-    let (_, import) = executor
++    let (initial_schemas, import) = executor
+         .parse_import(snapshot_import.developer_id())
+         .await?;
      // Find all tables being written to.
-     let mut count_by_table: BTreeMap<(ComponentPath, TableName), u64> = BTreeMap::new();
-     let mut tables_missing_id_field: BTreeSet<(ComponentPath, TableName)> = BTreeSet::new();
-@@ -106,11 +109,12 @@ async fn messages_to_confirm_replace<RT: Runtime>(
+@@ -108,11 +111,12 @@ async fn messages_to_confirm_replace<RT: Runtime>(
      }
  
      let db_snapshot = executor.database.latest_snapshot()?;
@@ -57,7 +57,7 @@ index 6601c510f9a7f1e6f5e287f66e27b08afec04eeb..aea960e1cf3ddc59a8b11c35d139d954
          let table_mapping = db_snapshot.table_mapping();
          for (tablet_id, namespace, _, table_name) in table_mapping.iter() {
              let Some(component_path) = component_paths.get(&namespace.into()) else {
-@@ -123,6 +127,25 @@ async fn messages_to_confirm_replace<RT: Runtime>(
+@@ -125,6 +129,25 @@ async fn messages_to_confirm_replace<RT: Runtime>(
                  .entry((component_path.clone(), table_name.clone()))
                  .or_default();
          }
@@ -83,7 +83,7 @@ index 6601c510f9a7f1e6f5e287f66e27b08afec04eeb..aea960e1cf3ddc59a8b11c35d139d954
      }
  
      let mut table_changes = BTreeMap::new();
-@@ -218,6 +241,18 @@ async fn messages_to_confirm_replace<RT: Runtime>(
+@@ -220,6 +243,18 @@ async fn messages_to_confirm_replace<RT: Runtime>(
              is_missing_id_field: *is_missing_id_field,
          });
      }
@@ -103,7 +103,7 @@ index 6601c510f9a7f1e6f5e287f66e27b08afec04eeb..aea960e1cf3ddc59a8b11c35d139d954
      for (component_path, table_changes) in &table_changes
          .into_iter()
 diff --git a/crates/application/src/snapshot_import/import_file_storage.rs b/crates/application/src/snapshot_import/import_file_storage.rs
-index e5d4a4a1052548d65d930d1f215e7b2de982691e..381d9c79b82bc334f309edf4246b2484336595bd 100644
+index d794db0ecdf316e3c6b564f824de5072efbe3421..67517230a4a81243a6cd9f2190624bb35d134cb2 100644
 --- a/crates/application/src/snapshot_import/import_file_storage.rs
 +++ b/crates/application/src/snapshot_import/import_file_storage.rs
 @@ -1,5 +1,8 @@
@@ -116,7 +116,7 @@ index e5d4a4a1052548d65d930d1f215e7b2de982691e..381d9c79b82bc334f309edf4246b2484
      str::FromStr,
  };
  
-@@ -98,7 +101,11 @@ pub async fn import_storage_table<RT: Runtime>(
+@@ -97,7 +100,11 @@ pub async fn import_storage_table<RT: Runtime>(
                  )
              )
          );
@@ -129,7 +129,7 @@ index e5d4a4a1052548d65d930d1f215e7b2de982691e..381d9c79b82bc334f309edf4246b2484
          let content_type = metadata
              .content_type
              .map(|content_type| anyhow::Ok(ContentType::from_str(&content_type)?))
-@@ -122,25 +129,77 @@ pub async fn import_storage_table<RT: Runtime>(
+@@ -121,25 +128,77 @@ pub async fn import_storage_table<RT: Runtime>(
              .transpose()
              .map_err(|e| ImportError::InvalidConvexValue(lineno, e))?;
  
@@ -220,7 +220,7 @@ index e5d4a4a1052548d65d930d1f215e7b2de982691e..381d9c79b82bc334f309edf4246b2484
          let mut entry = file_storage
              .transactional_file_storage
              .upload_file(content_length, content_type, file_chunks(), expected_sha256)
-@@ -148,10 +207,6 @@ pub async fn import_storage_table<RT: Runtime>(
+@@ -147,10 +206,6 @@ pub async fn import_storage_table<RT: Runtime>(
          if let Some(storage_id) = storage_id {
              entry.storage_id = storage_id;
          }
@@ -231,7 +231,7 @@ index e5d4a4a1052548d65d930d1f215e7b2de982691e..381d9c79b82bc334f309edf4246b2484
          let file_size = entry.size as u64;
          database
              .execute_with_overloaded_and_ratelimited_retries(
-@@ -223,6 +278,7 @@ pub async fn import_storage_table<RT: Runtime>(
+@@ -222,6 +277,7 @@ pub async fn import_storage_table<RT: Runtime>(
              .await;
          }
      }
@@ -240,7 +240,7 @@ index e5d4a4a1052548d65d930d1f215e7b2de982691e..381d9c79b82bc334f309edf4246b2484
          add_checkpoint_message(
              database,
 diff --git a/crates/application/src/snapshot_import/mod.rs b/crates/application/src/snapshot_import/mod.rs
-index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6a5345540 100644
+index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..126e83f45443b8f365ceef8187a591794b0de751 100644
 --- a/crates/application/src/snapshot_import/mod.rs
 +++ b/crates/application/src/snapshot_import/mod.rs
 @@ -41,7 +41,10 @@ use bytes::Bytes;
@@ -292,9 +292,9 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
  use serde_json::Value as JsonValue;
  use shape_inference::{
      export_context::GeneratedSchema,
-@@ -289,25 +298,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+@@ -288,25 +297,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
          ));
-         let import_id = snapshot_import.id();
+         let import_id = snapshot_import.developer_id();
          match self.attempt_perform_import(snapshot_import).await {
 -            Ok((ts, num_rows_written)) => {
 -                self.database
@@ -319,16 +319,16 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
              Err(e) => {
                  let mut e = wrap_import_err(e);
                  if e.is_bad_request()
-@@ -364,7 +355,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+@@ -363,7 +354,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
      async fn attempt_perform_import(
          &mut self,
          snapshot_import: ParsedDocument<SnapshotImport>,
 -    ) -> anyhow::Result<(Timestamp, u64)> {
 +    ) -> anyhow::Result<()> {
          self.fail_if_too_old(&snapshot_import)?;
-         let (initial_schemas, import) = self.parse_import(snapshot_import.id()).await?;
+         let (initial_schemas, import) = self.parse_import(snapshot_import.developer_id()).await?;
          let source_size = import.source_size;
-@@ -396,7 +387,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+@@ -395,7 +386,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
          let pause_client = self.runtime.pause_client();
          pause_client.wait("before_finalize_import").await;
          let (id, snapshot_import) = snapshot_import.into_id_and_value();
@@ -337,19 +337,19 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
              &self.database,
              Identity::system(),
              snapshot_import.member_id,
-@@ -407,7 +398,10 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+@@ -406,7 +397,10 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
              AuditLogInfo::SnapshotImport {
                  import_format: snapshot_import.format,
              },
--            Some(id),
+-            Some(id.developer_id),
 +            FinalizeImportGuard::InProgress {
-+                import_id: id,
++                import_id: id.developer_id,
 +                completed_num_rows_written: total_documents_imported,
 +            },
              snapshot_import.requestor.clone(),
              usage.clone(),
          )
-@@ -430,7 +424,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+@@ -429,7 +423,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
              )
              .await;
  
@@ -358,7 +358,7 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
      }
  
      async fn parse_import(
-@@ -734,7 +728,7 @@ pub async fn clear_tables<RT: Runtime>(
+@@ -730,7 +724,7 @@ pub async fn clear_tables<RT: Runtime>(
          ImportMode::Replace,
          table_mapping,
          AuditLogInfo::ClearTables,
@@ -367,7 +367,7 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
          requestor,
          usage.clone(),
      )
-@@ -742,6 +736,1044 @@ pub async fn clear_tables<RT: Runtime>(
+@@ -738,6 +732,1040 @@ pub async fn clear_tables<RT: Runtime>(
      Ok(documents_deleted)
  }
  
@@ -407,7 +407,7 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
 +}
 +
 +struct RepairFailedImportFromCheckpointsPlan {
-+    import_id: ResolvedDocumentId,
++    import_id: DeveloperDocumentId,
 +    expected_failed_import: SnapshotImport,
 +    mode: ImportMode,
 +    format: ImportFormat,
@@ -426,11 +426,11 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
 +
 +async fn ensure_no_other_nonterminal_snapshot_imports<RT: Runtime>(
 +    tx: &mut Transaction<RT>,
-+    repair_import_id: ResolvedDocumentId,
++    repair_import_id: DeveloperDocumentId,
 +) -> anyhow::Result<()> {
 +    let imports = SnapshotImportModel::new(tx).list().await?;
 +    let has_conflicting_import = imports.iter().any(|snapshot_import| {
-+        snapshot_import.id() != repair_import_id
++        snapshot_import.developer_id() != repair_import_id
 +            && matches!(
 +                &snapshot_import.state,
 +                ImportState::Uploaded
@@ -807,7 +807,7 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
 +
 +async fn build_repair_failed_import_from_checkpoints_plan<RT: Runtime>(
 +    tx: &mut Transaction<RT>,
-+    import_id: ResolvedDocumentId,
++    import_id: DeveloperDocumentId,
 +    dry_run: bool,
 +) -> anyhow::Result<RepairFailedImportFromCheckpointsPlan> {
 +    let snapshot_import =
@@ -1343,10 +1343,6 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
 +    dry_run: bool,
 +) -> anyhow::Result<RepairFailedImportFromCheckpointsReport> {
 +    identity.require_operation(DeploymentOp::ImportBackups)?;
-+    let resolved_import_id = {
-+        let mut tx = application.database.begin(identity.clone()).await?;
-+        tx.resolve_developer_id(&import_id, TableNamespace::Global)?
-+    };
 +    let (_plan_ts, plan, _plan_occ_stats) = application
 +        .database
 +        .execute_with_overloaded_retries(
@@ -1357,7 +1353,7 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
 +                async {
 +                    build_repair_failed_import_from_checkpoints_plan(
 +                        tx,
-+                        resolved_import_id,
++                        import_id,
 +                        dry_run,
 +                    )
 +                    .await
@@ -1412,7 +1408,7 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
  /// Reads all objects from a [`ParsedImport`] and writes them into the database.
  /// Returns a table mapping containing just the imported tables. If `mode` is
  /// ReplaceAll this includes empty tables for tables that should be cleared.
-@@ -897,6 +1929,17 @@ async fn import_objects<RT: Runtime>(
+@@ -893,6 +1921,17 @@ async fn import_objects<RT: Runtime>(
          )
          .await?;
      }
@@ -1430,18 +1426,18 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
  
      Ok((table_mapping_in_import, total_num_documents))
  }
-@@ -1013,6 +2056,40 @@ enum AuditLogInfo {
+@@ -1009,6 +2048,40 @@ enum AuditLogInfo {
      SnapshotImport { import_format: ImportFormat },
  }
  
 +enum FinalizeImportGuard {
 +    None,
 +    InProgress {
-+        import_id: ResolvedDocumentId,
++        import_id: DeveloperDocumentId,
 +        completed_num_rows_written: u64,
 +    },
 +    FailedRepair {
-+        import_id: ResolvedDocumentId,
++        import_id: DeveloperDocumentId,
 +        expected_failed_import: SnapshotImport,
 +        active_table_guards: Vec<RepairActiveTableGuard>,
 +        checkpoint_tablet_guards: Vec<RepairCheckpointTabletGuard>,
@@ -1450,7 +1446,7 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
 +}
 +
 +impl FinalizeImportGuard {
-+    fn import_id(&self) -> Option<ResolvedDocumentId> {
++    fn import_id(&self) -> Option<DeveloperDocumentId> {
 +        match self {
 +            Self::None => None,
 +            Self::InProgress {
@@ -1471,11 +1467,11 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
  async fn finalize_import<RT: Runtime>(
      database: &Database<RT>,
      identity: Identity,
-@@ -1022,14 +2099,13 @@ async fn finalize_import<RT: Runtime>(
+@@ -1018,14 +2091,13 @@ async fn finalize_import<RT: Runtime>(
      mode: ImportMode,
      imported_tables: TableMapping,
      audit_log_info: AuditLogInfo,
--    import_id: Option<ResolvedDocumentId>,
+-    import_id: Option<DeveloperDocumentId>,
 +    import_guard: FinalizeImportGuard,
      requestor: ImportRequestor,
      usage: FunctionUsageTracker,
@@ -1489,15 +1485,18 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
  
      // If we inserted into an existing table, we're done because the table is
      // now populated and active.
-@@ -1037,28 +2113,128 @@ async fn finalize_import<RT: Runtime>(
+@@ -1033,31 +2105,131 @@ async fn finalize_import<RT: Runtime>(
      let (ts, documents_deleted, _occ_stats) = database
          .execute_with_overloaded_retries(identity, usage, "snapshot_import_finalize", |tx| {
              async {
 -                if let Some(import_id) = import_id {
 -                    // Only finalize the import if it's in progress.
 -                    let mut snapshot_import_model = SnapshotImportModel::new(tx);
--                    let snapshot_import_state =
--                        snapshot_import_model.must_get_state(import_id).await?;
+-                    let snapshot_import_state = snapshot_import_model
+-                        .must_get(import_id)
+-                        .await?
+-                        .into_value()
+-                        .state;
 -                    match snapshot_import_state {
 -                        ImportState::InProgress { .. } => {},
 -                        // This can happen if the import was canceled or somehow retried after
@@ -1522,8 +1521,11 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
 +                    } => {
 +                        // Only finalize the import if it's in progress.
 +                        let mut snapshot_import_model = SnapshotImportModel::new(tx);
-+                        let snapshot_import_state =
-+                            snapshot_import_model.must_get_state(*import_id).await?;
++                        let snapshot_import_state = snapshot_import_model
++                            .must_get(*import_id)
++                            .await?
++                            .into_value()
++                            .state;
 +                        match snapshot_import_state {
 +                            ImportState::InProgress { .. } => {},
 +                            // This can happen if the import was canceled or somehow retried after
@@ -1639,7 +1641,7 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
  
                  let to_delete = match mode {
                      ImportMode::Append | ImportMode::Replace | ImportMode::RequireEmpty => {
-@@ -1135,11 +2311,36 @@ async fn finalize_import<RT: Runtime>(
+@@ -1134,11 +2306,36 @@ async fn finalize_import<RT: Runtime>(
                  .await?;
                  DeploymentAuditLogModel::new(tx)
                      .insert_with_member_override(
@@ -1677,7 +1679,7 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
  
                  Ok(documents_deleted)
              }
-@@ -1452,6 +2653,17 @@ async fn import_single_table<RT: Runtime>(
+@@ -1451,6 +2648,17 @@ async fn import_single_table<RT: Runtime>(
          }
          num_objects += 1;
      }
@@ -1696,7 +1698,7 @@ index ddd63d8c1b4a137230beb3cd329d83aeae363f23..f1d9c327c43e9964587b75baa83ce6b6
      insert_import_objects(
          database,
 diff --git a/crates/local_backend/src/router.rs b/crates/local_backend/src/router.rs
-index 8ea2c44dc06038bcd11c08109bcdb02f5c287c05..bcf5a8159dbaca4cfc13436a6324f731978f0b26 100644
+index 37943d3e25de9940c471875e1a650542228caa8e..e2f3457fc185743655fb85a0ff5756ae27fea079 100644
 --- a/crates/local_backend/src/router.rs
 +++ b/crates/local_backend/src/router.rs
 @@ -131,6 +131,7 @@ use crate::{
@@ -1707,7 +1709,7 @@ index 8ea2c44dc06038bcd11c08109bcdb02f5c287c05..bcf5a8159dbaca4cfc13436a6324f731
      },
      storage::{
          storage_get,
-@@ -478,6 +479,10 @@ where
+@@ -479,6 +480,10 @@ where
          .route("/import/upload_part", post(import_upload_part))
          .route("/import/finish_upload", post(import_finish_upload))
          .route("/perform_import", post(perform_import))
@@ -1769,10 +1771,10 @@ index f8306a36996cec2f02bcba24c9c67a0597b6a111..b47f4fc8fdfb8a79db875229f658068b
  #[serde(rename_all = "camelCase")]
  pub struct CancelImportArgs {
 diff --git a/crates/model/src/snapshot_imports/mod.rs b/crates/model/src/snapshot_imports/mod.rs
-index 8605d867e17f0e488d47da47619097fe7e5e4ee7..1892d97035c9590bc1c678b8dc601cf62e0b39d8 100644
+index e293f813dbcf0ac755cdef15daa0763e150fbf1b..0a63d6fd05520be3bd1c1fe6a598f7d98ee20630 100644
 --- a/crates/model/src/snapshot_imports/mod.rs
 +++ b/crates/model/src/snapshot_imports/mod.rs
-@@ -238,13 +238,56 @@ impl<'a, RT: Runtime> SnapshotImportModel<'a, RT> {
+@@ -236,13 +236,56 @@ impl<'a, RT: Runtime> SnapshotImportModel<'a, RT> {
          ts: Timestamp,
          num_rows_written: u64,
      ) -> anyhow::Result<()> {
@@ -1790,14 +1792,14 @@ index 8605d867e17f0e488d47da47619097fe7e5e4ee7..1892d97035c9590bc1c678b8dc601cf6
 +    /// been added to the same transaction.
 +    pub async fn complete_failed_import_from_checkpoints(
 +        &mut self,
-+        id: ResolvedDocumentId,
++        id: DeveloperDocumentId,
 +        ts: Timestamp,
 +        num_rows_written: u64,
 +    ) -> anyhow::Result<()> {
 +        let num_rows_written = i64::try_from(num_rows_written)
 +            .context("snapshot import row count exceeds the completed-state representation")?;
-+        let current_state = self.must_get_state(id).await?;
-+        match current_state {
++        let (resolved_id, import) = self.must_get(id).await?.into_id_and_value();
++        match import.state {
 +            ImportState::Failed(_) => {},
 +            ImportState::Completed { .. } => {
 +                anyhow::bail!(ErrorMetadata::bad_request(
@@ -1808,7 +1810,7 @@ index 8605d867e17f0e488d47da47619097fe7e5e4ee7..1892d97035c9590bc1c678b8dc601cf6
 +            _ => {
 +                anyhow::bail!(ErrorMetadata::bad_request(
 +                    "ImportNotFailed",
-+                    format!("expected failed import, found {current_state:?}"),
++                    format!("expected failed import, found {:?}", import.state),
 +                ))
 +            },
 +        }
@@ -1818,7 +1820,7 @@ index 8605d867e17f0e488d47da47619097fe7e5e4ee7..1892d97035c9590bc1c678b8dc601cf6
 +        };
 +        SystemMetadataModel::new_global(self.tx)
 +            .patch(
-+                id,
++                resolved_id,
 +                patch_value!(
 +                    "state" => Some(ConvexValue::Object(completed_state.try_into()?))
 +                )?,
@@ -1829,7 +1831,7 @@ index 8605d867e17f0e488d47da47619097fe7e5e4ee7..1892d97035c9590bc1c678b8dc601cf6
 +
      pub async fn fail_import(
          &mut self,
-         id: ResolvedDocumentId,
+         id: DeveloperDocumentId,
 diff --git a/crates/model/src/snapshot_imports/types.rs b/crates/model/src/snapshot_imports/types.rs
 index 575c8027921fb2adc3ae69ecb3bd1e4b8d07e52e..5d75dd5977d797ac19b9a8ad68d1ca159bb4a398 100644
 --- a/crates/model/src/snapshot_imports/types.rs

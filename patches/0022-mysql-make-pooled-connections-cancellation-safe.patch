@@ -18,8 +18,9 @@ Export bounded cancellation request, terminal-outcome, and latency metrics. Docu
  crates/db_connection/src/lib.rs               |   13 +-
  crates/mysql/src/cancellation.rs              |  933 ++++++
  crates/mysql/src/connection.rs                |  730 ++++-
- crates/mysql/src/lib.rs                       |   68 +-
+ crates/mysql/src/lib.rs                       |    2 +
  crates/mysql/src/metrics.rs                   |   36 +
+ crates/mysql/src/v5/persistence.rs            |   66 +-
  patches/README.md                             |   16 +
  .../README.md                                 |  189 ++
  self-hosted/docker-build/Dockerfile.backend   |    2 +
@@ -86,7 +87,7 @@ Export bounded cancellation request, terminal-outcome, and latency metrics. Docu
  third_party/mysql_async/test/key.pem          |   27 +
  third_party/mysql_async/tests/exports.rs      |   18 +
  third_party/mysql_async/tests/generic.rs      |   61 +
- 75 files changed, 17526 insertions(+), 165 deletions(-)
+ 76 files changed, 17526 insertions(+), 165 deletions(-)
  create mode 100644 crates/mysql/src/cancellation.rs
  create mode 100644 patches/cancellation_safe_mysql_connections/README.md
  create mode 100644 third_party/mysql_async/.gitignore
@@ -169,10 +170,10 @@ index e781581e1b02f4392863db3a3d45690c26e7ad52..8ec50657cb59ac9f7c73801cb3dcfc48
  !/rust-toolchain
  !/self-hosted/*
 diff --git a/Cargo.lock b/Cargo.lock
-index 3141ad2c3c475ece522a1a76073ea739bd0a94ef..592069a14e3b70acce5668b0d09457bda6316874 100644
+index 26f845abc7719019838b21fecc9187e29c61c8b8..a0be04dee7c6447afd3dc3d725b448a57514caf2 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -6465,7 +6465,6 @@ dependencies = [
+@@ -6549,7 +6549,6 @@ dependencies = [
  [[package]]
  name = "mysql_async"
  version = "0.36.1"
@@ -203,10 +204,10 @@ index c8cb86ad77aefd007987662bf4c3d3cf183b158b..343f795ad35ec55b41e90fc075b944cb
  node_executor = { path = "crates/node_executor" }
  oauth2 = { version = "5", default-features = false, features = [ "reqwest" ] }
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index ef0019071d1a347d95494320006d3f15fba45903..fb1d2795fa2435ec1108a13c728e92841098eb66 100644
+index fd93f6ade7e58159ea77143d743875e04e6814cc..9ace32ec2f56dfdbaae459aa886eb54ac1057b56 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -1471,6 +1471,18 @@ pub static MYSQL_TIMEOUT: LazyLock<u64> = LazyLock::new(|| env_config("MYSQL_TIM
+@@ -1501,6 +1501,18 @@ pub static MYSQL_TIMEOUT: LazyLock<u64> = LazyLock::new(|| env_config("MYSQL_TIM
  pub static MYSQL_MAX_CONNECTIONS: LazyLock<usize> =
      LazyLock::new(|| env_config("MYSQL_MAX_CONNECTIONS", 128));
  
@@ -226,7 +227,7 @@ index ef0019071d1a347d95494320006d3f15fba45903..fb1d2795fa2435ec1108a13c728e9284
  pub static MYSQL_MIN_QUERY_BATCH_SIZE: LazyLock<usize> =
      LazyLock::new(|| env_config("MYSQL_MIN_QUERY_BATCH_SIZE", 1));
 diff --git a/crates/db_connection/src/lib.rs b/crates/db_connection/src/lib.rs
-index 16d0aea04781c96bab1d875ce5fd160d182b7fd2..774cf5604371e15000cd3d6a438678aeafcec7bf 100644
+index 1ef338439259700c0b1566a4dcf0eb9d70f81ee3..c3be29e3d009b58212a7c831329252b93c5731a1 100644
 --- a/crates/db_connection/src/lib.rs
 +++ b/crates/db_connection/src/lib.rs
 @@ -10,7 +10,10 @@ use clusters::{
@@ -247,9 +248,9 @@ index 16d0aea04781c96bab1d875ce5fd160d182b7fd2..774cf5604371e15000cd3d6a438678ae
      ConvexMySqlPool,
 +    MySqlConnectionIdTopology,
      MySqlOptions,
-     MySqlPersistence,
      MySqlReaderOptions,
-@@ -125,7 +129,12 @@ pub fn persistence_seed<RT: Runtime>(
+ };
+@@ -122,7 +126,12 @@ pub fn persistence_seed<RT: Runtime>(
                              &url,
                              *DATABASE_USE_PREPARED_STATEMENTS,
                              require_leader,
@@ -2174,7 +2175,7 @@ index dc69070bbecbdda7df790dbf3d00ff49e86e9df3..8314db46e59d651a3db8e87a3b1c67d4
 +    }
 +}
 diff --git a/crates/mysql/src/lib.rs b/crates/mysql/src/lib.rs
-index b20ecca9556bd4ab254333193a164926c4a27c7a..4555dbefbc0e6fa739da1e0237169e920b96c8f9 100644
+index 3397dc1bd3fe8c16ba57b8feebe19a6749822289..ad4f88446fab7314e36ce615002b7232d753ff24 100644
 --- a/crates/mysql/src/lib.rs
 +++ b/crates/mysql/src/lib.rs
 @@ -2,6 +2,7 @@
@@ -2185,116 +2186,14 @@ index b20ecca9556bd4ab254333193a164926c4a27c7a..4555dbefbc0e6fa739da1e0237169e92
  mod chunks;
  mod connection;
  mod document_encoding;
-@@ -35,6 +36,7 @@ use std::{
+@@ -13,6 +14,7 @@ use std::{
+     sync::Arc,
+ };
  
- use anyhow::Context;
- use async_trait::async_trait;
 +pub use cancellation::MySqlConnectionIdTopology;
- use chunks::ApproxSize;
  use common::{
-     document::{
-@@ -84,7 +86,6 @@ use common::{
-     },
-     sha256::Sha256,
-     shutdown::ShutdownSignal,
--    try_anyhow,
-     types::{
-         IndexId,
-         PersistenceVersion,
-@@ -255,6 +256,7 @@ impl<RT: Runtime> MySqlPersistence<RT> {
-         {
-             return Err(ConnectError::ReadOnly);
-         }
-+        drop(client);
- 
-         let lease = Lease::acquire(
-             pool.clone(),
-@@ -342,7 +344,6 @@ impl<RT: Runtime> MySqlPersistence<RT> {
-             .await?
-             .is_none())
-     }
--
- }
- 
- #[async_trait]
-@@ -1605,6 +1606,7 @@ impl<RT: Runtime> Lease<RT> {
-         tracing::info!("lease acquired with ts {}", ts);
- 
-         timer.finish();
-+        drop(client);
-         Ok(Self {
-             db_name,
-             pool,
-@@ -1629,41 +1631,35 @@ impl<RT: Runtime> Lease<RT> {
-         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
-     {
-         let mut client = self.pool.acquire("transact", &self.db_name).await?;
--        let r = try_anyhow!({
--            let mut tx = client.transaction(self.pool.cluster_name()).await?;
--
--            let timer = metrics::lease_precond_timer(self.pool.cluster_name());
--            let mut params = vec![mysql_async::Value::Int(self.lease_ts)];
--            if self.multitenant {
--                params.push((&self.instance_name.raw).into());
--            }
--            let rows: Option<Row> = tx
--                .exec_first(sql::lease_precond(self.multitenant), params)
--                .in_span(Span::enter_with_local_parent(format!(
--                    "{}::lease_precondition",
--                    func_path!()
--                )))
--                .await?;
--            if rows.is_none() {
--                self.lease_lost_shutdown.signal(lease_lost_error());
--                anyhow::bail!(lease_lost_error());
--            }
--            timer.finish();
--
--            let result = f(&mut tx)
--                .in_span(Span::enter_with_local_parent(format!(
--                    "{}::execute_function",
--                    func_path!()
--                )))
--                .await?;
--
--            let timer = metrics::commit_timer(self.pool.cluster_name());
--            tx.commit().await?;
--            timer.finish();
-+        client
-+            .transaction(self.pool.cluster_name(), async |tx| {
-+                let timer = metrics::lease_precond_timer(self.pool.cluster_name());
-+                let mut params = vec![mysql_async::Value::Int(self.lease_ts)];
-+                if self.multitenant {
-+                    params.push((&self.instance_name.raw).into());
-+                }
-+                let rows: Option<Row> = tx
-+                    .exec_first(sql::lease_precond(self.multitenant), params)
-+                    .in_span(Span::enter_with_local_parent(format!(
-+                        "{}::lease_precondition",
-+                        func_path!()
-+                    )))
-+                    .await?;
-+                if rows.is_none() {
-+                    self.lease_lost_shutdown.signal(lease_lost_error());
-+                    anyhow::bail!(lease_lost_error());
-+                }
-+                timer.finish();
- 
--            result
--        });
--        client.handle_errors(r).await
-+                let result = f(tx)
-+                    .in_span(Span::enter_with_local_parent(format!(
-+                        "{}::execute_function",
-+                        func_path!()
-+                    )))
-+                    .await?;
-+                Ok(result)
-+            })
-+            .await
-     }
- }
- 
+     persistence::{
+         Persistence,
 diff --git a/crates/mysql/src/metrics.rs b/crates/mysql/src/metrics.rs
 index bb8effd7f7111e1c421ac0791f5aff23f094f17b..39315089c507928e021e48f6d9d5332fd052b31b 100644
 --- a/crates/mysql/src/metrics.rs
@@ -2342,6 +2241,112 @@ index bb8effd7f7111e1c421ac0791f5aff23f094f17b..39315089c507928e021e48f6d9d5332f
  fn persistence_global_key_label(key: PersistenceGlobalKey) -> StaticMetricLabel {
      StaticMetricLabel::new("key", String::from(key))
  }
+diff --git a/crates/mysql/src/v5/persistence.rs b/crates/mysql/src/v5/persistence.rs
+index bba5be4484e78386d9a73f4fe8a038719e711b47..903949cb247e01bb4f6c3c054351f6daebdb8a04 100644
+--- a/crates/mysql/src/v5/persistence.rs
++++ b/crates/mysql/src/v5/persistence.rs
+@@ -70,7 +70,6 @@ use common::{
+     },
+     sha256::Sha256,
+     shutdown::ShutdownSignal,
+-    try_anyhow,
+     types::{
+         IndexId,
+         PersistenceVersion,
+@@ -196,6 +195,7 @@ impl<RT: Runtime> Persistence<RT> {
+         {
+             return Err(ConnectError::ReadOnly);
+         }
++        drop(client);
+ 
+         let lease = Lease::acquire(
+             pool.clone(),
+@@ -285,7 +285,6 @@ impl<RT: Runtime> Persistence<RT> {
+             .await?
+             .is_none())
+     }
+-
+ }
+ 
+ #[async_trait]
+@@ -1562,6 +1561,7 @@ impl<RT: Runtime> Lease<RT> {
+         tracing::info!("lease acquired with ts {}", ts);
+ 
+         timer.finish();
++        drop(client);
+         Ok(Self {
+             db_name,
+             pool,
+@@ -1586,41 +1586,35 @@ impl<RT: Runtime> Lease<RT> {
+         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
+     {
+         let mut client = self.pool.acquire("transact", &self.db_name).await?;
+-        let r = try_anyhow!({
+-            let mut tx = client.transaction(self.pool.cluster_name()).await?;
+-
+-            let timer = metrics::lease_precond_timer(self.pool.cluster_name());
+-            let mut params = vec![mysql_async::Value::Int(self.lease_ts)];
+-            if self.multitenant {
+-                params.push((&self.instance_name.raw).into());
+-            }
+-            let rows: Option<Row> = tx
+-                .exec_first(super::lease_precond(self.multitenant), params)
+-                .in_span(Span::enter_with_local_parent(format!(
+-                    "{}::lease_precondition",
+-                    func_path!()
+-                )))
+-                .await?;
+-            if rows.is_none() {
+-                self.lease_lost_shutdown.signal(lease_lost_error());
+-                anyhow::bail!(lease_lost_error());
+-            }
+-            timer.finish();
+-
+-            let result = f(&mut tx)
+-                .in_span(Span::enter_with_local_parent(format!(
+-                    "{}::execute_function",
+-                    func_path!()
+-                )))
+-                .await?;
+-
+-            let timer = metrics::commit_timer(self.pool.cluster_name());
+-            tx.commit().await?;
+-            timer.finish();
++        client
++            .transaction(self.pool.cluster_name(), async |tx| {
++                let timer = metrics::lease_precond_timer(self.pool.cluster_name());
++                let mut params = vec![mysql_async::Value::Int(self.lease_ts)];
++                if self.multitenant {
++                    params.push((&self.instance_name.raw).into());
++                }
++                let rows: Option<Row> = tx
++                    .exec_first(super::lease_precond(self.multitenant), params)
++                    .in_span(Span::enter_with_local_parent(format!(
++                        "{}::lease_precondition",
++                        func_path!()
++                    )))
++                    .await?;
++                if rows.is_none() {
++                    self.lease_lost_shutdown.signal(lease_lost_error());
++                    anyhow::bail!(lease_lost_error());
++                }
++                timer.finish();
+ 
+-            result
+-        });
+-        client.handle_errors(r).await
++                let result = f(tx)
++                    .in_span(Span::enter_with_local_parent(format!(
++                        "{}::execute_function",
++                        func_path!()
++                    )))
++                    .await?;
++                Ok(result)
++            })
++            .await
+     }
+ }
+ 
 diff --git a/patches/README.md b/patches/README.md
 index bbaccc5b9b50dec7f26d54c7f305992cdbb8a7b0..873597b3d6fc4c8478ed78fbac78265e2320c1d5 100644
 --- a/patches/README.md

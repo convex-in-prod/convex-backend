@@ -15,12 +15,12 @@ Track cancellation-safe waiting and active requests and export bounded generatio
 ---
  crates/node_executor/src/executor.rs          |  366 ++-
  crates/node_executor/src/lib.rs               |    4 -
- crates/node_executor/src/local.rs             | 2243 ++++++++++++++++-
+ crates/node_executor/src/local.rs             | 2239 ++++++++++++++++-
  crates/node_executor/src/metrics.rs           |  336 +++
  npm-packages/node-executor/src/local.ts       |    4 -
  patches/README.md                             |   30 +-
  .../local_node_executor_resilience/README.md  |  312 +++
- 7 files changed, 3044 insertions(+), 251 deletions(-)
+ 7 files changed, 3042 insertions(+), 249 deletions(-)
  create mode 100644 patches/local_node_executor_resilience/README.md
 
 diff --git a/crates/node_executor/src/executor.rs b/crates/node_executor/src/executor.rs
@@ -546,7 +546,7 @@ index 7f154cddac4bc1a64860d162c922815641c33a40..bfde7653b4f955bbf86e50c3541fe287
      ARGS_TOO_LARGE_RESPONSE_MESSAGE,
      EXECUTE_TIMEOUT_RESPONSE_JSON,
 diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
-index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d9c9e5837 100644
+index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b055a7bca 100644
 --- a/crates/node_executor/src/local.rs
 +++ b/crates/node_executor/src/local.rs
 @@ -1,25 +1,42 @@
@@ -1148,7 +1148,7 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
          // Don't keep idle connections in the pool. The Node HTTP server closes
          // idle keep-alive connections after its (default 5s) `keepAliveTimeout`,
          // but hyper's pool would hold one much longer and reuse it right as the
-@@ -103,39 +584,140 @@ impl InnerLocalNodeExecutor {
+@@ -103,38 +584,139 @@ impl InnerLocalNodeExecutor {
          let mut client_builder = Client::builder().pool_max_idle_per_host(0);
          #[cfg(unix)]
          {
@@ -1233,11 +1233,6 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
 -            .output()
 -            .await?;
 -        let version = String::from_utf8_lossy(&cmd.stdout);
--
--        if !version.starts_with("v18.")
--            && !version.starts_with("v20.")
--            && !version.starts_with("v22.")
--            && !version.starts_with("v24.")
 +            .stdin(Stdio::null())
 +            .stdout(Stdio::piped())
 +            .stderr(Stdio::null())
@@ -1294,17 +1289,19 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
 +                        error.kind()
 +                    )
 +                })?;
-+
+ 
+-        if !version.starts_with("v20.")
+-            && !version.starts_with("v22.")
+-            && !version.starts_with("v24.")
 +        if output_too_large
 +            || !status.success()
-+            || (!version.starts_with(b"v18.")
-+                && !version.starts_with(b"v20.")
++            || (!version.starts_with(b"v20.")
 +                && !version.starts_with(b"v22.")
 +                && !version.starts_with(b"v24."))
          {
              anyhow::bail!(ErrorMetadata::bad_request(
                  "DeploymentNotConfiguredForNodeActions",
-@@ -148,36 +730,123 @@ impl InnerLocalNodeExecutor {
+@@ -147,36 +729,123 @@ impl InnerLocalNodeExecutor {
          Ok(())
      }
  
@@ -1445,7 +1442,7 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
          Self::check_node_version(&node_path).await?;
  
          let mut cmd = TokioCommand::new(node_path);
-@@ -186,6 +855,11 @@ impl InnerLocalNodeExecutor {
+@@ -185,6 +854,11 @@ impl InnerLocalNodeExecutor {
              .arg(socket_path)
              .arg("--tempdir")
              .arg(temp_dir.path())
@@ -1457,7 +1454,7 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
              .kill_on_drop(true);
          if let Some(backoff) = config.callback_initial_backoff {
              cmd.env(
-@@ -203,43 +877,163 @@ impl InnerLocalNodeExecutor {
+@@ -202,43 +876,163 @@ impl InnerLocalNodeExecutor {
  impl LocalNodeExecutor {
      pub async fn new(node_process_timeout: Duration) -> anyhow::Result<Self> {
          let executor = Self {
@@ -1616,12 +1613,6 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
 -                                anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Ok(())))
 -                            }
 -                        }
--                    },
--                    _ = timeout_future.fuse() => {
--                        anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Err(InvokeResponse {
--                            response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
--                            aws_request_id: None,
--                        })))
 +            let part = match tokio::time::timeout_at(deadline, response.chunk()).await {
 +                Ok(chunk) => match chunk? {
 +                    Some(chunk) => {
@@ -1633,6 +1624,12 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
 +                            })?;
 +                        NodeExecutorStreamPart::Chunk(chunk)
                      },
+-                    _ = timeout_future.fuse() => {
+-                        anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Err(InvokeResponse {
+-                            response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
+-                            aws_request_id: None,
+-                        })))
+-                    },
 -                }
 +                    None => NodeExecutorStreamPart::InvokeComplete(Ok(())),
 +                },
@@ -1645,7 +1642,7 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
              if let NodeExecutorStreamPart::InvokeComplete(_) = part {
                  yield part;
                  break;
-@@ -249,16 +1043,341 @@ impl LocalNodeExecutor {
+@@ -248,16 +1042,341 @@ impl LocalNodeExecutor {
          }
      }
  
@@ -1996,7 +1993,7 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
      }
  }
  
-@@ -273,48 +1392,106 @@ impl NodeExecutor for LocalNodeExecutor {
+@@ -272,48 +1391,106 @@ impl NodeExecutor for LocalNodeExecutor {
          request: ExecutorRequest,
          log_line_sender: mpsc::UnboundedSender<LogLine>,
      ) -> anyhow::Result<InvokeResponse> {
@@ -2129,7 +2126,7 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
                  return Err(
                      anyhow::anyhow!(e.without_url()).context(ErrorMetadata::bad_request(
                          "ArgsTooLarge",
-@@ -322,30 +1499,836 @@ impl NodeExecutor for LocalNodeExecutor {
+@@ -321,30 +1498,836 @@ impl NodeExecutor for LocalNodeExecutor {
                      )),
                  );
              }
@@ -2254,7 +2251,7 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
 +    fn shutdown(&self) {
 +        if self.shutting_down.swap(true, Ordering::AcqRel) {
 +            return;
-+        }
+         }
 +        let state = self.state.clone();
 +        tokio::spawn(async move {
 +            let Some(expected) = state.lock().await.inner.clone() else {
@@ -2422,8 +2419,9 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
 +            server_handle: Mutex::new(ManagedChild::new(generation, server_handle, source_dir)),
 +            client,
 +        })
-+    }
-+
+     }
+ 
+-    fn shutdown(&self) {}
 +    #[tokio::test(flavor = "current_thread")]
 +    async fn dropped_unpublished_child_retains_tempdir_until_cleanup_finishes() {
 +        let source_dir = TempDir::new().unwrap();
@@ -2610,7 +2608,7 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
 +            assert_eq!(state.replacement_for_generation, Some(old.generation));
 +            state.inner = Some(replacement.clone());
 +            state.replacement_for_generation = None;
-         }
++        }
 +
 +        assert!(!LocalNodeExecutor::retire_inner_state(
 +            &state,
@@ -2633,9 +2631,8 @@ index 2365e912223a5cffdb2ba0437445189e1d86765d..d329fda9ed0ebc8c26a69b67feef3e4d
 +        )
 +        .await
 +        .unwrap();
-     }
- 
--    fn shutdown(&self) {}
++    }
++
 +    #[tokio::test]
 +    async fn concurrent_retirements_remove_one_generation_once() {
 +        let generation = test_inner(1).await;
