@@ -11,6 +11,7 @@ import { spawnSync } from "child_process";
 import {
   deploymentFetch,
   logAndHandleFetchError,
+  ThrowingFetchError,
   typedDeploymentClient,
 } from "./utils/utils.js";
 import {
@@ -304,6 +305,7 @@ export async function finishPush(
     deploymentName: string | null;
     deploymentType?: DeploymentType;
     message: string | null;
+    forceNodeCutover: boolean;
   },
 ): Promise<FinishPushDiff> {
   changeSpinner("Finalizing push...");
@@ -316,6 +318,8 @@ export async function finishPush(
     startPush,
     dryRun: options.dryRun,
     message: options.message,
+    forceNodeCutover:
+      (!options.dryRun && options.forceNodeCutover) || undefined,
   };
   try {
     const response = await fetch("/api/deploy2/finish_push", {
@@ -329,6 +333,17 @@ export async function finishPush(
     });
     return finishPushDiff.parse(await response.json());
   } catch (error: unknown) {
+    if (
+      error instanceof ThrowingFetchError &&
+      error.serverErrorData?.code === "NodeExecutorCutoverFailedAfterCommit"
+    ) {
+      return await ctx.crash({
+        exitCode: 1,
+        errorType: "fatal",
+        errForSentry: error,
+        printedMessage: chalkStderr.red(error.serverErrorData.message),
+      });
+    }
     return await handlePushConfigError(
       ctx,
       error,
@@ -405,6 +420,7 @@ export async function deployToDeployment(
     skipWorkosCheck?: boolean | undefined;
     allowDeletingLargeIndexes: boolean;
     message: string | null;
+    forceNodeCutover?: boolean | undefined;
   },
 ) {
   const { url, adminKey } = credentials;
@@ -454,6 +470,7 @@ export async function deployToDeployment(
       ? "has confirmation"
       : "ask for confirmation",
     message: options.message,
+    forceNodeCutover: !!options.forceNodeCutover,
   };
   showSpinner(`Deploying to ${url}...${options.dryRun ? " [dry run]" : ""}`);
   await runPush(ctx, pushOptions);
