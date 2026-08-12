@@ -556,6 +556,7 @@ mod configuration_cancellation_tests {
                     source: source.clone(),
                     source_map: None,
                     environment: common::types::ModuleEnvironment::Isolate,
+                    node_pool: None,
                 };
                 let inner = match stage {
                     Stage::Schema => RequestType::EvaluateSchema {

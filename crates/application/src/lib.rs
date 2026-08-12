@@ -240,6 +240,7 @@ use model::{
             UncachedModuleLoader,
         },
         types::{
+            node_executor_pool_topology,
             ConfigFile,
             ConfigMetadata,
             ModuleConfig,
@@ -2420,6 +2421,7 @@ impl<RT: Runtime> Application<RT> {
                 source: auth_config_source.source.clone(),
                 source_map: auth_config_source.source_map.clone(),
                 environment,
+                node_pool: auth_config_metadata.node_pool.clone(),
             };
             let user_environment_variables = EnvironmentVariablesModel::new(tx).get_all().await?;
             let auth_config = Self::evaluate_auth_config(
@@ -2459,7 +2461,7 @@ impl<RT: Runtime> Application<RT> {
         identity: Identity,
         request_metadata: RequestMetadata,
         apply_config_args: ApplyConfigArgs,
-    ) -> anyhow::Result<(ConfigMetadataAndSchema, OccRetryStats)> {
+    ) -> anyhow::Result<(ConfigMetadataAndSchema, OccRetryStats, Timestamp)> {
         let runner = self.runner.clone();
         self.execute_with_audit_log_events_and_occ_retries_reporting_stats(
             identity,
@@ -2655,6 +2657,18 @@ impl<RT: Runtime> Application<RT> {
                         anyhow::bail!(ErrorMetadata::conflict(
                             "ExistingModuleEnvConflict",
                             "Existing module environment does not match."
+                        ));
+                    }
+                    if metadata.node_pool != unchanged_module.node_pool {
+                        anyhow::bail!(ErrorMetadata::conflict(
+                            "ExistingModuleNodePoolConflict",
+                            "Existing module Node pool does not match."
+                        ));
+                    }
+                    if module.node_pool != unchanged_module.node_pool {
+                        anyhow::bail!(ErrorMetadata::conflict(
+                            "ExistingSourcePackageNodePoolConflict",
+                            "Existing source package Node pool does not match."
                         ));
                     }
                     app_functions.push(module.clone());
@@ -2873,6 +2887,9 @@ impl<RT: Runtime> Application<RT> {
         external_deps_id_and_pkg: Option<(ExternalDepsPackageId, ExternalDepsPackage)>,
         node_version: Option<NodeVersion>,
     ) -> anyhow::Result<SourcePackage> {
+        let node_executor_pool_topology = node_executor_pool_topology(modules)?;
+        self.runner()
+            .validate_node_executor_pool_topology(&node_executor_pool_topology)?;
         // If there are any node actions, turn on the lambdas.
         if modules
             .iter()
@@ -2920,6 +2937,7 @@ impl<RT: Runtime> Application<RT> {
             external_deps_package_id,
             package_size,
             node_version,
+            node_executor_pool_topology,
         })
     }
 
@@ -3072,6 +3090,7 @@ impl<RT: Runtime> Application<RT> {
                 module.source_map,
                 Some(analyzed_module),
                 ModuleEnvironment::Isolate,
+                None,
             )
             .await?;
 
@@ -3123,10 +3142,14 @@ impl<RT: Runtime> Application<RT> {
         &self,
         deps: Vec<NodeDependency>,
     ) -> anyhow::Result<(ExternalDepsPackageId, ExternalDepsPackage)> {
-        // Check cache to see if we've built this package recently
-        let mut tx = self.begin(Identity::system()).await?;
-        let mut model = ExternalPackagesModel::new(&mut tx);
-        let cached_match = model.get_cached_package_match(deps.clone()).await?;
+        // End the cache snapshot before system admission. Waiting for the
+        // serialized child and running npm can both take minutes.
+        let cached_match = {
+            let mut tx = self.begin(Identity::system()).await?;
+            ExternalPackagesModel::new(&mut tx)
+                .get_cached_package_match(deps.clone())
+                .await?
+        };
         if let Some((cached_id, cached_pkg)) = cached_match {
             tracing::info!("Cache hit for external deps package!");
             log_external_deps_package(true);
@@ -3667,7 +3690,7 @@ impl<RT: Runtime> Application<RT> {
             f,
         )
         .await
-        .map(|(t, _)| t)
+        .map(|(t, ..)| t)
     }
 
     pub async fn execute_with_audit_log_events_and_occ_retries_reporting_stats<'a, F, T>(
@@ -3676,7 +3699,7 @@ impl<RT: Runtime> Application<RT> {
         request_metadata: RequestMetadata,
         write_source: impl Into<WriteSource>,
         f: F,
-    ) -> anyhow::Result<(T, OccRetryStats)>
+    ) -> anyhow::Result<(T, OccRetryStats, Timestamp)>
     where
         F: Send + Sync,
         T: Send + 'static,
@@ -3741,7 +3764,7 @@ impl<RT: Runtime> Application<RT> {
         request_metadata: RequestMetadata,
         write_source: impl Into<WriteSource>,
         f: F,
-    ) -> anyhow::Result<(T, OccRetryStats)>
+    ) -> anyhow::Result<(T, OccRetryStats, Timestamp)>
     where
         F: Send + Sync,
         T: Send + 'static,
@@ -3773,7 +3796,7 @@ impl<RT: Runtime> Application<RT> {
             .try_collect()?;
 
         self.log_manager_client.send_logs(logs);
-        Ok((t, stats))
+        Ok((t, stats, ts))
     }
 
     pub async fn execute_with_occ_retries<'a, T, F>(
