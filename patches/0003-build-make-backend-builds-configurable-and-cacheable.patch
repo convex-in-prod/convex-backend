@@ -1,0 +1,612 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Sat, 11 Jul 2026 14:03:07 +0800
+Subject: [PATCH 03/24] build: make backend builds configurable and cacheable
+
+Teach the workspace Cargo configuration to supply the GNU/Linux cstdint include required by bundled RocksDB 8.10 under GCC 15. Add a Cargo wrapper that resolves only the repository-pinned protoc through mise, supplies installed Clang resource headers to bindgen when needed, and preserves explicit caller overrides.
+
+Parameterize the backend Docker build by Cargo profile, map profiles to their actual artifact output, and preserve explicitly requested debug information instead of stripping it in the runtime stage. Keep the default release-image behavior unchanged and fail when either required executable is absent.
+
+Provision protoc consistently in dependency and final build layers. Keep cargo-chef and the final build on the same architecture-specific target cache, copy final artifacts out of that cache explicitly, and serialize access where cargo-chef cleanup can race another builder.
+
+Enable the pinned nightly Cargo shallow-dependency mode so locked Git dependencies do not fetch complete repository histories. Persist Cargo Git databases, checkouts, and registry data across prepare, cook, and final build steps, and clear stale Git lockfiles only while holding those caches exclusively.
+
+Remove the eager full-workspace just install-js layer. Keep the pinned pnpm and Turbo tools available before dependency cooking, copy package source with the remaining first-party source, and let isolate's real build perform the frozen, scripts-disabled install and the JavaScript builds embedded in the backend. Retain the pnpm store cache on that final layer.
+
+Document local prerequisites, artifact configuration, dependency layering, rollback, and measured build evidence in patches/backend_build_improvements/README.md.
+
+On one constrained builder, the previous Cargo path was stopped after more than 1 hour 20 minutes while repeatedly fetching complete Git histories. With shallow fetches and shared caches, cargo-chef prepare completed in 12 minutes 14 seconds, dependency cooking in 46 seconds, and the final two binaries in about 4 minutes 36 seconds. The then-eager JavaScript install took 13 minutes 20 seconds and included an unrelated Puppeteer download. The image has not been rebuilt after removing that eager install, so no replacement timing is claimed.
+---
+ .cargo/config.toml                           |   5 +
+ crates/AGENTS.md                             |  30 ++-
+ patches/backend_build_improvements/README.md | 267 +++++++++++++++++++
+ scripts/run_cargo.sh                         |  40 +++
+ self-hosted/docker-build/Dockerfile.backend  | 118 ++++++--
+ self-hosted/docker-build/README.md           |  23 ++
+ 6 files changed, 461 insertions(+), 22 deletions(-)
+ create mode 100644 patches/backend_build_improvements/README.md
+ create mode 100755 scripts/run_cargo.sh
+
+diff --git a/.cargo/config.toml b/.cargo/config.toml
+index 36de131c17823131c51a14af44332073c6cae398..9297bd8374b60ccf3c1d6a57a60bb8a83283b8b6 100644
+--- a/.cargo/config.toml
++++ b/.cargo/config.toml
+@@ -1,6 +1,11 @@
+ [env]
+ CARGO_WORKSPACE_ROOT = { value = "", relative = true }
+ CHRONO_TZ_TIMEZONE_FILTER = "US/Pacific"
++# Bundled RocksDB 8.10 relies on a transitive <cstdint> include that GCC 15 no
++# longer provides. Keep the workaround target-specific so it cannot affect MSVC
++# or Apple builds, and let an explicit caller value take precedence.
++CXXFLAGS_x86_64_unknown_linux_gnu = { value = "-include cstdint", force = false }
++CXXFLAGS_aarch64_unknown_linux_gnu = { value = "-include cstdint", force = false }
+ # Custom rusty_v8 build: V8 14.9.207.26 base with leaptiering dispatch-handle UAF
+ # fixes (JSFunction 8e1b07549b03 + FeedbackCell e4f0cfdd659) plus these backports:
+ #   - 5e34aa5c30c turboshaft store-store-elimination backedge revisit (never
+diff --git a/crates/AGENTS.md b/crates/AGENTS.md
+index 7dc47f542154c2ae2e4edb819512165c11073c95..db6c65798594acd90d6d4e0c447c1546259103a1 100644
+--- a/crates/AGENTS.md
++++ b/crates/AGENTS.md
+@@ -2,15 +2,35 @@
+ 
+ ## Development workflow
+ 
++Install the repository-pinned tools and JavaScript workspace dependencies once.
++`mise` must satisfy the `min_version` in `mise.toml`. Isolate builds invoke the
++pinned `pnpm` and `turbo` binaries from `scripts/node_modules`; install those
++before the workspace packages so a missing tool does not surface later as a
++Cargo build-script failure.
++
++```sh
++mise install --locked protoc
++npm ci --prefix scripts
++just install-js
++```
++
++Use `scripts/run_cargo.sh` so build scripts can find the pinned `protoc` without
++making `mise` install unrelated repository tools. The workspace Cargo
++configuration supplies the target-specific GCC 15 workaround required when
++bundled RocksDB 8.10 is compiled on Linux, and the wrapper supplies installed
++Clang resource headers to bindgen when the distro library cannot locate them.
++Do not rediscover or repeat ad hoc `CXXFLAGS` or `BINDGEN_EXTRA_CLANG_ARGS`
++prefixes at each call site.
++
+ ```sh
+ # After each change
+-just format-rust
++scripts/run_cargo.sh fmt -p <package>
+ 
+ # When a change is ready
+-just lint-rust
+-cargo build -p <package>
+-cargo test -p <package>
+-cargo test -p <package> "test_name" # for a specific test or test group
++scripts/run_cargo.sh clippy -p <package> --all-targets
++scripts/run_cargo.sh build -p <package>
++scripts/run_cargo.sh test -p <package>
++scripts/run_cargo.sh test -p <package> "test_name" # for a specific test or test group
+ ```
+ 
+ ## Rust style
+diff --git a/patches/backend_build_improvements/README.md b/patches/backend_build_improvements/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..5cb1b5f02b4e219a643f2c9927ec487c43401189
+--- /dev/null
++++ b/patches/backend_build_improvements/README.md
+@@ -0,0 +1,267 @@
++# Backend Build Improvements
++
++This patch makes the backend Docker build honor the Cargo profile the operator selected and keeps
++expensive dependency work reusable across first-party source changes. The default path still builds
++a normal release image and applies the existing final GNU `strip` pass for image size. Profiling or
++debugging builds preserve their requested artifact shape, while ordinary builds use shallow Cargo
++Git dependencies, shared Cargo caches, and no redundant eager JavaScript workspace install.
++
++## Local Cargo prerequisites
++
++The workspace Cargo configuration supplies a GNU/Linux-only `-include cstdint` workaround for
++bundled RocksDB 8.10 under GCC 15. Explicit caller `CXXFLAGS` values retain precedence, and the
++setting does not affect Apple or MSVC builds.
++
++`scripts/run_cargo.sh` resolves only the repository-pinned `protoc` through `mise` instead of
++installing unrelated repository tools. On Linux it also supplies installed Clang resource headers
++to bindgen when the distro library cannot locate them. Explicit `PROTOC` and
++`BINDGEN_EXTRA_CLANG_ARGS` values retain precedence. The scoped Rust workflow uses this wrapper for
++formatting, checks, builds, and tests after the pinned JavaScript tools and workspace dependencies
++have been installed once.
++
++The direct operator problem is backend profiling and debugging. A self-hosted
++operator may need an optimized backend binary with symbol information so `perf`,
++`addr2line`, flamegraph tooling, or a debugger can attribute CPU time to useful
++Rust frames. The previous Dockerfile path assumed the release profile and then
++stripped the copied binaries. That is fine for the normal production image. It
++is wrong for a build where a selected custom profile or a forwarded Cargo
++environment override explicitly asks to keep debug information.
++
++## Why the old shape was unsafe
++
++The upstream Dockerfile treated release as the fixed build shape. It used
++release cargo-chef and release cargo builds, copied binaries from
++`target/release`, and applied a final `strip` unless the legacy Docker `debug`
++arg was set.
++
++That made nonstandard backend builds awkward in several ways:
++
++- `CARGO_PROFILE_RELEASE_DEBUG=1` could make Cargo emit debuginfo, then the
++  Dockerfile's later `strip` removed it from `convex-local-backend` and
++  `generate_key`.
++- `CARGO_PROFILE_RELEASE_STRIP=none` or another explicit Cargo strip setting
++  could be overridden by the Dockerfile's stronger GNU `strip` pass.
++- Cargo's built-in profile names do not all match their target directories:
++  `dev` and `test` use `target/debug`, while `release` and `bench` use
++  `target/release`.
++- Guessing a target directory risks packaging the wrong binary when a cached
++  artifact exists. It also misses target-triple directories and companion
++  artifacts such as packed split-debuginfo files.
++
++The patch is intentionally strict. If Cargo does not produce both requested
++executables, the Docker build fails before the runtime image is assembled.
++
++## What changes
++
++`self-hosted/docker-build/Dockerfile.backend` now accepts `CARGO_BUILD_PROFILE`,
++defaulting to `release`, and passes that profile through both cargo-chef and the
++real backend/keybroker builds:
++
++```sh
++--build-arg CARGO_BUILD_PROFILE=release
++```
++
++The Dockerfile also forwards the release-profile overrides used for profiling
++builds:
++
++```sh
++--build-arg CARGO_PROFILE_RELEASE_DEBUG=1
++--build-arg CARGO_PROFILE_RELEASE_STRIP=none
++```
++
++Non-empty overrides are exported in the cargo-chef layer and in the final cargo
++build layer, so dependency builds and first-party builds see the same profile
++configuration. Empty Docker ARG defaults are explicitly unset before Cargo runs
++because Cargo rejects empty profile override environment variables.
++
++`.cargo/config.toml` is copied into both cargo-chef stages before `prepare` or
++`cook` runs. The cooked dependencies and final build therefore use the same
++repository environment and target rustflags. Without that copy, the final build
++would invalidate dependencies cooked without settings such as
++`tokio_unstable`, the custom V8 mirror, and the AArch64 CPU/frame-pointer flags.
++
++`CARGO_TARGET_DIR` is fixed at `/convex/target` in the build stage. This keeps
++cargo-chef and the final build on the same mounted cache and prevents a Cargo
++config `target-dir` override from separating their outputs. Final artifacts are
++copied out of that cache explicitly, so BuildKit can commit them to the build
++layer and pass them to the runtime stage.
++
++The BuildKit Cargo caches have explicit identities and use `sharing=locked` in
++both Cargo layers. Native target artifacts are separated by `TARGETARCH`.
++Serialization is required because cargo-chef removes dummy workspace artifacts
++after Cargo releases its target lock; without the BuildKit lock, that cleanup
++can race a concurrent real build using the same cache. The git and registry
++mounts are also locked because they mount only subdirectories of Cargo home and
++therefore do not share Cargo's global package-cache lock between containers.
++Cache contents remain an optimization only: an empty or replaced cache causes a
++rebuild, not a different runtime artifact.
++
++The repository pins a nightly Rust toolchain, so the final builds use Cargo's
++unstable `--artifact-dir` option to copy requested final artifacts out of the
++target cache and into `/convex/backend-artifacts`:
++
++```sh
++cargo -Z unstable-options build \
++  --artifact-dir /convex/backend-artifacts \
++  --profile "$CARGO_BUILD_PROFILE" \
++  -p local_backend --bin convex-local-backend
++```
++
++This avoids encoding Cargo's profile-to-directory mapping in the Dockerfile and
++also works if a target triple adds another directory level. Cargo copies packed
++split-debuginfo companions such as `.dwp` files with the executable. Explicit
++`test -x` checks verify both required binaries before the runtime stage copies
++the complete artifact directory.
++
++If `CARGO_BUILD_PROFILE` is explicitly empty, the build fails before cargo-chef
++with a direct error. If the selected profile is invalid, if Cargo fails, or if a
++required executable is missing, the Docker build also stops.
++
++The final GNU `strip` pass is now limited to the plain default release image. It
++is skipped when:
++
++- the legacy Docker `debug` build arg is set;
++- `CARGO_BUILD_PROFILE` is anything other than `release`;
++- `CARGO_PROFILE_RELEASE_STRIP` is set to any non-empty value;
++- `CARGO_PROFILE_RELEASE_DEBUG` requests debuginfo.
++
++That keeps the small default release image behavior while preserving symbols for
++explicit debug and profiling builds.
++
++The Dockerfile also provisions `protoc` with `mise` before the cargo layers.
++`PROTOC` is set for `cargo chef cook` and for the final cargo build. That keeps
++protobuf-using crates buildable in cached dependency layers and in the real
++backend build, instead of relying on a host-level `protoc` or discovering the
++missing tool only after a later layer invalidates.
++
++## Dependency fetch and source layering
++
++The chef and build stages set `CARGO_UNSTABLE_GIT=shallow-deps`, using the repository-pinned nightly
++Cargo support for shallow locked Git dependencies. The prepare, cook, and final build steps mount
++the same persistent Cargo Git database, Git checkout, and registry caches. The established Git
++database cache identity remains unchanged so existing builders retain it.
++
++All Cargo cache mounts use `sharing=locked`. While holding those mounts exclusively, each Cargo step
++removes stale Git lockfiles that a cancelled BuildKit step may have left behind. The cleanup is not
++run concurrently with another build using the same repositories.
++
++The pinned pnpm and Turbo tools remain installed before Cargo dependency cooking. The full
++JavaScript workspace is copied later with the remaining first-party source. The final backend build
++retains the pnpm store cache; isolate's build script performs the frozen workspace install with
++lifecycle scripts disabled and builds the packages embedded in the backend binary. The Dockerfile
++does not run a separate eager `just install-js`, which would run unrelated workspace lifecycle
++downloads whenever package source changes.
++
++### Observed build evidence
++
++On one constrained builder, the previous Cargo path was stopped after more than 1 hour 20 minutes
++while it repeatedly fetched complete Git dependency histories. With shallow fetches and shared
++caches, the corrected cargo-chef prepare completed in 12 minutes 14 seconds, dependency cooking in
++46 seconds, and the final two backend binaries in about 4 minutes 36 seconds.
++
++In that corrected build, the still-eager JavaScript install took 13 minutes 20 seconds and included
++a Puppeteer browser download. That observation motivated removing the layer. The image was not
++rebuilt after the JavaScript-layer removal, so the patch does not claim a measured replacement time
++for that step. Source changes still cause the final backend layer to run the scripts-disabled pnpm
++install and required JavaScript builds; the persistent store avoids repeating package transfers.
++
++## How to use it
++
++For the normal production-sized backend image, use the default Dockerfile path:
++
++```sh
++docker build -f self-hosted/docker-build/Dockerfile.backend .
++```
++
++That builds `release` and runs the final GNU `strip` pass.
++
++For an optimized profiling build with release debuginfo, pass the Cargo release
++overrides explicitly:
++
++```sh
++docker build \
++  -f self-hosted/docker-build/Dockerfile.backend \
++  --build-arg CARGO_BUILD_PROFILE=release \
++  --build-arg CARGO_PROFILE_RELEASE_DEBUG=1 \
++  --build-arg CARGO_PROFILE_RELEASE_STRIP=none \
++  .
++```
++
++That asks Cargo for release debuginfo and prevents the Dockerfile from stripping
++the copied backend binaries afterward.
++
++For a custom Cargo profile, define the profile in the workspace and select it:
++
++```sh
++docker build \
++  -f self-hosted/docker-build/Dockerfile.backend \
++  --build-arg CARGO_BUILD_PROFILE=slim-release \
++  .
++```
++
++Cargo copies that profile's final binary artifacts into the runtime artifact
++directory. The Dockerfile does not need to know the profile's target directory.
++
++On Linux, use embedded debug information or `split-debuginfo = "packed"` when
++symbols must be present in the runtime image. Cargo reports packed `.dwp` files
++as final artifacts, so `--artifact-dir` and the runtime-stage directory copy
++preserve them. `split-debuginfo = "unpacked"` leaves per-codegen-unit `.dwo`
++files inside the target cache instead; those cache internals are intentionally
++not copied into the runtime image.
++
++The legacy `debug` Docker build arg still skips the final GNU `strip`, but it
++does not tell Cargo to emit debuginfo. Use Cargo profile settings when the image
++needs symbols.
++
++The legacy strip decision can inspect Docker ARG values, but it cannot infer
++that a source checkout changed `[profile.release]` or set release-profile
++variables inside `.cargo/config.toml`. A release-profile customization that
++must preserve Cargo's output must also pass the corresponding
++`CARGO_PROFILE_RELEASE_DEBUG` or `CARGO_PROFILE_RELEASE_STRIP` build arg (or the
++legacy `debug` arg). Custom profiles do not have this limitation because every
++non-`release` profile skips the final GNU strip.
++
++## Scope
++
++This patch does not make profiling easy by itself. It does not install perf tooling in the runtime
++image, change kernel perf settings, tune isolate workers, or improve backend runtime performance.
++It makes the backend image faithful to custom profiles and explicit release-profile build args so a
++profiling build is actually a profiling build. It also does not make every JavaScript workspace
++build incremental; an empty BuildKit cache still performs a cold dependency fetch.
++
++Use the default release path when image size is the priority. Use an explicit
++profile or release debuginfo/strip override when symbol fidelity is the
++priority.
++
++## Verification
++
++Review confirmed the Dockerfile build, copy, and strip shell fragments pass
++`bash -n`. A strip decision-matrix check passed under bash: only plain `release`
++runs the final GNU `strip`; `debug`, `dev`, `test`, `bench`, custom profiles,
++explicit release strip overrides, and non-false release debug overrides preserve
++Cargo's selected artifact shape.
++
++`docker buildx build --check -f self-hosted/docker-build/Dockerfile.backend .`
++also passed with no warnings. A minimal BuildKit fixture confirmed that the
++automatic `TARGETARCH` argument resolves inside a cache-mount ID. A
++dependency-free temporary Cargo fixture confirmed `dev`, `test`, `release`,
++`bench`, and custom-profile builds; target-directory precedence; and copying of
++packed `.dwp` companions through `--artifact-dir`.
++
++The neighboring self-hosted Compose and script checks passed in the same review
++area:
++
++```sh
++docker compose -f self-hosted/docker/docker-compose.yml config --quiet
++bash -n self-hosted/docker-build/run_backend.sh self-hosted/docker-build/generate_admin_key.sh
++```
++
++A local custom-profile cargo build probe was blocked before checking the backend crate because the
++host was missing `cmake` for `aws-lc-sys`.
++
++A later normal release image build with shallow Cargo fetches and shared caches produced both
++backend binaries and a runnable image with the timings recorded above. The subsequent
++JavaScript-layer removal is supported by the isolate build-script contract: cargo-chef uses dummy
++workspace build scripts, while the real isolate build runs after the full source copy and performs
++the frozen, scripts-disabled install before its filtered Turbo build. No Docker image build was run
++after removing the eager install.
+diff --git a/scripts/run_cargo.sh b/scripts/run_cargo.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..a606797a3cdf3f551b649509eb33fb1a119b7876
+--- /dev/null
++++ b/scripts/run_cargo.sh
+@@ -0,0 +1,40 @@
++#!/usr/bin/env bash
++
++set -euo pipefail
++
++script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++repo_root="$(cd "$script_dir/.." && pwd)"
++
++if [[ "${OSTYPE:-}" == linux* && -z "${BINDGEN_EXTRA_CLANG_ARGS:-}" ]]; then
++  clang_resource_include=""
++  if command -v clang >/dev/null 2>&1; then
++    clang_resource_candidate="$(clang -print-resource-dir 2>/dev/null || true)/include"
++    if [[ -f "$clang_resource_candidate/stddef.h" ]]; then
++      clang_resource_include="$clang_resource_candidate"
++    fi
++  fi
++  if [[ -z "$clang_resource_include" ]]; then
++    for clang_resource_candidate in /usr/lib/llvm-*/lib/clang/*/include; do
++      if [[ -f "$clang_resource_candidate/stddef.h" ]]; then
++        clang_resource_include="$clang_resource_candidate"
++      fi
++    done
++  fi
++  if [[ -n "$clang_resource_include" ]]; then
++    export BINDGEN_EXTRA_CLANG_ARGS="-isystem${clang_resource_include}"
++  fi
++fi
++
++if [[ -z "${PROTOC:-}" ]]; then
++  if ! command -v mise >/dev/null 2>&1; then
++    echo "Missing mise. Install the version required by mise.toml, then run 'mise install --locked protoc'." >&2
++    exit 1
++  fi
++  if ! PROTOC="$(cd "$repo_root" && mise which protoc)"; then
++    echo "Pinned protoc is unavailable. Run 'mise install --locked protoc' from the repository root." >&2
++    exit 1
++  fi
++  export PROTOC
++fi
++
++exec cargo "$@"
+diff --git a/self-hosted/docker-build/Dockerfile.backend b/self-hosted/docker-build/Dockerfile.backend
+index 04463b6bda609e9f08a1bd1c076f9fe25c1ccebb..6f588f2f84e93151a473cb79dff3ba8c5701f275 100644
+--- a/self-hosted/docker-build/Dockerfile.backend
++++ b/self-hosted/docker-build/Dockerfile.backend
+@@ -13,8 +13,19 @@ WORKDIR /tmp
+ COPY rust-toolchain .
+ # Dummy command to just fetch the toolchain that'll get installed by running `cargo chef`
+ RUN rustup self update && rustup toolchain install
++# The pinned nightly supports shallow Git dependencies, including when Cargo
++# delegates fetching to the Git CLI. This avoids cloning reachable history for
++# exact revisions.
++ENV CARGO_UNSTABLE_GIT=shallow-deps
+ COPY --parents crates* Cargo* ./
+-RUN cargo chef prepare --recipe-path recipe.json --bin convex-local-backend
++COPY .cargo ./.cargo
++# Exclusive cache mounts make it safe to remove Git locks left by a canceled
++# BuildKit step before Cargo accesses the persistent repositories.
++RUN --mount=type=cache,id=convex-backend-cargo-git-db,target=/usr/local/cargo/git/db,sharing=locked \
++    --mount=type=cache,id=convex-backend-cargo-git-checkouts,target=/usr/local/cargo/git/checkouts,sharing=locked \
++    --mount=type=cache,id=convex-backend-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
++    find /usr/local/cargo/git -type f -name '*.lock' -delete && \
++    cargo chef prepare --recipe-path recipe.json --bin convex-local-backend
+ 
+ # Build stage: Compiles the Rust backend with all dependencies
+ # Uses cargo-chef's recipe from the previous stage for optimal caching
+@@ -55,15 +66,12 @@ EOF
+ COPY rust-toolchain /rust-toolchain
+ # Dummy command to just fetch the toolchain and cargo index
+ RUN rustup self update && rustup toolchain install && cargo search -q convex
++ENV CARGO_UNSTABLE_GIT=shallow-deps
+ 
+ WORKDIR /convex
+ COPY scripts ./scripts
+ RUN npm ci --prefix scripts/
+ 
+-COPY npm-packages ./npm-packages
+-COPY Justfile ./
+-RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked just install-js
+-
+ # Provision protoc via mise before the cargo layers (version + checksum from
+ # mise.toml/mise.lock; mise's own version from min_version). mise lives only in
+ # this build stage, never the runtime image. $PROTOC is set per cargo RUN below
+@@ -78,13 +86,46 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="v$(sed -nE 's/^min_version = "([
+ 
+ # Cargo reads .cargo/config.toml (e.g. RUSTY_V8_MIRROR, which redirects the V8
+ # static-lib download to our fork) via hierarchical discovery from the working
+-# directory, so it must be present before `cargo chef cook` builds dependencies.
+-COPY .cargo/config.toml ./.cargo/config.toml
++# directory, so the complete Cargo configuration must be present before
++# `cargo chef cook` builds dependencies.
++COPY .cargo ./.cargo
+ COPY --from=chef /tmp/recipe.json recipe.json
++ARG CARGO_BUILD_PROFILE=release
++ARG CARGO_PROFILE_RELEASE_DEBUG=
++ARG CARGO_PROFILE_RELEASE_STRIP=
++ARG TARGETARCH
++# Keep cargo-chef and the final build on the mounted target cache. This also
++# makes the artifact paths below independent of Cargo config target-dir changes.
++ENV CARGO_TARGET_DIR=/convex/target
++# cargo-chef removes dummy workspace artifacts after Cargo releases its own
++# target lock. Lock all partially mounted Cargo caches across concurrent builds;
++# TARGETARCH also keeps native artifacts from different platforms separate.
+ # Use cargo-chef to build dependencies from the recipe created in the first stage
+ # This step will be cached unless dependencies change
+-RUN --mount=type=cache,target=/convex/target/ --mount=type=cache,target=/usr/local/cargo/git/db --mount=type=cache,target=/usr/local/cargo/registry/ PROTOC="$(mise which protoc)" cargo chef cook --release --recipe-path recipe.json
+-# Now copy everything else over -- we've minimized the set of files that cause a full `pnpm install` or `cargo build` to run.
++RUN --mount=type=cache,id=convex-backend-target-${TARGETARCH},target=/convex/target,sharing=locked \
++    --mount=type=cache,id=convex-backend-cargo-git-db,target=/usr/local/cargo/git/db,sharing=locked \
++    --mount=type=cache,id=convex-backend-cargo-git-checkouts,target=/usr/local/cargo/git/checkouts,sharing=locked \
++    --mount=type=cache,id=convex-backend-cargo-registry,target=/usr/local/cargo/registry,sharing=locked <<EOF
++set -euo pipefail
++find /usr/local/cargo/git -type f -name '*.lock' -delete
++: "${CARGO_BUILD_PROFILE:?CARGO_BUILD_PROFILE must not be empty}"
++if [[ -n "$CARGO_PROFILE_RELEASE_DEBUG" ]]; then
++  export CARGO_PROFILE_RELEASE_DEBUG
++else
++  unset CARGO_PROFILE_RELEASE_DEBUG
++fi
++if [[ -n "$CARGO_PROFILE_RELEASE_STRIP" ]]; then
++  export CARGO_PROFILE_RELEASE_STRIP
++else
++  unset CARGO_PROFILE_RELEASE_STRIP
++fi
++PROTOC="$(mise which protoc)" cargo chef cook --profile "$CARGO_BUILD_PROFILE" --recipe-path recipe.json
++EOF
++# Copy first-party Rust and JavaScript sources only after dependency cooking.
++# isolate's build script installs the frozen JavaScript workspace with lifecycle
++# scripts disabled and builds the packages embedded in the backend. A separate
++# `just install-js` here duplicates that install and downloads unrelated browser
++# artifacts whenever package source changes.
+ COPY . .
+ 
+ # Build the convex-local-backend binary
+@@ -93,15 +134,58 @@ ARG VERGEN_GIT_SHA
+ ARG VERGEN_GIT_COMMIT_TIMESTAMP
+ ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
+ ENV VERGEN_GIT_COMMIT_TIMESTAMP=${VERGEN_GIT_COMMIT_TIMESTAMP}
+-RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked --mount=type=cache,target=/convex/target/ --mount=type=cache,target=/usr/local/cargo/git/db --mount=type=cache,target=/usr/local/cargo/registry/ <<EOF
++RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
++    --mount=type=cache,id=convex-backend-target-${TARGETARCH},target=/convex/target,sharing=locked \
++    --mount=type=cache,id=convex-backend-cargo-git-db,target=/usr/local/cargo/git/db,sharing=locked \
++    --mount=type=cache,id=convex-backend-cargo-git-checkouts,target=/usr/local/cargo/git/checkouts,sharing=locked \
++    --mount=type=cache,id=convex-backend-cargo-registry,target=/usr/local/cargo/registry,sharing=locked <<EOF
++set -euo pipefail
++find /usr/local/cargo/git -type f -name '*.lock' -delete
++if [[ -n "$CARGO_PROFILE_RELEASE_DEBUG" ]]; then
++  export CARGO_PROFILE_RELEASE_DEBUG
++else
++  unset CARGO_PROFILE_RELEASE_DEBUG
++fi
++if [[ -n "$CARGO_PROFILE_RELEASE_STRIP" ]]; then
++  export CARGO_PROFILE_RELEASE_STRIP
++else
++  unset CARGO_PROFILE_RELEASE_STRIP
++fi
+ export PROTOC="$(mise which protoc)"
+-cargo build --release -p local_backend --bin convex-local-backend
+-cp target/release/convex-local-backend .
+-cargo build --release -p keybroker --bin generate_key
+-cp target/release/generate_key .
++artifact_dir=/convex/backend-artifacts
++mkdir "$artifact_dir"
++# The pinned nightly Cargo copies each requested binary and final companion
++# artifacts such as packed split-debuginfo files out of the cache mount.
++cargo -Z unstable-options build \
++  --artifact-dir "$artifact_dir" \
++  --profile "$CARGO_BUILD_PROFILE" \
++  -p local_backend \
++  --bin convex-local-backend
++test -x "$artifact_dir/convex-local-backend"
++cargo -Z unstable-options build \
++  --artifact-dir "$artifact_dir" \
++  --profile "$CARGO_BUILD_PROFILE" \
++  -p keybroker \
++  --bin generate_key
++test -x "$artifact_dir/generate_key"
+ EOF
+ ARG debug
+-RUN if [[ -z "$debug" ]]; then strip ./convex-local-backend; strip ./generate_key; fi
++RUN <<EOF
++set -euo pipefail
++cargo_profile_release_debug="${CARGO_PROFILE_RELEASE_DEBUG:-}"
++# Keep the legacy GNU strip only for release builds where Cargo was not asked
++# to control stripping or emit debuginfo.
++if [[ -z "${debug:-}" &&
++      "${CARGO_BUILD_PROFILE:-release}" == "release" &&
++      -z "${CARGO_PROFILE_RELEASE_STRIP:-}" ]]; then
++  case "${cargo_profile_release_debug,,}" in
++    ""|false|0|none)
++      strip ./backend-artifacts/convex-local-backend
++      strip ./backend-artifacts/generate_key
++      ;;
++  esac
++fi
++EOF
+ 
+ # Final stage: Creates minimal runtime image with only necessary components
+ # Uses Ubuntu Noble (24.04) as the base image
+@@ -127,8 +211,8 @@ RUN ln -sf /usr/lib/node_modules/npm/bin/npm-cli.js /usr/bin/npm && \
+     chmod +x /usr/bin/npm
+ RUN ln -sf /usr/lib/node_modules/npm/bin/npx-cli.js /usr/bin/npx && \
+     chmod +x /usr/bin/npx
+-COPY --from=build --chmod=744 /convex/convex-local-backend .
+-COPY --from=build --chmod=744 /convex/generate_key .
++COPY --from=build /convex/backend-artifacts/ ./
++RUN chmod 744 ./convex-local-backend ./generate_key
+ COPY --chmod=744 self-hosted/docker-build/read_credentials.sh .
+ COPY --chmod=744 self-hosted/docker-build/run_backend.sh .
+ COPY --chmod=744 self-hosted/docker-build/generate_admin_key.sh .
+diff --git a/self-hosted/docker-build/README.md b/self-hosted/docker-build/README.md
+index 13a49046afeb79afcfaa96fc2e6f843d39ef1f03..be7ebae0c12f077f3e277bb118049d2685747ae5 100644
+--- a/self-hosted/docker-build/README.md
++++ b/self-hosted/docker-build/README.md
+@@ -11,6 +11,29 @@ Build the backend from scratch by running:
+ docker build -t convex-backend -f self-hosted/docker-build/Dockerfile.backend .
+ ```
+ 
++The backend build uses Cargo's `release` profile by default. Select another
++built-in or custom workspace profile with `CARGO_BUILD_PROFILE`:
++
++```sh
++docker build \
++  -t convex-backend \
++  -f self-hosted/docker-build/Dockerfile.backend \
++  --build-arg CARGO_BUILD_PROFILE=slim-release \
++  .
++```
++
++For a release profiling build, request Cargo debuginfo and disable both Cargo's
++strip setting and the Dockerfile's final strip pass:
++
++```sh
++docker build \
++  -t convex-backend \
++  -f self-hosted/docker-build/Dockerfile.backend \
++  --build-arg CARGO_PROFILE_RELEASE_DEBUG=1 \
++  --build-arg CARGO_PROFILE_RELEASE_STRIP=none \
++  .
++```
++
+ Build the dashboard from scratch by running:
+ 
+ ```sh

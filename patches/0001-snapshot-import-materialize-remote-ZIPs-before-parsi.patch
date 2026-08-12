@@ -1,0 +1,1729 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Sat, 11 Jul 2026 14:02:45 +0800
+Subject: [PATCH 01/24] snapshot-import: materialize remote ZIPs before parsing
+
+Download snapshot ZIP objects into a temporary local file before opening the archive. Verify every bounded range by byte count, retry early EOFs from the start of that range, and reject inconsistent range responses instead of allowing a truncated local archive.
+
+Keep the original streaming reader available for other storage consumers. Document provider behavior, disk cost, retry boundaries, and adoption criteria in patches/snapshot_import_zip_materialization/README.md.
+---
+ Cargo.lock                                    |   3 +-
+ crates/application/src/snapshot_import/mod.rs |  17 +-
+ .../application/src/snapshot_import/parse.rs  |  34 +-
+ crates/aws_s3/Cargo.toml                      |   1 +
+ crates/aws_s3/src/storage.rs                  | 534 +++++++++++++++++-
+ crates/storage/src/lib.rs                     |  46 +-
+ crates/storage_zip_reader/Cargo.toml          |   2 +-
+ crates/storage_zip_reader/src/lib.rs          | 517 ++++++++++++++---
+ .../README.md                                 | 235 ++++++++
+ self-hosted/advanced/s3_storage.md            |  11 +
+ 10 files changed, 1297 insertions(+), 103 deletions(-)
+ create mode 100644 patches/snapshot_import_zip_materialization/README.md
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 962adcbcf2e734c1ba025a9db15484fadd9b787f..77cefa23b4e26bc719f16b3fc430b16333013d25 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1203,6 +1203,7 @@ dependencies = [
+  "runtime",
+  "serde_json",
+  "storage",
++ "tempfile",
+  "tokio",
+  "tokio-stream",
+ ]
+@@ -9653,7 +9654,6 @@ dependencies = [
+  "async_zip 0.0.18",
+  "async_zip 0.0.9",
+  "aws_s3",
+- "bytes",
+  "common",
+  "convex_macro",
+  "errors",
+@@ -9661,6 +9661,7 @@ dependencies = [
+  "rc-zip",
+  "runtime",
+  "storage",
++ "tempfile",
+  "tokio",
+  "tokio-stream",
+  "tokio-util",
+diff --git a/crates/application/src/snapshot_import/mod.rs b/crates/application/src/snapshot_import/mod.rs
+index 62b12fd66a3a0f256064b54743016c6ab4de5b9a..ddd63d8c1b4a137230beb3cd329d83aeae363f23 100644
+--- a/crates/application/src/snapshot_import/mod.rs
++++ b/crates/application/src/snapshot_import/mod.rs
+@@ -367,6 +367,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+     ) -> anyhow::Result<(Timestamp, u64)> {
+         self.fail_if_too_old(&snapshot_import)?;
+         let (initial_schemas, import) = self.parse_import(snapshot_import.id()).await?;
++        let source_size = import.source_size;
+ 
+         let usage = FunctionUsageTracker::new();
+ 
+@@ -383,26 +384,12 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+         )
+         .await?;
+ 
+-        let object_attributes = (match &snapshot_import.object_key {
+-            Ok(key) => {
+-                self.snapshot_imports_storage
+-                    .get_fq_object_attributes(key)
+-                    .await
+-            },
+-            Err(key) => {
+-                self.snapshot_imports_storage
+-                    .get_object_attributes(key)
+-                    .await
+-            },
+-        })?
+-        .context("error getting export object attributes from S3")?;
+-
+         // Charge file bandwidth for the download of the snapshot from imports storage
+         usage
+             .track_storage_egress(
+                 ComponentPath::root(),
+                 snapshot_import.requestor.usage_tag().to_string(),
+-                object_attributes.size,
++                source_size,
+             )
+             .await;
+ 
+diff --git a/crates/application/src/snapshot_import/parse.rs b/crates/application/src/snapshot_import/parse.rs
+index a5a49920c8e10a017468d7ae68312f2788b1e85c..70e34a872fc39d329760f7d6287af568651b0a71 100644
+--- a/crates/application/src/snapshot_import/parse.rs
++++ b/crates/application/src/snapshot_import/parse.rs
+@@ -80,6 +80,7 @@ pub type ImportDocumentStream = BoxStream<'static, anyhow::Result<JsonValue>>;
+ pub type ImportStorageFileStream =
+     Box<dyn FnOnce() -> BoxStream<'static, anyhow::Result<Bytes>> + Send>;
+ pub struct ParsedImport {
++    pub source_size: u64,
+     pub generated_schemas: Vec<(ComponentPath, TableName, GeneratedSchema<ProdConfig>)>,
+     pub documents: Vec<(ComponentPath, TableName, ImportDocumentStream)>,
+     pub storage_files: BoxStream<
+@@ -93,8 +94,10 @@ impl ParsedImport {
+         component_path: ComponentPath,
+         table_name: TableName,
+         documents: ImportDocumentStream,
++        source_size: u64,
+     ) -> Self {
+         Self {
++            source_size,
+             generated_schemas: vec![],
+             documents: vec![(component_path, table_name, documents)],
+             storage_files: stream::empty().boxed(),
+@@ -158,13 +161,22 @@ pub async fn parse_import_file(
+             .with_context(|| format!("Missing import object {fq_object_key:?}"))
+     };
+     match format {
+-        ImportFormat::Csv(table_name) => Ok(ParsedImport::single_table(
+-            component_path,
+-            table_name,
+-            parse_csv_import(stream_body().await?).boxed(),
+-        )),
++        ImportFormat::Csv(table_name) => {
++            let body = stream_body().await?;
++            let source_size = u64::try_from(body.content_length)
++                .context("snapshot import object has a negative content length")?;
++            Ok(ParsedImport::single_table(
++                component_path,
++                table_name,
++                parse_csv_import(body).boxed(),
++                source_size,
++            ))
++        },
+         ImportFormat::JsonLines(table_name) => {
+-            let mut reader = stream_body().await?.into_reader();
++            let body = stream_body().await?;
++            let source_size = u64::try_from(body.content_length)
++                .context("snapshot import object has a negative content length")?;
++            let mut reader = body.into_reader();
+             Ok(ParsedImport::single_table(
+                 component_path,
+                 table_name,
+@@ -189,10 +201,13 @@ pub async fn parse_import_file(
+                     }
+                 })
+                 .boxed(),
++                source_size,
+             ))
+         },
+         ImportFormat::JsonArray(table_name) => {
+             let reader = stream_body().await?;
++            let source_size = u64::try_from(reader.content_length)
++                .context("snapshot import object has a negative content length")?;
+             let mut buf = Vec::new();
+             let mut truncated_reader = reader
+                 .into_reader()
+@@ -215,11 +230,15 @@ pub async fn parse_import_file(
+                 component_path,
+                 table_name,
+                 stream::iter(array.into_iter().map(Ok)).boxed(),
++                source_size,
+             ))
+         },
+         ImportFormat::Zip => {
+             let base_component_path = component_path;
+-            let zip_reader = StorageZipArchive::open_fq(storage, fq_object_key).await?;
++            tracing::info!("Materializing snapshot import zip object before parsing");
++            let zip_reader =
++                StorageZipArchive::open_fq_materialized(storage, fq_object_key).await?;
++            let source_size = zip_reader.size();
+ 
+             let mut generated_schemas = vec![];
+             let mut documents = vec![];
+@@ -274,6 +293,7 @@ pub async fn parse_import_file(
+                 }
+             });
+             Ok(ParsedImport {
++                source_size,
+                 generated_schemas,
+                 documents,
+                 storage_files: storage_files.boxed(),
+diff --git a/crates/aws_s3/Cargo.toml b/crates/aws_s3/Cargo.toml
+index 0160a4df1119fe83ebe7715581b560c4be35b659..d9fc9de15dd2efb1eea1bcb04f6b2e4c7affab57 100644
+--- a/crates/aws_s3/Cargo.toml
++++ b/crates/aws_s3/Cargo.toml
+@@ -32,6 +32,7 @@ errors = { workspace = true, features = ["testing"] }
+ metrics = { workspace = true, features = ["testing"] }
+ runtime = { workspace = true }
+ storage = { workspace = true, features = ["testing"] }
++tempfile = { workspace = true }
+ tokio-stream = { workspace = true }
+ 
+ [lints]
+diff --git a/crates/aws_s3/src/storage.rs b/crates/aws_s3/src/storage.rs
+index 4375feedecf387b3bdc2a3069969c4b9560e9d62..f73bc08f99fec33536c9ce161f763c26590ac085 100644
+--- a/crates/aws_s3/src/storage.rs
++++ b/crates/aws_s3/src/storage.rs
+@@ -1,5 +1,7 @@
+ use std::{
++    cmp,
+     env,
++    io::SeekFrom,
+     pin::Pin,
+     time::{
+         Duration,
+@@ -11,10 +13,14 @@ use anyhow::Context;
+ use async_trait::async_trait;
+ use aws_config::retry::RetryConfig;
+ use aws_sdk_s3::{
+-    config::IdentityCache,
++    config::{
++        IdentityCache,
++        StalledStreamProtectionConfig,
++    },
+     error::ProvideErrorMetadata,
+     operation::{
+         create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
++        get_object::GetObjectError,
+         head_object::{
+             HeadObjectError,
+             HeadObjectOutput,
+@@ -82,8 +88,13 @@ use storage::{
+     StorageUseCase,
+     Upload,
+     UploadId,
++    DOWNLOAD_CHUNK_SIZE,
+     MAXIMUM_PARALLEL_UPLOADS,
+ };
++use tokio::io::{
++    AsyncSeekExt,
++    AsyncWriteExt,
++};
+ 
+ use crate::{
+     metrics::sign_url_timer,
+@@ -105,6 +116,9 @@ pub const ACCESS_KEY_MAX_BACKOFF: Duration = Duration::from_secs(5);
+ const MIN_S3_INTERMEDIATE_PART_SIZE: usize = 5 * (1 << 20);
+ /// S3 maximum part size for multipart upload is 5GiB
+ const MAX_S3_INTERMEDIATE_PART_SIZE: usize = 5 * (1 << 30);
++const SNAPSHOT_IMPORT_S3_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
++const SNAPSHOT_IMPORT_S3_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
++const SNAPSHOT_IMPORT_S3_RANGE_RETRIES: usize = 5;
+ 
+ #[derive(Clone)]
+ pub struct S3Storage<RT: Runtime> {
+@@ -215,6 +229,265 @@ impl<RT: Runtime> S3Storage<RT> {
+         .await?;
+         Ok(s3_upload)
+     }
++
++    async fn download_snapshot_import_range_to_file(
++        &self,
++        bucket: &str,
++        s3_key: &str,
++        key: &FullyQualifiedObjectKey,
++        file: &mut tokio::fs::File,
++        range_start: u64,
++        range_end: u64,
++        object_size: u64,
++        expected_etag: &mut Option<String>,
++    ) -> Result<(), SnapshotImportRangeAttemptError> {
++        let mut request = self
++            .client
++            .get_object()
++            .bucket(bucket)
++            .key(s3_key)
++            .range(format!("bytes={range_start}-{}", range_end - 1));
++        if let Some(etag) = expected_etag.as_ref() {
++            request = request.if_match(etag);
++        }
++        let output = tokio::time::timeout(
++            SNAPSHOT_IMPORT_S3_REQUEST_TIMEOUT,
++            request
++                .customize()
++                .config_override(
++                    aws_sdk_s3::config::Builder::new()
++                        .stalled_stream_protection(StalledStreamProtectionConfig::disabled()),
++                )
++                .send(),
++        )
++        .await
++        .with_context(|| {
++            format!("timed out requesting object range {range_start}..{range_end} for {key:?}")
++        })
++        .map_err(SnapshotImportRangeAttemptError::Retryable)?
++        .map_err(|error| {
++            classify_snapshot_import_request_error(key, range_start, range_end, error)
++        })?;
++        validate_snapshot_import_range_response(
++            key,
++            range_start,
++            range_end,
++            object_size,
++            output.content_length(),
++            output.content_range(),
++        )
++        .map_err(SnapshotImportRangeAttemptError::Fatal)?;
++        validate_snapshot_import_etag(key, expected_etag, output.e_tag())
++            .map_err(SnapshotImportRangeAttemptError::Fatal)?;
++        write_snapshot_import_range_attempt(
++            key,
++            file,
++            range_start,
++            range_end,
++            output.body.into_stream(),
++            SNAPSHOT_IMPORT_S3_READ_IDLE_TIMEOUT,
++        )
++        .await?;
++        Ok(())
++    }
++}
++
++#[derive(Debug)]
++enum SnapshotImportRangeAttemptError {
++    // The SDK retries request failures internally. The bounded outer retry also
++    // covers an exhausted SDK request and starts a new request after a body
++    // transport failure.
++    Retryable(anyhow::Error),
++    Fatal(anyhow::Error),
++}
++
++impl SnapshotImportRangeAttemptError {
++    #[cfg(test)]
++    fn into_inner(self) -> anyhow::Error {
++        match self {
++            Self::Retryable(error) | Self::Fatal(error) => error,
++        }
++    }
++}
++
++fn classify_snapshot_import_request_error(
++    key: &FullyQualifiedObjectKey,
++    range_start: u64,
++    range_end: u64,
++    error: aws_sdk_s3::error::SdkError<GetObjectError>,
++) -> SnapshotImportRangeAttemptError {
++    let retryable = match &error {
++        aws_sdk_s3::error::SdkError::TimeoutError(_)
++        | aws_sdk_s3::error::SdkError::DispatchFailure(_)
++        | aws_sdk_s3::error::SdkError::ResponseError(_) => true,
++        aws_sdk_s3::error::SdkError::ServiceError(service_error) => {
++            let status = service_error.raw().status().as_u16();
++            status == 408 || status == 429 || status >= 500
++        },
++        aws_sdk_s3::error::SdkError::ConstructionFailure(_) => false,
++        // New SDK error variants need an explicit retry decision before they
++        // are safe to retry in a restore workflow.
++        _ => false,
++    };
++    let error = anyhow::Error::new(error).context(format!(
++        "download object range {range_start}..{range_end} for {key:?}"
++    ));
++    if retryable {
++        SnapshotImportRangeAttemptError::Retryable(error)
++    } else {
++        SnapshotImportRangeAttemptError::Fatal(error)
++    }
++}
++
++fn validate_snapshot_import_etag(
++    key: &FullyQualifiedObjectKey,
++    expected_etag: &mut Option<String>,
++    response_etag: Option<&str>,
++) -> anyhow::Result<()> {
++    let response_etag = response_etag
++        .with_context(|| format!("Missing ETag while materializing object {key:?}"))?;
++    match expected_etag.as_deref() {
++        Some(expected_etag) => {
++            anyhow::ensure!(
++                response_etag == expected_etag,
++                "Object {key:?} changed while it was being materialized: range response ETag \
++                 {response_etag:?} does not match {expected_etag:?}"
++            );
++        },
++        None => *expected_etag = Some(response_etag.to_owned()),
++    }
++    Ok(())
++}
++
++fn validate_snapshot_import_range_response(
++    key: &FullyQualifiedObjectKey,
++    range_start: u64,
++    range_end: u64,
++    object_size: u64,
++    content_length: Option<i64>,
++    content_range: Option<&str>,
++) -> anyhow::Result<()> {
++    let expected_range_len = range_end - range_start;
++    let content_length = content_length.with_context(|| {
++        format!("Missing content length for object range {range_start}..{range_end} for {key:?}")
++    })?;
++    anyhow::ensure!(
++        content_length >= 0 && content_length as u64 == expected_range_len,
++        "Downloaded object range {range_start}..{range_end} for {key:?} has content length \
++         {content_length}, expected {expected_range_len}"
++    );
++    let expected_content_range = format!("bytes {range_start}-{}/{object_size}", range_end - 1);
++    let content_range = content_range.with_context(|| {
++        format!("Missing content range for object range {range_start}..{range_end} for {key:?}")
++    })?;
++    let parsed_content_range =
++        parse_snapshot_import_content_range(content_range).with_context(|| {
++            format!(
++                "Downloaded object range {range_start}..{range_end} for {key:?} has invalid \
++                 content range {content_range:?}, expected {expected_content_range:?}"
++            )
++        })?;
++    anyhow::ensure!(
++        parsed_content_range == (range_start, range_end - 1, object_size),
++        "Downloaded object range {range_start}..{range_end} for {key:?} has content range \
++         {content_range:?}, expected {expected_content_range:?}"
++    );
++    Ok(())
++}
++
++fn parse_snapshot_import_content_range(content_range: &str) -> anyhow::Result<(u64, u64, u64)> {
++    let parse_decimal = |value: &str| -> anyhow::Result<u64> {
++        anyhow::ensure!(
++            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
++            "expected an unsigned decimal integer"
++        );
++        value.parse().context("content range integer is too large")
++    };
++    let (range_unit, range) = content_range
++        .split_once(' ')
++        .context("content range is missing its range unit")?;
++    anyhow::ensure!(
++        range_unit.eq_ignore_ascii_case("bytes"),
++        "content range unit is not bytes"
++    );
++    let (range, total) = range
++        .split_once('/')
++        .context("content range is missing its object size")?;
++    let (start, end) = range
++        .split_once('-')
++        .context("content range is missing its byte interval")?;
++    Ok((
++        parse_decimal(start)?,
++        parse_decimal(end)?,
++        parse_decimal(total)?,
++    ))
++}
++
++async fn write_snapshot_import_range_attempt<S, E>(
++    key: &FullyQualifiedObjectKey,
++    file: &mut tokio::fs::File,
++    range_start: u64,
++    range_end: u64,
++    mut stream: S,
++    read_idle_timeout: Duration,
++) -> Result<(), SnapshotImportRangeAttemptError>
++where
++    S: Stream<Item = Result<Bytes, E>> + Unpin,
++    E: std::error::Error + Send + Sync + 'static,
++{
++    // A failed attempt may already have written a prefix of this range.
++    file.seek(SeekFrom::Start(range_start))
++        .await
++        .with_context(|| format!("seek materialized S3 object to byte {range_start}"))
++        .map_err(SnapshotImportRangeAttemptError::Fatal)?;
++    let expected_range_len = range_end - range_start;
++    let mut range_bytes = 0;
++    let mut read_idle_deadline = tokio::time::Instant::now() + read_idle_timeout;
++    loop {
++        // `timeout_at` can prefer an immediately-ready stream item even after
++        // its deadline, so check explicitly before polling another empty frame.
++        if tokio::time::Instant::now() >= read_idle_deadline {
++            return Err(SnapshotImportRangeAttemptError::Retryable(anyhow::anyhow!(
++                "timed out reading object range {range_start}..{range_end} for {key:?}"
++            )));
++        }
++        let next_chunk = tokio::time::timeout_at(read_idle_deadline, stream.try_next())
++            .await
++            .with_context(|| {
++                format!("timed out reading object range {range_start}..{range_end} for {key:?}")
++            })
++            .map_err(SnapshotImportRangeAttemptError::Retryable)?
++            .with_context(|| format!("read object range {range_start}..{range_end} for {key:?}"))
++            .map_err(SnapshotImportRangeAttemptError::Retryable)?;
++        let Some(bytes) = next_chunk else {
++            break;
++        };
++        if bytes.is_empty() {
++            // Empty HTTP data frames are not byte progress. Yield so an
++            // immediately-ready stream cannot starve the idle deadline.
++            tokio::task::yield_now().await;
++            continue;
++        }
++        range_bytes += bytes.len() as u64;
++        if range_bytes > expected_range_len {
++            return Err(SnapshotImportRangeAttemptError::Fatal(anyhow::anyhow!(
++                "Downloaded too many bytes for object range {range_start}..{range_end} for \
++                 {key:?}: {range_bytes}, expected {expected_range_len}"
++            )));
++        }
++        file.write_all(&bytes)
++            .await
++            .context("write materialized S3 object range")
++            .map_err(SnapshotImportRangeAttemptError::Fatal)?;
++        read_idle_deadline = tokio::time::Instant::now() + read_idle_timeout;
++    }
++    if range_bytes != expected_range_len {
++        return Err(SnapshotImportRangeAttemptError::Retryable(anyhow::anyhow!(
++            "Downloaded {range_bytes} bytes for object range {range_start}..{range_end} for \
++             {key:?}, expected {expected_range_len}"
++        )));
++    }
++    Ok(())
+ }
+ 
+ async fn s3_client() -> Result<Client, anyhow::Error> {
+@@ -508,9 +781,11 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
+             .await;
+         match result {
+             Ok(head_attributes) => {
+-                let size = head_attributes
++                let content_length = head_attributes
+                     .content_length
+-                    .context("Object is missing size")? as u64;
++                    .context("Object is missing size")?;
++                let size =
++                    u64::try_from(content_length).context("Object has invalid negative size")?;
+                 Ok(Some(ObjectAttributes { size }))
+             },
+             Err(aws_sdk_s3::error::SdkError::ServiceError(err)) => match err.err() {
+@@ -523,6 +798,79 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
+         }
+     }
+ 
++    async fn download_fq_object_to_file(
++        &self,
++        key: &FullyQualifiedObjectKey,
++        file: &mut tokio::fs::File,
++        expected_size: u64,
++    ) -> anyhow::Result<u64> {
++        let (bucket, s3_key) = key
++            .as_str()
++            .split_once('/')
++            .with_context(|| format!("Invalid fully qualified S3 key {key:?}"))?;
++        file.set_len(0)
++            .await
++            .context("truncate materialized S3 object")?;
++        file.seek(SeekFrom::Start(0))
++            .await
++            .context("seek materialized S3 object to start")?;
++        let mut copied_bytes = 0;
++        let mut expected_etag = None;
++        while copied_bytes < expected_size {
++            let range_start = copied_bytes;
++            let range_end = cmp::min(
++                range_start.saturating_add(DOWNLOAD_CHUNK_SIZE),
++                expected_size,
++            );
++            let mut retries_remaining = SNAPSHOT_IMPORT_S3_RANGE_RETRIES;
++            loop {
++                match self
++                    .download_snapshot_import_range_to_file(
++                        bucket,
++                        s3_key,
++                        key,
++                        file,
++                        range_start,
++                        range_end,
++                        expected_size,
++                        &mut expected_etag,
++                    )
++                    .await
++                {
++                    Ok(()) => break,
++                    Err(SnapshotImportRangeAttemptError::Retryable(e)) if retries_remaining > 0 => {
++                        let mut toreport = e.context(format!(
++                            "failed to materialize snapshot import range \
++                             {range_start}..{range_end} for {key:?}. {retries_remaining} attempts \
++                             remaining"
++                        ));
++                        report_error(&mut toreport).await;
++                        retries_remaining -= 1;
++                    },
++                    Err(SnapshotImportRangeAttemptError::Retryable(e)) => {
++                        return Err(e).with_context(|| {
++                            format!(
++                                "failed to materialize snapshot import range \
++                                 {range_start}..{range_end} for {key:?} after \
++                                 {SNAPSHOT_IMPORT_S3_RANGE_RETRIES} retries"
++                            )
++                        });
++                    },
++                    Err(SnapshotImportRangeAttemptError::Fatal(e)) => {
++                        return Err(e).with_context(|| {
++                            format!(
++                                "failed to materialize snapshot import range \
++                                 {range_start}..{range_end} for {key:?}"
++                            )
++                        });
++                    },
++                }
++            }
++            copied_bytes = range_end;
++        }
++        Ok(copied_bytes)
++    }
++
+     fn storage_type_proto(&self) -> pb::searchlight::StorageType {
+         let prefix = self.key_prefix.clone();
+         let bucket = self.bucket.clone();
+@@ -865,4 +1213,182 @@ pub fn s3_bucket_name(use_case: &StorageUseCase) -> anyhow::Result<String> {
+     ))
+ }
+ 
+-// Test below only works if you have AWS environment variables set
+\ No newline at end of file
++#[cfg(test)]
++mod tests {
++    use std::{
++        io::{
++            self,
++            SeekFrom,
++        },
++        time::Duration,
++    };
++
++    use bytes::Bytes;
++    use futures::stream;
++    use tempfile::NamedTempFile;
++    use tokio::io::{
++        AsyncReadExt,
++        AsyncSeekExt,
++        AsyncWriteExt,
++    };
++
++    use super::{
++        validate_snapshot_import_etag,
++        validate_snapshot_import_range_response,
++        write_snapshot_import_range_attempt,
++        SnapshotImportRangeAttemptError,
++    };
++
++    #[test]
++    fn snapshot_import_range_response_requires_exact_content_range() {
++        let key = "bucket/object".to_string().into();
++        validate_snapshot_import_range_response(&key, 8, 12, 20, Some(4), Some("bytes 8-11/20"))
++            .unwrap();
++        validate_snapshot_import_range_response(
++            &key,
++            8,
++            12,
++            20,
++            Some(4),
++            Some("Bytes 008-011/020"),
++        )
++        .unwrap();
++
++        for invalid_content_range in [
++            "bytes 0-3/20",
++            "bytes 8-12/20",
++            "bytes 8-11/21",
++            "bytes 8-11/*",
++            "items 8-11/20",
++        ] {
++            let error = validate_snapshot_import_range_response(
++                &key,
++                8,
++                12,
++                20,
++                Some(4),
++                Some(invalid_content_range),
++            )
++            .unwrap_err();
++            assert!(
++                format!("{error:#}").contains("expected \"bytes 8-11/20\""),
++                "unexpected error: {error:#}",
++            );
++        }
++    }
++
++    #[test]
++    fn snapshot_import_ranges_require_one_object_version() {
++        let key = "bucket/object".to_string().into();
++        let mut expected_etag = None;
++        validate_snapshot_import_etag(&key, &mut expected_etag, Some("etag-a")).unwrap();
++        assert_eq!(expected_etag.as_deref(), Some("etag-a"));
++
++        let error =
++            validate_snapshot_import_etag(&key, &mut expected_etag, Some("etag-b")).unwrap_err();
++        assert!(
++            format!("{error:#}").contains("changed while it was being materialized"),
++            "unexpected error: {error:#}",
++        );
++    }
++
++    #[tokio::test]
++    async fn snapshot_import_range_retry_overwrites_partial_attempt() -> anyhow::Result<()> {
++        let temp_file = NamedTempFile::new()?;
++        let mut file = tokio::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(temp_file.path())
++            .await?;
++        file.write_all(b"01......89").await?;
++        let key = "bucket/object".to_string().into();
++
++        let short_stream = stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"bad"))]);
++        let error = write_snapshot_import_range_attempt(
++            &key,
++            &mut file,
++            2,
++            8,
++            short_stream,
++            Duration::from_secs(1),
++        )
++        .await
++        .unwrap_err();
++        assert!(matches!(
++            error,
++            SnapshotImportRangeAttemptError::Retryable(_)
++        ));
++        let error = error.into_inner();
++        assert!(
++            format!("{error:#}").contains("Downloaded 3 bytes"),
++            "unexpected error: {error:#}",
++        );
++
++        let overread_stream = stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"toolong"))]);
++        let error = write_snapshot_import_range_attempt(
++            &key,
++            &mut file,
++            2,
++            8,
++            overread_stream,
++            Duration::from_secs(1),
++        )
++        .await
++        .unwrap_err();
++        assert!(matches!(error, SnapshotImportRangeAttemptError::Fatal(_)));
++
++        let complete_stream = stream::iter([
++            Ok::<_, io::Error>(Bytes::from_static(b"ABC")),
++            Ok::<_, io::Error>(Bytes::from_static(b"DEF")),
++        ]);
++        write_snapshot_import_range_attempt(
++            &key,
++            &mut file,
++            2,
++            8,
++            complete_stream,
++            Duration::from_secs(1),
++        )
++        .await
++        .map_err(SnapshotImportRangeAttemptError::into_inner)?;
++        file.flush().await?;
++        file.seek(SeekFrom::Start(0)).await?;
++        let mut bytes = Vec::new();
++        file.read_to_end(&mut bytes).await?;
++        assert_eq!(bytes, b"01ABCDEF89");
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn snapshot_import_empty_chunks_do_not_reset_read_idle_timeout() -> anyhow::Result<()> {
++        let temp_file = NamedTempFile::new()?;
++        let mut file = tokio::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open(temp_file.path())
++            .await?;
++        let key = "bucket/object".to_string().into();
++        let empty_stream = stream::repeat_with(|| Ok::<_, io::Error>(Bytes::new()));
++
++        let error = write_snapshot_import_range_attempt(
++            &key,
++            &mut file,
++            0,
++            1,
++            empty_stream,
++            Duration::from_millis(10),
++        )
++        .await
++        .unwrap_err();
++        assert!(matches!(
++            error,
++            SnapshotImportRangeAttemptError::Retryable(_)
++        ));
++        let error = error.into_inner();
++        assert!(
++            format!("{error:#}").contains("timed out reading object range"),
++            "unexpected error: {error:#}",
++        );
++        Ok(())
++    }
++}
+diff --git a/crates/storage/src/lib.rs b/crates/storage/src/lib.rs
+index 2c885dfaf88f8eb0900dac746bbc9f7df5e62fa0..27d181f8a0eea6b0303721c0285af288a0f92b8e 100644
+--- a/crates/storage/src/lib.rs
++++ b/crates/storage/src/lib.rs
+@@ -173,6 +173,14 @@ pub trait Storage: Send + Sync + Debug {
+         &self,
+         key: &FullyQualifiedObjectKey,
+     ) -> anyhow::Result<Option<ObjectAttributes>>;
++    /// Copies an object of `expected_size` to an existing local file.
++    /// Implementations must truncate the destination and write from its start.
++    async fn download_fq_object_to_file(
++        &self,
++        key: &FullyQualifiedObjectKey,
++        file: &mut tokio::fs::File,
++        expected_size: u64,
++    ) -> anyhow::Result<u64>;
+     /// Not intended to be called directly.
+     /// Use get_range() or get() instead.
+     fn get_small_range(
+@@ -1071,16 +1079,36 @@ impl<RT: Runtime> Storage for LocalDirStorage<RT> {
+         key: &FullyQualifiedObjectKey,
+     ) -> anyhow::Result<Option<ObjectAttributes>> {
+         let path = Path::new(key.as_str());
+-        let mut buf = vec![];
+-        let result = File::open(path);
+-        if result.is_err() {
+-            return Ok(None);
++        match tokio::fs::metadata(path).await {
++            Ok(metadata) => Ok(Some(ObjectAttributes {
++                size: metadata.len(),
++            })),
++            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
++            Err(e) => Err(e).with_context(|| {
++                format!(
++                    "Local dir storage failed to read metadata for {}",
++                    path.display()
++                )
++            }),
+         }
+-        let mut file = result.unwrap();
+-        file.read_to_end(&mut buf)?;
+-        Ok(Some(ObjectAttributes {
+-            size: buf.len() as u64,
+-        }))
++    }
++
++    async fn download_fq_object_to_file(
++        &self,
++        key: &FullyQualifiedObjectKey,
++        file: &mut tokio::fs::File,
++        expected_size: u64,
++    ) -> anyhow::Result<u64> {
++        let source_path = Path::new(key.as_str());
++        let source = tokio::fs::File::open(source_path).await?;
++        file.set_len(0).await?;
++        tokio::io::AsyncSeekExt::seek(file, SeekFrom::Start(0)).await?;
++        // Copy one byte past the observed size so a concurrently growing source
++        // fails the caller's size check without consuming unbounded temporary disk.
++        let mut bounded_source =
++            tokio::io::AsyncReadExt::take(source, expected_size.saturating_add(1));
++        let copied_bytes = tokio::io::copy(&mut bounded_source, file).await?;
++        Ok(copied_bytes)
+     }
+ 
+     fn storage_type_proto(&self) -> pb::searchlight::StorageType {
+diff --git a/crates/storage_zip_reader/Cargo.toml b/crates/storage_zip_reader/Cargo.toml
+index 455543ddf92d275e9a9598a772e77e6ae512683b..c1d26885c3871b420fdee085412e22686a1d0e1d 100644
+--- a/crates/storage_zip_reader/Cargo.toml
++++ b/crates/storage_zip_reader/Cargo.toml
+@@ -13,12 +13,12 @@ testing = ["common/testing", "errors/testing", "storage/testing"]
+ 
+ [dependencies]
+ anyhow = { workspace = true }
+-bytes = { workspace = true }
+ common = { workspace = true }
+ errors = { workspace = true }
+ futures = { workspace = true }
+ rc-zip = { workspace = true }
+ storage = { workspace = true }
++tempfile = { workspace = true }
+ tokio = { workspace = true }
+ tokio-util = { workspace = true }
+ 
+diff --git a/crates/storage_zip_reader/src/lib.rs b/crates/storage_zip_reader/src/lib.rs
+index b34f9e98cfdc2d2bc2d9fd297ab6b090f0725dbb..d6a9331022afb22db62447ab3a0d2ca01e4c1c66 100644
+--- a/crates/storage_zip_reader/src/lib.rs
++++ b/crates/storage_zip_reader/src/lib.rs
+@@ -8,16 +8,15 @@ use std::{
+         Context,
+         Poll,
+     },
++    time::Duration,
+ };
+ 
+ use anyhow::Context as _;
+-use bytes::Bytes;
+ use common::types::{
+     FullyQualifiedObjectKey,
+     ObjectKey,
+ };
+ use errors::ErrorMetadata;
+-use futures::Stream;
+ pub use rc_zip;
+ use rc_zip::{
+     fsm::{
+@@ -34,19 +33,33 @@ use storage::{
+     Storage,
+     StorageExt as _,
+ };
++use tempfile::NamedTempFile;
+ use tokio::io::{
+     AsyncRead,
+     AsyncReadExt,
++    AsyncSeekExt,
++    AsyncWriteExt,
+     ReadBuf,
+ };
+ use tokio_util::io::StreamReader;
+ 
++const MATERIALIZED_OBJECT_ATTRIBUTES_TIMEOUT: Duration = Duration::from_secs(120);
++
+ pub struct StorageZipArchive {
+-    storage: Arc<dyn Storage>,
+-    object_key: FullyQualifiedObjectKey,
++    source: ZipSource,
+     archive: Archive,
+ }
+ 
++enum ZipSource {
++    Storage {
++        storage: Arc<dyn Storage>,
++        object_key: FullyQualifiedObjectKey,
++    },
++    LocalFile {
++        temp_file: Arc<NamedTempFile>,
++    },
++}
++
+ impl Deref for StorageZipArchive {
+     type Target = Archive;
+ 
+@@ -70,57 +83,55 @@ impl StorageZipArchive {
+             .get_fq_object_attributes(&object_key)
+             .await?
+             .with_context(|| format!("Could not find object with key {object_key:?}"))?;
+-        let mut fsm = ArchiveFsm::new(attributes.size);
+-        let mut read_position = u64::MAX; // arbitrary value that would never be used
+-        let mut read_stream: Option<StreamReader<_, _>> = None;
+-        loop {
+-            if let Some(offset) = fsm.wants_read() {
+-                if offset == read_position
+-                    && let Some(reader) = &mut read_stream
+-                {
+-                    // Continue reading
+-                    anyhow::ensure!(!fsm.space().is_empty(), "wants read but no buffer?");
+-                    let read_bytes = reader.read(fsm.space()).await?;
+-                    fsm.fill(read_bytes);
+-                    read_position += read_bytes as u64;
+-                    if read_bytes == 0 {
+-                        read_stream = None;
+-                        continue;
+-                    }
+-                } else {
+-                    let stream = if read_position == offset {
+-                        // If we are continuing a sequential read, then assume
+-                        // that we're reading the central directory; read more
+-                        // data at once
+-                        storage
+-                            .get_fq_object_exact_range(&object_key, offset..attributes.size)
+-                            .stream
+-                    } else {
+-                        let read_len = fsm.space().len() as u64;
+-                        let end = attributes.size.min(offset + read_len);
+-                        storage
+-                            .get_small_range_with_retries(&object_key, offset..end)
+-                            .await?
+-                            .stream
+-                    };
+-                    read_position = offset;
+-                    read_stream = Some(StreamReader::new(stream));
+-                }
+-            }
+-            match fsm
+-                .process()
+-                .context(ErrorMetadata::bad_request("InvalidZip", "invalid zip file"))?
+-            {
+-                FsmResult::Continue(next) => fsm = next,
+-                FsmResult::Done(archive) => {
+-                    return Ok(Self {
+-                        storage,
+-                        object_key,
+-                        archive,
+-                    })
+-                },
+-            }
+-        }
++        let archive = read_archive_from_storage(&storage, &object_key, attributes.size).await?;
++        Ok(Self {
++            source: ZipSource::Storage {
++                storage,
++                object_key,
++            },
++            archive,
++        })
++    }
++
++    /// Reads the object into a local temporary file before parsing the ZIP.
++    ///
++    /// This keeps S3 streams out of the row parsing path, where long pauses
++    /// between reads can trigger SDK stalled-stream protection.
++    pub async fn open_fq_materialized(
++        storage: Arc<dyn Storage>,
++        object_key: FullyQualifiedObjectKey,
++    ) -> anyhow::Result<Self> {
++        let attributes = tokio::time::timeout(
++            MATERIALIZED_OBJECT_ATTRIBUTES_TIMEOUT,
++            storage.get_fq_object_attributes(&object_key),
++        )
++        .await
++        .with_context(|| format!("timed out reading attributes for object {object_key:?}"))??
++        .with_context(|| format!("Could not find object with key {object_key:?}"))?;
++        let temp_file = Arc::new(NamedTempFile::new().context("create temporary zip file")?);
++        let mut local_file = tokio::fs::File::from_std(
++            temp_file
++                .reopen()
++                .context("reopen temporary zip file for materialization")?,
++        );
++        let copied_bytes = storage
++            .download_fq_object_to_file(&object_key, &mut local_file, attributes.size)
++            .await
++            .with_context(|| format!("download zip object {object_key:?}"))?;
++        anyhow::ensure!(
++            copied_bytes == attributes.size,
++            "Downloaded {copied_bytes} bytes for {object_key:?}, expected {} bytes",
++            attributes.size
++        );
++        local_file
++            .flush()
++            .await
++            .context("flush temporary zip file")?;
++        let archive = read_archive_from_file(local_file, attributes.size).await?;
++        Ok(Self {
++            source: ZipSource::LocalFile { temp_file },
++            archive,
++        })
+     }
+ 
+     /// Creates a reader for an entry in the archive.
+@@ -134,15 +145,26 @@ impl StorageZipArchive {
+         // name & extra fields), and then we add 1KiB for the remaining
+         // fixed-size stuff.
+         const MAX_HEADER_SIZE: u64 = (1 << 16) * 2 + 1024;
+-        let end = self
+-            .archive
+-            .size()
+-            .min(start + entry.compressed_size + MAX_HEADER_SIZE);
+-        let read_stream = StreamReader::new(
+-            self.storage
+-                .get_fq_object_exact_range(&self.object_key, start..end)
+-                .stream,
++        let end = self.archive.size().min(
++            start
++                .saturating_add(entry.compressed_size)
++                .saturating_add(MAX_HEADER_SIZE),
+         );
++        let read_stream = match &self.source {
++            ZipSource::Storage {
++                storage,
++                object_key,
++            } => Box::pin(StreamReader::new(
++                storage
++                    .get_fq_object_exact_range(object_key, start..end)
++                    .stream,
++            )) as Pin<Box<dyn AsyncRead + Send>>,
++            ZipSource::LocalFile { temp_file } => Box::pin(LazyLocalFileReader {
++                temp_file: temp_file.clone(),
++                unopened_range: Some(start..end),
++                reader: None,
++            }) as Pin<Box<dyn AsyncRead + Send>>,
++        };
+         StorageZipEntryReader {
+             read_stream,
+             entry_fsm: Some(EntryFsm::new(Some(entry), None)),
+@@ -150,10 +172,184 @@ impl StorageZipArchive {
+     }
+ }
+ 
++async fn read_archive_from_storage(
++    storage: &Arc<dyn Storage>,
++    object_key: &FullyQualifiedObjectKey,
++    object_size: u64,
++) -> anyhow::Result<Archive> {
++    let mut fsm = ArchiveFsm::new(object_size);
++    let mut read_position = u64::MAX; // arbitrary value that would never be used
++    let mut read_stream: Option<StreamReader<_, _>> = None;
++    let mut read_stream_end = 0;
++    loop {
++        if let Some(offset) = fsm.wants_read() {
++            anyhow::ensure!(
++                offset < object_size,
++                ErrorMetadata::bad_request(
++                    "InvalidZip",
++                    format!("zip parser requested byte {offset} outside the archive"),
++                )
++            );
++            if offset == read_position
++                && let Some(reader) = &mut read_stream
++            {
++                // Continue reading
++                anyhow::ensure!(!fsm.space().is_empty(), "wants read but no buffer?");
++                let read_bytes = reader.read(fsm.space()).await?;
++                if read_bytes == 0 {
++                    anyhow::ensure!(
++                        read_position >= read_stream_end,
++                        "storage stream ended at byte {read_position} before requested end byte \
++                         {read_stream_end}"
++                    );
++                    anyhow::ensure!(
++                        read_position < object_size,
++                        ErrorMetadata::bad_request(
++                            "InvalidZip",
++                            format!("zip archive ended unexpectedly at byte {read_position}"),
++                        )
++                    );
++                    // The parser consumed the small range exactly and still
++                    // needs sequential bytes. Open the next range instead of
++                    // treating the range boundary as archive EOF.
++                    read_stream = None;
++                    continue;
++                }
++                fsm.fill(read_bytes);
++                read_position += read_bytes as u64;
++            } else {
++                let (stream, end) = if read_position == offset {
++                    // If we are continuing a sequential read, then assume
++                    // that we're reading the central directory; read more
++                    // data at once
++                    (
++                        storage
++                            .get_fq_object_exact_range(object_key, offset..object_size)
++                            .stream,
++                        object_size,
++                    )
++                } else {
++                    let read_len = fsm.space().len() as u64;
++                    let end = object_size.min(offset.saturating_add(read_len));
++                    (
++                        storage
++                            .get_small_range_with_retries(object_key, offset..end)
++                            .await?
++                            .stream,
++                        end,
++                    )
++                };
++                read_position = offset;
++                read_stream_end = end;
++                read_stream = Some(StreamReader::new(stream));
++            }
++        }
++        match fsm
++            .process()
++            .context(ErrorMetadata::bad_request("InvalidZip", "invalid zip file"))?
++        {
++            FsmResult::Continue(next) => fsm = next,
++            FsmResult::Done(archive) => return validate_archive(archive),
++        }
++    }
++}
++
++async fn read_archive_from_file(
++    mut file: tokio::fs::File,
++    object_size: u64,
++) -> anyhow::Result<Archive> {
++    let mut fsm = ArchiveFsm::new(object_size);
++    let mut read_position = u64::MAX;
++    loop {
++        if let Some(offset) = fsm.wants_read() {
++            if offset != read_position {
++                file.seek(io::SeekFrom::Start(offset))
++                    .await
++                    .with_context(|| format!("seek temporary zip file to byte {offset}"))?;
++                read_position = offset;
++            }
++            anyhow::ensure!(!fsm.space().is_empty(), "wants read but no buffer?");
++            let read_bytes = file
++                .read(fsm.space())
++                .await
++                .context("read temporary zip file")?;
++            anyhow::ensure!(
++                read_bytes != 0,
++                ErrorMetadata::bad_request(
++                    "InvalidZip",
++                    format!("zip archive ended unexpectedly at byte {read_position}"),
++                )
++            );
++            fsm.fill(read_bytes);
++            read_position += read_bytes as u64;
++        }
++        match fsm
++            .process()
++            .context(ErrorMetadata::bad_request("InvalidZip", "invalid zip file"))?
++        {
++            FsmResult::Continue(next) => fsm = next,
++            FsmResult::Done(archive) => return validate_archive(archive),
++        }
++    }
++}
++
++fn validate_archive(archive: Archive) -> anyhow::Result<Archive> {
++    // Every entry needs at least the fixed 30-byte local file header before
++    // its compressed payload. Validate this before constructing byte ranges.
++    const MIN_LOCAL_FILE_HEADER_SIZE: u64 = 30;
++    for entry in archive.entries() {
++        let minimum_entry_end = entry
++            .header_offset
++            .checked_add(MIN_LOCAL_FILE_HEADER_SIZE)
++            .and_then(|offset| offset.checked_add(entry.compressed_size));
++        anyhow::ensure!(
++            minimum_entry_end.is_some_and(|end| end <= archive.size()),
++            ErrorMetadata::bad_request("InvalidZip", "zip entry points outside the archive")
++        );
++    }
++    Ok(archive)
++}
++
++struct LazyLocalFileReader {
++    // Keep the owner after opening the read handle. Otherwise dropping the
++    // archive can unlink the path while this reader is still active.
++    temp_file: Arc<NamedTempFile>,
++    unopened_range: Option<std::ops::Range<u64>>,
++    reader: Option<tokio::io::Take<tokio::fs::File>>,
++}
++
++impl AsyncRead for LazyLocalFileReader {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        // A parsed import keeps one reader per table. Delay opening the file so
++        // large snapshots do not hold one descriptor for every table at once.
++        if let Some(bytes_range) = self.unopened_range.take() {
++            match self.temp_file.reopen() {
++                Ok(mut file) => {
++                    use std::io::Seek as _;
++                    if let Err(e) = file.seek(io::SeekFrom::Start(bytes_range.start)) {
++                        return Poll::Ready(Err(e));
++                    }
++                    self.reader = Some(
++                        tokio::fs::File::from_std(file).take(bytes_range.end - bytes_range.start),
++                    );
++                },
++                Err(e) => return Poll::Ready(Err(e)),
++            }
++        }
++        let Some(reader) = self.reader.as_mut() else {
++            return Poll::Ready(Err(io::Error::other("reader failed before reading")));
++        };
++        Pin::new(reader).poll_read(cx, buf)
++    }
++}
++
+ /// Reads the content of a single file in a zip archive in storage.
+ pub struct StorageZipEntryReader {
+-    read_stream:
+-        StreamReader<Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>, Bytes>,
++    read_stream: Pin<Box<dyn AsyncRead + Send>>,
+     entry_fsm: Option<EntryFsm>,
+ }
+ 
+@@ -172,7 +368,7 @@ impl AsyncRead for StorageZipEntryReader {
+             let mut read_stream_eof = false;
+             if fsm.wants_read() {
+                 let mut read_buf = ReadBuf::new(fsm.space());
+-                ready!(Pin::new(&mut this.read_stream).poll_read(cx, &mut read_buf))?;
++                ready!(this.read_stream.as_mut().poll_read(cx, &mut read_buf))?;
+                 let read_bytes = read_buf.filled().len();
+                 fsm.fill(read_bytes);
+                 if read_bytes == 0 {
+@@ -215,3 +411,192 @@ impl AsyncRead for StorageZipEntryReader {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::{
++        io::Write as _,
++        sync::Arc,
++    };
++
++    use anyhow::Context as _;
++    use async_zip::{
++        tokio::write::ZipFileWriter,
++        Compression,
++        ZipEntryBuilder,
++    };
++    use common::types::ObjectKey;
++    use runtime::prod::ProdRuntime;
++    use storage::{
++        LocalDirStorage,
++        Storage,
++    };
++    use tempfile::NamedTempFile;
++    use tokio::io::AsyncReadExt as _;
++
++    use super::{
++        read_archive_from_file,
++        StorageZipArchive,
++        ZipSource,
++    };
++
++    #[test]
++    fn materialized_archive_reads_local_entries() -> anyhow::Result<()> {
++        let tokio_rt = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()?;
++        let rt = ProdRuntime::new(&tokio_rt);
++        let storage = LocalDirStorage::new(rt)?;
++        let key: ObjectKey = "materialized-test".try_into()?;
++        let source_path = storage.path().join("materialized-test.blob");
++        tokio_rt.block_on(async {
++            let file = tokio::fs::File::create(source_path).await?;
++            let mut writer = ZipFileWriter::with_tokio(file);
++            let entry = ZipEntryBuilder::new("entry.txt".into(), Compression::Deflate).build();
++            writer.write_entry_whole(entry, b"materialized").await?;
++            writer.close().await?;
++            anyhow::Ok(())
++        })?;
++        let fq_key = storage.fully_qualified_key(&key);
++
++        let archive = tokio_rt.block_on(StorageZipArchive::open_fq_materialized(
++            Arc::new(storage),
++            fq_key,
++        ))?;
++        let entry = archive
++            .entries()
++            .next()
++            .cloned()
++            .context("missing zip entry")?;
++        let temp_path = match &archive.source {
++            ZipSource::LocalFile { temp_file } => temp_file.path().to_owned(),
++            ZipSource::Storage { .. } => anyhow::bail!("expected materialized archive"),
++        };
++        let mut entry_reader = archive.read_entry(entry.clone());
++        drop(archive);
++        assert!(temp_path.exists());
++        let mut first_byte = [0];
++        tokio_rt.block_on(entry_reader.read_exact(&mut first_byte))?;
++        assert_eq!(&first_byte, b"m");
++        assert!(temp_path.exists());
++        let mut contents = String::new();
++        tokio_rt.block_on(entry_reader.read_to_string(&mut contents))?;
++        assert_eq!(entry.name, "entry.txt");
++        assert_eq!(contents, "aterialized");
++        assert!(temp_path.exists());
++        drop(entry_reader);
++        assert!(!temp_path.exists());
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn materialized_archive_rejects_truncated_central_directory() -> anyhow::Result<()> {
++        let mut temp_file = NamedTempFile::new()?;
++        let mut bytes = vec![0x50, 0x4b, 0x01, 0x02]; // Partial central directory header.
++        bytes.extend_from_slice(&[
++            0x50, 0x4b, 0x05, 0x06, // EOCD signature.
++            0x00, 0x00, // Disk number.
++            0x00, 0x00, // Central directory start disk.
++            0x01, 0x00, // Records on this disk.
++            0x01, 0x00, // Total records.
++            0x04, 0x00, 0x00, 0x00, // Central directory size.
++            0x00, 0x00, 0x00, 0x00, // Central directory offset.
++            0x00, 0x00, // Comment length.
++        ]);
++        temp_file.write_all(&bytes)?;
++        temp_file.flush()?;
++
++        let result = tokio::time::timeout(
++            std::time::Duration::from_secs(1),
++            read_archive_from_file(
++                tokio::fs::File::from_std(temp_file.reopen()?),
++                bytes.len() as u64,
++            ),
++        )
++        .await
++        .context("read_archive_from_file timed out")?;
++
++        let err = match result {
++            Ok(_) => anyhow::bail!("invalid zip should fail"),
++            Err(err) => err,
++        };
++        assert!(
++            format!("{err:#}").contains("zip archive ended unexpectedly"),
++            "unexpected error: {err:#}",
++        );
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn materialized_archive_rejects_out_of_bounds_entry_offset() -> anyhow::Result<()> {
++        let temp_file = NamedTempFile::new()?;
++        let file = tokio::fs::File::from_std(temp_file.reopen()?);
++        let mut writer = ZipFileWriter::with_tokio(file);
++        let entry = ZipEntryBuilder::new("entry.txt".into(), Compression::Stored).build();
++        writer.write_entry_whole(entry, b"contents").await?;
++        writer.close().await?;
++
++        let mut bytes = std::fs::read(temp_file.path())?;
++        let central_header = bytes
++            .windows(4)
++            .position(|window| window == b"PK\x01\x02")
++            .context("missing central directory header")?;
++        let invalid_offset = u32::try_from(bytes.len() - 1)?;
++        bytes[central_header + 42..central_header + 46]
++            .copy_from_slice(&invalid_offset.to_le_bytes());
++        std::fs::write(temp_file.path(), &bytes)?;
++
++        let result = read_archive_from_file(
++            tokio::fs::File::from_std(temp_file.reopen()?),
++            bytes.len() as u64,
++        )
++        .await;
++        let err = match result {
++            Ok(_) => anyhow::bail!("invalid zip should fail"),
++            Err(err) => err,
++        };
++        assert!(
++            format!("{err:#}").contains("zip entry points outside the archive"),
++            "unexpected error: {err:#}",
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn storage_archive_rejects_out_of_bounds_central_directory_offset() -> anyhow::Result<()> {
++        let tokio_rt = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()?;
++        let rt = ProdRuntime::new(&tokio_rt);
++        let storage = LocalDirStorage::new(rt)?;
++        let key: ObjectKey = "invalid-central-directory-offset".try_into()?;
++        let source_path = storage.path().join("invalid-central-directory-offset.blob");
++        tokio_rt.block_on(async {
++            let file = tokio::fs::File::create(&source_path).await?;
++            let mut writer = ZipFileWriter::with_tokio(file);
++            let entry = ZipEntryBuilder::new("entry.txt".into(), Compression::Stored).build();
++            writer.write_entry_whole(entry, b"contents").await?;
++            writer.close().await?;
++            anyhow::Ok(())
++        })?;
++
++        let mut bytes = std::fs::read(&source_path)?;
++        let eocd = bytes
++            .windows(4)
++            .rposition(|window| window == b"PK\x05\x06")
++            .context("missing end of central directory")?;
++        bytes[eocd + 16..eocd + 20].copy_from_slice(&u32::MAX.to_le_bytes());
++        std::fs::write(&source_path, bytes)?;
++
++        let result = tokio_rt.block_on(StorageZipArchive::open(Arc::new(storage), &key));
++        let err = match result {
++            Ok(_) => anyhow::bail!("invalid zip should fail"),
++            Err(err) => err,
++        };
++        assert!(
++            format!("{err:#}").contains("outside the archive"),
++            "unexpected error: {err:#}",
++        );
++        Ok(())
++    }
++}
+diff --git a/patches/snapshot_import_zip_materialization/README.md b/patches/snapshot_import_zip_materialization/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..035997c8ef5f07cbd67f08834e9e2509ffd43fed
+--- /dev/null
++++ b/patches/snapshot_import_zip_materialization/README.md
+@@ -0,0 +1,235 @@
++# Materialize Snapshot Import ZIPs
++
++This patch changes snapshot import parsing so ZIP archives are downloaded into a
++local temporary file before the ZIP central directory and entries are parsed. It
++is intended for self-hosted deployments that store import/export objects in
++DigitalOcean Spaces or another S3-compatible object store whose streaming
++behavior is not identical to AWS S3 in the ways the upstream import path
++assumes.
++
++The import code treats a remote object as a seekable ZIP file while the storage
++API exposes it as a sequence of HTTP range streams. ZIP parsing does many small
++reads around the central directory and later opens entry streams lazily while
++table parsing, validation, and database writes happen in between. That shape is
++straightforward against a local file. It is fragile when each read is backed by
++an SDK-managed HTTP stream with stalled-stream protection, provider-specific
++timeouts, provider-specific range response behavior, and long pauses between
++reads.
++
++The patch keeps the provider-specific hardening inside the snapshot import path.
++It does not change production file-storage byte streams. Snapshot import is an
++operator workflow, so each parse can spend local disk and one sequential download
++pass to finish transport verification and central-directory parsing before
++database mutation begins. Entry parsing then reads only the local file.
++
++## What Changes
++
++For ZIP snapshot imports, `parse_import_file` now calls
++`StorageZipArchive::open_fq_materialized` instead of opening the archive
++directly from object storage. The materialized path:
++
++- reads object attributes and records the expected object size;
++- downloads the whole object to a `NamedTempFile`;
++- verifies the copied byte count against the expected object size;
++- parses the ZIP central directory from the local temporary file;
++- retains the verified size for import egress accounting;
++- later reads ZIP entries from the same local file.
++
++After materialization succeeds, ZIP import execution does not read the source
++object or its attributes again. In particular, egress accounting uses the size
++already verified during parsing instead of issuing a second attributes request
++after hidden tables and file-storage rows have been written. A provider failure
++or source-object deletion after materialization therefore cannot fail the import
++solely at that accounting step. This remains logical source-size accounting:
++the separate confirmation materialization and bytes repeated by range retries
++consume provider bandwidth but do not add another usage charge.
++
++For S3-backed storage, `download_fq_object_to_file` downloads the object in
++bounded ranges. Each range checks `Content-Length`, parses and verifies the
++numeric start, end, and total from `Content-Range`, counts bytes read from the
++stream, rejects short reads and overreads, and retries the
++whole range from its start after request failures that exhaust the SDK's own
++retries, request timeouts before response headers, response-body transport
++errors, body-read idle timeouts, or early EOF. Decoded
++response metadata that fails `Content-Length`, `Content-Range`, or ETag
++validation, as well as overreads and local-file errors, fails immediately. The
++first range records the object ETag, later ranges use `If-Match`, and every
++response must report that same ETag so a same-size object replacement cannot
++produce a mixed local file. The S3 SDK stalled-stream protection is disabled
++only for this materialization path, and the code uses an explicit 120-second
++read idle timeout instead. Only non-empty body bytes reset that timeout; empty
++HTTP data frames cannot keep a stalled range alive. A separate 120-second
++timeout bounds the wait for each ranged request to return response headers.
++
++The materialized path also gives the initial object-attributes lookup a
++120-second timeout. This timeout is local to snapshot ZIP materialization and
++does not change ordinary storage attribute or byte-stream reads.
++
++The local ZIP reader also rejects zero-byte reads while the ZIP FSM still wants
++more input. Without that check, a truncated central directory can keep the FSM
++waiting for bytes that will never arrive. After parsing the central directory,
++both ZIP reader modes reject entries whose advertised local-header offset or
++compressed payload lies outside the archive instead of allowing an invalid
++range to reach the storage reader.
++
++The main code paths are:
++
++- `crates/application/src/snapshot_import/parse.rs`, where ZIP import parsing
++  selects the materialized archive path;
++- `crates/storage_zip_reader/src/lib.rs`, where `open_fq_materialized` downloads
++  the object and parses the local ZIP file;
++- `crates/aws_s3/src/storage.rs`, where the S3-backed materializer performs
++  bounded range downloads with response-range and byte-count verification and
++  retry.
++
++## Provider Behavior
++
++DigitalOcean Spaces exposed this issue: its S3-compatible behavior does not
++fully match the AWS S3 behavior assumed by this import path. We have not
++validated whether Hetzner, Vultr, GCS S3-compatible endpoints, Azure-backed
++S3-compatible gateways, or other providers have the same behavior.
++
++The import path is sensitive to differences that ordinary upload/download paths
++may never notice:
++
++- range responses must identify the requested offset and object size and
++  deliver exactly the requested byte count;
++- every range must identify the same object version by ETag;
++- stream EOF must mean the requested range was fully delivered, not merely that
++  the HTTP stream ended;
++- SDK stalled-stream protection must not classify a valid but paused import
++  stream as broken while the importer is doing CPU or database work;
++- ZIP central directory reads must fail cleanly on truncation or short reads.
++
++Materializing the object first converts those provider behaviors into one simple
++contract: either the complete object is present locally with the expected size,
++or the import fails before it starts parsing table data. After that point, ZIP
++parsing is ordinary local-file seek/read logic.
++
++Use this patch when snapshot imports come from DigitalOcean Spaces or another
++S3-compatible provider with observed short-read, range-read, stalled-stream, or
++idle-stream issues.
++
++## Scope
++
++This is not a broad replacement for Convex object storage reads. It leaves
++normal production file download behavior, normal file upload behavior, multipart
++upload behavior, and the general ranged reader unchanged outside snapshot import
++materialization.
++
++CSV and JSON snapshot imports remain streamed and are not materialized. Their
++parsed-import state also retains the source stream's declared content length so
++egress accounting does not require a second attributes lookup after writes.
++
++`LocalDirStorage` now obtains object size with filesystem metadata instead of
++reading the whole object into memory. Successful attribute results are
++unchanged, while filesystem errors other than a missing path now propagate
++instead of being reported as a missing object. Its object byte streams are
++unchanged. Its materialized copy reads at most one byte beyond the size observed
++from metadata, so a concurrently growing source fails the size check without
++consuming unbounded temporary disk.
++
++The ZIP parser selects materialization for every storage implementation. With
++`LocalDirStorage`, that means copying the source ZIP to a separate temporary
++file even though the source is already local. There is no provider-specific
++runtime switch in this patch; the provider-specific behavior is confined to the
++S3 implementation of the materialization method.
++
++A provider quirk that affects snapshot import can also affect other object
++storage paths. Hardening those paths is a separate patch. Snapshot import can
++use local-file materialization because imports are explicit operator workflows.
++User-facing file reads should not first copy an entire object to local disk.
++
++The patch also does not implement resume across backend restarts while the ZIP
++is being materialized. If the process restarts during the download, the next
++attempt starts materialization from the beginning. Snapshot import checkpoints
++still apply after parsing and row import begins; they are not a partial-object
++download checkpoint.
++
++Confirmation and execution materialize the ZIP in separate passes. For S3,
++ETag pinning keeps each pass internally consistent, but the import record does
++not persist an ETag across those passes. `LocalDirStorage` has no corresponding
++object-version token: the size check detects growth and truncation, but an
++in-place same-size rewrite during a copy is not detectable and can mix source
++bytes. Application-created snapshot import keys are immutable. A caller that
++supplies a fully qualified object key must keep that object unchanged from
++import creation through finalization; replacing it between confirmation and
++execution can make execution import different content from the content shown in
++the confirmation summary.
++
++## Operational Tradeoffs
++
++The main cost is local temporary disk. The Convex backend host needs enough free
++space for at least one full import ZIP plus normal runtime headroom. A snapshot
++ZIP is compressed and can be much smaller than the restored database footprint,
++because the database stores indexes, pages, metadata, and storage-engine
++overhead that are not represented one-for-one in the ZIP. The temporary file is
++created in the process's default temporary directory; on Unix, operators can
++set `TMPDIR` before starting the backend to select that location. The file is
++owned by `NamedTempFile`. Downloads and lazy entry reads use verified reopened
++handles rather than opening its raw path. Lazy entry readers retain the owner,
++so the file is removed after the archive and its last entry reader or
++storage-file stream are dropped. This is process-lifetime cleanup, not crash
++recovery: an abrupt process termination can leave a temporary file until the
++host or container cleans its temporary directory.
++
++The import also changes from lazy remote reads to an up-front sequential
++download. Transport truncation and inconsistent range responses are detected
++before table import starts, and later table parsing no longer depends on remote
++stream behavior. Entry decompression and CRC failures are still detected lazily
++when each entry is read. For very large ZIPs, the up-front download can make the
++beginning of the import look slower even if the full import is more predictable.
++
++The retry unit is one bounded range, not the entire ZIP. On a request failure
++that exhausts the SDK's retries, timeout while waiting for response headers,
++response-body transport error, body-read idle timeout, or early EOF, the failed
++range is rewritten from its start so the local file remains contiguous and
++byte-exact. Invalid response metadata, ETag changes, overreads, and local seek
++or write failures are not retried. This is a small range retry loop, not a
++general multi-part download manager.
++
++## Failure Model
++
++The patch prefers early, explicit failures over continuing with uncertain input.
++It checks:
++
++- the object exists and has an expected size;
++- each downloaded range reports the expected `Content-Length`;
++- each downloaded range reports the exact requested interval and object size in
++  `Content-Range`;
++- every downloaded range reports the same ETag, with later requests also using
++  `If-Match`;
++- each range delivers exactly the requested number of bytes;
++- no range delivers more bytes than requested;
++- the final copied byte count equals the object size;
++- the local ZIP reader does not hit EOF while the ZIP FSM still needs bytes;
++- central-directory entries do not point outside the downloaded archive.
++
++These checks are important for restore workflows. A snapshot import should fail
++before mutating deployment data when the object cannot be materialized exactly.
++It should not partially parse an archive after a provider stream ended early.
++Corruption discovered only while decompressing a ZIP entry remains subject to
++the existing snapshot import checkpoint and failure behavior.
++
++## When to Adopt
++
++Adopt this patch when:
++
++- the deployment is self-hosted;
++- snapshot import ZIPs are stored in DigitalOcean Spaces or another
++  S3-compatible provider;
++- streaming ZIP imports fail or stall on provider range streams;
++- the backend host has enough temporary disk for the largest expected import
++  ZIP;
++- operators want byte-exact ZIP materialization before database mutation begins.
++
++Do not adopt it when the extra local copy is not justified because the storage
++provider is known to work with the upstream streaming ZIP reader, or when import
++archives are too large for the backend's temporary disk budget. Local-directory
++storage also pays for the extra copy because this patch does not select the path
++by provider.
++
++For DigitalOcean Spaces specifically, this patch is a practical default. It
++keeps the rest of Convex's storage layer close to upstream while making the
++backup-restore path deterministic enough for production migration and recovery
++workflows.
+diff --git a/self-hosted/advanced/s3_storage.md b/self-hosted/advanced/s3_storage.md
+index fefb2194bf99e28ac0f584aa4a9b8f924a0d4bfc..43ef02d16e31211bf2c1a9276b172e0c1de046bb 100644
+--- a/self-hosted/advanced/s3_storage.md
++++ b/self-hosted/advanced/s3_storage.md
+@@ -19,6 +19,10 @@ Optionally set the `S3_ENDPOINT_URL` environment variable. This is required for
+ using [R2](https://www.cloudflare.com/developer-platform/products/r2/) or some
+ other drop-in replacement compatible with the AWS S3 API.
+ 
++For ZIP snapshot imports, compatible endpoints must return exact
++`Content-Length`, `Content-Range`, and `ETag` headers for ranged `GetObject`
++requests and honor `If-Match`.
++
+ Then run the backend!
+ 
+ ## Migrating storage providers
+@@ -37,3 +41,10 @@ Then set up a fresh backend with the new storage provider and import the data:
+ ```sh
+ npx convex import --replace-all <path-to-export-file>
+ ```
++
++ZIP snapshot imports are downloaded to a local temporary file before parsing,
++including when the snapshot-import bucket uses S3. The backend host or
++container therefore needs temporary disk space for the full ZIP plus normal
++runtime headroom. The file uses the process's default temporary directory; on
++Unix, set `TMPDIR` before starting the backend to select another location. The
++temporary file is removed after the import's lazy archive readers are closed.

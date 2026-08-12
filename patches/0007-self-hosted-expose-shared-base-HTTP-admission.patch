@@ -1,0 +1,1561 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Sun, 12 Jul 2026 14:33:15 +0800
+Subject: [PATCH 07/24] self-hosted: expose shared-base HTTP admission
+
+Use HTTP_SERVER_MAX_CONCURRENT_REQUESTS for both local-backend HTTP entry points, reject malformed, zero, or unsupported values before runtime and database initialization, and pass the setting through self-hosted Compose. Remove the fixed 128-request backend cap and fixed four-request HTTP action proxy cap.
+
+Treat HTTP_SERVER_MAX_CONCURRENT_REQUESTS minus HTTP_SERVER_DEPENDENCY_RESERVE as shared base occupancy consumed by every request. Permit only callback-token-bearing /api/actions requests above that base, preserve FIFO while base capacity is available, and keep total occupancy bounded by the configured maximum.
+
+Track actual permit waits with dependency-class waiter gauges and a duration histogram. Initialize both waiter labels for every HTTP service at zero so the sampled gauge remains an explicit compatibility anchor while histogram count, sum, and buckets retain waits shorter than the scrape interval.
+
+Place admission outside request instrumentation and timeout, bound direct constructor values, cover cancellation and waiter-guard handoff, and centralize the callback-token header contract. Document pre-permit waiting, response-stream permit lifetime, finite callback depth, reverse-proxy requirements, and the independent relationship with isolate-scheduler overflow.
+---
+ crates/common/src/dependency_overflow.rs      | 465 ++++++++++++++++++
+ crates/common/src/http/mod.rs                 | 409 ++++++++++++++-
+ crates/common/src/knobs.rs                    |  23 +-
+ crates/common/src/lib.rs                      |   1 +
+ crates/local_backend/src/lib.rs               |   2 -
+ crates/local_backend/src/main.rs              |  47 +-
+ .../src/node_action_callbacks.rs              |   3 +-
+ crates/local_backend/src/proxy.rs             |  33 +-
+ patches/shared_base_http_admission/README.md  | 171 +++++++
+ self-hosted/advanced/knobs.md                 |  74 +++
+ self-hosted/docker/docker-compose.yml         |   2 +
+ 11 files changed, 1198 insertions(+), 32 deletions(-)
+ create mode 100644 crates/common/src/dependency_overflow.rs
+ create mode 100644 patches/shared_base_http_admission/README.md
+
+diff --git a/crates/common/src/dependency_overflow.rs b/crates/common/src/dependency_overflow.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..493d27f92adfa2dd503d97287a923f9a516b2aba
+--- /dev/null
++++ b/crates/common/src/dependency_overflow.rs
+@@ -0,0 +1,465 @@
++use std::{
++    collections::VecDeque,
++    sync::Arc,
++};
++
++use parking_lot::Mutex;
++use tokio::sync::oneshot;
++
++/// A concurrency gate with shared base capacity and dependency-only overflow.
++///
++/// Every request may run while total occupancy is below `base_capacity`.
++/// Dependencies may additionally run up to `total_capacity`. Waiters retain
++/// FIFO order whenever the queue head is eligible; dependency waiters only
++/// bypass ordinary waiters while occupancy is in the overflow range.
++#[derive(Clone)]
++pub struct DependencyOverflowGate {
++    inner: Arc<Inner>,
++}
++
++struct Inner {
++    base_capacity: usize,
++    total_capacity: usize,
++    state: Mutex<State>,
++}
++
++#[derive(Default)]
++struct State {
++    active: usize,
++    next_waiter_id: u64,
++    waiters: VecDeque<Waiter>,
++}
++
++struct Waiter {
++    id: u64,
++    is_dependency: bool,
++    ready: oneshot::Sender<DependencyOverflowPermit>,
++    waiter_guard: Option<Box<dyn Send>>,
++}
++
++/// A permit returned by [`DependencyOverflowGate`].
++pub struct DependencyOverflowPermit {
++    inner: Option<Arc<Inner>>,
++}
++
++struct WaiterCancellation {
++    inner: Arc<Inner>,
++    waiter_id: Option<u64>,
++}
++
++impl DependencyOverflowGate {
++    /// Creates a gate with capacity shared by every request and additional
++    /// total capacity available only to dependencies.
++    pub fn new(base_capacity: usize, total_capacity: usize) -> Self {
++        assert!(
++            base_capacity <= total_capacity,
++            "dependency overflow base capacity must not exceed total capacity"
++        );
++        Self {
++            inner: Arc::new(Inner {
++                base_capacity,
++                total_capacity,
++                state: Mutex::new(State::default()),
++            }),
++        }
++    }
++
++    /// Acquires a permit.
++    pub async fn acquire(&self, is_dependency: bool) -> DependencyOverflowPermit {
++        self.acquire_with_waiter(is_dependency, || ()).await
++    }
++
++    /// Acquires a permit and creates `make_waiter_guard` only when the request
++    /// must enter the wait queue. The guard remains alive until permit handoff
++    /// or cancellation, allowing callers to account for actual waiters without
++    /// changing gate fairness.
++    pub async fn acquire_with_waiter<G: Send + 'static>(
++        &self,
++        is_dependency: bool,
++        make_waiter_guard: impl FnOnce() -> G,
++    ) -> DependencyOverflowPermit {
++        let (waiter_id, ready, cancellation) = {
++            let mut state = self.inner.state.lock();
++            if state.waiters.is_empty() && self.inner.can_start(state.active, is_dependency) {
++                state.active += 1;
++                return DependencyOverflowPermit {
++                    inner: Some(self.inner.clone()),
++                };
++            }
++
++            let waiter_id = state.next_waiter_id;
++            state.next_waiter_id = state
++                .next_waiter_id
++                .checked_add(1)
++                .expect("dependency overflow waiter id overflow");
++            let (ready_sender, ready) = oneshot::channel();
++            state.waiters.push_back(Waiter {
++                id: waiter_id,
++                is_dependency,
++                ready: ready_sender,
++                // Do not dispatch this entry until its waiter guard is attached.
++                // Otherwise a concurrent release can hand off the permit before
++                // waiter metrics start.
++                waiter_guard: None,
++            });
++            (
++                waiter_id,
++                ready,
++                WaiterCancellation {
++                    inner: self.inner.clone(),
++                    waiter_id: Some(waiter_id),
++                },
++            )
++        };
++
++        let waiter_guard: Box<dyn Send> = Box::new(make_waiter_guard());
++        {
++            let mut state = self.inner.state.lock();
++            let waiter = state
++                .waiters
++                .iter_mut()
++                .find(|waiter| waiter.id == waiter_id)
++                .expect("new dependency overflow waiter disappeared before registration");
++            assert!(
++                waiter.waiter_guard.is_none(),
++                "dependency overflow waiter guard registered twice"
++            );
++            waiter.waiter_guard = Some(waiter_guard);
++        }
++        self.inner.dispatch_waiters();
++        let permit = ready
++            .await
++            .expect("dependency overflow gate dropped while acquiring a permit");
++        cancellation.disarm();
++        permit
++    }
++
++    /// Returns the number of permits currently in use.
++    pub fn active(&self) -> usize {
++        self.inner.state.lock().active
++    }
++
++    /// Returns shared base occupancy, excluding dependency overflow.
++    pub fn base_in_use(&self) -> usize {
++        self.active().min(self.inner.base_capacity)
++    }
++}
++
++impl Inner {
++    fn can_start(&self, active: usize, is_dependency: bool) -> bool {
++        active
++            < if is_dependency {
++                self.total_capacity
++            } else {
++                self.base_capacity
++            }
++    }
++
++    fn dispatch_waiters(self: &Arc<Self>) {
++        loop {
++            let waiter = {
++                let mut state = self.state.lock();
++                if state.active >= self.total_capacity {
++                    return;
++                }
++                let index = if state.active < self.base_capacity {
++                    state
++                        .waiters
++                        .front()
++                        .and_then(|waiter| waiter.waiter_guard.is_some().then_some(0))
++                } else {
++                    let dependency = state.waiters.iter().position(|waiter| waiter.is_dependency);
++                    dependency.filter(|index| state.waiters[*index].waiter_guard.is_some())
++                };
++                let Some(index) = index else {
++                    return;
++                };
++                let mut waiter = state
++                    .waiters
++                    .remove(index)
++                    .expect("selected dependency overflow waiter must exist");
++                state.active += 1;
++                let waiter_guard = waiter
++                    .waiter_guard
++                    .take()
++                    .expect("selected dependency overflow waiter must be registered");
++                drop(state);
++                // The request stops being a waiter when the gate grants its
++                // permit, not when the receiving task is next polled.
++                drop(waiter_guard);
++                waiter
++            };
++
++            let permit = DependencyOverflowPermit {
++                inner: Some(self.clone()),
++            };
++            if let Err(mut permit) = waiter.ready.send(permit) {
++                // Avoid recursively dispatching through an arbitrarily long
++                // run of canceled waiters.
++                permit.release_without_dispatch();
++            }
++        }
++    }
++
++    fn release(self: &Arc<Self>) {
++        {
++            let mut state = self.state.lock();
++            state.active = state
++                .active
++                .checked_sub(1)
++                .expect("dependency overflow active count underflow");
++        }
++        self.dispatch_waiters();
++    }
++}
++
++impl Drop for DependencyOverflowPermit {
++    fn drop(&mut self) {
++        if let Some(inner) = self.inner.take() {
++            inner.release();
++        }
++    }
++}
++
++impl DependencyOverflowPermit {
++    fn release_without_dispatch(&mut self) {
++        let inner = self
++            .inner
++            .take()
++            .expect("dependency overflow permit released twice");
++        let mut state = inner.state.lock();
++        state.active = state
++            .active
++            .checked_sub(1)
++            .expect("dependency overflow active count underflow");
++    }
++}
++
++impl WaiterCancellation {
++    fn disarm(mut self) {
++        self.waiter_id.take();
++    }
++}
++
++impl Drop for WaiterCancellation {
++    fn drop(&mut self) {
++        let Some(waiter_id) = self.waiter_id else {
++            return;
++        };
++        let removed = {
++            let mut state = self.inner.state.lock();
++            state
++                .waiters
++                .iter()
++                .position(|waiter| waiter.id == waiter_id)
++                .map(|index| {
++                    state
++                        .waiters
++                        .remove(index)
++                        .expect("selected canceled dependency overflow waiter must exist")
++                })
++        };
++        if removed.is_some() {
++            // A canceled entry may have been the non-dispatchable FIFO head
++            // while capacity was available. Removing it must wake the next
++            // eligible waiter without waiting for another permit release.
++            drop(removed);
++            self.inner.dispatch_waiters();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::{
++        sync::{
++            atomic::{
++                AtomicUsize,
++                Ordering,
++            },
++            Arc,
++        },
++        time::Duration,
++    };
++
++    use super::DependencyOverflowGate;
++
++    #[tokio::test]
++    async fn dependencies_share_base_and_alone_use_overflow() {
++        let gate = DependencyOverflowGate::new(2, 3);
++        let dependency_in_base = gate.acquire(true).await;
++        let ordinary_in_base = gate.acquire(false).await;
++        assert_eq!(gate.base_in_use(), 2);
++        assert_eq!(gate.active() - gate.base_in_use(), 0);
++
++        let mut ordinary_waiter = std::pin::pin!(gate.acquire(false));
++        assert!(futures::poll!(&mut ordinary_waiter).is_pending());
++
++        let dependency_in_overflow = gate.acquire(true).await;
++        assert_eq!(gate.active(), 3);
++        assert_eq!(gate.active() - gate.base_in_use(), 1);
++
++        let mut dependency_waiter = std::pin::pin!(gate.acquire(true));
++        assert!(futures::poll!(&mut dependency_waiter).is_pending());
++
++        drop(dependency_in_base);
++        // Total occupancy remains B, so the ordinary waiter is still
++        // ineligible and the dependency waiter receives the newly free slot.
++        let dependency_after_release =
++            tokio::time::timeout(Duration::from_secs(1), &mut dependency_waiter)
++                .await
++                .expect("dependency did not use available overflow capacity");
++        assert_eq!(gate.active(), 3);
++        assert!(futures::poll!(&mut ordinary_waiter).is_pending());
++
++        drop(ordinary_in_base);
++        assert!(futures::poll!(&mut ordinary_waiter).is_pending());
++        drop(dependency_in_overflow);
++        let ordinary_after_release =
++            tokio::time::timeout(Duration::from_secs(1), &mut ordinary_waiter)
++                .await
++                .expect("ordinary waiter did not enter shared base capacity");
++
++        drop(dependency_after_release);
++        drop(ordinary_after_release);
++        assert_eq!(gate.active(), 0);
++    }
++
++    #[tokio::test]
++    async fn fifo_is_preserved_below_base_capacity() {
++        let gate = DependencyOverflowGate::new(1, 1);
++        let active = gate.acquire(false).await;
++        let mut ordinary = std::pin::pin!(gate.acquire(false));
++        let mut dependency = std::pin::pin!(gate.acquire(true));
++        assert!(futures::poll!(&mut ordinary).is_pending());
++        assert!(futures::poll!(&mut dependency).is_pending());
++
++        drop(active);
++        let ordinary = tokio::time::timeout(Duration::from_secs(1), &mut ordinary)
++            .await
++            .expect("FIFO head did not receive base capacity");
++        assert!(futures::poll!(&mut dependency).is_pending());
++
++        drop(ordinary);
++        let dependency = tokio::time::timeout(Duration::from_secs(1), &mut dependency)
++            .await
++            .expect("dependency did not receive released base capacity");
++        drop(dependency);
++    }
++
++    #[tokio::test]
++    async fn canceled_waiters_do_not_leak_capacity() {
++        let gate = DependencyOverflowGate::new(1, 2);
++        let active = gate.acquire(false).await;
++        let mut waiter = Box::pin(gate.acquire(false));
++        assert!(futures::poll!(&mut waiter).is_pending());
++        drop(waiter);
++
++        drop(active);
++        let permit = tokio::time::timeout(Duration::from_secs(1), gate.acquire(false))
++            .await
++            .expect("canceled waiter leaked capacity");
++        drop(permit);
++        assert_eq!(gate.active(), 0);
++    }
++
++    #[tokio::test]
++    async fn canceled_permit_handoffs_do_not_leak_capacity() {
++        let gate = DependencyOverflowGate::new(1, 1);
++        let active = gate.acquire(false).await;
++        let mut waiter = Box::pin(gate.acquire(false));
++        assert!(futures::poll!(&mut waiter).is_pending());
++
++        // Dispatch a permit into the waiter's channel, then cancel the waiter
++        // before it polls the channel and takes ownership of that permit.
++        drop(active);
++        assert_eq!(gate.active(), 1);
++        drop(waiter);
++        assert_eq!(gate.active(), 0);
++
++        let permit = tokio::time::timeout(Duration::from_secs(1), gate.acquire(false))
++            .await
++            .expect("canceled permit handoff leaked capacity");
++        drop(permit);
++    }
++
++    #[tokio::test]
++    async fn cancellation_redispatches_to_the_next_waiter() {
++        let gate = DependencyOverflowGate::new(1, 1);
++        let active = gate.acquire(false).await;
++        let mut canceled_before_handoff = Box::pin(gate.acquire(false));
++        let mut next = Box::pin(gate.acquire(false));
++        assert!(futures::poll!(&mut canceled_before_handoff).is_pending());
++        assert!(futures::poll!(&mut next).is_pending());
++
++        drop(canceled_before_handoff);
++        drop(active);
++        let permit = tokio::time::timeout(Duration::from_secs(1), &mut next)
++            .await
++            .expect("waiter did not progress after the queue head was canceled");
++        drop(permit);
++        assert_eq!(gate.active(), 0);
++
++        let active = gate.acquire(false).await;
++        let mut canceled_after_handoff = Box::pin(gate.acquire(false));
++        let mut next = Box::pin(gate.acquire(false));
++        assert!(futures::poll!(&mut canceled_after_handoff).is_pending());
++        assert!(futures::poll!(&mut next).is_pending());
++
++        drop(active);
++        assert_eq!(gate.active(), 1);
++        assert!(futures::poll!(&mut next).is_pending());
++        drop(canceled_after_handoff);
++        let permit = tokio::time::timeout(Duration::from_secs(1), &mut next)
++            .await
++            .expect("waiter did not progress after a permit handoff was canceled");
++        drop(permit);
++        assert_eq!(gate.active(), 0);
++    }
++
++    #[tokio::test]
++    async fn waiter_guard_only_covers_actual_queue_wait() {
++        struct WaiterGuard(Arc<AtomicUsize>);
++        impl Drop for WaiterGuard {
++            fn drop(&mut self) {
++                self.0.fetch_add(1, Ordering::Relaxed);
++            }
++        }
++
++        let immediate_gate = DependencyOverflowGate::new(1, 1);
++        let immediate = immediate_gate
++            .acquire_with_waiter(false, || panic!("immediate permit reported a waiter"))
++            .await;
++        drop(immediate);
++
++        let gate = DependencyOverflowGate::new(1, 1);
++        let active = gate.acquire(false).await;
++        let started = Arc::new(AtomicUsize::new(0));
++        let dropped = Arc::new(AtomicUsize::new(0));
++        let started_for_waiter = started.clone();
++        let dropped_for_waiter = dropped.clone();
++        let mut waiter = Box::pin(gate.acquire_with_waiter(false, move || {
++            started_for_waiter.fetch_add(1, Ordering::Relaxed);
++            WaiterGuard(dropped_for_waiter)
++        }));
++        assert!(futures::poll!(&mut waiter).is_pending());
++        assert_eq!(started.load(Ordering::Relaxed), 1);
++        assert_eq!(dropped.load(Ordering::Relaxed), 0);
++
++        drop(active);
++        assert_eq!(dropped.load(Ordering::Relaxed), 1);
++        let permit = waiter.await;
++        drop(permit);
++        assert_eq!(gate.active(), 0);
++
++        let active = gate.acquire(false).await;
++        let dropped_for_cancellation = dropped.clone();
++        let mut canceled = Box::pin(
++            gate.acquire_with_waiter(false, move || WaiterGuard(dropped_for_cancellation)),
++        );
++        assert!(futures::poll!(&mut canceled).is_pending());
++        drop(canceled);
++        assert_eq!(dropped.load(Ordering::Relaxed), 2);
++        drop(active);
++    }
++}
+diff --git a/crates/common/src/http/mod.rs b/crates/common/src/http/mod.rs
+index f17aa359e291e6e8d2f62f7faabe70d987e297d9..f000bdce411f4f7767cd716d5fdc8cc2ac2203e8 100644
+--- a/crates/common/src/http/mod.rs
++++ b/crates/common/src/http/mod.rs
+@@ -90,7 +90,6 @@ use serde::{
+ };
+ use tokio::net::TcpSocket;
+ use tower::{
+-    limit::GlobalConcurrencyLimitLayer,
+     timeout::TimeoutLayer,
+     Layer,
+     Service,
+@@ -142,13 +141,22 @@ pub use sync_types::headers::{
+     DEPRECATION_STATE_HEADER_NAME,
+ };
+ use value::heap_size::HeapSize;
++
++/// Header carrying the authenticated token on Node action callback requests.
++pub const CONVEX_ACTIONS_CALLBACK_TOKEN: &str = "Convex-Action-Callback-Token";
++
+ mod metrics {
+     use std::time::Duration;
+ 
+     use metrics::{
++        add_to_gauge_with_labels,
+         log_distribution_with_labels,
++        log_gauge_with_labels,
++        register_convex_gauge,
+         register_convex_histogram,
++        subtract_from_gauge_with_labels,
+         MetricLabel,
++        StaticMetricLabel,
+     };
+ 
+     register_convex_histogram!(
+@@ -181,6 +189,92 @@ mod metrics {
+             labels,
+         );
+     }
++
++    register_convex_gauge!(
++        HTTP_ADMISSION_WAITERS_INFO,
++        "Number of HTTP requests waiting for service admission",
++        &["service_name", "is_dependency"]
++    );
++    register_convex_histogram!(
++        HTTP_ADMISSION_WAIT_SECONDS,
++        "Time HTTP requests spent waiting for service admission",
++        &["service_name", "is_dependency"]
++    );
++
++    fn http_admission_labels(
++        service_name: &'static str,
++        is_dependency: &'static str,
++    ) -> Vec<StaticMetricLabel> {
++        vec![
++            StaticMetricLabel::new("service_name", service_name),
++            StaticMetricLabel::new("is_dependency", is_dependency),
++        ]
++    }
++
++    pub fn initialize_http_admission_metrics(service_name: &'static str) {
++        for is_dependency in ["false", "true"] {
++            log_gauge_with_labels(
++                &HTTP_ADMISSION_WAITERS_INFO,
++                0.0,
++                http_admission_labels(service_name, is_dependency),
++            );
++        }
++    }
++
++    #[cfg(test)]
++    pub fn http_admission_waiters(service_name: &'static str, is_dependency: &'static str) -> f64 {
++        HTTP_ADMISSION_WAITERS_INFO
++            .with_label_values(&[service_name, is_dependency])
++            .get()
++    }
++
++    #[cfg(test)]
++    pub fn http_admission_wait_observations(
++        service_name: &'static str,
++        is_dependency: &'static str,
++    ) -> u64 {
++        use prometheus::core::Metric as _;
++
++        HTTP_ADMISSION_WAIT_SECONDS
++            .with_label_values(&[service_name, is_dependency])
++            .metric()
++            .get_vm_histogram()
++            .sample_count()
++    }
++
++    pub struct HttpAdmissionWaitGuard {
++        service_name: &'static str,
++        is_dependency: &'static str,
++        started: std::time::Instant,
++    }
++
++    impl HttpAdmissionWaitGuard {
++        pub fn new(service_name: &'static str, is_dependency: bool) -> Self {
++            let is_dependency = if is_dependency { "true" } else { "false" };
++            let labels = http_admission_labels(service_name, is_dependency);
++            add_to_gauge_with_labels(&HTTP_ADMISSION_WAITERS_INFO, 1.0, labels);
++            Self {
++                service_name,
++                is_dependency,
++                started: std::time::Instant::now(),
++            }
++        }
++
++        fn labels(&self) -> Vec<StaticMetricLabel> {
++            http_admission_labels(self.service_name, self.is_dependency)
++        }
++    }
++
++    impl Drop for HttpAdmissionWaitGuard {
++        fn drop(&mut self) {
++            subtract_from_gauge_with_labels(&HTTP_ADMISSION_WAITERS_INFO, 1.0, self.labels());
++            log_distribution_with_labels(
++                &HTTP_ADMISSION_WAIT_SECONDS,
++                self.started.elapsed().as_secs_f64(),
++                self.labels(),
++            );
++        }
++    }
+ }
+ 
+ #[allow(clippy::declare_interior_mutable_const)]
+@@ -212,9 +306,6 @@ impl From<HttpRequest> for HttpRequestStream {
+     }
+ }
+ 
+-impl HttpRequestStream {
+-}
+-
+ impl HeapSize for HttpRequest {
+     fn heap_size(&self) -> usize {
+         // Assume heap size is dominated by body (because the rest is annoying
+@@ -493,6 +584,40 @@ pub struct ConvexHttpService {
+     version: String,
+     service_name: &'static str,
+     _concurrency_gauge: Option<PullingGauge>,
++    _base_concurrency_gauge: Option<PullingGauge>,
++}
++
++#[derive(Clone)]
++struct HttpConcurrencyLimiter {
++    gate: crate::dependency_overflow::DependencyOverflowGate,
++    dependency_path_prefixes: &'static [&'static str],
++    service_name: &'static str,
++}
++
++async fn dependency_aware_concurrency_middleware(
++    State(limiter): State<HttpConcurrencyLimiter>,
++    request: http::Request<Body>,
++    next: axum::middleware::Next,
++) -> Response {
++    // Every callback can be waiting behind the HTTP permit retained by its
++    // parent Node action request. Isolate-worker ancestry remains a separate
++    // downstream classification carried by a different request header.
++    let is_dependency = limiter
++        .dependency_path_prefixes
++        .iter()
++        .any(|prefix| request.uri().path().starts_with(prefix))
++        && request
++            .headers()
++            .contains_key(CONVEX_ACTIONS_CALLBACK_TOKEN);
++    let permit = limiter
++        .gate
++        .acquire_with_waiter(is_dependency, || {
++            metrics::HttpAdmissionWaitGuard::new(limiter.service_name, is_dependency)
++        })
++        .await;
++    let response = next.run(request).await;
++    drop(permit);
++    response
+ }
+ 
+ impl ConvexHttpService {
+@@ -504,19 +629,76 @@ impl ConvexHttpService {
+         request_timeout: Duration,
+         route_metric_mapper: RM,
+     ) -> Self {
++        Self::new_with_dependency_reserve(
++            router,
++            service_name,
++            version,
++            max_concurrency,
++            0,
++            &[],
++            request_timeout,
++            route_metric_mapper,
++        )
++    }
++
++    pub fn new_with_dependency_reserve<RM: RouteMapper>(
++        router: Router,
++        service_name: &'static str,
++        version: String,
++        max_concurrency: usize,
++        dependency_reserve: usize,
++        dependency_path_prefixes: &'static [&'static str],
++        request_timeout: Duration,
++        route_metric_mapper: RM,
++    ) -> Self {
++        assert!(
++            max_concurrency <= tokio::sync::Semaphore::MAX_PERMITS,
++            "HTTP concurrency must not exceed Tokio's supported semaphore capacity"
++        );
++        assert!(
++            dependency_reserve < max_concurrency,
++            "HTTP dependency reserve must be smaller than total concurrency"
++        );
+         let sentry_layer = ServiceBuilder::new()
+             .layer(sentry_tower::NewSentryLayer::<_>::new_from_top())
+             .layer(sentry_tower::SentryHttpLayer::new());
++        metrics::initialize_http_admission_metrics(service_name);
+         log_http_service_max_concurrent_requests(service_name, max_concurrency);
+-        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
+-        let semaphore_ = semaphore.clone();
++        let base_capacity = max_concurrency - dependency_reserve;
++        let concurrency_gate =
++            crate::dependency_overflow::DependencyOverflowGate::new(base_capacity, max_concurrency);
++        let concurrency_gate_for_base_gauge = concurrency_gate.clone();
++        let base_concurrency_gauge = (dependency_reserve > 0).then(|| {
++            PullingGauge::new(
++                format!(
++                    "{}_http_service_base_concurrent_requests",
++                    service_name.replace('-', "_")
++                ),
++                "The amount of shared base HTTP admission capacity in use",
++                Box::new(move || concurrency_gate_for_base_gauge.base_in_use() as f64),
++            )
++            .expect("Invalid base concurrency gauge initialization")
++        });
++        if let Some(gauge) = &base_concurrency_gauge
++            && let Err(e) = CONVEX_METRICS_REGISTRY.register(Box::new(gauge.clone()))
++        {
++            tracing::error!(
++                "Failed to register base request concurrency gauge for {service_name}: {e}"
++            );
++        }
++        let concurrency_gate_for_total_gauge = concurrency_gate.clone();
++        let concurrency_limiter = HttpConcurrencyLimiter {
++            gate: concurrency_gate,
++            dependency_path_prefixes,
++            service_name,
++        };
+         let concurrency_gauge = PullingGauge::new(
+             format!(
+                 "{}_http_service_concurrent_requests",
+                 service_name.replace('-', "_")
+             ),
+             "The number of currently outstanding requests on the ConvexHttpService",
+-            Box::new(move || (max_concurrency - semaphore_.available_permits()) as f64),
++            Box::new(move || concurrency_gate_for_total_gauge.active() as f64),
+         )
+         .expect("Invalid gauge initialization");
+         if let Err(e) = CONVEX_METRICS_REGISTRY.register(Box::new(concurrency_gauge.clone())) {
+@@ -526,6 +708,12 @@ impl ConvexHttpService {
+         let router = router
+             .layer(
+                 ServiceBuilder::new()
++                    // Admission stays outside request instrumentation and timeout
++                    // so queued requests do not consume their budgets before starting.
++                    .layer(axum::middleware::from_fn_with_state(
++                        concurrency_limiter,
++                        dependency_aware_concurrency_middleware,
++                    ))
+                     // Order important. Log/stats first because they are infallible.
+                     .layer(axum::middleware::from_fn(tokio_instrumentation_middleware))
+                     .layer(axum::middleware::from_fn(log_middleware))
+@@ -534,7 +722,6 @@ impl ConvexHttpService {
+                         stats_middleware::<RM>,
+                     ))
+                     .layer(axum::middleware::from_fn(client_version_state_middleware))
+-                    .layer(GlobalConcurrencyLimitLayer::with_semaphore(semaphore))
+                     .layer(tower_cookies::CookieManagerLayer::new())
+                     .layer(HandleErrorLayer::new(|_: BoxError| async {
+                         StatusCode::REQUEST_TIMEOUT
+@@ -547,6 +734,7 @@ impl ConvexHttpService {
+             router,
+             version,
+             _concurrency_gauge: Some(concurrency_gauge),
++            _base_concurrency_gauge: base_concurrency_gauge,
+             service_name,
+             meta_routes_enabled: true,
+         }
+@@ -626,7 +814,6 @@ impl ConvexHttpService {
+             .await
+         }
+     }
+-
+ }
+ 
+ /// Serves an HTTP server using the given service.
+@@ -1385,3 +1572,207 @@ where
+         (key, value)
+     })
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::{
++        sync::Arc,
++        time::Duration,
++    };
++
++    use axum::{
++        extract::State,
++        routing::get,
++        Router,
++    };
++    use http::Request;
++    use tokio::sync::{
++        mpsc,
++        Semaphore,
++    };
++    use tower::ServiceExt as _;
++
++    use super::{
++        dependency_aware_concurrency_middleware,
++        metrics::{
++            http_admission_wait_observations,
++            http_admission_waiters,
++            initialize_http_admission_metrics,
++            HttpAdmissionWaitGuard,
++        },
++        Body,
++        HttpConcurrencyLimiter,
++        StatusCode,
++    };
++    use crate::dependency_overflow::DependencyOverflowGate;
++
++    #[derive(Clone)]
++    struct BlockingHandlerState {
++        started: mpsc::UnboundedSender<&'static str>,
++        release: Arc<Semaphore>,
++    }
++
++    async fn ordinary_handler(State(state): State<BlockingHandlerState>) -> StatusCode {
++        state.started.send("ordinary").unwrap();
++        state.release.acquire().await.unwrap().forget();
++        StatusCode::OK
++    }
++
++    async fn dependency_handler(State(state): State<BlockingHandlerState>) -> StatusCode {
++        state.started.send("dependency").unwrap();
++        state.release.acquire().await.unwrap().forget();
++        StatusCode::OK
++    }
++
++    #[tokio::test]
++    async fn dependencies_share_base_before_using_http_overflow() {
++        let limiter = HttpConcurrencyLimiter {
++            gate: DependencyOverflowGate::new(2, 3),
++            dependency_path_prefixes: &["/api/actions/"],
++            service_name: "test",
++        };
++        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
++        let release = Arc::new(Semaphore::new(0));
++        let app = Router::new()
++            .route("/ordinary", get(ordinary_handler))
++            .route("/api/actions/query", get(dependency_handler))
++            .with_state(BlockingHandlerState {
++                started: started_tx,
++                release: release.clone(),
++            })
++            .layer(axum::middleware::from_fn_with_state(
++                limiter,
++                dependency_aware_concurrency_middleware,
++            ));
++
++        let first_dependency = tokio::spawn(
++            app.clone().oneshot(
++                Request::get("/api/actions/query")
++                    .header("Convex-Action-Callback-Token", "token")
++                    .body(Body::empty())
++                    .unwrap(),
++            ),
++        );
++        assert_eq!(started_rx.recv().await, Some("dependency"));
++
++        let first_ordinary = tokio::spawn(
++            app.clone()
++                .oneshot(Request::get("/ordinary").body(Body::empty()).unwrap()),
++        );
++        assert_eq!(started_rx.recv().await, Some("ordinary"));
++
++        let second_ordinary = tokio::spawn(
++            app.clone().oneshot(
++                Request::get("/ordinary")
++                    .header("Convex-Action-Callback-Token", "forged")
++                    .body(Body::empty())
++                    .unwrap(),
++            ),
++        );
++        assert!(
++            tokio::time::timeout(Duration::from_millis(25), started_rx.recv())
++                .await
++                .is_err()
++        );
++
++        let unmarked_callback = tokio::spawn(
++            app.clone().oneshot(
++                Request::get("/api/actions/query")
++                    .body(Body::empty())
++                    .unwrap(),
++            ),
++        );
++        assert!(
++            tokio::time::timeout(Duration::from_millis(25), started_rx.recv())
++                .await
++                .is_err()
++        );
++
++        let overflow_dependency = tokio::spawn(
++            app.oneshot(
++                Request::get("/api/actions/query")
++                    .header("Convex-Action-Callback-Token", "token")
++                    .body(Body::empty())
++                    .unwrap(),
++            ),
++        );
++        assert_eq!(
++            tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
++                .await
++                .unwrap(),
++            Some("dependency")
++        );
++
++        release.add_permits(5);
++        first_dependency.await.unwrap().unwrap();
++        first_ordinary.await.unwrap().unwrap();
++        overflow_dependency.await.unwrap().unwrap();
++        second_ordinary.await.unwrap().unwrap();
++        unmarked_callback.await.unwrap().unwrap();
++    }
++
++    #[tokio::test]
++    async fn dependency_http_requests_still_obey_total_capacity() {
++        let limiter = HttpConcurrencyLimiter {
++            gate: DependencyOverflowGate::new(1, 1),
++            dependency_path_prefixes: &["/api/actions/"],
++            service_name: "test",
++        };
++        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
++        let release = Arc::new(Semaphore::new(0));
++        let app = Router::new()
++            .route("/api/actions/query", get(dependency_handler))
++            .with_state(BlockingHandlerState {
++                started: started_tx,
++                release: release.clone(),
++            })
++            .layer(axum::middleware::from_fn_with_state(
++                limiter,
++                dependency_aware_concurrency_middleware,
++            ));
++        let request = || {
++            Request::get("/api/actions/query")
++                .header("Convex-Action-Callback-Token", "token")
++                .body(Body::empty())
++                .unwrap()
++        };
++
++        let first = tokio::spawn(app.clone().oneshot(request()));
++        assert_eq!(started_rx.recv().await, Some("dependency"));
++        let second = tokio::spawn(app.oneshot(request()));
++        assert!(
++            tokio::time::timeout(Duration::from_millis(25), started_rx.recv())
++                .await
++                .is_err()
++        );
++
++        release.add_permits(1);
++        first.await.unwrap().unwrap();
++        assert_eq!(
++            tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
++                .await
++                .unwrap(),
++            Some("dependency")
++        );
++        release.add_permits(1);
++        second.await.unwrap().unwrap();
++    }
++
++    #[test]
++    fn short_http_admission_waits_emit_histogram_observations() {
++        const SERVICE_NAME: &str = "short_http_admission_wait_test";
++        initialize_http_admission_metrics(SERVICE_NAME);
++        for is_dependency in ["false", "true"] {
++            assert_eq!(http_admission_waiters(SERVICE_NAME, is_dependency), 0.0);
++        }
++
++        let before = http_admission_wait_observations(SERVICE_NAME, "false");
++        drop(HttpAdmissionWaitGuard::new(SERVICE_NAME, false));
++
++        assert_eq!(http_admission_waiters(SERVICE_NAME, "false"), 0.0);
++        assert_eq!(
++            http_admission_wait_observations(SERVICE_NAME, "false"),
++            before + 1
++        );
++    }
++}
+diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
+index b63c0c5ee2fce373155d0009b375e3c6fad5fbb5..951b58d7d9ea7b5533a7be5ee965eed38e3b707a 100644
+--- a/crates/common/src/knobs.rs
++++ b/crates/common/src/knobs.rs
+@@ -385,10 +385,22 @@ pub static TABLE_ITERATOR_MAX_RETRIES: LazyLock<u32> =
+ pub static HTTP_SERVER_TCP_BACKLOG: LazyLock<u32> =
+     LazyLock::new(|| env_config("HTTP_SERVER_TCP_BACKLOG", 256));
+ 
+-/// The max concurrent of concurrent HTTP requests. This also limits Node.js
+-/// action callbacks concurrency since those go over http.
++/// The maximum number of concurrent HTTP requests. Node.js action callbacks
++/// share this admission limit with their parent requests because the callbacks
++/// re-enter the backend over HTTP, so small values must leave callback
++/// capacity. This knob is strict so malformed self-hosted values fail startup
++/// instead of silently falling back to a different concurrency gate. Values
++/// above the supported admission limit are also rejected before server
++/// construction.
+ pub static HTTP_SERVER_MAX_CONCURRENT_REQUESTS: LazyLock<usize> =
+-    LazyLock::new(|| env_config("HTTP_SERVER_MAX_CONCURRENT_REQUESTS", 1024));
++    LazyLock::new(|| env_config_usize_strict_nonzero("HTTP_SERVER_MAX_CONCURRENT_REQUESTS", 1024));
++
++/// Dependency-only HTTP overflow above shared base capacity. Node action
++/// callbacks may use the overflow because their parent request can retain a
++/// base permit while waiting for them. This knob is parsed strictly so invalid
++/// operator configuration fails startup.
++pub static HTTP_SERVER_DEPENDENCY_RESERVE: LazyLock<usize> =
++    LazyLock::new(|| env_config_usize_strict("HTTP_SERVER_DEPENDENCY_RESERVE", 1));
+ 
+ /// Max number of user writes in a transaction. Make sure to also increase
+ /// `MAX_INSERT_SIZE` in mysql/src/lib.rs and postgres/src/lib.rs.
+@@ -955,6 +967,8 @@ pub static ISOLATE_QUEUE_CONGESTED_TIMEOUT: LazyLock<Duration> =
+     LazyLock::new(|| Duration::from_millis(env_config("ISOLATE_QUEUE_CONGESTED_TIMEOUT_MS", 200)));
+ 
+ /// Maximum number of isolate worker threads in a function runner process.
++/// For self-hosted tuning guidance, see
++/// patches/isolate_concurrency_knobs.md.
+ pub static MAX_ISOLATE_WORKERS: LazyLock<usize> =
+     LazyLock::new(|| env_config_isolate_scheduler_usize_strict("MAX_ISOLATE_WORKERS", 300));
+ 
+@@ -1383,7 +1397,8 @@ pub static TICKETMASTER_CLUSTER_NAME: LazyLock<String> =
+     LazyLock::new(|| env_config("TICKETMASTER_CLUSTER_NAME", String::from("ticketmaster")));
+ 
+ /// The maximum number of CPU cores that can be used simultaneously by the
+-/// isolates. Zero means no limit.
++/// isolates. Zero means no limit. For self-hosted tuning guidance, see
++/// patches/isolate_concurrency_knobs.md.
+ pub static FUNRUN_ISOLATE_ACTIVE_THREADS: LazyLock<usize> =
+     LazyLock::new(|| env_config_isolate_scheduler_usize_strict("FUNRUN_ISOLATE_ACTIVE_THREADS", 0));
+ 
+diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
+index 122fbbeff4f84c86cfb6fd5fcb3ef1e1af2ba8fb..9a68d1c886ddbf316b57973632090ade2769496c 100644
+--- a/crates/common/src/lib.rs
++++ b/crates/common/src/lib.rs
+@@ -21,6 +21,7 @@ pub mod codel_queue;
+ pub mod comparators;
+ pub mod components;
+ pub mod deleted_bitset;
++mod dependency_overflow;
+ pub mod document;
+ pub mod document_index_keys;
+ pub mod errors;
+diff --git a/crates/local_backend/src/lib.rs b/crates/local_backend/src/lib.rs
+index 669e0e608a43059d4bcd85524abc163c95e1677b..bce3f4f212b56dd079908497cc14f56929b88b25 100644
+--- a/crates/local_backend/src/lib.rs
++++ b/crates/local_backend/src/lib.rs
+@@ -113,8 +113,6 @@ pub mod streaming_import;
+ pub mod subs;
+ pub mod usage_limits;
+ 
+-pub const MAX_CONCURRENT_REQUESTS: usize = 128;
+-
+ #[derive(Clone)]
+ pub struct LocalAppState {
+     // Origin for the server (e.g. http://127.0.0.1:3210, https://demo.convex.cloud)
+diff --git a/crates/local_backend/src/main.rs b/crates/local_backend/src/main.rs
+index 4217d331d4edae0ee72db21361b49f17f8fdc037..e9c900241cf67e1bc7060a27b9c0017c10137d51 100644
+--- a/crates/local_backend/src/main.rs
++++ b/crates/local_backend/src/main.rs
+@@ -8,7 +8,11 @@ use cmd_util::env::{
+ use common::{
+     errors::MainError,
+     http::ConvexHttpService,
+-    knobs::HTTP_SERVER_TIMEOUT_DURATION,
++    knobs::{
++        HTTP_SERVER_DEPENDENCY_RESERVE,
++        HTTP_SERVER_MAX_CONCURRENT_REQUESTS,
++        HTTP_SERVER_TIMEOUT_DURATION,
++    },
+     runtime::Runtime,
+     sentry::set_sentry_tags,
+     shutdown::ShutdownSignal,
+@@ -41,7 +45,6 @@ use local_backend::{
+     proxy::dev_site_proxy,
+     router::router,
+     HttpActionRouteMapper,
+-    MAX_CONCURRENT_REQUESTS,
+ };
+ use runtime::prod::ProdRuntime;
+ use tokio::{
+@@ -60,6 +63,12 @@ fn main() -> Result<(), MainError> {
+         return run_subcommand(subcommand);
+     }
+     let _guard = config_service();
++    let max_concurrent_requests = *HTTP_SERVER_MAX_CONCURRENT_REQUESTS;
++    let dependency_reserve = *HTTP_SERVER_DEPENDENCY_RESERVE;
++    assert!(
++        dependency_reserve < max_concurrent_requests,
++        "HTTP_SERVER_DEPENDENCY_RESERVE must be smaller than HTTP_SERVER_MAX_CONCURRENT_REQUESTS"
++    );
+     tracing::info!("Starting a Convex backend");
+     if !config.disable_beacon {
+         tracing::info!(
+@@ -99,7 +108,13 @@ fn main() -> Result<(), MainError> {
+ 
+     let runtime_ = runtime.clone();
+     let server_future = async {
+-        run_server(runtime_, config).await?;
++        run_server(
++            runtime_,
++            config,
++            max_concurrent_requests,
++            dependency_reserve,
++        )
++        .await?;
+         Ok(())
+     };
+ 
+@@ -122,8 +137,16 @@ fn generate_admin_key(args: &AdminKeyArgs) -> Result<(), MainError> {
+     Ok(())
+ }
+ 
+-async fn run_server(runtime: ProdRuntime, config: LocalConfig) -> anyhow::Result<()> {
+-    let serve_future = async move { run_server_inner(runtime, config).await }.fuse();
++async fn run_server(
++    runtime: ProdRuntime,
++    config: LocalConfig,
++    max_concurrent_requests: usize,
++    dependency_reserve: usize,
++) -> anyhow::Result<()> {
++    let serve_future = async move {
++        run_server_inner(runtime, config, max_concurrent_requests, dependency_reserve).await
++    }
++    .fuse();
+     futures::pin_mut!(serve_future);
+ 
+     futures::select! {
+@@ -136,7 +159,12 @@ async fn run_server(runtime: ProdRuntime, config: LocalConfig) -> anyhow::Result
+     Ok(())
+ }
+ 
+-async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::Result<()> {
++async fn run_server_inner(
++    runtime: ProdRuntime,
++    config: LocalConfig,
++    max_concurrent_requests: usize,
++    dependency_reserve: usize,
++) -> anyhow::Result<()> {
+     // Used to receive fatal errors from the database or /preempt endpoint.
+     let (preempt_tx, preempt_rx) = oneshot::channel();
+     let preempt_signal = ShutdownSignal::new(preempt_tx);
+@@ -165,11 +193,13 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
+     .await?;
+     let router = router(st.clone());
+     let mut shutdown_rx_ = shutdown_rx.clone();
+-    let http_service = ConvexHttpService::new(
++    let http_service = ConvexHttpService::new_with_dependency_reserve(
+         router,
+         "backend",
+         SERVER_VERSION_STR.to_string(),
+-        MAX_CONCURRENT_REQUESTS,
++        max_concurrent_requests,
++        dependency_reserve,
++        &["/api/actions/"],
+         *HTTP_SERVER_TIMEOUT_DURATION,
+         HttpActionRouteMapper,
+     );
+@@ -179,6 +209,7 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
+     let proxy_future = dev_site_proxy(
+         config.site_bind_address(),
+         config.site_forward_prefix(),
++        max_concurrent_requests,
+         shutdown_rx,
+     );
+ 
+diff --git a/crates/local_backend/src/node_action_callbacks.rs b/crates/local_backend/src/node_action_callbacks.rs
+index d9597516ca8b45c7fe93f7ac437ed843afbbc1ff..b56dd2acd6a78e0af478b1097b486de7febe0fa2 100644
+--- a/crates/local_backend/src/node_action_callbacks.rs
++++ b/crates/local_backend/src/node_action_callbacks.rs
+@@ -9,6 +9,7 @@ use axum::{
+     response::IntoResponse,
+     RequestPartsExt,
+ };
++pub use common::http::CONVEX_ACTIONS_CALLBACK_TOKEN;
+ use common::{
+     components::{
+         ComponentFunctionPath,
+@@ -609,8 +610,6 @@ pub async fn audit_log(
+     .into())
+ }
+ 
+-pub static CONVEX_ACTIONS_CALLBACK_TOKEN: &str = "Convex-Action-Callback-Token";
+-
+ async fn check_actions_token(
+     st: &LocalAppState,
+     headers: &HeaderMap,
+diff --git a/crates/local_backend/src/proxy.rs b/crates/local_backend/src/proxy.rs
+index 0ea3363beb08eb3e8e7ff21eb5b5c312b6b7cf2d..499638cebc7a68ef03ad8a629bec60d0df001b38 100644
+--- a/crates/local_backend/src/proxy.rs
++++ b/crates/local_backend/src/proxy.rs
+@@ -1,6 +1,7 @@
+ use std::net::SocketAddr;
+ 
+ use axum::{
++    body::Body,
+     extract::{
+         Request,
+         State,
+@@ -17,12 +18,27 @@ use common::{
+     },
+     knobs::HTTP_SERVER_TIMEOUT_DURATION,
+ };
+-use hyper_util::rt::TokioExecutor;
++use hyper_util::{
++    client::legacy::{
++        connect::HttpConnector,
++        Client,
++    },
++    rt::TokioExecutor,
++};
++
++type ProxyClient = Client<HttpConnector, Body>;
++
++#[derive(Clone)]
++struct ProxyState {
++    site_forward_prefix: String,
++    client: ProxyClient,
++}
+ 
+ /// Routes HTTP actions to the main webserver
+ pub async fn dev_site_proxy(
+     site_bind_addr: Option<([u8; 4], u16)>,
+     site_forward_prefix: String,
++    max_concurrent_requests: usize,
+     mut shutdown_rx: async_broadcast::Receiver<()>,
+ ) -> anyhow::Result<()> {
+     let Some(addr) = site_bind_addr else {
+@@ -32,13 +48,13 @@ pub async fn dev_site_proxy(
+     tracing::info!("Starting dev site proxy at {:?}...", addr);
+ 
+     async fn proxy_method(
+-        State(site_forward_prefix): State<String>,
++        State(state): State<ProxyState>,
+         mut request: Request,
+     ) -> Result<impl IntoResponse, HttpResponseError> {
+-        let new_uri = format!("{}{}", site_forward_prefix, request.uri());
++        let new_uri = format!("{}{}", state.site_forward_prefix, request.uri());
+         *request.uri_mut() = new_uri.parse().map_err(anyhow::Error::new)?;
+-        let resp = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+-            .build_http()
++        let resp = state
++            .client
+             .request(request)
+             .await
+             .map_err(anyhow::Error::new)?;
+@@ -54,13 +70,16 @@ pub async fn dev_site_proxy(
+     let router = Router::new()
+         .route("/{*rest}", proxy_handler.clone())
+         .route("/", proxy_handler)
+-        .with_state(site_forward_prefix);
++        .with_state(ProxyState {
++            site_forward_prefix,
++            client: Client::builder(TokioExecutor::new()).build_http(),
++        });
+ 
+     let service = ConvexHttpService::new(
+         Router::new().fallback_service(router),
+         "backend_http_proxy",
+         "unknown".to_string(),
+-        4,
++        max_concurrent_requests,
+         *HTTP_SERVER_TIMEOUT_DURATION,
+         NoopRouteMapper,
+     );
+diff --git a/patches/shared_base_http_admission/README.md b/patches/shared_base_http_admission/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..c84c301c88d8ed73eaae27b77012b2a6a3f362d6
+--- /dev/null
++++ b/patches/shared_base_http_admission/README.md
+@@ -0,0 +1,171 @@
++# Shared-Base HTTP Admission
++
++## Summary
++
++This self-hosted patch makes both local Convex HTTP gates use the strict
++`HTTP_SERVER_MAX_CONCURRENT_REQUESTS` setting and adds bounded dependency-only overflow to the main
++backend gate through `HTTP_SERVER_DEPENDENCY_RESERVE`.
++
++All requests consume shared base admission while it is available. Only authenticated Node callback
++routes carrying the callback-token header may raise main-service occupancy above that base. The
++patch does not prioritize application routes, bound an external reverse proxy, or replace
++application and isolate limits.
++
++The isolate and application dependency-capacity companion is documented in
++[`dependency_capacity/README.md`](../dependency_capacity/README.md). The patches are independently selectable, but a
++Node action chain under saturation normally needs callback headroom at both the HTTP and isolate
++stages.
++
++## Motivation
++
++The stock local backend historically used unrelated fixed gates: `128` requests for the main API on
++port `3210` and `4` for the HTTP-actions proxy on port `3211`. They were not selected from host
++capacity and could not be configured together. Replacing them with the common upstream default
++without an explicit operator value can also admit much more work than the old local limits.
++
++Node actions add a liveness constraint. Their callbacks re-enter the main API while an ancestor may
++retain application or isolate capacity. If independent requests consume every HTTP permit, the
++callback cannot enter and the ancestor cannot release its downstream resources.
++
++## Admission model
++
++Let:
++
++- `H = HTTP_SERVER_MAX_CONCURRENT_REQUESTS`, the total permits in each local HTTP service;
++- `D = HTTP_SERVER_DEPENDENCY_RESERVE`, callback-only overflow in the main service;
++- `H - D`, the main-service shared base.
++
++The main API and port `3211` proxy have separate gates with the same `H`. A request sent to port
++`3211` retains a proxy permit while its forwarded `/http` request holds a main-service permit. A
++reverse proxy may instead route directly to `/http` on port `3210`, which uses only the main gate.
++
++Every main-service request consumes shared base while it has room. Only `/api/actions/*` requests
++carrying the callback-token header may raise occupancy above `H - D`, up to `H`. The port `3211`
++proxy has no dependency overflow because Node callbacks target the main API origin.
++
++This classification occurs before route middleware authenticates the token. The token still
++protects callback operations, but the reserve is not a denial-of-service security boundary: a
++public caller can forge the header and compete for the finite overflow permits. Restrict callback
++routes at the external proxy to backend or Node-executor sources when the network layout supports
++it, and keep public admission bounded regardless.
++
++All callback operations share `D`. A callback retains its HTTP permit while it waits at later
++application, isolate, or database stages. Nested chains and parallel fan-out therefore need enough
++HTTP headroom for their measured concurrent callbacks. This finite reserve cannot guarantee
++arbitrary recursion.
++
++## Permit lifetime and waiting
++
++The concurrency middleware releases a permit when the service future returns the HTTP response
++head. A streaming HTTP action body and its producing isolate work can outlive both main and proxy
++permits. These settings do not bound concurrently streaming response bodies.
++
++Requests above a gate wait for a permit. The current request instrumentation and
++`HTTP_SERVER_TIMEOUT_SECONDS` layer start after permit acquisition, so neither measures nor bounds
++that pre-permit wait. Use Caddy or another upstream load balancer for finite external queueing,
++route-specific bulkheads, and caller-visible overload timeouts.
++
++Application `APPLICATION_MAX_CONCURRENT_*`, isolate queue, worker, action-shell, active-JavaScript,
++and database limits remain independent downstream gates. Raising `H` can simply create a deeper
++wait at one of those stages. It does not create CPU or isolate throughput.
++
++## Configuration
++
++The self-hosted Compose template passes through:
++
++- `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`;
++- `HTTP_SERVER_DEPENDENCY_RESERVE`.
++
++If `H` is unset, both local services use the backend default `1024`. This is higher than the old
++local fixed limits, so operators should normally select an explicit value from measured workload
++and downstream capacity.
++
++`H` must be a positive integer no larger than Tokio's supported semaphore bound. `D` defaults to
++`1`, may be `0` to disable callback overflow, and must be smaller than `H`. Empty, malformed,
++non-Unicode, signed, overflowing, zero total, and inconsistent values fail before runtime and
++database initialization rather than falling back.
++
++If the published host `PORT` differs from `3210`, set `CONVEX_CLOUD_ORIGIN` to an API address that
++the backend container can reach. The backend listener remains on internal port `3210`;
++`127.0.0.1:$PORT` inside the container does not reach a differently published host port.
++
++A reverse proxy on `CONVEX_CLOUD_ORIGIN` must preserve the callback-token header and the isolate
++ancestry header used by the dependency-capacity patch. Its callback route must also leave enough
++headroom; the backend cannot reserve capacity in an external proxy.
++
++## Metrics
++
++Use the HTTP metrics as a stage-specific admission view:
++
++- total and base concurrent-request gauges for the main service;
++- `http_admission_waiters_info{service_name,is_dependency}` for requests that entered permit wait;
++- `http_admission_wait_seconds{service_name,is_dependency}` for waits ending in handoff or
++  cancellation;
++- request status and duration after permit acquisition.
++
++Each HTTP service initializes the dependency and non-dependency waiter gauges at zero. The gauge is
++a sampled occupancy signal and can miss a wait that starts and finishes between scrapes. The wait
++histogram count, sum, and buckets retain every completed wait, including waits shorter than the
++scrape interval. Immediate admission produces no wait sample. Caddy duration includes any upstream
++transport wait, backend execution, and response transfer, while Convex request duration begins
++after HTTP permit acquisition. Compare the two rather than attributing all proxy latency to Convex
++execution.
++
++Do not infer saturation from one positive queued or waiter sample. A normal asynchronous handoff can
++briefly report waiting. Capacity conclusions require wait duration, running occupancy near the
++configured limit, timeout or rejection, and downstream queue and CPU evidence.
++
++Labels remain bounded by service and dependency class. Do not add route, module, client, tenant,
++request, or deployment identifiers to backend metric labels. Route policy belongs at the proxy.
++
++## Interaction with dependency capacity
++
++[`dependency_capacity/README.md`](../dependency_capacity/README.md) supplies ancestry propagation and bounded
++overflow at application, cache, isolate queue, and worker stages. `D` and
++`ISOLATE_DEPENDENCY_WORKER_RESERVE` are intentionally separate because their totals and permit
++lifetimes differ.
++
++An HTTP callback can pass its reserve and still wait for an application permit, isolate worker,
++active-JavaScript permit, database connection, or external provider. Conversely, isolate reserve
++cannot help a callback that never entered the HTTP service. Size and observe each stage separately.
++
++HTTP-action context reuse can lower service time after admission but does not alter gate ownership.
++Lane-aware isolate queue control and degradable query admission operate downstream and do not
++replace upstream proxy bulkheads.
++
++## Rollout and rollback
++
++1. Record route arrival rate, Caddy and Convex latency, HTTP wait, application wait, isolate queue,
++   action-shell occupancy, CPU, and error baselines.
++2. Set explicit `H` and `D`, validate the rendered Compose configuration, and verify callback-header
++   preservation at the reverse proxy.
++3. Restart one controlled backend population and confirm the resolved HTTP capacity metrics.
++4. Exercise direct API traffic, port `3211` or direct `/http` traffic as deployed, and nested Node
++   callbacks together.
++5. Confirm finite callback progress without sustained ordinary HTTP wait, downstream shedding, or
++   CPU saturation.
++6. Change route-specific Caddy limits separately unless a combined policy trial is explicitly
++   intended and has a rollback order.
++
++Rollback restores the prior image and both HTTP values. Lower external proxy concurrency before
++lowering backend admission if the proxy configuration assumes the larger gate. Removing the
++callback reserve can reintroduce Node callback deadlock under HTTP saturation.
++
++## Verification boundary
++
++Focused tests cover strict total and reserve parsing, invalid relationships, shared-base FIFO,
++dependency-only overflow, cancellation before and after permit handoff, callback classification,
++both local services, constructor bounds, zero-initialized waiter labels, and histogram observation
++of a wait that returns the sampled waiter gauge to zero. Production verification should use real
++callback and HTTP-action traffic; a synthetic stress fixture is not required.
++
++## Rejected alternatives
++
++- A single fixed local limit cannot represent different host sizes or workloads.
++- Giving callback traffic an unbounded or external priority queue weakens overload bounds.
++- Classifying by application route or module name makes the backend deployment-specific.
++- Treating every HTTP action as a dependency spends liveness headroom on independent work.
++- Increasing `H` to remove proxy wait can move the backlog into application or isolate queues and
++  increase failures without improving throughput.
++- Relying only on `HTTP_SERVER_TIMEOUT_SECONDS` does not bound the current pre-permit wait because
++  that timeout begins after admission.
+diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
+index b9fe56bada4b465ab84dc5c4110a9ae37b8cc516..89f56f434a5f52afc6f88906e0954bb5dae8281a 100644
+--- a/self-hosted/advanced/knobs.md
++++ b/self-hosted/advanced/knobs.md
+@@ -8,6 +8,80 @@ environment variables by adding them to your `docker-compose.yml` file. Commonly
+ overriden knobs are listed in the `env` section of the
+ [`docker-compose.yml`](../docker/docker-compose.yml)
+ 
++## `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`
++
++This limits concurrent application requests admitted by the backend HTTP
++server. It also applies to the local HTTP actions proxy exposed on port `3211`.
++Requests through that proxy also pass through the main backend gate on port
++`3210`. This is an outer HTTP limit; the `APPLICATION_MAX_CONCURRENT_*` knobs
++and isolate worker limits still apply independently. The `/version` and
++`/metrics` service routes retain their existing admission bypass.
++
++If the variable is unset, both services use the common default of `1024`. This
++replaces the former local-backend limits of `128` on port `3210` and `4` on port
++`3211`, so adopting this version without setting the variable raises admission.
++The stock Compose entry does not set another default: an unset host variable is
++omitted from the container environment. An empty, malformed, zero, or
++larger-than-supported value is passed to the backend and fails startup before
++runtime and database initialization.
++
++The two services have separate admission gates. A request sent to port `3211`
++uses a proxy permit and a main backend permit while it is forwarded. A reverse proxy
++can instead rewrite HTTP action traffic to `/http` on port `3210`; that route
++uses only the main backend permit. Raising the limit can increase load and
++queueing. Without dependency-aware isolate scheduling, it can also let actions
++in the default Convex runtime and HTTP actions occupy every isolate worker while
++waiting for their `ctx.runQuery` or `ctx.runMutation` calls.
++
++If the published `PORT` is changed from `3210`, set
++`CONVEX_CLOUD_ORIGIN` explicitly to an API address that both clients and the
++backend container can reach. The backend listener remains on internal port
++`3210`; the Compose default `127.0.0.1:$PORT` does not reach that listener from
++inside the container when `$PORT` differs from `3210`, so Node action callbacks
++would fail.
++
++Each permit covers request handling only until that service returns the HTTP
++response head. A streaming HTTP action body, and the isolate work producing it,
++can outlive the main and proxy permits. These knobs therefore do not bound the
++number of response bodies being streamed concurrently.
++
++Requests above the limit enter an unbounded in-process permit wait instead of
++being rejected immediately. `HTTP_SERVER_TIMEOUT_SECONDS` and request handling
++metrics start after permit acquisition, so they do not bound or measure this
++admission wait. Use an upstream proxy or load balancer with bounded request
++queues and timeouts when overload must be rejected within a fixed time.
++
++## `HTTP_SERVER_DEPENDENCY_RESERVE`
++
++This creates dependency-only overflow above shared base capacity on port
++`3210`, so Node action callbacks can enter while their parent requests retain
++base permits. All requests, including callbacks, consume the shared base while
++it has room. Only `/api/actions/*` requests carrying the action callback-token
++header may raise total occupancy above the base. The default is `1`; `0`
++disables the overflow. The value must be a nonnegative integer smaller than
++`HTTP_SERVER_MAX_CONCURRENT_REQUESTS`. The port `3211` proxy does not use this
++reserve because Node callbacks target the main API origin.
++
++All Node callback operations share this finite reserve. A callback retains its
++HTTP permit while it waits at later application or isolate stages, so callback
++chains and parallel fanout need enough HTTP reserve for their expected depth
++and concurrency.
++
++An empty, malformed, non-Unicode, negative, or too-large reserve fails startup
++before runtime and database initialization instead of falling back to the
++default.
++
++The callback path and presence of the callback-token header are classified
++before the token is authenticated. The token still protects callback
++operations, but an untrusted client can forge the header and compete for
++reserved permits.
++Restrict `/api/actions/*` at the public reverse proxy to the backend or Node
++executor network source when the network layout permits it. A reverse proxy on
++`CONVEX_CLOUD_ORIGIN` must preserve the callback-token header and, when the
++scheduler dependency-reserve patch is installed, the isolate-ancestry header
++used by downstream scheduler classification. It must also leave callback
++headroom because the backend cannot reserve capacity in an external proxy.
++
+ ## `APPLICATION_MAX_CONCURRENT_*` knobs
+ 
+ You can increase the max concurrency on your self-hosted instance with these
+diff --git a/self-hosted/docker/docker-compose.yml b/self-hosted/docker/docker-compose.yml
+index ade92cdebf8f9c7bbec570502f5e894a6bc28e0f..fc6494ae26ad0b7560019fc99a642bd6f1824598 100644
+--- a/self-hosted/docker/docker-compose.yml
++++ b/self-hosted/docker/docker-compose.yml
+@@ -37,6 +37,8 @@ services:
+       - DOCUMENT_RETENTION_DELAY=${DOCUMENT_RETENTION_DELAY:-172800} # Lower default document retention to 2 days
+       - DO_NOT_REQUIRE_SSL
+       - HTTP_SERVER_TIMEOUT_SECONDS
++      - HTTP_SERVER_DEPENDENCY_RESERVE
++      - HTTP_SERVER_MAX_CONCURRENT_REQUESTS
+       - INSTANCE_NAME
+       - INSTANCE_SECRET
+       - MYSQL_URL

@@ -1,0 +1,770 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 29 Jul 2026 02:38:51 +0800
+Subject: [PATCH 19/24] database: fail closed on write-log retention stalls
+
+Expose retained write-log payload weight, entry count, timestamp span, subscription progress lag, trim activity, live metric-owner state, and fatal worker failures with explicit current-state and reset semantics.
+
+Coordinate multiple subscription managers through a monotone enforced minimum so stale observations, leapfrogging managers, and empty appends cannot regress or freeze retention progress. Serialize owner gauges and republish a remaining owner's state when another database is dropped.
+
+Use fair worker selection to prevent subscription churn from starving write-log advancement. Propagate internal subscription and advancement errors to local-backend fatal preemption, and route unwind-profile worker panics through the same boundary; production release panics continue to abort directly.
+---
+ crates/database/src/database.rs     |   8 +-
+ crates/database/src/metrics.rs      | 180 +++++++++++++++++++++
+ crates/database/src/subscription.rs | 240 +++++++++++++++++++++++-----
+ crates/database/src/write_log.rs    | 101 +++++++++++-
+ 4 files changed, 479 insertions(+), 50 deletions(-)
+
+diff --git a/crates/database/src/database.rs b/crates/database/src/database.rs
+index f7231ffd9edeb1b25b44df28f0b41b1a7699e932..a0ed3dd7c789b9695414b9da4bd65a954025e93a 100644
+--- a/crates/database/src/database.rs
++++ b/crates/database/src/database.rs
+@@ -1069,8 +1069,12 @@ impl<RT: Runtime> Database<RT> {
+             Arc::new(log_reader.clone()),
+         );
+         let invalidation_callback = InvalidationMetricCallback::new();
+-        let subscriptions =
+-            SubscriptionsWorker::start(log_owner, runtime.clone(), invalidation_callback.clone());
++        let subscriptions = SubscriptionsWorker::start(
++            log_owner,
++            runtime.clone(),
++            invalidation_callback.clone(),
++            shutdown.clone(),
++        );
+         let committer = Committer::start(
+             log_writer,
+             snapshot_writer,
+diff --git a/crates/database/src/metrics.rs b/crates/database/src/metrics.rs
+index 39314cf89fc7de8e20e8bc3239f5d7e82e8f795b..16ff039c9ddc90e1ac4a2a997f51cae0fc157aa0 100644
+--- a/crates/database/src/metrics.rs
++++ b/crates/database/src/metrics.rs
+@@ -1,3 +1,8 @@
++use std::{
++    collections::BTreeMap,
++    sync::LazyLock,
++};
++
+ use ::search::metrics::{
+     SearchType,
+     SEARCH_TYPE_LABEL,
+@@ -14,6 +19,7 @@ use metrics::{
+     log_counter_with_labels,
+     log_distribution,
+     log_distribution_with_labels,
++    log_gauge,
+     register_convex_counter,
+     register_convex_gauge,
+     register_convex_histogram,
+@@ -25,6 +31,7 @@ use metrics::{
+     Timer,
+     STATUS_LABEL,
+ };
++use parking_lot::Mutex;
+ use prometheus::{
+     VMHistogram,
+     VMHistogramVec,
+@@ -367,6 +374,179 @@ pub fn write_log_commit_bytes(bytes: usize) {
+     log_distribution(&DATABASE_WRITE_LOG_COMMIT_BYTES, bytes as f64);
+ }
+ 
++register_convex_gauge!(
++    DATABASE_WRITE_LOG_RETAINED_BYTES_INFO,
++    "HeapSize-weighted dynamic bytes in retained update elements; excludes write-log collection \
++     overhead and inline fields"
++);
++register_convex_gauge!(
++    DATABASE_WRITE_LOG_RETAINED_ENTRIES_INFO,
++    "Database- and text-index (index, timestamp) update vectors currently retained in the \
++     in-memory write log"
++);
++register_convex_gauge!(
++    DATABASE_WRITE_LOG_RETENTION_SPAN_SECONDS_INFO,
++    "Timestamp span from the oldest retained write-log entry to the latest appended write"
++);
++register_convex_int_gauge!(
++    DATABASE_WRITE_LOG_OWNERS_INFO,
++    "Live in-memory write-log owners contributing to process-global write-log metrics"
++);
++register_convex_counter!(
++    DATABASE_WRITE_LOG_TRIMMED_BYTES_TOTAL,
++    "HeapSize-weighted dynamic bytes in update elements removed from the in-memory write log"
++);
++register_convex_counter!(
++    DATABASE_WRITE_LOG_TRIMMED_ENTRIES_TOTAL,
++    "Per-index timestamp update vectors removed from the in-memory write log"
++);
++register_convex_counter!(
++    DATABASE_WRITE_LOG_RETENTION_RUNS_TOTAL,
++    "Attempts to enforce the in-memory write-log retention policy"
++);
++register_convex_gauge!(
++    DATABASE_SUBSCRIPTION_RETENTION_PROGRESS_LAG_SECONDS_INFO,
++    "Timestamp lag between the write-log maximum and the slowest subscription manager"
++);
++register_convex_counter!(
++    DATABASE_SUBSCRIPTION_ADVANCE_FAILURES_TOTAL,
++    "Fatal subscription worker errors and caught unwind panics that prevent write-log advancement"
++);
++
++#[derive(Clone, Copy)]
++pub struct WriteLogMetricOwner(u64);
++
++#[derive(Clone, Copy, Default)]
++struct WriteLogMetricState {
++    retained_bytes: usize,
++    retained_entries: usize,
++    retention_span_seconds: f64,
++    retention_progress_lag_seconds: f64,
++    updated_at: u64,
++}
++
++#[derive(Default)]
++struct WriteLogMetricOwners {
++    next_owner_id: u64,
++    next_update: u64,
++    states: BTreeMap<u64, WriteLogMetricState>,
++}
++
++// Current-state metrics have no owner label. Serialize their producers and
++// retain each live owner's latest state so owners_info == 1 is exact even
++// after another in-process database is dropped.
++static WRITE_LOG_METRIC_OWNERS: LazyLock<Mutex<WriteLogMetricOwners>> =
++    LazyLock::new(|| Mutex::new(WriteLogMetricOwners::default()));
++
++fn publish_write_log_metric_state(state: WriteLogMetricState) {
++    log_gauge(
++        &DATABASE_WRITE_LOG_RETAINED_BYTES_INFO,
++        state.retained_bytes as f64,
++    );
++    log_gauge(
++        &DATABASE_WRITE_LOG_RETAINED_ENTRIES_INFO,
++        state.retained_entries as f64,
++    );
++    log_gauge(
++        &DATABASE_WRITE_LOG_RETENTION_SPAN_SECONDS_INFO,
++        state.retention_span_seconds,
++    );
++    log_gauge(
++        &DATABASE_SUBSCRIPTION_RETENTION_PROGRESS_LAG_SECONDS_INFO,
++        state.retention_progress_lag_seconds,
++    );
++}
++
++pub fn initialize_write_log_metrics() -> WriteLogMetricOwner {
++    log_counter(&DATABASE_WRITE_LOG_TRIMMED_BYTES_TOTAL, 0);
++    log_counter(&DATABASE_WRITE_LOG_TRIMMED_ENTRIES_TOTAL, 0);
++    log_counter(&DATABASE_WRITE_LOG_RETENTION_RUNS_TOTAL, 0);
++    log_counter(&DATABASE_SUBSCRIPTION_ADVANCE_FAILURES_TOTAL, 0);
++
++    let mut owners = WRITE_LOG_METRIC_OWNERS.lock();
++    let owner_id = owners.next_owner_id;
++    owners.next_owner_id = owners
++        .next_owner_id
++        .checked_add(1)
++        .expect("write log metric owner ID overflow");
++    let updated_at = owners.next_update;
++    owners.next_update = owners
++        .next_update
++        .checked_add(1)
++        .expect("write log metric update sequence overflow");
++    let state = WriteLogMetricState {
++        updated_at,
++        ..Default::default()
++    };
++    assert!(
++        owners.states.insert(owner_id, state).is_none(),
++        "write log metric owner ID reused"
++    );
++    DATABASE_WRITE_LOG_OWNERS_INFO
++        .set(i64::try_from(owners.states.len()).expect("write log metric owner count exceeds i64"));
++    publish_write_log_metric_state(state);
++    WriteLogMetricOwner(owner_id)
++}
++
++pub fn set_write_log_retained_state(
++    owner: WriteLogMetricOwner,
++    retained_bytes: usize,
++    retained_entries: usize,
++    retention_span_seconds: f64,
++    retention_progress_lag_seconds: f64,
++) {
++    let mut owners = WRITE_LOG_METRIC_OWNERS.lock();
++    let updated_at = owners.next_update;
++    owners.next_update = owners
++        .next_update
++        .checked_add(1)
++        .expect("write log metric update sequence overflow");
++    let state = WriteLogMetricState {
++        retained_bytes,
++        retained_entries,
++        retention_span_seconds,
++        retention_progress_lag_seconds,
++        updated_at,
++    };
++    *owners
++        .states
++        .get_mut(&owner.0)
++        .expect("unknown write log metric owner") = state;
++    publish_write_log_metric_state(state);
++}
++
++pub fn drop_write_log_metrics_owner(owner: WriteLogMetricOwner) {
++    let mut owners = WRITE_LOG_METRIC_OWNERS.lock();
++    assert!(
++        owners.states.remove(&owner.0).is_some(),
++        "unknown write log metric owner"
++    );
++    DATABASE_WRITE_LOG_OWNERS_INFO
++        .set(i64::try_from(owners.states.len()).expect("write log metric owner count exceeds i64"));
++    let state = owners
++        .states
++        .values()
++        .max_by_key(|state| state.updated_at)
++        .copied()
++        .unwrap_or_default();
++    // A departing last writer must not leave its state behind when another
++    // database remains alive in the same process.
++    publish_write_log_metric_state(state);
++}
++
++pub fn log_write_log_trimmed(bytes: usize, entries: usize) {
++    log_counter(&DATABASE_WRITE_LOG_TRIMMED_BYTES_TOTAL, bytes as u64);
++    log_counter(&DATABASE_WRITE_LOG_TRIMMED_ENTRIES_TOTAL, entries as u64);
++}
++
++pub fn log_write_log_retention_run() {
++    log_counter(&DATABASE_WRITE_LOG_RETENTION_RUNS_TOTAL, 1);
++}
++
++pub fn log_subscription_advance_failure() {
++    log_counter(&DATABASE_SUBSCRIPTION_ADVANCE_FAILURES_TOTAL, 1);
++}
++
+ register_convex_counter!(DATABASE_COMMIT_ROWS, "Number of commits to database");
+ pub fn commit_rows(num_rows: u64) {
+     log_counter(&DATABASE_COMMIT_ROWS, num_rows);
+diff --git a/crates/database/src/subscription.rs b/crates/database/src/subscription.rs
+index 4730d85de6324970f235343bfcc72a5d52f74626..1b39377b25d99a14a176e087013005901396d3a9 100644
+--- a/crates/database/src/subscription.rs
++++ b/crates/database/src/subscription.rs
+@@ -7,6 +7,7 @@ use std::{
+         HashMap,
+     },
+     future::Future,
++    panic::AssertUnwindSafe,
+     sync::{
+         atomic::{
+             AtomicI64,
+@@ -27,7 +28,6 @@ use common::{
+         DatabaseIndexWrite,
+         TextIndexWrite,
+     },
+-    errors::report_error,
+     knobs::{
+         NUM_SUBSCRIPTION_MANAGERS,
+         SUBSCRIPTIONS_WORKER_QUEUE_SIZE,
+@@ -40,6 +40,7 @@ use common::{
+         Runtime,
+         SpawnHandle,
+     },
++    shutdown::ShutdownSignal,
+     types::{
+         GenericIndexName,
+         SubscriberId,
+@@ -226,14 +227,22 @@ struct SubscriptionRequest {
+ struct RetentionCoordinator {
+     /// Stores the processed_ts for each manager, indexed by manager id.
+     processed_timestamps: Arc<Mutex<Vec<Timestamp>>>,
+-    log: Arc<Mutex<LogOwner>>,
++    log: Arc<Mutex<RetentionLog>>,
++}
++
++struct RetentionLog {
++    owner: LogOwner,
++    enforced_ts: Timestamp,
+ }
+ 
+ impl RetentionCoordinator {
+     fn new(num_managers: usize, initial_ts: Timestamp, log: LogOwner) -> Self {
+         Self {
+             processed_timestamps: Arc::new(Mutex::new(vec![initial_ts; num_managers])),
+-            log: Arc::new(Mutex::new(log)),
++            log: Arc::new(Mutex::new(RetentionLog {
++                owner: log,
++                enforced_ts: initial_ts,
++            })),
+         }
+     }
+ 
+@@ -244,14 +253,24 @@ impl RetentionCoordinator {
+     ) -> anyhow::Result<()> {
+         let min_ts = {
+             let mut timestamps = self.processed_timestamps.lock();
+-            timestamps[manager_id] = processed_ts;
++            let manager_ts = timestamps
++                .get_mut(manager_id)
++                .context("known subscription manager")?;
++            anyhow::ensure!(
++                processed_ts >= *manager_ts,
++                "subscription manager processed timestamp regressed"
++            );
++            *manager_ts = processed_ts;
+             *timestamps.iter().min().context("at least one manager")?
+         };
+ 
+-        // We only need to enforce retention when the passed in processed_ts is the
+-        // minimum across all managers
+-        if min_ts == processed_ts {
+-            self.log.lock().enforce_retention_policy(min_ts);
++        let mut log = self.log.lock();
++        // Managers can observe different maximum timestamps and leapfrog each
++        // other. Enforce whenever the global minimum advances, even when the
++        // manager making this update has already advanced beyond that minimum.
++        if min_ts > log.enforced_ts {
++            log.owner.enforce_retention_policy(min_ts);
++            log.enforced_ts = min_ts;
+         }
+         Ok(())
+     }
+@@ -264,8 +283,13 @@ impl SubscriptionsWorker {
+         log: LogOwner,
+         runtime: RT,
+         invalidation_callback: InvalidationMetricCallback,
++        shutdown: ShutdownSignal,
+     ) -> SubscriptionsClient {
+         let num_managers = *NUM_SUBSCRIPTION_MANAGERS;
++        assert!(
++            num_managers > 0,
++            "NUM_SUBSCRIPTION_MANAGERS must be greater than zero"
++        );
+         let log_reader = log.reader();
+         let initial_ts = log_reader.max_ts();
+ 
+@@ -280,6 +304,7 @@ impl SubscriptionsWorker {
+ 
+             let manager_log = log_reader.clone();
+             let coordinator = retention_coordinator.clone();
++            let shutdown = shutdown.clone();
+             let mut manager = SubscriptionManager::new(
+                 manager_id,
+                 manager_log,
+@@ -288,7 +313,7 @@ impl SubscriptionsWorker {
+                 invalidation_callback.clone(),
+             );
+             let handle = runtime.spawn("subscription_worker", async move {
+-                manager.run_worker(rx).await
++                manager.run_worker(rx, shutdown).await
+             });
+             handles.push(handle);
+             senders.push(tx);
+@@ -321,38 +346,49 @@ impl CountingReceiver {
+ }
+ 
+ impl SubscriptionManager {
+-    async fn run_worker(&mut self, mut rx: CountingReceiver) {
+-        tracing::info!("Starting subscriptions worker");
+-        loop {
+-            let processed_ts = self.processed_ts();
+-            futures::select_biased! {
+-                // N.B.: `futures` select macro (not `tokio`) needed for `select_next_some`
+-                key = self.closed_subscriptions.select_next_some() => {
+-                    self.remove(key);
+-                },
+-                request = rx.recv().fuse() => {
+-                    match request {
+-                        Some(SubscriptionRequest { token, sender, is_system }) => {
+-                            match self.subscribe(token, sender, is_system) {
+-                                Ok(_) => (),
+-                                Err(mut e) => {
+-                                    report_error(&mut e).await;
+-                                },
+-                            }
+-                        },
+-                        None => {
+-                            tracing::info!("All clients have gone away, shutting down subscriptions worker...");
+-                            break;
+-                        },
+-                    }
+-                },
+-                next_ts = self.log.wait_for_higher_ts(processed_ts).fuse() => {
+-                    if let Err(mut e) = self.advance_log(next_ts) {
+-                        report_error(&mut e).await;
+-                    }
+-                },
++    async fn run_worker(&mut self, mut rx: CountingReceiver, shutdown: ShutdownSignal) {
++        let manager_id = self.manager_id;
++        let result = AssertUnwindSafe(async {
++            tracing::info!("Starting subscriptions worker");
++            loop {
++                let processed_ts = self.processed_ts();
++                // Use fair selection so sustained subscription churn cannot
++                // starve write-log advancement and retention.
++                futures::select! {
++                    // N.B.: `futures` select macro (not `tokio`) needed for `select_next_some`.
++                    key = self.closed_subscriptions.select_next_some() => {
++                        self.remove(key);
++                    },
++                    request = rx.recv().fuse() => {
++                        match request {
++                            Some(SubscriptionRequest { token, sender, is_system }) => {
++                                self.subscribe(token, sender, is_system)?;
++                            },
++                            None => {
++                                tracing::info!("All clients have gone away, shutting down subscriptions worker...");
++                                break;
++                            },
++                        }
++                    },
++                    next_ts = self.log.wait_for_higher_ts(processed_ts).fuse() => {
++                        self.advance_log(next_ts)?;
++                    },
++                }
+             }
+-        }
++            Ok::<(), anyhow::Error>(())
++        })
++        .catch_unwind()
++        .await;
++
++        let error = match result {
++            Ok(Ok(())) => return,
++            Ok(Err(error)) => error,
++            Err(_) => anyhow::anyhow!("Subscription worker panicked"),
++        };
++        metrics::log_subscription_advance_failure();
++        shutdown.signal(error.context(format!(
++            "Subscription manager {manager_id} failed; write-log retention can no longer advance",
++        )));
+     }
+ }
+ 
+@@ -929,3 +965,127 @@ impl SubscriptionMap {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::time::Duration;
++
++    use common::{
++        shutdown::ShutdownSignal,
++        types::Timestamp,
++    };
++    use futures::FutureExt as _;
++    use tokio::sync::{
++        mpsc,
++        oneshot,
++    };
++
++    use super::{
++        CountingReceiver,
++        InvalidationMetricCallback,
++        RetentionCoordinator,
++        SubscriptionKey,
++        SubscriptionManager,
++    };
++    use crate::write_log::{
++        new_write_log,
++        OrderedIndexKeyWrites,
++        WriteSource,
++    };
++
++    async fn assert_worker_signals_shutdown(mut manager: SubscriptionManager) {
++        let (_request_tx, request_rx) = mpsc::channel(1);
++        let (shutdown_tx, shutdown_rx) = oneshot::channel();
++        let shutdown = ShutdownSignal::new(shutdown_tx);
++
++        let worker = tokio::spawn(async move {
++            manager
++                .run_worker(CountingReceiver(request_rx), shutdown)
++                .await;
++        });
++        let error = tokio::time::timeout(Duration::from_secs(1), shutdown_rx)
++            .await
++            .expect("subscription worker did not signal shutdown")
++            .expect("subscription worker dropped the shutdown signal");
++        assert!(
++            error
++                .to_string()
++                .contains("write-log retention can no longer advance"),
++            "{error:#}"
++        );
++        worker.await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn advance_log_failure_signals_backend_shutdown() {
++        let log_ts = Timestamp::try_from(2_u64).unwrap();
++        let (log_owner, log_reader, _log_writer) = new_write_log(log_ts);
++        let coordinator = RetentionCoordinator::new(1, log_ts, log_owner);
++        let manager = SubscriptionManager::new(
++            0,
++            log_reader,
++            coordinator,
++            Timestamp::try_from(1_u64).unwrap(),
++            InvalidationMetricCallback::new(),
++        );
++        // Keep select_next_some pending while the already-newer log drives the
++        // advance branch.
++        manager
++            .closed_subscriptions
++            .push(std::future::pending::<SubscriptionKey>().boxed());
++        assert_worker_signals_shutdown(manager).await;
++    }
++
++    #[tokio::test]
++    async fn worker_panic_signals_backend_shutdown() {
++        let log_ts = Timestamp::try_from(1_u64).unwrap();
++        let (log_owner, log_reader, _log_writer) = new_write_log(log_ts);
++        let coordinator = RetentionCoordinator::new(1, log_ts, log_owner);
++        let manager = SubscriptionManager::new(
++            0,
++            log_reader,
++            coordinator,
++            log_ts,
++            InvalidationMetricCallback::new(),
++        );
++        manager.closed_subscriptions.push(
++            std::future::poll_fn(|_| -> std::task::Poll<SubscriptionKey> {
++                panic!("injected subscription worker panic")
++            })
++            .boxed(),
++        );
++
++        assert_worker_signals_shutdown(manager).await;
++    }
++
++    #[tokio::test]
++    async fn retention_advances_when_managers_leapfrog() {
++        let initial_ts = Timestamp::try_from(5_u64).unwrap();
++        let (log_owner, _log_reader, mut log_writer) = new_write_log(initial_ts);
++        let coordinator = RetentionCoordinator::new(2, initial_ts, log_owner);
++
++        let manager_0_ts = Timestamp::try_from(6_u64).unwrap();
++        log_writer.append(
++            manager_0_ts,
++            &OrderedIndexKeyWrites::empty(),
++            WriteSource::system("test"),
++            || {},
++        );
++        coordinator
++            .update_and_enforce_retention(0, manager_0_ts)
++            .unwrap();
++        assert_eq!(coordinator.log.lock().enforced_ts, initial_ts);
++
++        let manager_1_ts = Timestamp::try_from(7_u64).unwrap();
++        log_writer.append(
++            manager_1_ts,
++            &OrderedIndexKeyWrites::empty(),
++            WriteSource::system("test"),
++            || {},
++        );
++        coordinator
++            .update_and_enforce_retention(1, manager_1_ts)
++            .unwrap();
++        assert_eq!(coordinator.log.lock().enforced_ts, manager_0_ts);
++    }
++}
+diff --git a/crates/database/src/write_log.rs b/crates/database/src/write_log.rs
+index 220c9c40582efdd0682cf02751c7e88af7c1f0ff..4d32d8498dd4d4ba7f3b6a48363cd65b1e839992 100644
+--- a/crates/database/src/write_log.rs
++++ b/crates/database/src/write_log.rs
+@@ -257,16 +257,19 @@ struct WriteLogManager {
+     /// so we can remove from the right map.
+     min_ts_to_index: BinaryHeap<Reverse<(Timestamp, TabletIndexName, IndexKind)>>,
+     waiters: VecDeque<(Timestamp, oneshot::Sender<()>)>,
++    metrics_owner: metrics::WriteLogMetricOwner,
+ }
+ 
+ impl WriteLogManager {
+     fn new(initial_timestamp: Timestamp) -> Self {
++        let metrics_owner = metrics::initialize_write_log_metrics();
+         let log = WriteLog::new(initial_timestamp);
+         let waiters = VecDeque::new();
+         Self {
+             log,
+             min_ts_to_index: BinaryHeap::new(),
+             waiters,
++            metrics_owner,
+         }
+     }
+ 
+@@ -299,6 +302,7 @@ impl WriteLogManager {
+                 write_source.clone(),
+                 IndexKind::Database,
+                 &mut self.log.size,
++                &mut self.log.retained_entries,
+                 &mut self.min_ts_to_index,
+             );
+         }
+@@ -310,10 +314,12 @@ impl WriteLogManager {
+                 write_source.clone(),
+                 IndexKind::Text,
+                 &mut self.log.size,
++                &mut self.log.retained_entries,
+                 &mut self.min_ts_to_index,
+             );
+         }
+         self.log.max_ts = ts;
++        self.report_retained_state();
+ 
+         self.notify_waiters();
+     }
+@@ -340,6 +346,18 @@ impl WriteLogManager {
+     }
+ 
+     fn enforce_retention_policy(&mut self, current_ts: Timestamp) {
++        assert!(
++            current_ts <= self.log.max_ts,
++            "write log retention progress exceeds the maximum appended timestamp"
++        );
++        assert!(
++            current_ts >= self.log.retention_progress_ts,
++            "write log retention progress timestamp regressed"
++        );
++        self.log.retention_progress_ts = current_ts;
++        metrics::log_write_log_retention_run();
++        let initial_size = self.log.size;
++        let initial_entries = self.log.retained_entries;
+         let hard_limit_ts = current_ts
+             .sub(*WRITE_LOG_MIN_RETENTION_SECS)
+             .unwrap_or(Timestamp::MIN);
+@@ -368,6 +386,7 @@ impl WriteLogManager {
+                         ts,
+                         IndexKind::Database,
+                         &mut self.log.size,
++                        &mut self.log.retained_entries,
+                         &mut self.min_ts_to_index,
+                     );
+                 },
+@@ -377,11 +396,55 @@ impl WriteLogManager {
+                         ts,
+                         IndexKind::Text,
+                         &mut self.log.size,
++                        &mut self.log.retained_entries,
+                         &mut self.min_ts_to_index,
+                     );
+                 },
+             }
+         }
++        let trimmed_bytes = initial_size
++            .checked_sub(self.log.size)
++            .expect("write log size increased while enforcing retention");
++        let trimmed_entries = initial_entries
++            .checked_sub(self.log.retained_entries)
++            .expect("write log entry count increased while enforcing retention");
++        if trimmed_bytes > 0 || trimmed_entries > 0 {
++            metrics::log_write_log_trimmed(trimmed_bytes, trimmed_entries);
++        }
++        self.report_retained_state();
++    }
++
++    fn report_retained_state(&self) {
++        let span_seconds = self
++            .min_ts_to_index
++            .peek()
++            .map(|Reverse((oldest_ts, ..))| {
++                assert!(
++                    *oldest_ts <= self.log.max_ts,
++                    "oldest write log timestamp exceeds the maximum appended timestamp"
++                );
++                self.log.max_ts.secs_since_f64(*oldest_ts)
++            })
++            .unwrap_or(0.0);
++        assert!(
++            self.log.retention_progress_ts <= self.log.max_ts,
++            "write log retention progress exceeds the maximum appended timestamp"
++        );
++        metrics::set_write_log_retained_state(
++            self.metrics_owner,
++            self.log.size,
++            self.log.retained_entries,
++            span_seconds,
++            self.log
++                .max_ts
++                .secs_since_f64(self.log.retention_progress_ts),
++        );
++    }
++}
++
++impl Drop for WriteLogManager {
++    fn drop(&mut self) {
++        metrics::drop_write_log_metrics_owner(self.metrics_owner);
+     }
+ }
+ 
+@@ -405,12 +468,21 @@ impl<T: Clone + HeapSize> WritesByIndex<T> {
+         write_source: WriteSource,
+         kind: IndexKind,
+         by_index_size: &mut usize,
++        retained_entries: &mut usize,
+         min_ts_to_index: &mut BinaryHeap<Reverse<(Timestamp, TabletIndexName, IndexKind)>>,
+     ) {
+-        *by_index_size += updates.heap_size();
++        *by_index_size = by_index_size
++            .checked_add(updates.heap_size())
++            .expect("write log retained byte count overflow");
++        *retained_entries = retained_entries
++            .checked_add(1)
++            .expect("write log retained entry count overflow");
+         match self.0.entry(index.clone()) {
+             Entry::Occupied(mut e) => {
+-                e.get_mut().insert(ts, (updates, write_source));
++                assert!(
++                    e.get_mut().insert(ts, (updates, write_source)).is_none(),
++                    "write log appended the same index and timestamp twice"
++                );
+             },
+             Entry::Vacant(e) => {
+                 let mut inner = OrdMap::new();
+@@ -429,14 +501,22 @@ impl<T: Clone + HeapSize> WritesByIndex<T> {
+         ts: Timestamp,
+         kind: IndexKind,
+         by_index_size: &mut usize,
++        retained_entries: &mut usize,
+         min_ts_to_index: &mut BinaryHeap<Reverse<(Timestamp, TabletIndexName, IndexKind)>>,
+     ) {
+-        let Some(inner) = self.0.get_mut(&index) else {
+-            return;
+-        };
+-        if let Some((updates, _)) = inner.remove(&ts) {
+-            *by_index_size = by_index_size.saturating_sub(updates.heap_size());
+-        }
++        let inner = self
++            .0
++            .get_mut(&index)
++            .expect("write log retention referenced a missing index");
++        let (updates, _) = inner
++            .remove(&ts)
++            .expect("write log retention referenced a missing timestamp");
++        *by_index_size = by_index_size
++            .checked_sub(updates.heap_size())
++            .expect("write log retained byte count underflow");
++        *retained_entries = retained_entries
++            .checked_sub(1)
++            .expect("write log retained entry count underflow");
+         if let Some((new_min_ts, _)) = inner.get_min() {
+             let new_min_ts = *new_min_ts;
+             min_ts_to_index.push(Reverse((new_min_ts, index, kind)));
+@@ -478,7 +558,10 @@ struct WriteLog {
+     by_database_index: WritesByIndex<DatabaseIndexWrite>,
+     by_text_index: WritesByIndex<TextIndexWrite>,
+     size: usize,
++    retained_entries: usize,
+     max_ts: Timestamp,
++    /// Minimum timestamp processed by every subscription manager.
++    retention_progress_ts: Timestamp,
+     purged_ts: Timestamp,
+ }
+ 
+@@ -488,7 +571,9 @@ impl WriteLog {
+             by_database_index: WritesByIndex::new(),
+             by_text_index: WritesByIndex::new(),
+             size: 0,
++            retained_entries: 0,
+             max_ts: initial_timestamp,
++            retention_progress_ts: initial_timestamp,
+             purged_ts: initial_timestamp,
+         }
+     }

@@ -1,0 +1,4640 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 29 Jul 2026 02:38:40 +0800
+Subject: [PATCH 15/24] runtime: add backend memory resilience
+
+Expose process, allocator, cgroup, Node, cache, and control-plane memory ownership so operators can account for backend RSS and telemetry coverage. Report glibc arena count separately and preserve the distinction between logical allocator free space and resident memory.
+
+Bound the local Node generation with an explicit V8 old-space share and graceful retirement based on sampled direct-child RSS, sustained cgroup pressure with material RSS, age, and lifetime imported-package count. Preserve generation fencing, active-request drain, and child reaping across replacement. Publish a shared cgroup-pressure signal for local Node and downstream owner-specific patches.
+
+Validate configured worker, cache, Node, native, and kernel allowances against a finite cgroup limit at startup. At an earlier hysteretic cgroup boundary, run a cooldown-limited glibc trim, resample headroom, and add a separately configured lower external HTTP shedding boundary for new work while preserving internal dependency callbacks and observability endpoints.
+
+Export bounded controller transitions, allocator-trim outcomes and before/after memory changes, arena availability, and Node pressure state and configuration. Document allocator-accounting limits, strict knob relationships, metric reset semantics, and the generic self-hosted operator contract without requiring context reuse.
+
+A long-running multithreaded self-hosted backend under a 30 GiB cgroup limit reached 19.57 GiB process RSS and 20.85 GiB cgroup use while glibc reported 13.75 GiB of arena space, 10.08 GiB logically free, and 123 arenas. An explicit malloc_trim(0) reduced cgroup use by about 6.35 GiB in 4.122 seconds, while mmap allocations were negligible. This supports cgroup-aware accounting and controlled trimming and shows that default glibc retention was poorly matched to this workload. Logical free bytes are not resident bytes, and this observation is not a general allocator ranking.
+---
+ Cargo.lock                                    |    1 +
+ crates/common/src/http/mod.rs                 |  188 ++
+ crates/common/src/knobs.rs                    |  166 +-
+ crates/common/src/lib.rs                      |    1 +
+ crates/common/src/memory_pressure.rs          |   54 +
+ crates/local_backend/Cargo.toml               |    1 +
+ crates/local_backend/src/lib.rs               |   12 +-
+ crates/local_backend/src/main.rs              |   29 +-
+ crates/local_backend/src/memory_metrics.rs    | 1775 +++++++++++++++++
+ crates/local_backend/src/proxy.rs             |    7 +-
+ crates/node_executor/src/local.rs             |  807 +++++++-
+ crates/node_executor/src/metrics.rs           |  137 ++
+ npm-packages/node-executor/src/executor.ts    |   15 +-
+ .../node-executor/src/source_package.test.ts  |   46 +
+ .../node-executor/src/source_package.ts       |   11 +
+ patches/README.md                             |   25 +-
+ patches/backend_memory_resilience/README.md   |  125 ++
+ .../local_node_executor_resilience/README.md  |  163 +-
+ self-hosted/advanced/knobs.md                 |  129 ++
+ self-hosted/docker/docker-compose.yml         |    8 +
+ 20 files changed, 3603 insertions(+), 97 deletions(-)
+ create mode 100644 crates/common/src/memory_pressure.rs
+ create mode 100644 crates/local_backend/src/memory_metrics.rs
+ create mode 100644 patches/backend_memory_resilience/README.md
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 7680f332e2e92e15458a474afe3675e904705293..0e8459299e1b5f8d520de06992270133f9ca9ca7 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5834,6 +5834,7 @@ dependencies = [
+  "indexing",
+  "jsonschema",
+  "keybroker",
++ "libc",
+  "maplit",
+  "metrics",
+  "model",
+diff --git a/crates/common/src/http/mod.rs b/crates/common/src/http/mod.rs
+index f000bdce411f4f7767cd716d5fdc8cc2ac2203e8..66fa3974f49c95ed4abe796d62a47a87d94bd73c 100644
+--- a/crates/common/src/http/mod.rs
++++ b/crates/common/src/http/mod.rs
+@@ -12,6 +12,7 @@ use std::{
+     },
+     sync::{
+         atomic::{
++            AtomicBool,
+             AtomicU64,
+             Ordering,
+         },
+@@ -150,8 +151,10 @@ mod metrics {
+ 
+     use metrics::{
+         add_to_gauge_with_labels,
++        log_counter_with_labels,
+         log_distribution_with_labels,
+         log_gauge_with_labels,
++        register_convex_counter,
+         register_convex_gauge,
+         register_convex_histogram,
+         subtract_from_gauge_with_labels,
+@@ -200,6 +203,12 @@ mod metrics {
+         "Time HTTP requests spent waiting for service admission",
+         &["service_name", "is_dependency"]
+     );
++    register_convex_counter!(
++        HTTP_MEMORY_PRESSURE_SHED_TOTAL,
++        "External HTTP requests rejected before handling because backend cgroup memory headroom \
++         was low",
++        &["service_name"]
++    );
+ 
+     fn http_admission_labels(
+         service_name: &'static str,
+@@ -219,6 +228,19 @@ mod metrics {
+                 http_admission_labels(service_name, is_dependency),
+             );
+         }
++        log_counter_with_labels(
++            &HTTP_MEMORY_PRESSURE_SHED_TOTAL,
++            0,
++            vec![StaticMetricLabel::new("service_name", service_name)],
++        );
++    }
++
++    pub fn log_http_memory_pressure_shed(service_name: &'static str) {
++        log_counter_with_labels(
++            &HTTP_MEMORY_PRESSURE_SHED_TOTAL,
++            1,
++            vec![StaticMetricLabel::new("service_name", service_name)],
++        );
+     }
+ 
+     #[cfg(test)]
+@@ -587,13 +609,54 @@ pub struct ConvexHttpService {
+     _base_concurrency_gauge: Option<PullingGauge>,
+ }
+ 
++/// Shared state used by a host-specific controller to shed new external HTTP
++/// work. The HTTP layer owns request classification; the controller owns only
++/// the current pressure state.
++#[derive(Clone)]
++pub struct ExternalRequestShedding {
++    active: Arc<AtomicBool>,
++}
++
++impl ExternalRequestShedding {
++    pub fn new(active: bool) -> Self {
++        Self {
++            active: Arc::new(AtomicBool::new(active)),
++        }
++    }
++
++    pub fn is_active(&self) -> bool {
++        self.active.load(Ordering::Acquire)
++    }
++
++    /// Returns the prior state so the controller can record transitions.
++    pub fn set_active(&self, active: bool) -> bool {
++        self.active.swap(active, Ordering::AcqRel)
++    }
++}
++
+ #[derive(Clone)]
+ struct HttpConcurrencyLimiter {
+     gate: crate::dependency_overflow::DependencyOverflowGate,
+     dependency_path_prefixes: &'static [&'static str],
++    external_request_shedding: Option<ExternalRequestShedding>,
+     service_name: &'static str,
+ }
+ 
++fn memory_pressure_response(service_name: &'static str) -> Response {
++    metrics::log_http_memory_pressure_shed(service_name);
++    let mut response = HttpError::new(
++        StatusCode::SERVICE_UNAVAILABLE,
++        "BackendMemoryPressure",
++        "The backend is temporarily limiting new work because memory headroom is low. Retry the \
++         request.",
++    )
++    .into_response();
++    response
++        .headers_mut()
++        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
++    response
++}
++
+ async fn dependency_aware_concurrency_middleware(
+     State(limiter): State<HttpConcurrencyLimiter>,
+     request: http::Request<Body>,
+@@ -609,12 +672,32 @@ async fn dependency_aware_concurrency_middleware(
+         && request
+             .headers()
+             .contains_key(CONVEX_ACTIONS_CALLBACK_TOKEN);
++    if !is_dependency
++        && limiter
++            .external_request_shedding
++            .as_ref()
++            .is_some_and(ExternalRequestShedding::is_active)
++    {
++        return memory_pressure_response(limiter.service_name);
++    }
+     let permit = limiter
+         .gate
+         .acquire_with_waiter(is_dependency, || {
+             metrics::HttpAdmissionWaitGuard::new(limiter.service_name, is_dependency)
+         })
+         .await;
++    // A request can wait for a normal concurrency permit while memory pressure
++    // begins. Recheck before running the handler so queued external work does
++    // not bypass an active shedding interval.
++    if !is_dependency
++        && limiter
++            .external_request_shedding
++            .as_ref()
++            .is_some_and(ExternalRequestShedding::is_active)
++    {
++        drop(permit);
++        return memory_pressure_response(limiter.service_name);
++    }
+     let response = next.run(request).await;
+     drop(permit);
+     response
+@@ -636,6 +719,7 @@ impl ConvexHttpService {
+             max_concurrency,
+             0,
+             &[],
++            None,
+             request_timeout,
+             route_metric_mapper,
+         )
+@@ -648,6 +732,7 @@ impl ConvexHttpService {
+         max_concurrency: usize,
+         dependency_reserve: usize,
+         dependency_path_prefixes: &'static [&'static str],
++        external_request_shedding: Option<ExternalRequestShedding>,
+         request_timeout: Duration,
+         route_metric_mapper: RM,
+     ) -> Self {
+@@ -690,6 +775,7 @@ impl ConvexHttpService {
+         let concurrency_limiter = HttpConcurrencyLimiter {
+             gate: concurrency_gate,
+             dependency_path_prefixes,
++            external_request_shedding,
+             service_name,
+         };
+         let concurrency_gauge = PullingGauge::new(
+@@ -1601,6 +1687,7 @@ mod tests {
+             HttpAdmissionWaitGuard,
+         },
+         Body,
++        ExternalRequestShedding,
+         HttpConcurrencyLimiter,
+         StatusCode,
+     };
+@@ -1624,11 +1711,111 @@ mod tests {
+         StatusCode::OK
+     }
+ 
++    async fn ok_handler() -> StatusCode {
++        StatusCode::OK
++    }
++
++    #[tokio::test]
++    async fn memory_pressure_sheds_external_requests_but_preserves_dependencies() {
++        let shedding = ExternalRequestShedding::new(true);
++        let limiter = HttpConcurrencyLimiter {
++            gate: DependencyOverflowGate::new(1, 2),
++            dependency_path_prefixes: &["/api/actions/"],
++            external_request_shedding: Some(shedding.clone()),
++            service_name: "memory_pressure_test",
++        };
++        let app = Router::new()
++            .route("/ordinary", get(ok_handler))
++            .route("/api/actions/query", get(ok_handler))
++            .layer(axum::middleware::from_fn_with_state(
++                limiter,
++                dependency_aware_concurrency_middleware,
++            ));
++
++        let ordinary = app
++            .clone()
++            .oneshot(Request::get("/ordinary").body(Body::empty()).unwrap())
++            .await
++            .unwrap();
++        assert_eq!(ordinary.status(), StatusCode::SERVICE_UNAVAILABLE);
++
++        let dependency = app
++            .clone()
++            .oneshot(
++                Request::get("/api/actions/query")
++                    .header("Convex-Action-Callback-Token", "token")
++                    .body(Body::empty())
++                    .unwrap(),
++            )
++            .await
++            .unwrap();
++        assert_eq!(dependency.status(), StatusCode::OK);
++
++        assert!(shedding.set_active(false));
++        let recovered = app
++            .oneshot(Request::get("/ordinary").body(Body::empty()).unwrap())
++            .await
++            .unwrap();
++        assert_eq!(recovered.status(), StatusCode::OK);
++    }
++
++    #[tokio::test]
++    async fn queued_external_request_rechecks_memory_pressure_before_handling() {
++        let shedding = ExternalRequestShedding::new(false);
++        let limiter = HttpConcurrencyLimiter {
++            gate: DependencyOverflowGate::new(1, 1),
++            dependency_path_prefixes: &[],
++            external_request_shedding: Some(shedding.clone()),
++            service_name: "queued_memory_pressure_test",
++        };
++        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
++        let release = Arc::new(Semaphore::new(0));
++        let app = Router::new()
++            .route("/ordinary", get(ordinary_handler))
++            .with_state(BlockingHandlerState {
++                started: started_tx,
++                release: release.clone(),
++            })
++            .layer(axum::middleware::from_fn_with_state(
++                limiter,
++                dependency_aware_concurrency_middleware,
++            ));
++
++        let first = tokio::spawn(
++            app.clone()
++                .oneshot(Request::get("/ordinary").body(Body::empty()).unwrap()),
++        );
++        assert_eq!(started_rx.recv().await, Some("ordinary"));
++        let queued =
++            tokio::spawn(app.oneshot(Request::get("/ordinary").body(Body::empty()).unwrap()));
++        match tokio::time::timeout(Duration::from_millis(25), started_rx.recv()).await {
++            Ok(Some(request_kind)) => {
++                panic!("shed queued request reached the handler: {request_kind}")
++            },
++            Ok(None) | Err(_) => {},
++        }
++
++        assert!(!shedding.set_active(true));
++        release.add_permits(1);
++        assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
++        assert_eq!(
++            queued.await.unwrap().unwrap().status(),
++            StatusCode::SERVICE_UNAVAILABLE
++        );
++        match tokio::time::timeout(Duration::from_millis(25), started_rx.recv()).await {
++            Ok(Some(request_kind)) => {
++                panic!("shed queued request reached the handler: {request_kind}")
++            },
++            Ok(None) | Err(_) => {},
++        }
++    }
++
+     #[tokio::test]
+     async fn dependencies_share_base_before_using_http_overflow() {
+         let limiter = HttpConcurrencyLimiter {
+             gate: DependencyOverflowGate::new(2, 3),
+             dependency_path_prefixes: &["/api/actions/"],
++            external_request_shedding: None,
+             service_name: "test",
+         };
+         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+@@ -1716,6 +1903,7 @@ mod tests {
+         let limiter = HttpConcurrencyLimiter {
+             gate: DependencyOverflowGate::new(1, 1),
+             dependency_path_prefixes: &["/api/actions/"],
++            external_request_shedding: None,
+             service_name: "test",
+         };
+         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
+index 436be7258808a5e2dd178c21bca51dffd93b5986..342039e7a901f054fec7d36636efe460cbff33d9 100644
+--- a/crates/common/src/knobs.rs
++++ b/crates/common/src/knobs.rs
+@@ -282,6 +282,166 @@ pub static V8_ACTION_USER_TIMEOUT: LazyLock<Duration> =
+ pub static NODE_ACTION_USER_TIMEOUT: LazyLock<Duration> =
+     LazyLock::new(|| Duration::from_secs(env_config("NODE_ACTION_USER_TIMEOUT_SECS", 600)));
+ 
++/// V8 old-space allowance for the long-lived local Node executor child, in MiB.
++/// This does not include Buffers, native modules, executable code, or allocator
++/// retention, so the independent RSS retirement threshold must remain larger.
++pub static LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB: LazyLock<usize> = LazyLock::new(|| {
++    let value = env_config_usize_strict("LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB", 2048);
++    assert!(
++        value > 0,
++        "LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB must be greater than zero"
++    );
++    value
++});
++
++/// Sampled Linux direct-child resident-memory threshold that starts graceful
++/// retirement of the local Node executor generation. This is a planning
++/// allowance, not a hard maximum: the child can grow between samples and while
++/// active requests drain, and descendant processes are excluded. Failed samples
++/// skip this trigger observably while other retirement checks continue. The
++/// value must be greater than zero.
++pub static LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES: LazyLock<usize> = LazyLock::new(|| {
++    let value =
++        env_config_usize_strict("LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES", 3 * 1024 * 1024 * 1024);
++    assert!(
++        value > 0,
++        "LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES must be greater than zero"
++    );
++    value
++});
++
++/// Maximum age of a local Node executor generation before graceful retirement.
++/// A finite age bounds retained ESM identities even when RSS remains low.
++pub static LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE: LazyLock<Duration> = LazyLock::new(|| {
++    let seconds =
++        env_config_usize_strict("LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS", 6 * 60 * 60);
++    assert!(
++        seconds > 0,
++        "LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS must be greater than zero"
++    );
++    Duration::from_secs(
++        seconds
++            .try_into()
++            .expect("LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS does not fit in u64"),
++    )
++});
++
++/// Maximum lifetime-unique imported source-package roots in one local Node
++/// executor generation before graceful retirement. Disk-cache eviction does
++/// not reduce this count because it cannot evict Node's ESM module graph.
++pub static LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES: LazyLock<usize> =
++    LazyLock::new(|| {
++        let value =
++            env_config_usize_strict("LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES", 1000);
++        assert!(
++            value > 0,
++            "LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES must be greater than zero"
++        );
++        value
++    });
++
++/// Startup memory reserved for backend allocations that do not have a separate
++/// configured cache or runtime ceiling, including Rust data structures,
++/// allocator retention, thread stacks, page tables, and cgroup kernel memory.
++pub static LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES: LazyLock<usize> =
++    LazyLock::new(|| {
++        let value = env_config_usize_strict(
++            "LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES",
++            2 * 1024 * 1024 * 1024,
++        );
++        assert!(
++            value > 0,
++            "LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES must be greater than zero"
++        );
++        value
++    });
++
++/// Reclaim optional backend memory before external admission reaches its
++/// shedding boundary. This requires a finite cgroup v2 memory limit.
++pub static LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED: LazyLock<bool> =
++    LazyLock::new(|| env_config_bool_strict("LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED", false));
++
++/// Cgroup memory headroom at or below which internal reclamation starts.
++pub static LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES: LazyLock<usize> =
++    LazyLock::new(|| {
++        env_config_usize_strict(
++            "LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES",
++            6 * 1024 * 1024 * 1024,
++        )
++    });
++
++/// Cgroup memory headroom at or above which internal reclamation stops.
++pub static LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES: LazyLock<usize> =
++    LazyLock::new(|| {
++        env_config_usize_strict(
++            "LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES",
++            8 * 1024 * 1024 * 1024,
++        )
++    });
++
++/// Ask glibc to discard free arena pages while internal cgroup reclamation is
++/// active. Unsupported allocators report explicit telemetry and do nothing.
++pub static LOCAL_BACKEND_MALLOC_TRIM_ENABLED: LazyLock<bool> =
++    LazyLock::new(|| env_config_bool_strict("LOCAL_BACKEND_MALLOC_TRIM_ENABLED", false));
++
++/// Minimum logical free glibc arena space required before an explicit trim.
++pub static LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES: LazyLock<usize> = LazyLock::new(|| {
++    env_config_usize_strict(
++        "LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES",
++        1024 * 1024 * 1024,
++    )
++});
++
++/// Minimum time between explicit glibc trim attempts during one or more
++/// pressure episodes.
++pub static LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN: LazyLock<Duration> = LazyLock::new(|| {
++    Duration::from_secs(env_config("LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN_SECS", 300))
++});
++
++/// Minimum sampled direct-child RSS for sustained cgroup pressure to retire a
++/// local Node executor generation before its ordinary RSS limit.
++pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES: LazyLock<usize> =
++    LazyLock::new(|| {
++        env_config_usize_strict(
++            "LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES",
++            2 * 1024 * 1024 * 1024,
++        )
++    });
++
++/// Time internal cgroup pressure must remain active before it may retire a
++/// material local Node executor generation.
++pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE: LazyLock<Duration> = LazyLock::new(|| {
++    Duration::from_secs(env_config(
++        "LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS",
++        60,
++    ))
++});
++
++/// Reject new external HTTP work when finite cgroup memory headroom is low.
++/// Internal Node action callbacks remain eligible so already-running work can
++/// make progress and release memory.
++pub static LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED: LazyLock<bool> = LazyLock::new(|| {
++    env_config_bool_strict("LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED", false)
++});
++
++/// Cgroup memory headroom at or below which external HTTP admission is shed.
++pub static LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES: LazyLock<usize> =
++    LazyLock::new(|| {
++        env_config_usize_strict(
++            "LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES",
++            3 * 1024 * 1024 * 1024,
++        )
++    });
++
++/// Cgroup memory headroom at or above which external HTTP admission resumes.
++pub static LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES: LazyLock<usize> =
++    LazyLock::new(|| {
++        env_config_usize_strict(
++            "LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES",
++            5 * 1024 * 1024 * 1024,
++        )
++    });
++
+ /// Ideally, we should have no timeout here but we are relying on defense in
+ /// depth in case somehow the upstream get stuck. Use very high timeout here.
+ ///
+@@ -847,7 +1007,7 @@ pub static WRITE_LOG_MIN_RETENTION_SECS: LazyLock<Duration> =
+     LazyLock::new(|| Duration::from_secs(env_config("WRITE_LOG_MIN_RETENTION_SECS", 30)));
+ 
+ /// The maximum time to retain the WriteLog, note that the WriteLog might be
+-/// trimmed sooner if it size exceeds WRITE_LOG_MAX_SIZE_BYTES.
++/// trimmed sooner if its size exceeds WRITE_LOG_SOFT_MAX_SIZE_BYTES.
+ pub static WRITE_LOG_MAX_RETENTION_SECS: LazyLock<Duration> =
+     LazyLock::new(|| Duration::from_secs(env_config("WRITE_LOG_MAX_RETENTION_SECS", 300)));
+ 
+@@ -2013,8 +2173,8 @@ pub static SUBSCRIPTIONS_WORKER_QUEUE_SIZE: LazyLock<usize> =
+     LazyLock::new(|| env_config("SUBSCRIPTIONS_WORKER_QUEUE_SIZE", 10000));
+ 
+ /// The number of SubscriptionManager instances to run per SubscriptionsWorker.
+-/// Incoming subscription requests are randomly sharded across these managers
+-/// to distribute load and avoid overloading a single manager.
++/// Incoming subscription requests are assigned round-robin across these
++/// managers to distribute load and avoid overloading a single manager.
+ pub static NUM_SUBSCRIPTION_MANAGERS: LazyLock<usize> =
+     LazyLock::new(|| env_config("NUM_SUBSCRIPTION_MANAGERS", 1));
+ 
+diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
+index 76250c104e6275c0c40ed5aa7920931cbf933cee..5368ec7076f6ee117fbe849d5502b40682f86100 100644
+--- a/crates/common/src/lib.rs
++++ b/crates/common/src/lib.rs
+@@ -44,6 +44,7 @@ pub mod json_schemas;
+ pub mod knobs;
+ pub mod log_lines;
+ pub mod log_streaming;
++pub mod memory_pressure;
+ pub mod metrics;
+ pub mod numeric;
+ pub mod paths;
+diff --git a/crates/common/src/memory_pressure.rs b/crates/common/src/memory_pressure.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..420b59cf8c1f313511ea317263ecefb020f85755
+--- /dev/null
++++ b/crates/common/src/memory_pressure.rs
+@@ -0,0 +1,54 @@
++use tokio::sync::watch;
++
++/// Process-local cgroup memory-reclamation state shared with subsystems that
++/// can release optional retained state. The controller owns state changes;
++/// consumers may observe the current value or wait for a transition.
++#[derive(Clone)]
++pub struct MemoryPressureSignal {
++    sender: watch::Sender<bool>,
++}
++
++impl MemoryPressureSignal {
++    pub fn new(active: bool) -> Self {
++        let (sender, _) = watch::channel(active);
++        Self { sender }
++    }
++
++    pub fn is_active(&self) -> bool {
++        *self.sender.borrow()
++    }
++
++    /// Returns the prior state so the one controller can verify transitions.
++    pub fn set_active(&self, active: bool) -> bool {
++        self.sender.send_replace(active)
++    }
++
++    pub fn subscribe(&self) -> watch::Receiver<bool> {
++        self.sender.subscribe()
++    }
++}
++
++impl Default for MemoryPressureSignal {
++    fn default() -> Self {
++        Self::new(false)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::MemoryPressureSignal;
++
++    #[test]
++    fn signal_preserves_current_state_and_transition_order() {
++        let signal = MemoryPressureSignal::default();
++        let receiver = signal.subscribe();
++        assert!(!signal.is_active());
++        assert!(!*receiver.borrow());
++
++        assert!(!signal.set_active(true));
++        assert!(signal.is_active());
++        assert!(*receiver.borrow());
++        assert!(signal.set_active(false));
++        assert!(!signal.is_active());
++    }
++}
+diff --git a/crates/local_backend/Cargo.toml b/crates/local_backend/Cargo.toml
+index 249d63a766f38f3c90a21568b5b4773ea945f6d9..844603535a7b7d14b9822a9a0b900b2f0331cb41 100644
+--- a/crates/local_backend/Cargo.toml
++++ b/crates/local_backend/Cargo.toml
+@@ -69,6 +69,7 @@ http_client = { workspace = true }
+ hyper-util = { workspace = true }
+ indexing = { workspace = true }
+ keybroker = { workspace = true }
++libc = { workspace = true }
+ maplit = { workspace = true }
+ metrics = { workspace = true }
+ model = { workspace = true }
+diff --git a/crates/local_backend/src/lib.rs b/crates/local_backend/src/lib.rs
+index bce3f4f212b56dd079908497cc14f56929b88b25..acda181c6f86968b546cf1d640e552d4e5de1856 100644
+--- a/crates/local_backend/src/lib.rs
++++ b/crates/local_backend/src/lib.rs
+@@ -34,6 +34,7 @@ use common::{
+         NODE_ACTION_USER_TIMEOUT,
+         UDF_CACHE_MAX_SIZE,
+     },
++    memory_pressure::MemoryPressureSignal,
+     persistence::Persistence,
+     runtime::{
+         new_rate_limiter,
+@@ -98,6 +99,8 @@ pub mod environment_variables;
+ pub mod http_actions;
+ pub mod log_sinks;
+ pub mod logs;
++#[cfg(target_os = "linux")]
++pub mod memory_metrics;
+ pub mod node_action_callbacks;
+ pub mod parse;
+ pub mod proxy;
+@@ -151,6 +154,7 @@ pub async fn make_app(
+     persistence: Arc<dyn Persistence>,
+     zombify_rx: async_broadcast::Receiver<()>,
+     preempt_tx: ShutdownSignal,
++    memory_reclamation: MemoryPressureSignal,
+ ) -> anyhow::Result<LocalAppState> {
+     let key_broker = config.key_broker()?;
+     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
+@@ -197,7 +201,13 @@ pub async fn make_app(
+         class: DeploymentClass::S16,
+     };
+     let node_process_timeout = *NODE_ACTION_USER_TIMEOUT + Duration::from_secs(5);
+-    let node_executor = Arc::new(LocalNodeExecutor::new(node_process_timeout).await?);
++    let node_executor = Arc::new(
++        LocalNodeExecutor::new_with_memory_pressure(
++            node_process_timeout,
++            memory_reclamation.clone(),
++        )
++        .await?,
++    );
+     let node_actions = NodeActions::new(
+         node_executor,
+         config.convex_origin_url()?,
+diff --git a/crates/local_backend/src/main.rs b/crates/local_backend/src/main.rs
+index e9c900241cf67e1bc7060a27b9c0017c10137d51..57cdd08403b13fd341a423c6a838c1b68e2203b4 100644
+--- a/crates/local_backend/src/main.rs
++++ b/crates/local_backend/src/main.rs
+@@ -34,6 +34,8 @@ use keybroker::{
+     DeploymentSecret,
+     KeyBroker,
+ };
++#[cfg(target_os = "linux")]
++use local_backend::memory_metrics;
+ use local_backend::{
+     config::{
+         AdminKeyArgs,
+@@ -165,9 +167,31 @@ async fn run_server_inner(
+     max_concurrent_requests: usize,
+     dependency_reserve: usize,
+ ) -> anyhow::Result<()> {
+-    // Used to receive fatal errors from the database or /preempt endpoint.
++    // Used to receive fatal errors from the database, memory pressure
++    // controller, or /preempt endpoint.
+     let (preempt_tx, preempt_rx) = oneshot::channel();
+     let preempt_signal = ShutdownSignal::new(preempt_tx);
++
++    #[cfg(target_os = "linux")]
++    let (external_request_shedding, memory_reclamation) = {
++        memory_metrics::validate_startup_budget()?;
++        let controller = memory_metrics::initialize_memory_pressure_controller()?;
++        let external_request_shedding = controller
++            .as_ref()
++            .and_then(memory_metrics::CgroupMemoryPressureController::external_request_shedding);
++        let memory_reclamation = controller
++            .as_ref()
++            .map(memory_metrics::CgroupMemoryPressureController::memory_reclamation)
++            .unwrap_or_default();
++        memory_metrics::start(runtime.clone(), controller, preempt_signal.clone());
++        (external_request_shedding, memory_reclamation)
++    };
++    #[cfg(not(target_os = "linux"))]
++    let (external_request_shedding, memory_reclamation) = (
++        None,
++        common::memory_pressure::MemoryPressureSignal::default(),
++    );
++
+     // Use to signal to the http service to stop.
+     let (shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
+     let persistence = connect_persistence(
+@@ -189,6 +213,7 @@ async fn run_server_inner(
+         persistence,
+         shutdown_rx.clone(),
+         preempt_signal.clone(),
++        memory_reclamation,
+     )
+     .await?;
+     let router = router(st.clone());
+@@ -200,6 +225,7 @@ async fn run_server_inner(
+         max_concurrent_requests,
+         dependency_reserve,
+         &["/api/actions/"],
++        external_request_shedding.clone(),
+         *HTTP_SERVER_TIMEOUT_DURATION,
+         HttpActionRouteMapper,
+     );
+@@ -210,6 +236,7 @@ async fn run_server_inner(
+         config.site_bind_address(),
+         config.site_forward_prefix(),
+         max_concurrent_requests,
++        external_request_shedding,
+         shutdown_rx,
+     );
+ 
+diff --git a/crates/local_backend/src/memory_metrics.rs b/crates/local_backend/src/memory_metrics.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb3715d12d18794df9337d7fec5d3e195f7bae5e
+--- /dev/null
++++ b/crates/local_backend/src/memory_metrics.rs
+@@ -0,0 +1,1775 @@
++use std::{
++    collections::BTreeMap,
++    fs,
++    path::Path,
++    time::{
++        Duration,
++        Instant,
++    },
++};
++
++use anyhow::Context;
++use common::{
++    http::ExternalRequestShedding,
++    knobs::{
++        FUNRUN_CODE_CACHE_SIZE,
++        FUNRUN_INDEX_CACHE_SIZE,
++        FUNRUN_MODULE_CACHE_SIZE,
++        INDEX_CACHE_SIZE,
++        ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE,
++        ISOLATE_MAX_HEAP_EXTRA_SIZE,
++        ISOLATE_MAX_USER_HEAP_SIZE,
++        LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN,
++        LOCAL_BACKEND_MALLOC_TRIM_ENABLED,
++        LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES,
++        LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES,
++        LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES,
++        LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED,
++        LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED,
++        LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES,
++        LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES,
++        LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES,
++        LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES,
++        MAX_ISOLATE_WORKERS,
++        MODULE_CACHE_MAX_SIZE_BYTES,
++        UDF_CACHE_MAX_SIZE,
++    },
++    memory_pressure::MemoryPressureSignal,
++    runtime::{
++        tokio_spawn_blocking,
++        Runtime,
++    },
++    shutdown::ShutdownSignal,
++};
++use metrics::{
++    log_counter,
++    log_counter_with_labels,
++    log_distribution,
++    log_gauge,
++    log_gauge_with_labels,
++    register_convex_counter,
++    register_convex_gauge,
++    register_convex_histogram,
++    StaticMetricLabel,
++};
++
++const REPORT_INTERVAL: Duration = Duration::from_secs(15);
++const PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
++const ALLOCATOR_ARENA_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
++const MEMORY_REPORTS_PER_ALLOCATOR_ARENA_REPORT: usize =
++    (ALLOCATOR_ARENA_REPORT_INTERVAL.as_secs() / REPORT_INTERVAL.as_secs()) as usize;
++const MAX_MALLOC_INFO_BYTES: usize = 4 * 1024 * 1024;
++const CGROUP_ROOT: &str = "/sys/fs/cgroup";
++
++register_convex_gauge!(
++    BACKEND_PROCESS_MEMORY_BYTES,
++    "Memory attributed directly to the backend process",
++    &["component"]
++);
++register_convex_gauge!(
++    BACKEND_ALLOCATOR_MEMORY_BYTES,
++    "Memory reported by the backend process allocator",
++    &["component"]
++);
++register_convex_gauge!(
++    BACKEND_ALLOCATOR_MMAP_REGIONS_INFO,
++    "Number of mmap-backed regions reported by the backend process allocator"
++);
++register_convex_gauge!(
++    BACKEND_ALLOCATOR_ARENAS_INFO,
++    "Number of glibc malloc arenas reported by malloc_info"
++);
++register_convex_gauge!(
++    BACKEND_ALLOCATOR_ARENA_TELEMETRY_INFO,
++    "Whether glibc malloc arena-count telemetry is available"
++);
++register_convex_gauge!(
++    BACKEND_ALLOCATOR_TELEMETRY_INFO,
++    "Whether allocator-specific backend memory telemetry is available"
++);
++register_convex_gauge!(
++    BACKEND_CGROUP_MEMORY_CONTROLLER_INFO,
++    "Whether the backend can read its cgroup v2 memory controller"
++);
++register_convex_gauge!(
++    BACKEND_CGROUP_MEMORY_BYTES,
++    "Memory reported by the backend cgroup v2 memory controller",
++    &["component"]
++);
++register_convex_gauge!(
++    BACKEND_CGROUP_MEMORY_COMPONENT_AVAILABLE_INFO,
++    "Whether a selected cgroup v2 memory.stat component is available",
++    &["component"]
++);
++register_convex_gauge!(
++    BACKEND_CGROUP_MEMORY_LIMITED_INFO,
++    "Whether the backend cgroup v2 has a finite memory limit"
++);
++register_convex_gauge!(
++    BACKEND_CGROUP_MEMORY_EVENTS_INFO,
++    "Absolute cgroup v2 memory event counts for the backend container",
++    &["event"]
++);
++register_convex_gauge!(
++    BACKEND_CGROUP_MEMORY_EVENT_AVAILABLE_INFO,
++    "Whether a selected cgroup v2 memory.events field is available",
++    &["event"]
++);
++register_convex_gauge!(
++    BACKEND_MEMORY_TELEMETRY_UP_INFO,
++    "Whether the latest backend memory telemetry sample completed without source errors"
++);
++register_convex_gauge!(
++    BACKEND_MEMORY_TELEMETRY_SOURCE_UP_INFO,
++    "Whether a backend memory telemetry source succeeded in the latest sample",
++    &["source"]
++);
++register_convex_counter!(
++    BACKEND_MEMORY_TELEMETRY_FAILURES_TOTAL,
++    "Number of failed backend memory telemetry samples"
++);
++register_convex_gauge!(
++    BACKEND_STARTUP_MEMORY_BUDGET_BYTES,
++    "Configured startup memory budget; this is configuration feasibility, not current allocation",
++    &["component"]
++);
++register_convex_gauge!(
++    BACKEND_STARTUP_MEMORY_BUDGET_LIMIT_AVAILABLE_INFO,
++    "Whether startup memory feasibility was checked against a finite cgroup v2 limit"
++);
++register_convex_gauge!(
++    BACKEND_STARTUP_MEMORY_BUDGET_HEADROOM_BYTES,
++    "Cgroup memory limit remaining after the configured startup memory budget"
++);
++register_convex_gauge!(
++    BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED_INFO,
++    "Whether cgroup memory pressure can shed new external HTTP work"
++);
++register_convex_gauge!(
++    BACKEND_MEMORY_PRESSURE_SHEDDING_ACTIVE_INFO,
++    "Whether new external HTTP work is currently shed because cgroup memory headroom is low"
++);
++register_convex_gauge!(
++    BACKEND_MEMORY_PRESSURE_HEADROOM_BYTES,
++    "Finite cgroup memory headroom used by the external-admission pressure controller"
++);
++register_convex_gauge!(
++    BACKEND_MEMORY_PRESSURE_HEADROOM_THRESHOLD_BYTES,
++    "Configured cgroup memory headroom boundaries for external-admission shedding",
++    &["boundary"]
++);
++register_convex_counter!(
++    BACKEND_MEMORY_PRESSURE_TRANSITIONS_TOTAL,
++    "Transitions of cgroup memory external-admission shedding",
++    &["state"]
++);
++register_convex_counter!(
++    BACKEND_MEMORY_PRESSURE_FAILURES_TOTAL,
++    "Fatal cgroup source or configuration failures in the enabled memory pressure controller"
++);
++register_convex_gauge!(
++    BACKEND_MEMORY_RECLAMATION_ENABLED_INFO,
++    "Whether cgroup memory pressure can reclaim optional backend memory"
++);
++register_convex_gauge!(
++    BACKEND_MEMORY_RECLAMATION_ACTIVE_INFO,
++    "Whether optional backend memory reclamation is currently active"
++);
++register_convex_gauge!(
++    BACKEND_MEMORY_RECLAMATION_HEADROOM_THRESHOLD_BYTES,
++    "Configured cgroup memory headroom boundaries for internal reclamation",
++    &["boundary"]
++);
++register_convex_counter!(
++    BACKEND_MEMORY_RECLAMATION_TRANSITIONS_TOTAL,
++    "Transitions of cgroup memory internal reclamation",
++    &["state"]
++);
++register_convex_gauge!(
++    BACKEND_ALLOCATOR_TRIM_ENABLED_INFO,
++    "Whether glibc malloc trim is enabled during cgroup memory reclamation"
++);
++register_convex_gauge!(
++    BACKEND_ALLOCATOR_TRIM_ACTIVE_INFO,
++    "Whether a glibc malloc trim call is currently running"
++);
++register_convex_gauge!(
++    BACKEND_ALLOCATOR_TRIM_CONFIGURATION_INFO,
++    "Configured glibc malloc trim controls",
++    &["component"]
++);
++register_convex_counter!(
++    BACKEND_ALLOCATOR_TRIM_ATTEMPTS_TOTAL,
++    "Explicit backend allocator trim attempts by bounded measurement outcome",
++    &["outcome"]
++);
++register_convex_histogram!(
++    BACKEND_ALLOCATOR_TRIM_SECONDS,
++    "Duration of explicit backend allocator trim calls"
++);
++register_convex_gauge!(
++    BACKEND_ALLOCATOR_TRIM_MEMORY_CHANGE_BYTES,
++    "Immediate signed memory change after explicit allocator trim",
++    &["component"]
++);
++register_convex_counter!(
++    BACKEND_ALLOCATOR_TRIM_PAGE_FAULTS_TOTAL,
++    "Process page faults observed during an explicit allocator trim sample",
++    &["kind"]
++);
++
++#[derive(Debug, Eq, PartialEq)]
++struct ProcessMemory {
++    virtual_bytes: u64,
++    resident_bytes: u64,
++    resident_anon_bytes: u64,
++    resident_file_bytes: u64,
++    resident_shmem_bytes: u64,
++    swap_bytes: u64,
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct AllocatorMemory {
++    arena_bytes: u64,
++    mmap_bytes: u64,
++    in_use_bytes: u64,
++    free_bytes: u64,
++    releasable_bytes: u64,
++    mmap_regions: u64,
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct CgroupMemory {
++    current_bytes: u64,
++    max_bytes: Option<u64>,
++}
++
++pub struct CgroupMemoryPressureController {
++    external_request_shedding: Option<ExternalRequestShedding>,
++    shedding_enter_headroom_bytes: u64,
++    shedding_exit_headroom_bytes: u64,
++    memory_reclamation: MemoryPressureSignal,
++    reclamation_active: bool,
++    reclamation_enabled: bool,
++    reclamation_enter_headroom_bytes: u64,
++    reclamation_exit_headroom_bytes: u64,
++    allocator_trim_enabled: bool,
++    allocator_trim_min_free_bytes: u64,
++    allocator_trim_cooldown: Duration,
++    last_allocator_trim_evaluated: Option<Instant>,
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct PageFaults {
++    minor: u64,
++    major: u64,
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct AllocatorTrimSnapshot {
++    process: ProcessMemory,
++    allocator: Option<AllocatorMemory>,
++    cgroup_current_bytes: u64,
++    cgroup_anon_bytes: u64,
++    page_faults: PageFaults,
++}
++
++enum AllocatorTrimRun {
++    Unsupported,
++    BelowFreeThreshold,
++    Completed {
++        before: AllocatorTrimSnapshot,
++        after: anyhow::Result<AllocatorTrimSnapshot>,
++        returned: bool,
++        elapsed: Duration,
++    },
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct MemoryBudgetComponent {
++    name: &'static str,
++    bytes: u64,
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct StartupMemoryBudget {
++    components: Vec<MemoryBudgetComponent>,
++    total_bytes: u64,
++}
++
++impl StartupMemoryBudget {
++    fn new(components: Vec<MemoryBudgetComponent>) -> anyhow::Result<Self> {
++        let total_bytes = components.iter().try_fold(0u64, |total, component| {
++            total
++                .checked_add(component.bytes)
++                .context("configured startup memory budget overflow")
++        })?;
++        Ok(Self {
++            components,
++            total_bytes,
++        })
++    }
++}
++
++#[derive(Debug)]
++struct SourceFailure {
++    source: &'static str,
++    error: anyhow::Error,
++}
++
++pub fn initialize_memory_pressure_controller(
++) -> anyhow::Result<Option<CgroupMemoryPressureController>> {
++    let shedding_enabled = *LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED;
++    let reclamation_enabled = *LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED;
++    let allocator_trim_enabled = *LOCAL_BACKEND_MALLOC_TRIM_ENABLED;
++    log_gauge(
++        &BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED_INFO,
++        if shedding_enabled { 1.0 } else { 0.0 },
++    );
++    log_gauge(&BACKEND_MEMORY_PRESSURE_SHEDDING_ACTIVE_INFO, 0.0);
++    log_gauge(
++        &BACKEND_MEMORY_RECLAMATION_ENABLED_INFO,
++        if reclamation_enabled { 1.0 } else { 0.0 },
++    );
++    log_gauge(&BACKEND_MEMORY_RECLAMATION_ACTIVE_INFO, 0.0);
++    log_gauge(
++        &BACKEND_ALLOCATOR_TRIM_ENABLED_INFO,
++        if allocator_trim_enabled { 1.0 } else { 0.0 },
++    );
++    log_gauge(&BACKEND_ALLOCATOR_TRIM_ACTIVE_INFO, 0.0);
++    log_counter(&BACKEND_MEMORY_PRESSURE_FAILURES_TOTAL, 0);
++    for state in ["active", "inactive"] {
++        log_counter_with_labels(
++            &BACKEND_MEMORY_PRESSURE_TRANSITIONS_TOTAL,
++            0,
++            vec![StaticMetricLabel::new("state", state)],
++        );
++        log_counter_with_labels(
++            &BACKEND_MEMORY_RECLAMATION_TRANSITIONS_TOTAL,
++            0,
++            vec![StaticMetricLabel::new("state", state)],
++        );
++    }
++    for outcome in [
++        "returned_true",
++        "returned_false",
++        "unsupported",
++        "sample_failure",
++    ] {
++        log_counter_with_labels(
++            &BACKEND_ALLOCATOR_TRIM_ATTEMPTS_TOTAL,
++            0,
++            vec![StaticMetricLabel::new("outcome", outcome)],
++        );
++    }
++    anyhow::ensure!(
++        !allocator_trim_enabled || reclamation_enabled,
++        "Allocator trim requires internal memory reclamation"
++    );
++    let allocator_trim_min_free_bytes = u64::try_from(*LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES)?;
++    let allocator_trim_cooldown = *LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN;
++    anyhow::ensure!(
++        allocator_trim_min_free_bytes > 0,
++        "Allocator trim minimum free bytes must be greater than zero"
++    );
++    anyhow::ensure!(
++        allocator_trim_cooldown > Duration::ZERO,
++        "Allocator trim cooldown must be greater than zero"
++    );
++    for (component, value) in [
++        ("min_free_bytes", allocator_trim_min_free_bytes as f64),
++        ("cooldown_seconds", allocator_trim_cooldown.as_secs_f64()),
++    ] {
++        log_gauge_with_labels(
++            &BACKEND_ALLOCATOR_TRIM_CONFIGURATION_INFO,
++            value,
++            vec![StaticMetricLabel::new("component", component)],
++        );
++    }
++
++    if !shedding_enabled && !reclamation_enabled {
++        return Ok(None);
++    }
++
++    let shedding_enter_headroom_bytes =
++        u64::try_from(*LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES)?;
++    let shedding_exit_headroom_bytes =
++        u64::try_from(*LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES)?;
++    let reclamation_enter_headroom_bytes =
++        u64::try_from(*LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES)?;
++    let reclamation_exit_headroom_bytes =
++        u64::try_from(*LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES)?;
++
++    if shedding_enabled {
++        anyhow::ensure!(
++            shedding_enter_headroom_bytes < shedding_exit_headroom_bytes,
++            "Memory pressure shedding exit headroom must exceed enter headroom"
++        );
++        for (boundary, bytes) in [
++            ("enter", shedding_enter_headroom_bytes),
++            ("exit", shedding_exit_headroom_bytes),
++        ] {
++            log_gauge_with_labels(
++                &BACKEND_MEMORY_PRESSURE_HEADROOM_THRESHOLD_BYTES,
++                bytes as f64,
++                vec![StaticMetricLabel::new("boundary", boundary)],
++            );
++        }
++    }
++    if reclamation_enabled {
++        anyhow::ensure!(
++            reclamation_enter_headroom_bytes < reclamation_exit_headroom_bytes,
++            "Memory reclamation exit headroom must exceed enter headroom"
++        );
++        for (boundary, bytes) in [
++            ("enter", reclamation_enter_headroom_bytes),
++            ("exit", reclamation_exit_headroom_bytes),
++        ] {
++            log_gauge_with_labels(
++                &BACKEND_MEMORY_RECLAMATION_HEADROOM_THRESHOLD_BYTES,
++                bytes as f64,
++                vec![StaticMetricLabel::new("boundary", boundary)],
++            );
++        }
++    }
++    if shedding_enabled && reclamation_enabled {
++        anyhow::ensure!(
++            reclamation_enter_headroom_bytes > shedding_enter_headroom_bytes
++                && reclamation_exit_headroom_bytes > shedding_exit_headroom_bytes,
++            "Internal memory reclamation must start and recover with more headroom than external \
++             shedding"
++        );
++    }
++
++    let cgroup = read_cgroup_memory(Path::new(CGROUP_ROOT))?
++        .context("Memory pressure control requires the cgroup v2 memory controller")?;
++    let max_bytes = cgroup
++        .max_bytes
++        .context("Memory pressure control requires a finite cgroup v2 memory limit")?;
++    if shedding_enabled {
++        anyhow::ensure!(
++            shedding_exit_headroom_bytes < max_bytes,
++            "Memory pressure shedding exit headroom must be smaller than the finite cgroup memory \
++             limit"
++        );
++    }
++    if reclamation_enabled {
++        anyhow::ensure!(
++            reclamation_exit_headroom_bytes < max_bytes,
++            "Memory reclamation exit headroom must be smaller than the finite cgroup memory limit"
++        );
++    }
++    let headroom_bytes = max_bytes.saturating_sub(cgroup.current_bytes);
++    log_gauge(
++        &BACKEND_MEMORY_PRESSURE_HEADROOM_BYTES,
++        headroom_bytes as f64,
++    );
++    let shedding_initially_active = shedding_enabled
++        && pressure_state(
++            false,
++            headroom_bytes,
++            shedding_enter_headroom_bytes,
++            shedding_exit_headroom_bytes,
++        );
++    let reclamation_initially_active = reclamation_enabled
++        && pressure_state(
++            false,
++            headroom_bytes,
++            reclamation_enter_headroom_bytes,
++            reclamation_exit_headroom_bytes,
++        );
++    log_gauge(
++        &BACKEND_MEMORY_PRESSURE_SHEDDING_ACTIVE_INFO,
++        if shedding_initially_active { 1.0 } else { 0.0 },
++    );
++    log_gauge(
++        &BACKEND_MEMORY_RECLAMATION_ACTIVE_INFO,
++        if reclamation_initially_active {
++            1.0
++        } else {
++            0.0
++        },
++    );
++
++    Ok(Some(CgroupMemoryPressureController {
++        external_request_shedding: shedding_enabled
++            .then(|| ExternalRequestShedding::new(shedding_initially_active)),
++        shedding_enter_headroom_bytes,
++        shedding_exit_headroom_bytes,
++        // Consumers enter only after the controller has attempted allocator
++        // trim for the initial pressure state.
++        memory_reclamation: MemoryPressureSignal::default(),
++        reclamation_active: reclamation_initially_active,
++        reclamation_enabled,
++        reclamation_enter_headroom_bytes,
++        reclamation_exit_headroom_bytes,
++        allocator_trim_enabled,
++        allocator_trim_min_free_bytes,
++        allocator_trim_cooldown,
++        last_allocator_trim_evaluated: None,
++    }))
++}
++
++impl CgroupMemoryPressureController {
++    pub fn external_request_shedding(&self) -> Option<ExternalRequestShedding> {
++        self.external_request_shedding.clone()
++    }
++
++    pub fn memory_reclamation(&self) -> MemoryPressureSignal {
++        self.memory_reclamation.clone()
++    }
++
++    fn update(&mut self, cgroup: &CgroupMemory) -> anyhow::Result<()> {
++        let max_bytes = cgroup
++            .max_bytes
++            .context("Memory pressure control requires a finite cgroup v2 memory limit")?;
++        let headroom_bytes = max_bytes.saturating_sub(cgroup.current_bytes);
++        log_gauge(
++            &BACKEND_MEMORY_PRESSURE_HEADROOM_BYTES,
++            headroom_bytes as f64,
++        );
++        if self.reclamation_enabled {
++            anyhow::ensure!(
++                self.reclamation_exit_headroom_bytes < max_bytes,
++                "Memory reclamation exit headroom must be smaller than the finite cgroup memory \
++                 limit"
++            );
++            let was_active = self.reclamation_active;
++            let is_active = pressure_state(
++                was_active,
++                headroom_bytes,
++                self.reclamation_enter_headroom_bytes,
++                self.reclamation_exit_headroom_bytes,
++            );
++            if is_active != was_active {
++                self.reclamation_active = is_active;
++                log_gauge(
++                    &BACKEND_MEMORY_RECLAMATION_ACTIVE_INFO,
++                    if is_active { 1.0 } else { 0.0 },
++                );
++                let state = if is_active { "active" } else { "inactive" };
++                log_counter_with_labels(
++                    &BACKEND_MEMORY_RECLAMATION_TRANSITIONS_TOTAL,
++                    1,
++                    vec![StaticMetricLabel::new("state", state)],
++                );
++                if is_active {
++                    tracing::warn!(
++                        cgroup_memory_current_bytes = cgroup.current_bytes,
++                        cgroup_memory_max_bytes = max_bytes,
++                        cgroup_memory_headroom_bytes = headroom_bytes,
++                        "Started reclaiming optional backend memory because cgroup headroom is low"
++                    );
++                } else {
++                    tracing::info!(
++                        cgroup_memory_current_bytes = cgroup.current_bytes,
++                        cgroup_memory_max_bytes = max_bytes,
++                        cgroup_memory_headroom_bytes = headroom_bytes,
++                        "Stopped internal memory reclamation after cgroup headroom recovered"
++                    );
++                }
++            }
++        }
++        if let Some(external_request_shedding) = &self.external_request_shedding {
++            anyhow::ensure!(
++                self.shedding_exit_headroom_bytes < max_bytes,
++                "Memory pressure shedding exit headroom must be smaller than the finite cgroup \
++                 memory limit"
++            );
++            let was_active = external_request_shedding.is_active();
++            let is_active = pressure_state(
++                was_active,
++                headroom_bytes,
++                self.shedding_enter_headroom_bytes,
++                self.shedding_exit_headroom_bytes,
++            );
++            if is_active != was_active {
++                let prior = external_request_shedding.set_active(is_active);
++                assert_eq!(
++                    prior, was_active,
++                    "memory pressure shedding has more than one state writer"
++                );
++                log_gauge(
++                    &BACKEND_MEMORY_PRESSURE_SHEDDING_ACTIVE_INFO,
++                    if is_active { 1.0 } else { 0.0 },
++                );
++                let state = if is_active { "active" } else { "inactive" };
++                log_counter_with_labels(
++                    &BACKEND_MEMORY_PRESSURE_TRANSITIONS_TOTAL,
++                    1,
++                    vec![StaticMetricLabel::new("state", state)],
++                );
++                if is_active {
++                    tracing::warn!(
++                        cgroup_memory_current_bytes = cgroup.current_bytes,
++                        cgroup_memory_max_bytes = max_bytes,
++                        cgroup_memory_headroom_bytes = headroom_bytes,
++                        "Started shedding new external HTTP work because cgroup memory headroom \
++                         is low"
++                    );
++                } else {
++                    tracing::info!(
++                        cgroup_memory_current_bytes = cgroup.current_bytes,
++                        cgroup_memory_max_bytes = max_bytes,
++                        cgroup_memory_headroom_bytes = headroom_bytes,
++                        "Stopped shedding external HTTP work after cgroup memory headroom \
++                         recovered"
++                    );
++                }
++            }
++        }
++        Ok(())
++    }
++
++    fn claim_allocator_trim(&mut self) -> bool {
++        if !self.allocator_trim_enabled || !self.reclamation_active {
++            return false;
++        }
++        let now = Instant::now();
++        if self
++            .last_allocator_trim_evaluated
++            .is_some_and(|last| now.duration_since(last) < self.allocator_trim_cooldown)
++        {
++            return false;
++        }
++        // The blocking trim task checks logical free space. Claim its cooldown
++        // first so pressure cannot start an arena-lock scan every second when
++        // the threshold is not met.
++        self.last_allocator_trim_evaluated = Some(now);
++        true
++    }
++
++    fn publish_reclamation_state(&self) {
++        let was_active = self.memory_reclamation.is_active();
++        if was_active == self.reclamation_active {
++            return;
++        }
++        let prior = self.memory_reclamation.set_active(self.reclamation_active);
++        assert_eq!(
++            prior, was_active,
++            "memory reclamation has more than one state writer"
++        );
++    }
++}
++
++fn update_memory_pressure_controller(
++    controller: &mut CgroupMemoryPressureController,
++) -> anyhow::Result<()> {
++    let cgroup = read_cgroup_memory(Path::new(CGROUP_ROOT))?
++        .context("Enabled memory pressure controller lost the cgroup v2 memory controller")?;
++    controller.update(&cgroup)
++}
++
++fn pressure_state(
++    active: bool,
++    headroom_bytes: u64,
++    enter_headroom_bytes: u64,
++    exit_headroom_bytes: u64,
++) -> bool {
++    if active {
++        headroom_bytes < exit_headroom_bytes
++    } else {
++        headroom_bytes <= enter_headroom_bytes
++    }
++}
++
++async fn run_allocator_trim(root: &Path, min_free_bytes: u64) -> anyhow::Result<()> {
++    let root = root.to_owned();
++    let run = match tokio_spawn_blocking("backend_allocator_trim", move || {
++        measure_allocator_trim(&root, min_free_bytes)
++    })
++    .await
++    .context("allocator trim blocking task failed")
++    .and_then(|result| result)
++    {
++        Ok(run) => run,
++        Err(error) => {
++            log_allocator_trim_attempt("sample_failure");
++            return Err(error);
++        },
++    };
++    let (before, after, returned, elapsed) = match run {
++        AllocatorTrimRun::Unsupported => {
++            log_allocator_trim_attempt("unsupported");
++            return Ok(());
++        },
++        AllocatorTrimRun::BelowFreeThreshold => return Ok(()),
++        AllocatorTrimRun::Completed {
++            before,
++            after,
++            returned,
++            elapsed,
++        } => (before, after, returned, elapsed),
++    };
++    let outcome = if returned {
++        "returned_true"
++    } else {
++        "returned_false"
++    };
++    log_distribution(&BACKEND_ALLOCATOR_TRIM_SECONDS, elapsed.as_secs_f64());
++    let after = match after {
++        Ok(after) => after,
++        Err(error) => {
++            log_allocator_trim_attempt("sample_failure");
++            return Err(error);
++        },
++    };
++    let minor_faults = match after
++        .page_faults
++        .minor
++        .checked_sub(before.page_faults.minor)
++    {
++        Some(faults) => faults,
++        None => {
++            log_allocator_trim_attempt("sample_failure");
++            anyhow::bail!("process minor page-fault counter decreased during allocator trim");
++        },
++    };
++    let major_faults = match after
++        .page_faults
++        .major
++        .checked_sub(before.page_faults.major)
++    {
++        Some(faults) => faults,
++        None => {
++            log_allocator_trim_attempt("sample_failure");
++            anyhow::bail!("process major page-fault counter decreased during allocator trim");
++        },
++    };
++    for (component, before_bytes, after_bytes) in [
++        (
++            "process_resident",
++            before.process.resident_bytes,
++            after.process.resident_bytes,
++        ),
++        (
++            "process_resident_anon",
++            before.process.resident_anon_bytes,
++            after.process.resident_anon_bytes,
++        ),
++        (
++            "cgroup_current",
++            before.cgroup_current_bytes,
++            after.cgroup_current_bytes,
++        ),
++        (
++            "cgroup_anon",
++            before.cgroup_anon_bytes,
++            after.cgroup_anon_bytes,
++        ),
++    ] {
++        log_trim_memory_change(component, before_bytes, after_bytes);
++    }
++    if let (Some(before_allocator), Some(after_allocator)) = (&before.allocator, &after.allocator) {
++        log_trim_memory_change(
++            "allocator_free",
++            before_allocator.free_bytes,
++            after_allocator.free_bytes,
++        );
++    }
++    for (kind, faults) in [("minor", minor_faults), ("major", major_faults)] {
++        log_counter_with_labels(
++            &BACKEND_ALLOCATOR_TRIM_PAGE_FAULTS_TOTAL,
++            faults,
++            vec![StaticMetricLabel::new("kind", kind)],
++        );
++    }
++    log_allocator_trim_attempt(outcome);
++    tracing::info!(
++        allocator_trim_outcome = outcome,
++        allocator_trim_duration_seconds = elapsed.as_secs_f64(),
++        process_resident_before_bytes = before.process.resident_bytes,
++        process_resident_after_bytes = after.process.resident_bytes,
++        cgroup_current_before_bytes = before.cgroup_current_bytes,
++        cgroup_current_after_bytes = after.cgroup_current_bytes,
++        "Completed explicit backend allocator trim"
++    );
++    Ok(())
++}
++
++fn log_allocator_trim_attempt(outcome: &'static str) {
++    log_counter_with_labels(
++        &BACKEND_ALLOCATOR_TRIM_ATTEMPTS_TOTAL,
++        1,
++        vec![StaticMetricLabel::new("outcome", outcome)],
++    );
++}
++
++fn measure_allocator_trim(root: &Path, min_free_bytes: u64) -> anyhow::Result<AllocatorTrimRun> {
++    let before = allocator_trim_snapshot(root)?;
++    let Some(allocator) = &before.allocator else {
++        return Ok(AllocatorTrimRun::Unsupported);
++    };
++    if allocator.free_bytes < min_free_bytes {
++        return Ok(AllocatorTrimRun::BelowFreeThreshold);
++    }
++
++    log_gauge(&BACKEND_ALLOCATOR_TRIM_ACTIVE_INFO, 1.0);
++    let started = Instant::now();
++    let returned = explicit_allocator_trim();
++    let elapsed = started.elapsed();
++    log_gauge(&BACKEND_ALLOCATOR_TRIM_ACTIVE_INFO, 0.0);
++    let returned = returned.context("allocator telemetry was available but trim is unsupported")?;
++    let after = allocator_trim_snapshot(root);
++    Ok(AllocatorTrimRun::Completed {
++        before,
++        after,
++        returned,
++        elapsed,
++    })
++}
++
++fn log_trim_memory_change(component: &'static str, before: u64, after: u64) {
++    let change = signed_memory_change(before, after);
++    log_gauge_with_labels(
++        &BACKEND_ALLOCATOR_TRIM_MEMORY_CHANGE_BYTES,
++        change as f64,
++        vec![StaticMetricLabel::new("component", component)],
++    );
++}
++
++fn signed_memory_change(before: u64, after: u64) -> i128 {
++    i128::from(after) - i128::from(before)
++}
++
++fn allocator_trim_snapshot(root: &Path) -> anyhow::Result<AllocatorTrimSnapshot> {
++    let process = parse_process_status(&fs::read_to_string("/proc/self/status")?)?;
++    let allocator = allocator_memory()?;
++    let cgroup = read_cgroup_memory(root)?
++        .context("allocator trim requires the cgroup v2 memory controller")?;
++    let stat = parse_keyed_u64(&fs::read_to_string(root.join("memory.stat"))?)?;
++    let cgroup_anon_bytes = *stat
++        .get("anon")
++        .context("allocator trim requires cgroup anonymous-memory accounting")?;
++    Ok(AllocatorTrimSnapshot {
++        process,
++        allocator,
++        cgroup_current_bytes: cgroup.current_bytes,
++        cgroup_anon_bytes,
++        page_faults: read_process_page_faults()?,
++    })
++}
++
++fn read_process_page_faults() -> anyhow::Result<PageFaults> {
++    // SAFETY: `getrusage` initializes the provided process-local `rusage`
++    // structure and does not retain the pointer.
++    let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
++    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
++    anyhow::ensure!(result == 0, "getrusage failed for allocator trim telemetry");
++    Ok(PageFaults {
++        minor: u64::try_from(usage.ru_minflt)?,
++        major: u64::try_from(usage.ru_majflt)?,
++    })
++}
++
++#[cfg(target_env = "gnu")]
++fn explicit_allocator_trim() -> Option<bool> {
++    // SAFETY: glibc documents `malloc_trim` as MT-Safe. A zero pad asks the
++    // allocator to retain no extra main-arena top space.
++    Some(unsafe { libc::malloc_trim(0) } != 0)
++}
++
++#[cfg(not(target_env = "gnu"))]
++fn explicit_allocator_trim() -> Option<bool> {
++    None
++}
++
++fn report_allocator_arena_count() -> anyhow::Result<()> {
++    match allocator_arena_count()? {
++        Some(count) => {
++            log_gauge(&BACKEND_ALLOCATOR_ARENA_TELEMETRY_INFO, 1.0);
++            log_gauge(&BACKEND_ALLOCATOR_ARENAS_INFO, count as f64);
++        },
++        None => log_gauge(&BACKEND_ALLOCATOR_ARENA_TELEMETRY_INFO, 0.0),
++    }
++    Ok(())
++}
++
++#[cfg(target_env = "gnu")]
++fn allocator_arena_count() -> anyhow::Result<Option<usize>> {
++    let mut contents = vec![0u8; MAX_MALLOC_INFO_BYTES];
++    // SAFETY: `contents` is writable for its full length and remains alive until
++    // after the returned stream has been closed. The mode is NUL terminated.
++    let stream =
++        unsafe { libc::fmemopen(contents.as_mut_ptr().cast(), contents.len(), c"w".as_ptr()) };
++    anyhow::ensure!(!stream.is_null(), "fmemopen failed for malloc_info");
++    // SAFETY: the stream is a valid writable FILE owned by this function. The
++    // fixed backing buffer bounds output even if allocator state is malformed.
++    let info_result = unsafe { libc::malloc_info(0, stream) };
++    let flush_result = unsafe { libc::fflush(stream) };
++    let stream_error = unsafe { libc::ferror(stream) };
++    let length = unsafe { libc::ftell(stream) };
++    let close_result = unsafe { libc::fclose(stream) };
++    anyhow::ensure!(info_result == 0, "malloc_info failed");
++    anyhow::ensure!(flush_result == 0, "flushing malloc_info stream failed");
++    anyhow::ensure!(
++        stream_error == 0,
++        "malloc_info output exceeded its size limit"
++    );
++    anyhow::ensure!(length >= 0, "malloc_info stream position is unavailable");
++    anyhow::ensure!(close_result == 0, "closing malloc_info stream failed");
++    let length = usize::try_from(length)?;
++    anyhow::ensure!(
++        length < contents.len(),
++        "malloc_info output exceeded its size limit"
++    );
++    let xml =
++        std::str::from_utf8(&contents[..length]).context("malloc_info returned invalid UTF-8")?;
++    let count = xml.match_indices("<heap nr=").count();
++    anyhow::ensure!(count > 0, "malloc_info returned no allocator arenas");
++    Ok(Some(count))
++}
++
++#[cfg(not(target_env = "gnu"))]
++fn allocator_arena_count() -> anyhow::Result<Option<usize>> {
++    Ok(None)
++}
++
++pub fn validate_startup_budget() -> anyhow::Result<()> {
++    let budget = configured_startup_budget()?;
++    for component in &budget.components {
++        log_gauge_with_labels(
++            &BACKEND_STARTUP_MEMORY_BUDGET_BYTES,
++            component.bytes as f64,
++            vec![StaticMetricLabel::new("component", component.name)],
++        );
++    }
++    log_gauge_with_labels(
++        &BACKEND_STARTUP_MEMORY_BUDGET_BYTES,
++        budget.total_bytes as f64,
++        vec![StaticMetricLabel::new("component", "configured_total")],
++    );
++
++    match startup_budget_headroom(Path::new(CGROUP_ROOT), &budget)? {
++        Some(headroom_bytes) => {
++            log_gauge(&BACKEND_STARTUP_MEMORY_BUDGET_LIMIT_AVAILABLE_INFO, 1.0);
++            log_gauge(
++                &BACKEND_STARTUP_MEMORY_BUDGET_HEADROOM_BYTES,
++                headroom_bytes as f64,
++            );
++            tracing::info!(
++                configured_memory_budget_bytes = budget.total_bytes,
++                memory_budget_headroom_bytes = headroom_bytes,
++                "Validated configured startup memory budget against the cgroup limit"
++            );
++        },
++        None => {
++            log_gauge(&BACKEND_STARTUP_MEMORY_BUDGET_LIMIT_AVAILABLE_INFO, 0.0);
++            tracing::info!(
++                configured_memory_budget_bytes = budget.total_bytes,
++                "Skipped startup memory feasibility because no finite cgroup v2 limit is available"
++            );
++        },
++    }
++    Ok(())
++}
++
++fn configured_startup_budget() -> anyhow::Result<StartupMemoryBudget> {
++    let isolate_workers =
++        u64::try_from(*MAX_ISOLATE_WORKERS).context("MAX_ISOLATE_WORKERS does not fit in u64")?;
++    let isolate_heap_per_worker = ISOLATE_MAX_USER_HEAP_SIZE
++        .checked_add(*ISOLATE_MAX_HEAP_EXTRA_SIZE)
++        .context("configured isolate heap size overflow")?;
++    let isolate_heap_pool = u64::try_from(isolate_heap_per_worker)?
++        .checked_mul(isolate_workers)
++        .context("configured isolate heap pool overflow")?;
++    let isolate_array_buffer_pool = u64::try_from(*ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE)?
++        .checked_mul(isolate_workers)
++        .context("configured isolate ArrayBuffer pool overflow")?;
++    StartupMemoryBudget::new(vec![
++        MemoryBudgetComponent {
++            name: "isolate_heap_pool",
++            bytes: isolate_heap_pool,
++        },
++        MemoryBudgetComponent {
++            name: "isolate_array_buffer_pool",
++            bytes: isolate_array_buffer_pool,
++        },
++        MemoryBudgetComponent {
++            name: "query_cache",
++            bytes: u64::try_from(*UDF_CACHE_MAX_SIZE)?,
++        },
++        MemoryBudgetComponent {
++            name: "shared_index_cache",
++            bytes: *INDEX_CACHE_SIZE,
++        },
++        MemoryBudgetComponent {
++            name: "application_module_cache",
++            bytes: *MODULE_CACHE_MAX_SIZE_BYTES,
++        },
++        MemoryBudgetComponent {
++            name: "function_runner_index_cache",
++            bytes: *FUNRUN_INDEX_CACHE_SIZE,
++        },
++        MemoryBudgetComponent {
++            name: "function_runner_module_cache",
++            bytes: *FUNRUN_MODULE_CACHE_SIZE,
++        },
++        MemoryBudgetComponent {
++            name: "function_runner_code_cache",
++            bytes: *FUNRUN_CODE_CACHE_SIZE,
++        },
++        MemoryBudgetComponent {
++            // This sampled Linux direct-child retirement trigger is a planning allowance, not a
++            // hard RSS maximum. Sampling delay, active-request drain, and descendants can exceed
++            // it.
++            name: "local_node_rss_threshold",
++            bytes: u64::try_from(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES)?,
++        },
++        MemoryBudgetComponent {
++            name: "native_kernel_reserve",
++            bytes: u64::try_from(*LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES)?,
++        },
++    ])
++}
++
++fn startup_budget_headroom(
++    root: &Path,
++    budget: &StartupMemoryBudget,
++) -> anyhow::Result<Option<u64>> {
++    let Some(cgroup) = read_cgroup_memory(root)? else {
++        return Ok(None);
++    };
++    let Some(limit_bytes) = cgroup.max_bytes else {
++        return Ok(None);
++    };
++    anyhow::ensure!(
++        budget.total_bytes <= limit_bytes,
++        "Configured startup memory budget exceeds the finite cgroup memory limit: budget={} \
++         bytes, limit={} bytes",
++        budget.total_bytes,
++        limit_bytes
++    );
++    Ok(Some(limit_bytes - budget.total_bytes))
++}
++
++pub fn start<RT: Runtime>(
++    runtime: RT,
++    pressure_controller: Option<CgroupMemoryPressureController>,
++    shutdown: ShutdownSignal,
++) {
++    log_counter(&BACKEND_MEMORY_TELEMETRY_FAILURES_TOTAL, 0);
++    if let Some(mut controller) = pressure_controller {
++        let pressure_runtime = runtime.clone();
++        runtime
++            .clone()
++            .spawn_background("backend_memory_pressure_controller", async move {
++                loop {
++                    if let Err(error) = update_memory_pressure_controller(&mut controller) {
++                        log_counter(&BACKEND_MEMORY_PRESSURE_FAILURES_TOTAL, 1);
++                        shutdown.signal(error);
++                        return;
++                    }
++                    if controller.claim_allocator_trim() {
++                        if let Err(error) = run_allocator_trim(
++                            Path::new(CGROUP_ROOT),
++                            controller.allocator_trim_min_free_bytes,
++                        )
++                        .await
++                        {
++                            // Trimming is an optional recovery action. Keep the
++                            // remaining reclamation controls available when the
++                            // allocator or its diagnostic snapshot fails.
++                            log_counter(&BACKEND_MEMORY_TELEMETRY_FAILURES_TOTAL, 1);
++                            tracing::error!(
++                                "Backend allocator trim or its telemetry failed: {error:#}"
++                            );
++                        }
++                        // Trim can either recover the reclamation threshold or
++                        // take long enough for headroom to cross the shedding
++                        // threshold. Publish only after a fresh cgroup sample.
++                        if let Err(error) = update_memory_pressure_controller(&mut controller) {
++                            log_counter(&BACKEND_MEMORY_PRESSURE_FAILURES_TOTAL, 1);
++                            shutdown.signal(error);
++                            return;
++                        }
++                    }
++                    // Allocator trim is the first pressure action. Context and
++                    // Node consumers observe entry only after it completes or
++                    // is skipped; exit is published in the same sample.
++                    controller.publish_reclamation_state();
++                    pressure_runtime.wait(PRESSURE_SAMPLE_INTERVAL).await;
++                }
++            });
++    }
++
++    runtime
++        .clone()
++        .spawn_background("backend_memory_metrics", async move {
++            let mut memory_reports_since_allocator_arena_report = 0;
++            loop {
++                let report = tokio_spawn_blocking("backend_memory_metrics_sample", || {
++                    let root = Path::new(CGROUP_ROOT);
++                    report_with_cgroup(root, read_cgroup_memory(root))
++                })
++                .await;
++                let failures = match report {
++                    Ok(failures) => failures,
++                    Err(error) => vec![SourceFailure {
++                        source: "blocking_task",
++                        error: error.into(),
++                    }],
++                };
++                log_gauge(
++                    &BACKEND_MEMORY_TELEMETRY_UP_INFO,
++                    if failures.is_empty() { 1.0 } else { 0.0 },
++                );
++                if !failures.is_empty() {
++                    // Memory telemetry is an observability boundary when it is
++                    // not also the configured pressure-control source. Publish
++                    // coverage loss and retry.
++                    log_counter(&BACKEND_MEMORY_TELEMETRY_FAILURES_TOTAL, 1);
++                }
++                for failure in failures {
++                    tracing::error!(
++                        source = failure.source,
++                        "Backend memory telemetry source failed: {:#}",
++                        failure.error
++                    );
++                }
++
++                if memory_reports_since_allocator_arena_report == 0 {
++                    let arena_report =
++                        tokio_spawn_blocking("backend_allocator_arena_metrics", || {
++                            report_allocator_arena_count()
++                        })
++                        .await;
++                    match arena_report {
++                        Ok(Ok(())) => {},
++                        Ok(Err(error)) => {
++                            log_gauge(&BACKEND_ALLOCATOR_ARENA_TELEMETRY_INFO, 0.0);
++                            log_counter(&BACKEND_MEMORY_TELEMETRY_FAILURES_TOTAL, 1);
++                            tracing::error!(
++                                "Backend allocator arena telemetry source failed: {error:#}"
++                            );
++                        },
++                        Err(error) => {
++                            log_gauge(&BACKEND_ALLOCATOR_ARENA_TELEMETRY_INFO, 0.0);
++                            log_counter(&BACKEND_MEMORY_TELEMETRY_FAILURES_TOTAL, 1);
++                            tracing::error!(
++                                "Backend allocator arena telemetry task failed: {error:#}"
++                            );
++                        },
++                    }
++                }
++                memory_reports_since_allocator_arena_report =
++                    (memory_reports_since_allocator_arena_report + 1)
++                        % MEMORY_REPORTS_PER_ALLOCATOR_ARENA_REPORT;
++                runtime.wait(REPORT_INTERVAL).await;
++            }
++        });
++}
++
++#[cfg(test)]
++fn report() -> Vec<SourceFailure> {
++    let root = Path::new(CGROUP_ROOT);
++    report_with_cgroup(root, read_cgroup_memory(root))
++}
++
++fn report_with_cgroup(
++    root: &Path,
++    cgroup: anyhow::Result<Option<CgroupMemory>>,
++) -> Vec<SourceFailure> {
++    let mut failures = Vec::new();
++    sample_source("process", report_process_memory, &mut failures);
++    sample_source("allocator", report_allocator_memory, &mut failures);
++    report_cgroup_memory(root, cgroup, &mut failures);
++    failures
++}
++
++fn sample_source(
++    source: &'static str,
++    sample: impl FnOnce() -> anyhow::Result<()>,
++    failures: &mut Vec<SourceFailure>,
++) {
++    match sample() {
++        Ok(()) => log_gauge_with_labels(
++            &BACKEND_MEMORY_TELEMETRY_SOURCE_UP_INFO,
++            1.0,
++            vec![StaticMetricLabel::new("source", source)],
++        ),
++        Err(error) => {
++            log_gauge_with_labels(
++                &BACKEND_MEMORY_TELEMETRY_SOURCE_UP_INFO,
++                0.0,
++                vec![StaticMetricLabel::new("source", source)],
++            );
++            failures.push(SourceFailure { source, error });
++        },
++    }
++}
++
++fn report_process_memory() -> anyhow::Result<()> {
++    let process = parse_process_status(&fs::read_to_string("/proc/self/status")?)?;
++    for (component, value) in [
++        ("virtual", process.virtual_bytes),
++        ("resident", process.resident_bytes),
++        ("resident_anon", process.resident_anon_bytes),
++        ("resident_file", process.resident_file_bytes),
++        ("resident_shmem", process.resident_shmem_bytes),
++        ("swap", process.swap_bytes),
++    ] {
++        log_gauge_with_labels(
++            &BACKEND_PROCESS_MEMORY_BYTES,
++            value as f64,
++            vec![StaticMetricLabel::new("component", component)],
++        );
++    }
++    Ok(())
++}
++
++fn report_allocator_memory() -> anyhow::Result<()> {
++    if let Some(allocator) = allocator_memory()? {
++        log_gauge(&BACKEND_ALLOCATOR_TELEMETRY_INFO, 1.0);
++        for (component, value) in [
++            ("arena", allocator.arena_bytes),
++            ("mmap", allocator.mmap_bytes),
++            ("in_use", allocator.in_use_bytes),
++            ("free", allocator.free_bytes),
++            ("releasable", allocator.releasable_bytes),
++        ] {
++            log_gauge_with_labels(
++                &BACKEND_ALLOCATOR_MEMORY_BYTES,
++                value as f64,
++                vec![StaticMetricLabel::new("component", component)],
++            );
++        }
++        log_gauge(
++            &BACKEND_ALLOCATOR_MMAP_REGIONS_INFO,
++            allocator.mmap_regions as f64,
++        );
++    } else {
++        log_gauge(&BACKEND_ALLOCATOR_TELEMETRY_INFO, 0.0);
++    }
++    Ok(())
++}
++
++fn report_cgroup_memory(
++    root: &Path,
++    cgroup: anyhow::Result<Option<CgroupMemory>>,
++    failures: &mut Vec<SourceFailure>,
++) {
++    let cgroup = match cgroup {
++        Ok(cgroup) => {
++            log_gauge_with_labels(
++                &BACKEND_MEMORY_TELEMETRY_SOURCE_UP_INFO,
++                1.0,
++                vec![StaticMetricLabel::new("source", "cgroup_controller")],
++            );
++            cgroup
++        },
++        Err(error) => {
++            log_gauge(&BACKEND_CGROUP_MEMORY_CONTROLLER_INFO, 0.0);
++            log_gauge_with_labels(
++                &BACKEND_MEMORY_TELEMETRY_SOURCE_UP_INFO,
++                0.0,
++                vec![StaticMetricLabel::new("source", "cgroup_controller")],
++            );
++            failures.push(SourceFailure {
++                source: "cgroup_controller",
++                error,
++            });
++            None
++        },
++    };
++    let Some(cgroup) = cgroup else {
++        log_gauge(&BACKEND_CGROUP_MEMORY_CONTROLLER_INFO, 0.0);
++        for source in ["cgroup_stat", "cgroup_events"] {
++            log_gauge_with_labels(
++                &BACKEND_MEMORY_TELEMETRY_SOURCE_UP_INFO,
++                0.0,
++                vec![StaticMetricLabel::new("source", source)],
++            );
++        }
++        set_cgroup_field_availability(0.0);
++        return;
++    };
++
++    log_gauge(&BACKEND_CGROUP_MEMORY_CONTROLLER_INFO, 1.0);
++    log_gauge_with_labels(
++        &BACKEND_CGROUP_MEMORY_BYTES,
++        cgroup.current_bytes as f64,
++        vec![StaticMetricLabel::new("component", "current")],
++    );
++    match cgroup.max_bytes {
++        Some(max_bytes) => {
++            log_gauge(&BACKEND_CGROUP_MEMORY_LIMITED_INFO, 1.0);
++            log_gauge_with_labels(
++                &BACKEND_CGROUP_MEMORY_BYTES,
++                max_bytes as f64,
++                vec![StaticMetricLabel::new("component", "max")],
++            );
++        },
++        None => log_gauge(&BACKEND_CGROUP_MEMORY_LIMITED_INFO, 0.0),
++    }
++
++    sample_source("cgroup_stat", || report_cgroup_stat(root), failures);
++    sample_source("cgroup_events", || report_cgroup_events(root), failures);
++}
++
++fn report_cgroup_stat(root: &Path) -> anyhow::Result<()> {
++    let stat = parse_keyed_u64(&fs::read_to_string(root.join("memory.stat"))?)?;
++    for component in ["anon", "file", "kernel", "shmem", "sock"] {
++        let value = stat.get(component);
++        log_gauge_with_labels(
++            &BACKEND_CGROUP_MEMORY_COMPONENT_AVAILABLE_INFO,
++            if value.is_some() { 1.0 } else { 0.0 },
++            vec![StaticMetricLabel::new("component", component)],
++        );
++        if let Some(value) = value {
++            log_gauge_with_labels(
++                &BACKEND_CGROUP_MEMORY_BYTES,
++                *value as f64,
++                vec![StaticMetricLabel::new("component", component)],
++            );
++        }
++    }
++    anyhow::ensure!(
++        stat.contains_key("anon") && stat.contains_key("file"),
++        "cgroup memory.stat is missing required anon or file accounting"
++    );
++    Ok(())
++}
++
++fn report_cgroup_events(root: &Path) -> anyhow::Result<()> {
++    let events = parse_keyed_u64(&fs::read_to_string(root.join("memory.events"))?)?;
++    for event in ["low", "high", "max", "oom", "oom_kill"] {
++        let value = events.get(event);
++        log_gauge_with_labels(
++            &BACKEND_CGROUP_MEMORY_EVENT_AVAILABLE_INFO,
++            if value.is_some() { 1.0 } else { 0.0 },
++            vec![StaticMetricLabel::new("event", event)],
++        );
++        if let Some(value) = value {
++            log_gauge_with_labels(
++                &BACKEND_CGROUP_MEMORY_EVENTS_INFO,
++                *value as f64,
++                vec![StaticMetricLabel::new("event", event)],
++            );
++        }
++    }
++    anyhow::ensure!(
++        ["low", "high", "max", "oom", "oom_kill"]
++            .iter()
++            .all(|event| events.contains_key(*event)),
++        "cgroup memory.events is missing a required event"
++    );
++
++    let oom_group_kill = events.get("oom_group_kill");
++    log_gauge_with_labels(
++        &BACKEND_CGROUP_MEMORY_EVENT_AVAILABLE_INFO,
++        if oom_group_kill.is_some() { 1.0 } else { 0.0 },
++        vec![StaticMetricLabel::new("event", "oom_group_kill")],
++    );
++    if let Some(value) = oom_group_kill {
++        log_gauge_with_labels(
++            &BACKEND_CGROUP_MEMORY_EVENTS_INFO,
++            *value as f64,
++            vec![StaticMetricLabel::new("event", "oom_group_kill")],
++        );
++    }
++    Ok(())
++}
++
++fn set_cgroup_field_availability(value: f64) {
++    for component in ["anon", "file", "kernel", "shmem", "sock"] {
++        log_gauge_with_labels(
++            &BACKEND_CGROUP_MEMORY_COMPONENT_AVAILABLE_INFO,
++            value,
++            vec![StaticMetricLabel::new("component", component)],
++        );
++    }
++    for event in ["low", "high", "max", "oom", "oom_kill", "oom_group_kill"] {
++        log_gauge_with_labels(
++            &BACKEND_CGROUP_MEMORY_EVENT_AVAILABLE_INFO,
++            value,
++            vec![StaticMetricLabel::new("event", event)],
++        );
++    }
++}
++
++fn parse_process_status(status: &str) -> anyhow::Result<ProcessMemory> {
++    let mut values = BTreeMap::new();
++    for line in status.lines() {
++        let Some((name, value)) = line.split_once(':') else {
++            continue;
++        };
++        if matches!(
++            name,
++            "VmSize" | "VmRSS" | "RssAnon" | "RssFile" | "RssShmem" | "VmSwap"
++        ) {
++            anyhow::ensure!(
++                values
++                    .insert(name, parse_kib(value).with_context(|| name.to_owned())?)
++                    .is_none(),
++                "duplicate {name} in /proc/self/status"
++            );
++        }
++    }
++    let get = |name| {
++        values
++            .get(name)
++            .copied()
++            .with_context(|| format!("/proc/self/status missing {name}"))
++    };
++    let memory = ProcessMemory {
++        virtual_bytes: get("VmSize")?,
++        resident_bytes: get("VmRSS")?,
++        resident_anon_bytes: get("RssAnon")?,
++        resident_file_bytes: get("RssFile")?,
++        resident_shmem_bytes: get("RssShmem")?,
++        swap_bytes: get("VmSwap")?,
++    };
++    let resident_parts = memory
++        .resident_anon_bytes
++        .checked_add(memory.resident_file_bytes)
++        .and_then(|value| value.checked_add(memory.resident_shmem_bytes))
++        .context("process resident-memory accounting overflow")?;
++    anyhow::ensure!(
++        resident_parts == memory.resident_bytes,
++        "process resident-memory accounting does not reconcile"
++    );
++    Ok(memory)
++}
++
++fn parse_kib(value: &str) -> anyhow::Result<u64> {
++    let mut fields = value.split_whitespace();
++    let kib: u64 = fields.next().context("missing KiB value")?.parse()?;
++    anyhow::ensure!(fields.next() == Some("kB"), "memory value is not in KiB");
++    anyhow::ensure!(fields.next().is_none(), "memory value has trailing fields");
++    kib.checked_mul(1024).context("memory byte count overflow")
++}
++
++#[cfg(target_env = "gnu")]
++fn allocator_memory() -> anyhow::Result<Option<AllocatorMemory>> {
++    // SAFETY: `mallinfo2` has no arguments and returns a value snapshot. glibc
++    // documents it as MT-Safe.
++    let info = unsafe { libc::mallinfo2() };
++    let arena_bytes = u64::try_from(info.arena)?;
++    let in_use_bytes = u64::try_from(info.uordblks)?;
++    let free_bytes = u64::try_from(info.fordblks)?;
++    anyhow::ensure!(
++        in_use_bytes.checked_add(free_bytes) == Some(arena_bytes),
++        "allocator arena accounting does not reconcile"
++    );
++    let releasable_bytes = u64::try_from(info.keepcost)?;
++    anyhow::ensure!(
++        releasable_bytes <= free_bytes,
++        "allocator releasable bytes exceed free arena bytes"
++    );
++    Ok(Some(AllocatorMemory {
++        arena_bytes,
++        mmap_bytes: u64::try_from(info.hblkhd)?,
++        in_use_bytes,
++        free_bytes,
++        releasable_bytes,
++        mmap_regions: u64::try_from(info.hblks)?,
++    }))
++}
++
++#[cfg(not(target_env = "gnu"))]
++fn allocator_memory() -> anyhow::Result<Option<AllocatorMemory>> {
++    Ok(None)
++}
++
++fn read_cgroup_memory(root: &Path) -> anyhow::Result<Option<CgroupMemory>> {
++    let current_path = root.join("memory.current");
++    let max_path = root.join("memory.max");
++    match (current_path.exists(), max_path.exists()) {
++        (false, false) => return Ok(None),
++        (true, true) => {},
++        _ => anyhow::bail!(
++            "incomplete cgroup v2 memory controller: memory.current and memory.max must both exist"
++        ),
++    }
++    let current_bytes = parse_single_u64(&fs::read_to_string(current_path)?)?;
++    let max = fs::read_to_string(max_path)?;
++    let max = max.trim();
++    let max_bytes = if max == "max" {
++        None
++    } else {
++        Some(max.parse().context("invalid cgroup memory.max")?)
++    };
++    Ok(Some(CgroupMemory {
++        current_bytes,
++        max_bytes,
++    }))
++}
++
++fn parse_single_u64(value: &str) -> anyhow::Result<u64> {
++    let mut fields = value.split_whitespace();
++    let value = fields.next().context("missing integer")?.parse()?;
++    anyhow::ensure!(fields.next().is_none(), "integer has trailing fields");
++    Ok(value)
++}
++
++fn parse_keyed_u64(input: &str) -> anyhow::Result<BTreeMap<String, u64>> {
++    let mut values = BTreeMap::new();
++    for line in input.lines() {
++        let mut fields = line.split_whitespace();
++        let key = fields.next().context("missing key")?;
++        let value = fields.next().context("missing value")?.parse()?;
++        anyhow::ensure!(
++            fields.next().is_none(),
++            "value for {key} has trailing fields"
++        );
++        anyhow::ensure!(
++            values.insert(key.to_owned(), value).is_none(),
++            "duplicate key {key}"
++        );
++    }
++    Ok(values)
++}
++
++#[cfg(test)]
++mod tests {
++    use std::{
++        fs,
++        time::{
++            Duration,
++            Instant,
++        },
++    };
++
++    use common::memory_pressure::MemoryPressureSignal;
++    use tempfile::TempDir;
++
++    #[cfg(target_env = "gnu")]
++    use super::allocator_arena_count;
++    use super::{
++        parse_process_status,
++        pressure_state,
++        read_cgroup_memory,
++        report,
++        report_cgroup_events,
++        report_cgroup_stat,
++        signed_memory_change,
++        startup_budget_headroom,
++        CgroupMemory,
++        CgroupMemoryPressureController,
++        MemoryBudgetComponent,
++        ProcessMemory,
++        StartupMemoryBudget,
++    };
++
++    #[test]
++    fn memory_pressure_state_uses_inclusive_enter_and_exit_hysteresis() {
++        let enter = 3;
++        let exit = 5;
++
++        assert!(!pressure_state(false, 4, enter, exit));
++        assert!(pressure_state(false, 3, enter, exit));
++        assert!(pressure_state(true, 4, enter, exit));
++        assert!(!pressure_state(true, 5, enter, exit));
++    }
++
++    #[test]
++    fn reclamation_signal_is_published_after_controller_state_changes() {
++        let signal = MemoryPressureSignal::default();
++        let mut controller = CgroupMemoryPressureController {
++            external_request_shedding: None,
++            shedding_enter_headroom_bytes: 3,
++            shedding_exit_headroom_bytes: 5,
++            memory_reclamation: signal.clone(),
++            reclamation_active: false,
++            reclamation_enabled: true,
++            reclamation_enter_headroom_bytes: 6,
++            reclamation_exit_headroom_bytes: 8,
++            allocator_trim_enabled: false,
++            allocator_trim_min_free_bytes: 1,
++            allocator_trim_cooldown: Duration::from_secs(1),
++            last_allocator_trim_evaluated: None,
++        };
++
++        controller
++            .update(&CgroupMemory {
++                current_bytes: 94,
++                max_bytes: Some(100),
++            })
++            .unwrap();
++        assert!(controller.reclamation_active);
++        assert!(!signal.is_active());
++        controller.publish_reclamation_state();
++        assert!(signal.is_active());
++
++        controller
++            .update(&CgroupMemory {
++                current_bytes: 92,
++                max_bytes: Some(100),
++            })
++            .unwrap();
++        assert!(!controller.reclamation_active);
++        assert!(signal.is_active());
++        controller.publish_reclamation_state();
++        assert!(!signal.is_active());
++    }
++
++    #[test]
++    fn allocator_trim_eligibility_scan_obeys_the_trim_cooldown() {
++        let cooldown = Duration::from_secs(300);
++        let mut controller = CgroupMemoryPressureController {
++            external_request_shedding: None,
++            shedding_enter_headroom_bytes: 3,
++            shedding_exit_headroom_bytes: 5,
++            memory_reclamation: MemoryPressureSignal::default(),
++            reclamation_active: true,
++            reclamation_enabled: true,
++            reclamation_enter_headroom_bytes: 6,
++            reclamation_exit_headroom_bytes: 8,
++            allocator_trim_enabled: true,
++            allocator_trim_min_free_bytes: 1,
++            allocator_trim_cooldown: cooldown,
++            last_allocator_trim_evaluated: None,
++        };
++
++        assert!(controller.claim_allocator_trim());
++        assert!(!controller.claim_allocator_trim());
++        controller.last_allocator_trim_evaluated = Some(Instant::now() - cooldown);
++        assert!(controller.claim_allocator_trim());
++    }
++
++    #[test]
++    fn trim_memory_change_preserves_release_direction() {
++        assert_eq!(signed_memory_change(100, 40), -60);
++        assert_eq!(signed_memory_change(40, 100), 60);
++        assert_eq!(signed_memory_change(40, 40), 0);
++    }
++
++    #[cfg(target_env = "gnu")]
++    #[test]
++    fn live_glibc_arena_count_is_bounded_and_nonzero() {
++        assert!(allocator_arena_count().unwrap().unwrap() > 0);
++    }
++
++    #[test]
++    fn live_process_memory_accounting_reconciles() {
++        assert!(report().is_empty());
++    }
++
++    #[test]
++    fn process_status_requires_reconciled_rss_components() {
++        let status = "\
++VmSize:\t1000 kB
++VmRSS:\t600 kB
++RssAnon:\t300 kB
++RssFile:\t200 kB
++RssShmem:\t100 kB
++VmSwap:\t50 kB
++";
++        assert_eq!(
++            parse_process_status(status).unwrap(),
++            ProcessMemory {
++                virtual_bytes: 1_024_000,
++                resident_bytes: 614_400,
++                resident_anon_bytes: 307_200,
++                resident_file_bytes: 204_800,
++                resident_shmem_bytes: 102_400,
++                swap_bytes: 51_200,
++            }
++        );
++
++        let inconsistent = status.replace("VmRSS:\t600", "VmRSS:\t601");
++        assert!(parse_process_status(&inconsistent)
++            .unwrap_err()
++            .to_string()
++            .contains("does not reconcile"));
++    }
++
++    #[test]
++    fn cgroup_memory_preserves_absolute_events_and_unlimited_state() {
++        let root = TempDir::new().unwrap();
++        fs::write(root.path().join("memory.current"), "123\n").unwrap();
++        fs::write(root.path().join("memory.max"), "max\n").unwrap();
++        fs::write(root.path().join("memory.stat"), "anon 10\nfile 20\n").unwrap();
++        fs::write(
++            root.path().join("memory.events"),
++            "low 1\nhigh 2\nmax 3\noom 4\noom_kill 5\noom_group_kill 6\n",
++        )
++        .unwrap();
++
++        let memory = read_cgroup_memory(root.path()).unwrap().unwrap();
++        assert_eq!(memory.current_bytes, 123);
++        assert_eq!(memory.max_bytes, None);
++        report_cgroup_stat(root.path()).unwrap();
++        report_cgroup_events(root.path()).unwrap();
++    }
++
++    #[test]
++    fn missing_cgroup_memory_controller_is_explicit() {
++        let root = TempDir::new().unwrap();
++        assert_eq!(read_cgroup_memory(root.path()).unwrap(), None);
++    }
++
++    #[test]
++    fn finite_cgroup_limit_must_cover_configured_budget() {
++        let root = TempDir::new().unwrap();
++        fs::write(root.path().join("memory.current"), "80\n").unwrap();
++        fs::write(root.path().join("memory.max"), "150\n").unwrap();
++        let budget = StartupMemoryBudget::new(vec![MemoryBudgetComponent {
++            name: "test",
++            bytes: 100,
++        }])
++        .unwrap();
++
++        assert_eq!(
++            startup_budget_headroom(root.path(), &budget).unwrap(),
++            Some(50)
++        );
++
++        fs::write(root.path().join("memory.max"), "99\n").unwrap();
++        assert!(startup_budget_headroom(root.path(), &budget)
++            .unwrap_err()
++            .to_string()
++            .contains("exceeds the finite cgroup memory limit"));
++    }
++
++    #[test]
++    fn unlimited_or_absent_cgroup_skips_feasibility_failure() {
++        let budget = StartupMemoryBudget::new(vec![MemoryBudgetComponent {
++            name: "test",
++            bytes: 100,
++        }])
++        .unwrap();
++
++        let absent = TempDir::new().unwrap();
++        assert_eq!(
++            startup_budget_headroom(absent.path(), &budget).unwrap(),
++            None
++        );
++
++        let unlimited = TempDir::new().unwrap();
++        fs::write(unlimited.path().join("memory.current"), "80\n").unwrap();
++        fs::write(unlimited.path().join("memory.max"), "max\n").unwrap();
++        assert_eq!(
++            startup_budget_headroom(unlimited.path(), &budget).unwrap(),
++            None
++        );
++    }
++
++    #[test]
++    fn malformed_present_cgroup_controller_fails_feasibility_check() {
++        let root = TempDir::new().unwrap();
++        fs::write(root.path().join("memory.current"), "80\n").unwrap();
++        fs::write(root.path().join("memory.max"), "not-a-limit\n").unwrap();
++        let budget = StartupMemoryBudget::new(vec![MemoryBudgetComponent {
++            name: "test",
++            bytes: 100,
++        }])
++        .unwrap();
++
++        assert!(startup_budget_headroom(root.path(), &budget).is_err());
++    }
++
++    #[test]
++    fn incomplete_present_cgroup_controller_fails_feasibility_check() {
++        let root = TempDir::new().unwrap();
++        fs::write(root.path().join("memory.max"), "100\n").unwrap();
++        let budget = StartupMemoryBudget::new(vec![MemoryBudgetComponent {
++            name: "test",
++            bytes: 100,
++        }])
++        .unwrap();
++
++        assert!(startup_budget_headroom(root.path(), &budget).is_err());
++    }
++}
+diff --git a/crates/local_backend/src/proxy.rs b/crates/local_backend/src/proxy.rs
+index 499638cebc7a68ef03ad8a629bec60d0df001b38..81f4b3d4c18dc45efe63456ac9c19ea1f917db3f 100644
+--- a/crates/local_backend/src/proxy.rs
++++ b/crates/local_backend/src/proxy.rs
+@@ -13,6 +13,7 @@ use axum::{
+ use common::{
+     http::{
+         ConvexHttpService,
++        ExternalRequestShedding,
+         HttpResponseError,
+         NoopRouteMapper,
+     },
+@@ -39,6 +40,7 @@ pub async fn dev_site_proxy(
+     site_bind_addr: Option<([u8; 4], u16)>,
+     site_forward_prefix: String,
+     max_concurrent_requests: usize,
++    external_request_shedding: Option<ExternalRequestShedding>,
+     mut shutdown_rx: async_broadcast::Receiver<()>,
+ ) -> anyhow::Result<()> {
+     let Some(addr) = site_bind_addr else {
+@@ -75,11 +77,14 @@ pub async fn dev_site_proxy(
+             client: Client::builder(TokioExecutor::new()).build_http(),
+         });
+ 
+-    let service = ConvexHttpService::new(
++    let service = ConvexHttpService::new_with_dependency_reserve(
+         Router::new().fallback_service(router),
+         "backend_http_proxy",
+         "unknown".to_string(),
+         max_concurrent_requests,
++        0,
++        &[],
++        external_request_shedding,
+         *HTTP_SERVER_TIMEOUT_DURATION,
+         NoopRouteMapper,
+     );
+diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
+index d329fda9ed0ebc8c26a69b67feef3e4d9c9e5837..c82013f3b3bd0d9a515211c697b4493566e323f0 100644
+--- a/crates/node_executor/src/local.rs
++++ b/crates/node_executor/src/local.rs
+@@ -26,7 +26,18 @@ use std::{
+ 
+ use anyhow::Context;
+ use async_trait::async_trait;
+-use common::log_lines::LogLine;
++use common::{
++    knobs::{
++        LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE,
++        LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES,
++        LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB,
++        LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES,
++        LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE,
++        LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES,
++    },
++    log_lines::LogLine,
++    memory_pressure::MemoryPressureSignal,
++};
+ use errors::ErrorMetadata;
+ use futures_async_stream::try_stream;
+ use isolate::bundled_js::node_executor_file;
+@@ -44,6 +55,7 @@ use tokio::{
+     sync::{
+         mpsc,
+         Mutex,
++        Notify,
+     },
+ };
+ 
+@@ -65,8 +77,10 @@ const MAX_INVOKE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+ const MAX_NODE_VERSION_OUTPUT_BYTES: usize = 1024;
+ const MAX_HEALTH_CHECK_ATTEMPTS: u32 = 50;
+ const NODE_VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
++const PROCESS_RSS_READ_TIMEOUT: Duration = Duration::from_secs(1);
+ const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+ const WATCHDOG_FAILURE_THRESHOLD: u32 = 5;
++const MIB_BYTES: u64 = 1024 * 1024;
+ 
+ pub struct LocalNodeExecutor {
+     state: Arc<Mutex<LocalNodeExecutorState>>,
+@@ -78,6 +92,7 @@ pub struct LocalNodeExecutor {
+ #[derive(Default)]
+ struct LocalNodeExecutorState {
+     inner: Option<Arc<InnerLocalNodeExecutor>>,
++    retiring: Option<Arc<InnerLocalNodeExecutor>>,
+     replacement_for_generation: Option<u64>,
+     next_generation: u64,
+ }
+@@ -93,6 +108,13 @@ struct LocalNodeExecutorConfig {
+     health_check_timeout: Duration,
+     watchdog_interval: Duration,
+     watchdog_failure_threshold: u32,
++    max_old_space_size_mib: usize,
++    max_rss_bytes: u64,
++    memory_pressure: MemoryPressureSignal,
++    memory_pressure_min_rss_bytes: u64,
++    memory_pressure_grace: Duration,
++    max_generation_age: Duration,
++    max_imported_source_packages: u64,
+ }
+ 
+ struct ManagedChild {
+@@ -110,11 +132,18 @@ struct ReapingTempDir {
+ 
+ struct InnerLocalNodeExecutor {
+     generation: u64,
++    pid: u32,
+     started_at: Instant,
+     runtime_stats_supported: bool,
+     active_requests: AtomicUsize,
++    retirement_requested: AtomicBool,
++    idle: Notify,
++    retired: AtomicBool,
++    retirement_failed: AtomicBool,
++    retired_notify: Notify,
+     retained_source_packages: AtomicU64,
+     retained_external_packages: AtomicU64,
++    imported_source_packages: AtomicU64,
+     registered_stack_roots: AtomicU64,
+     // Initiate kill and reaping before removing the tempdir if explicit
+     // termination cannot complete or startup is canceled.
+@@ -143,6 +172,7 @@ where
+ #[derive(Default, Deserialize)]
+ #[serde(rename_all = "camelCase")]
+ struct NodePackageCacheStats {
++    imported_source_packages: u64,
+     retained_source_packages: u64,
+     retained_source_bytes: u64,
+     active_source_owners: u64,
+@@ -167,13 +197,17 @@ struct NodeStackTraceStats {
+     duration_ms: f64,
+ }
+ 
+-#[derive(Clone, Copy)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ enum GenerationRetirementReason {
+     RequestTimeout,
+     ResponseStreamTimeout,
+     ConnectionError,
+     ProcessExiting,
+     HealthCheckFailed,
++    RssLimit,
++    CgroupPressure,
++    AgeLimit,
++    PackageLimit,
+     ExplicitShutdown,
+ }
+ 
+@@ -185,6 +219,10 @@ impl GenerationRetirementReason {
+             Self::ConnectionError => "connection_error",
+             Self::ProcessExiting => "process_exiting",
+             Self::HealthCheckFailed => "health_check_failed",
++            Self::RssLimit => "rss_limit",
++            Self::CgroupPressure => "cgroup_pressure",
++            Self::AgeLimit => "age_limit",
++            Self::PackageLimit => "package_limit",
+             Self::ExplicitShutdown => "explicit_shutdown",
+         }
+     }
+@@ -230,6 +268,22 @@ impl GenerationRetirementDiagnostics {
+             transport_error_kind: "not_applicable",
+         }
+     }
++
++    fn proactive(reason: GenerationRetirementReason) -> Self {
++        assert!(matches!(
++            reason,
++            GenerationRetirementReason::RssLimit
++                | GenerationRetirementReason::CgroupPressure
++                | GenerationRetirementReason::AgeLimit
++                | GenerationRetirementReason::PackageLimit
++        ));
++        Self {
++            reason,
++            request_kind: "not_applicable",
++            phase: "watchdog",
++            transport_error_kind: "not_applicable",
++        }
++    }
+ }
+ 
+ #[derive(Debug, PartialEq, Eq)]
+@@ -282,6 +336,74 @@ fn classify_io_error_kind(error_kind: std::io::ErrorKind) -> &'static str {
+     }
+ }
+ 
++fn proactive_retirement_reason(
++    config: &LocalNodeExecutorConfig,
++    age: Duration,
++    rss_bytes: Option<u64>,
++    imported_source_packages: u64,
++    memory_pressure_active_for: Option<Duration>,
++) -> Option<GenerationRetirementReason> {
++    if rss_bytes.is_some_and(|rss| rss >= config.max_rss_bytes) {
++        Some(GenerationRetirementReason::RssLimit)
++    } else if memory_pressure_active_for.is_some_and(|active_for| {
++        active_for >= config.memory_pressure_grace
++            && rss_bytes.is_some_and(|rss| rss >= config.memory_pressure_min_rss_bytes)
++    }) {
++        Some(GenerationRetirementReason::CgroupPressure)
++    } else if imported_source_packages >= config.max_imported_source_packages {
++        Some(GenerationRetirementReason::PackageLimit)
++    } else if age >= config.max_generation_age {
++        Some(GenerationRetirementReason::AgeLimit)
++    } else {
++        None
++    }
++}
++
++#[cfg(target_os = "linux")]
++fn parse_process_rss(status: &str) -> anyhow::Result<u64> {
++    let mut rss = None;
++    for line in status.lines() {
++        let Some(value) = line.strip_prefix("VmRSS:") else {
++            continue;
++        };
++        anyhow::ensure!(
++            rss.is_none(),
++            "Node process status contains duplicate VmRSS"
++        );
++        let mut fields = value.split_whitespace();
++        let kib: u64 = fields
++            .next()
++            .context("Node process VmRSS is missing a value")?
++            .parse()
++            .context("Node process VmRSS is invalid")?;
++        anyhow::ensure!(
++            fields.next() == Some("kB") && fields.next().is_none(),
++            "Node process VmRSS has an invalid unit"
++        );
++        rss = Some(
++            kib.checked_mul(1024)
++                .context("Node process RSS byte count overflow")?,
++        );
++    }
++    rss.context("Node process status is missing VmRSS")
++}
++
++#[cfg(target_os = "linux")]
++async fn read_process_rss(pid: u32) -> anyhow::Result<Option<u64>> {
++    let status = tokio::time::timeout(
++        PROCESS_RSS_READ_TIMEOUT,
++        tokio::fs::read_to_string(format!("/proc/{pid}/status")),
++    )
++    .await
++    .context("Timed out reading local Node process status")??;
++    Ok(Some(parse_process_rss(&status)?))
++}
++
++#[cfg(not(target_os = "linux"))]
++async fn read_process_rss(_pid: u32) -> anyhow::Result<Option<u64>> {
++    Ok(None)
++}
++
+ struct ActiveRequestGuard {
+     inner: Arc<InnerLocalNodeExecutor>,
+     outcome: &'static str,
+@@ -291,6 +413,15 @@ struct WaitingRequestGuard {
+     waiting: bool,
+ }
+ 
++enum InnerAcquisition {
++    Ready {
++        inner: Arc<InnerLocalNodeExecutor>,
++        guard: ActiveRequestGuard,
++    },
++    Draining(Arc<InnerLocalNodeExecutor>),
++    Missing,
++}
++
+ impl ReapingTempDir {
+     fn new(generation: u64, source_dir: TempDir) -> Self {
+         Self {
+@@ -483,7 +614,8 @@ impl NodeExecutorHealth {
+             .stack_trace
+             .as_ref()
+             .expect("Validated Node health response is missing stack stats");
+-        package.source_hits >= previous_package.source_hits
++        package.imported_source_packages >= previous_package.imported_source_packages
++            && package.source_hits >= previous_package.source_hits
+             && package.source_publishes >= previous_package.source_publishes
+             && package.source_retirements >= previous_package.source_retirements
+             && package.source_failed_publications >= previous_package.source_failed_publications
+@@ -550,11 +682,106 @@ impl Drop for ActiveRequestGuard {
+     fn drop(&mut self) {
+         let generation_previous = self.inner.active_requests.fetch_sub(1, Ordering::Relaxed);
+         assert!(generation_previous > 0);
++        if generation_previous == 1 {
++            self.inner.idle.notify_waiters();
++        }
+         crate::metrics::log_local_node_request_completion(self.outcome);
+     }
+ }
+ 
++impl LocalNodeExecutorConfig {
++    fn validate(&self) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            self.node_process_timeout > Duration::ZERO,
++            "Local Node executor process timeout must be greater than zero"
++        );
++        anyhow::ensure!(
++            self.health_check_timeout > Duration::ZERO,
++            "Local Node executor health-check timeout must be greater than zero"
++        );
++        anyhow::ensure!(
++            self.watchdog_interval > Duration::ZERO,
++            "Local Node executor watchdog interval must be greater than zero"
++        );
++        anyhow::ensure!(
++            self.watchdog_failure_threshold > 0,
++            "Local Node executor watchdog failure threshold must be greater than zero"
++        );
++        anyhow::ensure!(
++            self.max_old_space_size_mib > 0,
++            "Local Node executor old-space allowance must be greater than zero"
++        );
++        anyhow::ensure!(
++            self.max_rss_bytes > 0,
++            "Local Node executor RSS threshold must be greater than zero"
++        );
++        anyhow::ensure!(
++            self.memory_pressure_min_rss_bytes > 0,
++            "Local Node executor cgroup-pressure RSS threshold must be greater than zero"
++        );
++        anyhow::ensure!(
++            self.memory_pressure_min_rss_bytes < self.max_rss_bytes,
++            "Local Node executor cgroup-pressure RSS threshold must be below the ordinary RSS \
++             threshold"
++        );
++        anyhow::ensure!(
++            self.memory_pressure_grace > Duration::ZERO,
++            "Local Node executor cgroup-pressure grace must be greater than zero"
++        );
++        anyhow::ensure!(
++            self.max_generation_age > Duration::ZERO,
++            "Local Node executor generation age threshold must be greater than zero"
++        );
++        anyhow::ensure!(
++            self.max_imported_source_packages > 0,
++            "Local Node executor package threshold must be greater than zero"
++        );
++        let old_space_bytes = u64::try_from(self.max_old_space_size_mib)?
++            .checked_mul(MIB_BYTES)
++            .context("Local Node executor old-space allowance overflow")?;
++        anyhow::ensure!(
++            old_space_bytes < self.max_rss_bytes,
++            "Local Node executor RSS threshold must exceed its V8 old-space allowance"
++        );
++        Ok(())
++    }
++
++    fn old_space_bytes(&self) -> u64 {
++        u64::try_from(self.max_old_space_size_mib)
++            .expect("validated local Node old-space allowance does not fit u64")
++            .checked_mul(MIB_BYTES)
++            .expect("validated local Node old-space allowance overflow")
++    }
++}
++
+ impl InnerLocalNodeExecutor {
++    async fn wait_until_idle(&self) {
++        loop {
++            let notified = self.idle.notified();
++            tokio::pin!(notified);
++            notified.as_mut().enable();
++            if self.active_requests.load(Ordering::Acquire) == 0 {
++                return;
++            }
++            notified.await;
++        }
++    }
++
++    async fn wait_until_retired(&self) -> anyhow::Result<()> {
++        loop {
++            let notified = self.retired_notify.notified();
++            tokio::pin!(notified);
++            notified.as_mut().enable();
++            if self.retired.load(Ordering::Acquire) {
++                return Ok(());
++            }
++            if self.retirement_failed.load(Ordering::Acquire) {
++                anyhow::bail!("Local Node executor generation retirement failed");
++            }
++            notified.await;
++        }
++    }
++
+     async fn new(generation: u64, config: &LocalNodeExecutorConfig) -> anyhow::Result<Self> {
+         tracing::info!("Initializing inner local node executor");
+         // Create a single temp directory for both source files and Node.js temp files
+@@ -593,6 +820,9 @@ impl InnerLocalNodeExecutor {
+         let client = client_builder.build()?;
+         let server_handle =
+             Self::start_node_with_listener(config, &source_path, &source_dir, &socket_path).await?;
++        let pid = server_handle
++            .id()
++            .context("Local Node executor child has no process id")?;
+         let mut server_handle = ManagedChild::new(generation, server_handle, source_dir);
+         crate::metrics::log_local_node_child_start();
+ 
+@@ -633,11 +863,18 @@ impl InnerLocalNodeExecutor {
+             if let Some(runtime_stats_supported) = runtime_stats_supported {
+                 return Ok(Self {
+                     generation,
++                    pid,
+                     started_at: Instant::now(),
+                     runtime_stats_supported,
+                     active_requests: AtomicUsize::new(0),
++                    retirement_requested: AtomicBool::new(false),
++                    idle: Notify::new(),
++                    retired: AtomicBool::new(false),
++                    retirement_failed: AtomicBool::new(false),
++                    retired_notify: Notify::new(),
+                     retained_source_packages: AtomicU64::new(0),
+                     retained_external_packages: AtomicU64::new(0),
++                    imported_source_packages: AtomicU64::new(0),
+                     registered_stack_roots: AtomicU64::new(0),
+                     server_handle: Mutex::new(server_handle),
+                     client,
+@@ -850,7 +1087,11 @@ impl InnerLocalNodeExecutor {
+         Self::check_node_version(&node_path).await?;
+ 
+         let mut cmd = TokioCommand::new(node_path);
+-        cmd.arg(source_path)
++        cmd.arg(format!(
++            "--max-old-space-size={}",
++            config.max_old_space_size_mib
++        ))
++            .arg(source_path)
+             .arg("--ipc-path")
+             .arg(socket_path)
+             .arg("--tempdir")
+@@ -876,24 +1117,58 @@ impl InnerLocalNodeExecutor {
+ 
+ impl LocalNodeExecutor {
+     pub async fn new(node_process_timeout: Duration) -> anyhow::Result<Self> {
++        Self::new_with_memory_pressure(node_process_timeout, MemoryPressureSignal::default()).await
++    }
++
++    pub async fn new_with_memory_pressure(
++        node_process_timeout: Duration,
++        memory_pressure: MemoryPressureSignal,
++    ) -> anyhow::Result<Self> {
++        let config = LocalNodeExecutorConfig {
++            node_process_timeout,
++            callback_initial_backoff: None,
++            health_check_timeout: HEALTH_CHECK_TIMEOUT,
++            watchdog_interval: WATCHDOG_INTERVAL,
++            watchdog_failure_threshold: WATCHDOG_FAILURE_THRESHOLD,
++            max_old_space_size_mib: *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB,
++            max_rss_bytes: u64::try_from(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES)
++                .context("Local Node executor RSS threshold does not fit u64")?,
++            memory_pressure,
++            memory_pressure_min_rss_bytes: u64::try_from(
++                *LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES,
++            )
++            .context("Local Node executor cgroup-pressure RSS threshold does not fit u64")?,
++            memory_pressure_grace: *LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE,
++            max_generation_age: *LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE,
++            max_imported_source_packages: u64::try_from(
++                *LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES,
++            )
++            .context("Local Node executor package threshold does not fit u64")?,
++        };
++        config.validate()?;
+         let executor = Self {
+             state: Arc::new(Mutex::new(LocalNodeExecutorState::default())),
+             startup_lock: Mutex::new(()),
+             shutting_down: AtomicBool::new(false),
+-            config: LocalNodeExecutorConfig {
+-                node_process_timeout,
+-                callback_initial_backoff: None,
+-                health_check_timeout: HEALTH_CHECK_TIMEOUT,
+-                watchdog_interval: WATCHDOG_INTERVAL,
+-                watchdog_failure_threshold: WATCHDOG_FAILURE_THRESHOLD,
+-            },
++            config,
+         };
+ 
+         crate::metrics::set_local_node_generation_present(false);
+         crate::metrics::set_local_node_generation_age(Duration::ZERO);
++        crate::metrics::set_local_node_generation_draining(false);
++        crate::metrics::set_local_node_child_rss(None);
+         crate::metrics::set_local_node_waiting_requests(0);
+         crate::metrics::set_local_node_active_requests(0);
+         crate::metrics::set_local_node_consecutive_health_misses(0);
++        crate::metrics::set_local_node_memory_pressure_active(false);
++        crate::metrics::set_local_node_memory_configuration(
++            executor.config.old_space_bytes(),
++            executor.config.max_rss_bytes,
++            executor.config.memory_pressure_min_rss_bytes,
++            executor.config.memory_pressure_grace,
++            executor.config.max_generation_age,
++            executor.config.max_imported_source_packages,
++        );
+ 
+         Ok(executor)
+     }
+@@ -901,16 +1176,13 @@ impl LocalNodeExecutor {
+     async fn acquire_inner(
+         &self,
+     ) -> anyhow::Result<(Arc<InnerLocalNodeExecutor>, ActiveRequestGuard, bool)> {
+-        {
+-            let state = self.state.lock().await;
+-            anyhow::ensure!(
+-                !self.shutting_down.load(Ordering::Acquire),
+-                "Local Node executor is shutting down"
+-            );
+-            if let Some(inner) = &state.inner {
+-                let inner = inner.clone();
+-                let request_guard = ActiveRequestGuard::new(inner.clone());
+-                return Ok((inner, request_guard, false));
++        loop {
++            match self.acquire_existing_inner().await? {
++                InnerAcquisition::Ready { inner, guard } => {
++                    return Ok((inner, guard, false));
++                },
++                InnerAcquisition::Draining(inner) => inner.wait_until_retired().await?,
++                InnerAcquisition::Missing => break,
+             }
+         }
+ 
+@@ -918,17 +1190,23 @@ impl LocalNodeExecutor {
+         // work separately so late failures from the retired generation can
+         // still inspect the generation slot without waiting for its replacement.
+         let _startup_guard = self.startup_lock.lock().await;
++        loop {
++            match self.acquire_existing_inner().await? {
++                InnerAcquisition::Ready { inner, guard } => {
++                    return Ok((inner, guard, false));
++                },
++                InnerAcquisition::Draining(inner) => inner.wait_until_retired().await?,
++                InnerAcquisition::Missing => break,
++            }
++        }
+         let (generation, replaces_generation) = {
+             let mut state = self.state.lock().await;
+             anyhow::ensure!(
+                 !self.shutting_down.load(Ordering::Acquire),
+                 "Local Node executor is shutting down"
+             );
+-            if let Some(inner) = &state.inner {
+-                let inner = inner.clone();
+-                let request_guard = ActiveRequestGuard::new(inner.clone());
+-                return Ok((inner, request_guard, false));
+-            }
++            assert!(state.inner.is_none());
++            assert!(state.retiring.is_none());
+             state.next_generation = state
+                 .next_generation
+                 .checked_add(1)
+@@ -979,14 +1257,20 @@ impl LocalNodeExecutor {
+             anyhow::bail!("Local Node executor is shutting down");
+         }
+         assert!(state.inner.is_none());
++        assert!(state.retiring.is_none());
+         assert_eq!(state.replacement_for_generation, replaces_generation);
+         state.inner = Some(replacement.clone());
+         state.replacement_for_generation = None;
+         crate::metrics::set_local_node_generation_present(true);
++        crate::metrics::set_local_node_memory_pressure_active(
++            self.config.memory_pressure.is_active(),
++        );
+         crate::metrics::set_local_node_generation_age(Duration::ZERO);
++        crate::metrics::set_local_node_generation_draining(false);
++        crate::metrics::set_local_node_child_rss(None);
+         crate::metrics::set_local_node_consecutive_health_misses(0);
+         if replacement.runtime_stats_supported {
+-            crate::metrics::set_local_node_package_state(0, 0, 0, 0, 0, 0);
++            crate::metrics::set_local_node_package_state(0, 0, 0, 0, 0, 0, 0);
+         }
+         crate::metrics::log_local_node_generation_start();
+         let startup_elapsed = replacement_started.elapsed();
+@@ -1006,6 +1290,29 @@ impl LocalNodeExecutor {
+         Ok((replacement, request_guard, true))
+     }
+ 
++    async fn acquire_existing_inner(&self) -> anyhow::Result<InnerAcquisition> {
++        let state = self.state.lock().await;
++        anyhow::ensure!(
++            !self.shutting_down.load(Ordering::Acquire),
++            "Local Node executor is shutting down"
++        );
++        if let Some(inner) = &state.inner {
++            let inner = inner.clone();
++            if inner.retirement_requested.load(Ordering::Acquire) {
++                return Ok(InnerAcquisition::Draining(inner));
++            }
++            // Selection and the active increment happen under the generation
++            // slot lock, so proactive retirement cannot observe zero and close
++            // admission between these operations.
++            let guard = ActiveRequestGuard::new(inner.clone());
++            return Ok(InnerAcquisition::Ready { inner, guard });
++        }
++        if let Some(retiring) = &state.retiring {
++            return Ok(InnerAcquisition::Draining(retiring.clone()));
++        }
++        Ok(InnerAcquisition::Missing)
++    }
++
+     #[try_stream(ok = NodeExecutorStreamPart, error = anyhow::Error)]
+     async fn response_stream(mut response: reqwest::Response, deadline: tokio::time::Instant) {
+         anyhow::ensure!(
+@@ -1066,14 +1373,19 @@ impl LocalNodeExecutor {
+             {
+                 // A late result from an old generation cannot retire its replacement.
+                 state.inner.take();
++                assert!(state.retiring.is_none());
++                state.retiring = Some(expected.clone());
+                 state.replacement_for_generation =
+                     (!matches!(reason, GenerationRetirementReason::ExplicitShutdown))
+                         .then_some(expected.generation);
+                 crate::metrics::set_local_node_generation_present(false);
++                crate::metrics::set_local_node_memory_pressure_active(false);
+                 crate::metrics::set_local_node_generation_age(Duration::ZERO);
++                crate::metrics::set_local_node_generation_draining(false);
++                crate::metrics::set_local_node_child_rss(None);
+                 crate::metrics::set_local_node_consecutive_health_misses(0);
+                 if expected.runtime_stats_supported {
+-                    crate::metrics::set_local_node_package_state(0, 0, 0, 0, 0, 0);
++                    crate::metrics::set_local_node_package_state(0, 0, 0, 0, 0, 0, 0);
+                 }
+                 crate::metrics::log_local_node_generation_retirement(reason.as_str());
+                 crate::metrics::log_local_node_retirement_diagnostics(
+@@ -1097,6 +1409,8 @@ impl LocalNodeExecutor {
+                             expected.retained_source_packages.load(Ordering::Relaxed),
+                         last_observed_retained_external_packages =
+                             expected.retained_external_packages.load(Ordering::Relaxed),
++                        last_observed_imported_source_packages =
++                            expected.imported_source_packages.load(Ordering::Relaxed),
+                         last_observed_registered_stack_roots =
+                             expected.registered_stack_roots.load(Ordering::Relaxed),
+                         "Retiring local Node executor generation"
+@@ -1116,6 +1430,8 @@ impl LocalNodeExecutor {
+                             expected.retained_source_packages.load(Ordering::Relaxed),
+                         last_observed_retained_external_packages =
+                             expected.retained_external_packages.load(Ordering::Relaxed),
++                        last_observed_imported_source_packages =
++                            expected.imported_source_packages.load(Ordering::Relaxed),
+                         last_observed_registered_stack_roots =
+                             expected.registered_stack_roots.load(Ordering::Relaxed),
+                         "Retiring local Node executor generation"
+@@ -1134,6 +1450,7 @@ impl LocalNodeExecutor {
+         // so a blocked event loop does not continue consuming a core until each
+         // old request reaches its ten-minute timeout. The spawned task remains
+         // the child owner if the request that initiated retirement is canceled.
++        let state = state.clone();
+         let expected = expected.clone();
+         let generation = expected.generation;
+         let termination = tokio::spawn(async move {
+@@ -1163,6 +1480,22 @@ impl LocalNodeExecutor {
+                     );
+                 },
+             }
++            if result.is_ok() {
++                let mut state = state.lock().await;
++                let retiring = state
++                    .retiring
++                    .take()
++                    .expect("retiring local Node generation is missing");
++                assert!(Arc::ptr_eq(&retiring, &expected));
++                // A waiter must not start the replacement while the old child
++                // is still resident. A short process overlap is unsafe when
++                // RSS retirement is preserving cgroup memory headroom.
++                expected.retired.store(true, Ordering::Release);
++                expected.retired_notify.notify_waiters();
++            } else {
++                expected.retirement_failed.store(true, Ordering::Release);
++                expected.retired_notify.notify_waiters();
++            }
+             result
+         })
+         .await;
+@@ -1181,6 +1514,58 @@ impl LocalNodeExecutor {
+         Ok(true)
+     }
+ 
++    async fn drain_and_retire_inner_state(
++        state: &Arc<Mutex<LocalNodeExecutorState>>,
++        expected: &Arc<InnerLocalNodeExecutor>,
++        diagnostics: GenerationRetirementDiagnostics,
++    ) -> anyhow::Result<bool> {
++        let reason = diagnostics.reason;
++        let started_draining = {
++            let state = state.lock().await;
++            if !state
++                .inner
++                .as_ref()
++                .is_some_and(|current| Arc::ptr_eq(current, expected))
++            {
++                crate::metrics::log_local_node_retirement_decision(reason.as_str(), "not_current");
++                return Ok(false);
++            }
++            let started_draining = !expected.retirement_requested.swap(true, Ordering::AcqRel);
++            if started_draining {
++                // Retirement and request admission share this lock. Publish the
++                // corresponding gauge transition here too, so an immediate
++                // request-triggered retirement cannot reset it before this write.
++                crate::metrics::set_local_node_generation_draining(true);
++            }
++            started_draining
++        };
++        if !started_draining {
++            crate::metrics::log_local_node_retirement_decision(reason.as_str(), "already_draining");
++            return Ok(false);
++        }
++
++        // Admission and the active-request increment share the state lock with
++        // this transition. Once draining is visible, the count can only fall.
++        crate::metrics::log_local_node_retirement_decision(reason.as_str(), "drain_started");
++        let state = state.clone();
++        let expected = expected.clone();
++        let retirement = tokio::spawn(async move {
++            expected.wait_until_idle().await;
++            Self::retire_inner_state(&state, &expected, diagnostics).await
++        })
++        .await;
++        match retirement {
++            Ok(result) => result,
++            Err(error) if error.is_cancelled() => {
++                anyhow::bail!("Local Node executor drain task was canceled")
++            },
++            Err(error) if error.is_panic() => {
++                anyhow::bail!("Local Node executor drain task panicked")
++            },
++            Err(_) => anyhow::bail!("Local Node executor drain task failed"),
++        }
++    }
++
+     fn spawn_watchdog(&self, inner: &Arc<InnerLocalNodeExecutor>) {
+         let state = Arc::downgrade(&self.state);
+         let expected = Arc::downgrade(inner);
+@@ -1198,6 +1583,7 @@ impl LocalNodeExecutor {
+         let mut consecutive_misses = 0;
+         let mut previous_package_stats = NodePackageCacheStats::default();
+         let mut previous_stack_stats = NodeStackTraceStats::default();
++        let mut memory_pressure_started_at = None;
+         loop {
+             tokio::time::sleep(config.watchdog_interval).await;
+             let Some(state) = state.upgrade() else {
+@@ -1217,11 +1603,21 @@ impl LocalNodeExecutor {
+             }
+ 
+             let health_check_started = Instant::now();
+-            let health = InnerLocalNodeExecutor::check_server_health(
+-                &expected.client,
+-                config.health_check_timeout,
+-            )
+-            .await;
++            let (health, rss) = tokio::join!(
++                InnerLocalNodeExecutor::check_server_health(
++                    &expected.client,
++                    config.health_check_timeout,
++                ),
++                read_process_rss(expected.pid),
++            );
++            // RSS enforcement is Linux-only. A failed or unsupported sample
++            // skips only the RSS trigger for this iteration; age, package, and
++            // unhealthy-generation checks remain active.
++            let (rss_bytes, rss_sample_outcome) = match rss {
++                Ok(Some(rss_bytes)) => (Some(rss_bytes), "success"),
++                Ok(None) => (None, "unsupported"),
++                Err(_) => (None, "failure"),
++            };
+             let success = health.as_ref().is_some_and(|health| {
+                 health.status == "ok"
+                     && health
+@@ -1242,9 +1638,21 @@ impl LocalNodeExecutor {
+                 return;
+             }
+             crate::metrics::log_local_node_health_check(health_check_elapsed, "watchdog", success);
+-            crate::metrics::set_local_node_generation_age(expected.started_at.elapsed());
++            crate::metrics::log_local_node_child_rss_sample(rss_sample_outcome);
++            crate::metrics::set_local_node_child_rss(rss_bytes);
++            let generation_age = expected.started_at.elapsed();
++            crate::metrics::set_local_node_generation_age(generation_age);
++            let memory_pressure_active = config.memory_pressure.is_active();
++            crate::metrics::set_local_node_memory_pressure_active(memory_pressure_active);
++            let memory_pressure_active_for = if memory_pressure_active {
++                let started_at = memory_pressure_started_at.get_or_insert_with(Instant::now);
++                Some(started_at.elapsed())
++            } else {
++                memory_pressure_started_at = None;
++                None
++            };
+ 
+-            if let Some(health) = health.filter(|_| success) {
++            let should_retire_unhealthy = if let Some(health) = health.filter(|_| success) {
+                 consecutive_misses = 0;
+                 crate::metrics::set_local_node_consecutive_health_misses(0);
+                 if expected.runtime_stats_supported {
+@@ -1255,14 +1663,42 @@ impl LocalNodeExecutor {
+                         &mut previous_stack_stats,
+                     );
+                 }
+-                continue;
+-            }
++                false
++            } else {
++                consecutive_misses += 1;
++                crate::metrics::set_local_node_consecutive_health_misses(consecutive_misses);
++                consecutive_misses >= config.watchdog_failure_threshold
++            };
+ 
+-            consecutive_misses += 1;
+-            crate::metrics::set_local_node_consecutive_health_misses(consecutive_misses);
+-            let should_retire = consecutive_misses >= config.watchdog_failure_threshold;
++            // Memory and lifetime bounds remain effective while the health
++            // endpoint is unhealthy. In particular, memory pressure must not
++            // disable the RSS safety threshold.
++            let retirement_reason = proactive_retirement_reason(
++                &config,
++                generation_age,
++                rss_bytes,
++                expected.imported_source_packages.load(Ordering::Relaxed),
++                memory_pressure_active_for,
++            );
+             drop(current_state);
+-            if should_retire {
++            if let Some(reason) = retirement_reason {
++                if Self::drain_and_retire_inner_state(
++                    &state,
++                    &expected,
++                    GenerationRetirementDiagnostics::proactive(reason),
++                )
++                .await
++                .is_err()
++                {
++                    tracing::error!(
++                        generation = expected.generation,
++                        reason = reason.as_str(),
++                        "Failed to drain and retire local Node executor generation"
++                    );
++                }
++                return;
++            }
++            if should_retire_unhealthy {
+                 if Self::retire_inner_state(
+                     &state,
+                     &expected,
+@@ -1303,10 +1739,14 @@ impl LocalNodeExecutor {
+         inner
+             .retained_external_packages
+             .store(package.retained_external_packages, Ordering::Relaxed);
++        inner
++            .imported_source_packages
++            .store(package.imported_source_packages, Ordering::Relaxed);
+         inner
+             .registered_stack_roots
+             .store(stack.registered_roots, Ordering::Relaxed);
+         crate::metrics::set_local_node_package_state(
++            package.imported_source_packages,
+             package.retained_source_packages,
+             package.retained_source_bytes,
+             package.active_source_owners,
+@@ -1658,6 +2098,13 @@ mod tests {
+             health_check_timeout: Duration::from_millis(10),
+             watchdog_interval: Duration::from_millis(10),
+             watchdog_failure_threshold: 2,
++            max_old_space_size_mib: 128,
++            max_rss_bytes: 256 * MIB_BYTES,
++            memory_pressure: MemoryPressureSignal::default(),
++            memory_pressure_min_rss_bytes: 192 * MIB_BYTES,
++            memory_pressure_grace: Duration::from_secs(5),
++            max_generation_age: Duration::from_secs(60),
++            max_imported_source_packages: 100,
+         }
+     }
+ 
+@@ -1722,6 +2169,152 @@ mod tests {
+             }))
+             .is_err()
+         );
++
++        let imported_package_regression = NodeExecutorHealth {
++            status: "ok".to_string(),
++            package_cache: Some(NodePackageCacheStats {
++                imported_source_packages: 1,
++                ..NodePackageCacheStats::default()
++            }),
++            stack_trace: Some(NodeStackTraceStats::default()),
++        };
++        assert_eq!(
++            imported_package_regression.valid_runtime_stats_support(
++                &NodePackageCacheStats {
++                    imported_source_packages: 2,
++                    ..NodePackageCacheStats::default()
++                },
++                &NodeStackTraceStats::default(),
++            ),
++            None
++        );
++    }
++
++    #[test]
++    fn config_rejects_rss_threshold_at_or_below_old_space_allowance() {
++        let config = test_config();
++        config.validate().unwrap();
++
++        let mut equal = config.clone();
++        equal.max_rss_bytes = equal.old_space_bytes();
++        assert!(equal.validate().is_err());
++
++        let mut below = config;
++        below.max_rss_bytes = below.old_space_bytes() - 1;
++        assert!(below.validate().is_err());
++    }
++
++    #[test]
++    fn proactive_retirement_thresholds_are_inclusive_and_prioritized() {
++        let config = test_config();
++        assert_eq!(
++            proactive_retirement_reason(
++                &config,
++                config.max_generation_age - Duration::from_nanos(1),
++                Some(config.max_rss_bytes - 1),
++                config.max_imported_source_packages - 1,
++                None,
++            ),
++            None
++        );
++        assert_eq!(
++            proactive_retirement_reason(
++                &config,
++                config.max_generation_age,
++                Some(config.max_rss_bytes - 1),
++                config.max_imported_source_packages - 1,
++                None,
++            ),
++            Some(GenerationRetirementReason::AgeLimit)
++        );
++        assert_eq!(
++            proactive_retirement_reason(
++                &config,
++                config.max_generation_age,
++                Some(config.max_rss_bytes - 1),
++                config.max_imported_source_packages,
++                None,
++            ),
++            Some(GenerationRetirementReason::PackageLimit)
++        );
++        assert_eq!(
++            proactive_retirement_reason(
++                &config,
++                config.max_generation_age,
++                Some(config.max_rss_bytes),
++                config.max_imported_source_packages,
++                None,
++            ),
++            Some(GenerationRetirementReason::RssLimit)
++        );
++    }
++
++    #[test]
++    fn cgroup_pressure_retirement_requires_grace_and_material_rss() {
++        let config = test_config();
++        let below_hard_limit = config.max_rss_bytes - 1;
++        assert_eq!(
++            proactive_retirement_reason(
++                &config,
++                Duration::ZERO,
++                Some(below_hard_limit),
++                0,
++                Some(config.memory_pressure_grace - Duration::from_nanos(1)),
++            ),
++            None
++        );
++        assert_eq!(
++            proactive_retirement_reason(
++                &config,
++                Duration::ZERO,
++                Some(config.memory_pressure_min_rss_bytes - 1),
++                0,
++                Some(config.memory_pressure_grace),
++            ),
++            None
++        );
++        assert_eq!(
++            proactive_retirement_reason(
++                &config,
++                Duration::ZERO,
++                None,
++                0,
++                Some(config.memory_pressure_grace),
++            ),
++            None
++        );
++        assert_eq!(
++            proactive_retirement_reason(
++                &config,
++                Duration::ZERO,
++                Some(config.memory_pressure_min_rss_bytes),
++                0,
++                Some(config.memory_pressure_grace),
++            ),
++            Some(GenerationRetirementReason::CgroupPressure)
++        );
++        assert_eq!(
++            proactive_retirement_reason(
++                &config,
++                Duration::ZERO,
++                Some(config.max_rss_bytes),
++                0,
++                Some(config.memory_pressure_grace),
++            ),
++            Some(GenerationRetirementReason::RssLimit)
++        );
++    }
++
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn process_rss_parser_requires_one_kib_value() {
++        assert_eq!(
++            parse_process_rss("Name:\tnode\nVmRSS:\t12345 kB\nVmSize:\t99999 kB\n").unwrap(),
++            12_641_280
++        );
++        assert!(parse_process_rss("Name:\tnode\n").is_err());
++        assert!(parse_process_rss("VmRSS:\t12345 MB\n").is_err());
++        assert!(parse_process_rss("VmRSS:\t1 kB\nVmRSS:\t2 kB\n").is_err());
+     }
+ 
+     #[tokio::test]
+@@ -1765,13 +2358,23 @@ done
+             .kill_on_drop(true)
+             .spawn()
+             .unwrap();
++        let pid = server_handle
++            .id()
++            .expect("Test local Node executor child has no process id");
+         Arc::new(InnerLocalNodeExecutor {
+             generation,
++            pid,
+             started_at: Instant::now(),
+             runtime_stats_supported: false,
+             active_requests: AtomicUsize::new(0),
++            retirement_requested: AtomicBool::new(false),
++            idle: Notify::new(),
++            retired: AtomicBool::new(false),
++            retirement_failed: AtomicBool::new(false),
++            retired_notify: Notify::new(),
+             retained_source_packages: AtomicU64::new(0),
+             retained_external_packages: AtomicU64::new(0),
++            imported_source_packages: AtomicU64::new(0),
+             registered_stack_roots: AtomicU64::new(0),
+             server_handle: Mutex::new(ManagedChild::new(generation, server_handle, source_dir)),
+             client,
+@@ -1924,6 +2527,7 @@ done
+         let state = Arc::new(Mutex::new(LocalNodeExecutorState {
+             next_generation: inner.generation,
+             inner: Some(inner),
++            retiring: None,
+             replacement_for_generation: None,
+         }));
+         let executor = LocalNodeExecutor {
+@@ -1935,12 +2539,117 @@ done
+         (executor, state)
+     }
+ 
++    #[tokio::test]
++    async fn graceful_retirement_stops_admission_and_waits_for_active_request() {
++        let generation = test_inner(1).await;
++        let (executor, state) = test_executor(generation.clone(), test_config());
++        let active_guard = match executor.acquire_existing_inner().await.unwrap() {
++            InnerAcquisition::Ready { inner, guard } => {
++                assert!(Arc::ptr_eq(&inner, &generation));
++                guard
++            },
++            InnerAcquisition::Draining(_) | InnerAcquisition::Missing => {
++                panic!("Test generation was not available")
++            },
++        };
++        assert_eq!(generation.active_requests.load(Ordering::Acquire), 1);
++
++        let retirement_state = state.clone();
++        let retirement_generation = generation.clone();
++        let retirement = tokio::spawn(async move {
++            LocalNodeExecutor::drain_and_retire_inner_state(
++                &retirement_state,
++                &retirement_generation,
++                GenerationRetirementDiagnostics::proactive(
++                    GenerationRetirementReason::PackageLimit,
++                ),
++            )
++            .await
++        });
++        tokio::time::timeout(Duration::from_secs(1), async {
++            while !generation.retirement_requested.load(Ordering::Acquire) {
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .unwrap();
++
++        match executor.acquire_existing_inner().await.unwrap() {
++            InnerAcquisition::Draining(inner) => assert!(Arc::ptr_eq(&inner, &generation)),
++            InnerAcquisition::Ready { .. } | InnerAcquisition::Missing => {
++                panic!("Draining generation admitted a new request")
++            },
++        }
++        assert_eq!(generation.active_requests.load(Ordering::Acquire), 1);
++        assert!(state.lock().await.inner.is_some());
++
++        drop(active_guard);
++        assert!(tokio::time::timeout(Duration::from_secs(1), retirement)
++            .await
++            .unwrap()
++            .unwrap()
++            .unwrap());
++        assert!(state.lock().await.inner.is_none());
++        assert!(generation.retired.load(Ordering::Acquire));
++        assert!(generation.server_handle.lock().await.child.is_none());
++    }
++
++    #[tokio::test]
++    async fn canceled_drain_caller_does_not_wedge_generation_retirement() {
++        let generation = test_inner(1).await;
++        let (executor, state) = test_executor(generation.clone(), test_config());
++        let active_guard = match executor.acquire_existing_inner().await.unwrap() {
++            InnerAcquisition::Ready { guard, .. } => guard,
++            InnerAcquisition::Draining(_) | InnerAcquisition::Missing => {
++                panic!("Test generation was not available")
++            },
++        };
++
++        let retirement_state = state.clone();
++        let retirement_generation = generation.clone();
++        let retirement = tokio::spawn(async move {
++            LocalNodeExecutor::drain_and_retire_inner_state(
++                &retirement_state,
++                &retirement_generation,
++                GenerationRetirementDiagnostics::proactive(
++                    GenerationRetirementReason::PackageLimit,
++                ),
++            )
++            .await
++        });
++        tokio::time::timeout(Duration::from_secs(1), async {
++            while !generation.retirement_requested.load(Ordering::Acquire) {
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .unwrap();
++
++        retirement.abort();
++        assert!(retirement.await.unwrap_err().is_cancelled());
++        drop(active_guard);
++
++        tokio::time::timeout(Duration::from_secs(1), async {
++            generation.wait_until_retired().await.unwrap();
++            loop {
++                if generation.server_handle.lock().await.child.is_none() {
++                    break;
++                }
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .unwrap();
++        assert!(state.lock().await.inner.is_none());
++    }
++
+     #[tokio::test]
+     async fn late_old_generation_retirement_preserves_replacement() {
+         let old = test_inner(1).await;
+         let replacement = test_inner(2).await;
+         let state = Arc::new(Mutex::new(LocalNodeExecutorState {
+             inner: Some(old.clone()),
++            retiring: None,
+             replacement_for_generation: None,
+             next_generation: 2,
+         }));
+@@ -1994,6 +2703,7 @@ done
+         let generation = test_inner(1).await;
+         let state = Arc::new(Mutex::new(LocalNodeExecutorState {
+             inner: Some(generation.clone()),
++            retiring: None,
+             replacement_for_generation: None,
+             next_generation: 1,
+         }));
+@@ -2026,11 +2736,7 @@ done
+     #[tokio::test]
+     async fn retirement_reaps_child_after_retiring_caller_is_canceled() {
+         let generation = test_inner(1).await;
+-        let state = Arc::new(Mutex::new(LocalNodeExecutorState {
+-            inner: Some(generation.clone()),
+-            replacement_for_generation: None,
+-            next_generation: 1,
+-        }));
++        let (executor, state) = test_executor(generation.clone(), test_config());
+ 
+         // Hold the child lock so the detached termination owner cannot finish
+         // before the task that initiated retirement is canceled.
+@@ -2052,11 +2758,18 @@ done
+         })
+         .await
+         .unwrap();
++        match executor.acquire_existing_inner().await.unwrap() {
++            InnerAcquisition::Draining(inner) => assert!(Arc::ptr_eq(&inner, &generation)),
++            InnerAcquisition::Ready { .. } | InnerAcquisition::Missing => {
++                panic!("Unreaped generation did not fence replacement startup")
++            },
++        }
+         retirement_task.abort();
+         assert!(retirement_task.await.unwrap_err().is_cancelled());
+         drop(child_guard);
+ 
+         tokio::time::timeout(Duration::from_secs(1), async {
++            generation.wait_until_retired().await.unwrap();
+             loop {
+                 if generation.server_handle.lock().await.child.is_none() {
+                     break;
+@@ -2066,6 +2779,7 @@ done
+         })
+         .await
+         .unwrap();
++        assert!(state.lock().await.retiring.is_none());
+     }
+ 
+     #[tokio::test]
+@@ -2106,6 +2820,7 @@ done
+         let generation = test_inner_with_client(1, client).await;
+         let state = Arc::new(Mutex::new(LocalNodeExecutorState {
+             inner: Some(generation.clone()),
++            retiring: None,
+             replacement_for_generation: None,
+             next_generation: 1,
+         }));
+diff --git a/crates/node_executor/src/metrics.rs b/crates/node_executor/src/metrics.rs
+index 2fc6d3a7755fe7a07e991787e9e05c7a2faa3a42..fb51d90d030777f57ac40394380246694adcca07 100644
+--- a/crates/node_executor/src/metrics.rs
++++ b/crates/node_executor/src/metrics.rs
+@@ -268,6 +268,134 @@ pub fn set_local_node_generation_age(age: Duration) {
+     );
+ }
+ 
++register_convex_gauge!(
++    LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES,
++    "Configured V8 old-space allowance for the local Node executor child"
++);
++register_convex_gauge!(
++    LOCAL_NODE_EXECUTOR_RSS_RETIREMENT_THRESHOLD_BYTES,
++    "Configured RSS threshold for graceful local Node executor generation retirement"
++);
++register_convex_gauge!(
++    LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_RSS_THRESHOLD_BYTES,
++    "Configured direct-child RSS threshold for retirement during sustained cgroup memory pressure"
++);
++register_convex_gauge!(
++    LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECONDS,
++    "Configured cgroup memory-pressure duration before local Node executor retirement"
++);
++register_convex_gauge!(
++    LOCAL_NODE_EXECUTOR_AGE_RETIREMENT_THRESHOLD_SECONDS,
++    "Configured age threshold for graceful local Node executor generation retirement"
++);
++register_convex_gauge!(
++    LOCAL_NODE_EXECUTOR_PACKAGE_RETIREMENT_THRESHOLD_INFO,
++    "Configured lifetime imported source-package threshold for graceful local Node executor \
++     generation retirement"
++);
++pub fn set_local_node_memory_configuration(
++    old_space_limit_bytes: u64,
++    rss_threshold_bytes: u64,
++    memory_pressure_rss_threshold_bytes: u64,
++    memory_pressure_grace: Duration,
++    age_threshold: Duration,
++    package_threshold: u64,
++) {
++    log_gauge(
++        &LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES,
++        old_space_limit_bytes as f64,
++    );
++    log_gauge(
++        &LOCAL_NODE_EXECUTOR_RSS_RETIREMENT_THRESHOLD_BYTES,
++        rss_threshold_bytes as f64,
++    );
++    log_gauge(
++        &LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_RSS_THRESHOLD_BYTES,
++        memory_pressure_rss_threshold_bytes as f64,
++    );
++    log_gauge(
++        &LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECONDS,
++        memory_pressure_grace.as_secs_f64(),
++    );
++    log_gauge(
++        &LOCAL_NODE_EXECUTOR_AGE_RETIREMENT_THRESHOLD_SECONDS,
++        age_threshold.as_secs_f64(),
++    );
++    log_gauge(
++        &LOCAL_NODE_EXECUTOR_PACKAGE_RETIREMENT_THRESHOLD_INFO,
++        package_threshold as f64,
++    );
++}
++
++register_convex_gauge!(
++    LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_ACTIVE_INFO,
++    "Whether the current local Node executor generation observes cgroup memory pressure"
++);
++pub fn set_local_node_memory_pressure_active(active: bool) {
++    log_gauge(
++        &LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_ACTIVE_INFO,
++        if active { 1.0 } else { 0.0 },
++    );
++}
++
++register_convex_gauge!(
++    LOCAL_NODE_EXECUTOR_CHILD_RSS_BYTES,
++    "Resident memory of the current local Node executor child"
++);
++register_convex_gauge!(
++    LOCAL_NODE_EXECUTOR_CHILD_RSS_TELEMETRY_INFO,
++    "Whether the latest local Node executor child RSS sample succeeded"
++);
++pub fn set_local_node_child_rss(rss: Option<u64>) {
++    match rss {
++        Some(rss) => {
++            log_gauge(&LOCAL_NODE_EXECUTOR_CHILD_RSS_BYTES, rss as f64);
++            log_gauge(&LOCAL_NODE_EXECUTOR_CHILD_RSS_TELEMETRY_INFO, 1.0);
++        },
++        None => log_gauge(&LOCAL_NODE_EXECUTOR_CHILD_RSS_TELEMETRY_INFO, 0.0),
++    }
++}
++
++register_convex_counter!(
++    LOCAL_NODE_EXECUTOR_CHILD_RSS_SAMPLES_TOTAL,
++    "Local Node executor direct-child RSS sampling outcomes",
++    &["outcome"]
++);
++pub fn log_local_node_child_rss_sample(outcome: &'static str) {
++    log_counter_with_labels(
++        &LOCAL_NODE_EXECUTOR_CHILD_RSS_SAMPLES_TOTAL,
++        1,
++        vec![StaticMetricLabel::new("outcome", outcome)],
++    );
++}
++
++register_convex_gauge!(
++    LOCAL_NODE_EXECUTOR_GENERATION_DRAINING_INFO,
++    "Whether the current local Node executor generation has stopped accepting new requests"
++);
++pub fn set_local_node_generation_draining(draining: bool) {
++    log_gauge(
++        &LOCAL_NODE_EXECUTOR_GENERATION_DRAINING_INFO,
++        if draining { 1.0 } else { 0.0 },
++    );
++}
++
++register_convex_counter!(
++    LOCAL_NODE_EXECUTOR_RETIREMENT_DECISIONS_TOTAL,
++    "Local Node executor generation retirement decisions",
++    &["reason", "decision"]
++);
++pub fn log_local_node_retirement_decision(reason: &'static str, decision: &'static str) {
++    log_counter_with_labels(
++        &LOCAL_NODE_EXECUTOR_RETIREMENT_DECISIONS_TOTAL,
++        1,
++        vec![
++            StaticMetricLabel::new("reason", reason),
++            StaticMetricLabel::new("decision", decision),
++        ],
++    );
++}
++
+ register_convex_histogram!(
+     LOCAL_NODE_EXECUTOR_HEALTH_CHECK_SECONDS,
+     "Duration of local Node executor health checks",
+@@ -344,6 +472,10 @@ register_convex_gauge!(
+     LOCAL_NODE_EXECUTOR_RETAINED_SOURCE_PACKAGES_INFO,
+     "Retained dynamic source packages in the current local Node executor generation"
+ );
++register_convex_gauge!(
++    LOCAL_NODE_EXECUTOR_IMPORTED_SOURCE_PACKAGES_INFO,
++    "Lifetime-unique imported source-package roots in the current local Node executor generation"
++);
+ register_convex_gauge!(
+     LOCAL_NODE_EXECUTOR_RETAINED_SOURCE_PACKAGE_BYTES,
+     "Retained dynamic source-package bytes in the current local Node executor generation"
+@@ -365,6 +497,7 @@ register_convex_gauge!(
+     "Registered source-package stack roots in the current local Node executor generation"
+ );
+ pub fn set_local_node_package_state(
++    imported_source_packages: u64,
+     source_packages: u64,
+     source_bytes: u64,
+     active_source_owners: u64,
+@@ -372,6 +505,10 @@ pub fn set_local_node_package_state(
+     external_bytes: u64,
+     stack_roots: u64,
+ ) {
++    log_gauge(
++        &LOCAL_NODE_EXECUTOR_IMPORTED_SOURCE_PACKAGES_INFO,
++        imported_source_packages as f64,
++    );
+     log_gauge(
+         &LOCAL_NODE_EXECUTOR_RETAINED_SOURCE_PACKAGES_INFO,
+         source_packages as f64,
+diff --git a/npm-packages/node-executor/src/executor.ts b/npm-packages/node-executor/src/executor.ts
+index e6b61202ec2fe421798524274a127b17eea8ad62..aa4771bbd57ee9bb88cd82c2628313b82f64fab4 100644
+--- a/npm-packages/node-executor/src/executor.ts
++++ b/npm-packages/node-executor/src/executor.ts
+@@ -27,7 +27,11 @@ import {
+ } from "./errors";
+ import { findLineNumbers } from "./analyze";
+ import { Syscalls, SyscallsImpl } from "./syscalls";
+-import { SourcePackage, acquireSourcePackage } from "./source_package";
++import {
++  SourcePackage,
++  acquireSourcePackage,
++  recordSourcePackageImport,
++} from "./source_package";
+ import { buildDeps, BuildDepsRequest } from "./build_deps";
+ import { ConvexError, JSONValue } from "convex/values";
+ import { log, logDebug, logDurationMs } from "./log";
+@@ -443,6 +447,7 @@ export async function executeInner(
+       setupGlobals(modulePath);
+       const moduleUrl = pathToFileURL(modulePath);
+       moduleUrl.searchParams.set("envHash", envHash);
++      recordSourcePackageImport(dir);
+       const module = await import(moduleUrl.href);
+       const importTimeMs = logDurationMs("importTimeMs", start);
+ 
+@@ -578,7 +583,11 @@ export async function analyze(
+         for (const modulePath of local.modules) {
+           try {
+             const filePath = path.join(modulesDir, modulePath);
+-            modules[modulePath] = await analyzeModule(filePath, envHash);
++            modules[modulePath] = await analyzeModule(
++              local.dir,
++              filePath,
++              envHash,
++            );
+           } catch (e: unknown) {
+             return {
+               type: "error",
+@@ -610,6 +619,7 @@ export type AnalyzedFunctions = Array<{
+ }>;
+ 
+ async function analyzeModule(
++  packageRoot: string,
+   filePath: string,
+   envHash: string,
+ ): Promise<AnalyzedFunctions> {
+@@ -619,6 +629,7 @@ async function analyzeModule(
+   // Analysis evaluates user initialization code. Keep its entry-module instance
+   // separate from execute while still invalidating it when the environment changes.
+   fileUrl.searchParams.set("phase", "analyze");
++  recordSourcePackageImport(packageRoot);
+   const module = await import(fileUrl.href);
+ 
+   const functions: Map<
+diff --git a/npm-packages/node-executor/src/source_package.test.ts b/npm-packages/node-executor/src/source_package.test.ts
+index 6bfe3d257055d8978f87377a42796aa4966331cc..8375a8a20c2fc64ad366fdf8c5f72a7dea4f36b2 100644
+--- a/npm-packages/node-executor/src/source_package.test.ts
++++ b/npm-packages/node-executor/src/source_package.test.ts
+@@ -15,6 +15,7 @@ import {
+   getPackageCacheStats,
+   maybeDownloadAndLinkPackages,
+   populatePrebuildPackages,
++  recordSourcePackageImport,
+   resetPackageCachesForTests,
+   SourcePackage,
+ } from "./source_package";
+@@ -214,6 +215,51 @@ test("local cache bounds preserve active source packages and retire released pac
+   }
+ });
+ 
++test("imported source package count survives disk cache retirement", async () => {
++  const sourceZip = makeSourcePackageZip(null);
++  const routes = Object.fromEntries(
++    Array.from({ length: 9 }, (_, index) => [
++      `/source-${index}.zip`,
++      sourceZip,
++    ]),
++  );
++  const server = await startPackageServer(routes);
++
++  try {
++    const firstLease = await acquireSourcePackage(
++      makeSourceOnlyPackage(
++        `${server.baseUrl}/source-0.zip`,
++        sha256(sourceZip),
++        "source-package-0",
++      ),
++    );
++    expect(getPackageCacheStats().importedSourcePackages).toBe(0);
++    recordSourcePackageImport(firstLease.package.dir);
++    recordSourcePackageImport(firstLease.package.dir);
++    expect(getPackageCacheStats().importedSourcePackages).toBe(1);
++    await firstLease.release();
++
++    for (let index = 1; index < 9; index += 1) {
++      const lease = await acquireSourcePackage(
++        makeSourceOnlyPackage(
++          `${server.baseUrl}/source-${index}.zip`,
++          sha256(sourceZip),
++          `source-package-${index}`,
++        ),
++      );
++      recordSourcePackageImport(lease.package.dir);
++      await lease.release();
++    }
++
++    expect(getPackageCacheStats()).toMatchObject({
++      importedSourcePackages: 9,
++      retainedSourcePackages: 8,
++    });
++  } finally {
++    await server.close();
++  }
++});
++
+ test("byte bounds retire oversized source and external packages after release", async () => {
+   const sourceZip = makeSourcePackageZip();
+   const sourceOnlyZip = makeSourcePackageZip(null);
+diff --git a/npm-packages/node-executor/src/source_package.ts b/npm-packages/node-executor/src/source_package.ts
+index cb0dff0c96930296bd728cd1c19243c91007381f..c1a2848c7f009e18022400a7446a46b89283b9a2 100644
+--- a/npm-packages/node-executor/src/source_package.ts
++++ b/npm-packages/node-executor/src/source_package.ts
+@@ -985,6 +985,11 @@ async function processSourcePackageStream(
+ 
+ export const availableSourcePackages = new Map<string, LocalSourcePackage>();
+ export const availableExternalPackages = new Map<string, ExternalDepsPackage>();
++// Node's ESM cache retains module graphs by URL after the corresponding
++// disk-cache entry is retired. Package directories are unique publication
++// roots, so this lifetime count tracks that non-evictable generation growth
++// without exporting the paths.
++const importedSourcePackageRoots = new Set<string>();
+ const sourcePackageRetirements = new Map<string, Promise<void>>();
+ const externalPackageRetirements = new Map<string, Promise<void>>();
+ type PackageDownload<T> = {
+@@ -1061,6 +1066,10 @@ export async function acquireSourcePackage(
+   };
+ }
+ 
++export function recordSourcePackageImport(packageRoot: string) {
++  importedSourcePackageRoots.add(packageRoot);
++}
++
+ export function getPackageCacheStats() {
+   const sourcePackages = [...availableSourcePackages.values()].filter(
+     (localPackage) => localPackage.dynamicallyDownloaded,
+@@ -1069,6 +1078,7 @@ export function getPackageCacheStats() {
+     (localPackage) => localPackage.dynamicallyDownloaded,
+   );
+   return {
++    importedSourcePackages: importedSourcePackageRoots.size,
+     retainedSourcePackages: sourcePackages.length,
+     retainedSourceBytes: sourcePackages.reduce(
+       (total, localPackage) => total + localPackage.retainedBytes,
+@@ -1135,6 +1145,7 @@ export function resetPackageCachesForTests() {
+   }
+   availableSourcePackages.clear();
+   availableExternalPackages.clear();
++  importedSourcePackageRoots.clear();
+   packageUseSequence = 0;
+   for (const event of Object.keys(packageEvents) as Array<
+     keyof typeof packageEvents
+diff --git a/patches/README.md b/patches/README.md
+index 2e14fa5459c1e69e56c9b05e14044cb394a0c853..a1461dc103625e951370867f4e24b418e4724603 100644
+--- a/patches/README.md
++++ b/patches/README.md
+@@ -43,6 +43,23 @@ protocol and adoption essay but is not another commit in this backend chain.
+ - Rollback: restore the backend before the dashboard; no data or configuration rollback is
+   required, but the previous backend restores the original contention risk.
+ 
++## Backend memory resilience
++
++### [Backend memory resilience](backend_memory_resilience/README.md)
++
++- Purpose: account for configured and observed backend memory, reclaim optional allocator and local
++  Node state before external HTTP shedding, export a shared pressure signal for owner-specific
++  patches, and preserve finite cgroup limits as the hard boundary.
++- Prerequisites: local Node executor resilience for pressure-triggered generation retirement and
++  shared-base HTTP admission for dependency-preserving external shedding. Pressure control also
++  requires Linux cgroup v2 with a finite readable memory limit; explicit allocator trim and arena
++  counting require glibc.
++- Activation: all pressure switches default to disabled. Internal reclamation, allocator trim, and
++  external shedding have strict independent settings and ordered headroom thresholds documented in
++  the patch essay.
++- Rollback: restore the previous backend image and remove settings it does not understand; no schema
++  or data change is required.
++
+ ## Build and runtime packaging
+ 
+ ### [Backend build improvements](backend_build_improvements/README.md)
+@@ -75,11 +92,15 @@ protocol and adoption essay but is not another commit in this backend chain.
+   a process-declared exit, repeated event-loop health failure, or backend shutdown; bound startup
+   probes and local response streaming; prevent child stdio from bypassing function-log handling;
+   terminate and reap only that direct child; and expose bounded lifecycle and health metrics.
++  Proactive RSS, imported-package, and age thresholds close admission and drain a healthy
++  generation before replacement. Backend memory resilience extends the same mechanism with
++  cgroup-pressure retirement.
+   Detached descendant process groups, including `build_deps` npm installs, require separate
+   ownership. The atomic-package patch adds best-effort npm process-group containment, but Rust does
+   not wait for descendant exit before removing a generation tempdir.
+-- Prerequisites: none for generation recovery; the atomic package patch adds package and stack
+-  aggregate metrics to the same health protocol.
++- Prerequisites: none for generation recovery or RSS/package/age retirement. The atomic-package
++  patch adds package and stack aggregate metrics to the same health protocol; backend memory
++  resilience adds cgroup-pressure retirement.
+ - Activation: automatic in the local Node executor.
+ - Rollback: restore the previous backend image if healthy generations are retired unexpectedly.
+ 
+diff --git a/patches/backend_memory_resilience/README.md b/patches/backend_memory_resilience/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8423c6a1edb883a450eb5cf031763dc91e6b118
+--- /dev/null
++++ b/patches/backend_memory_resilience/README.md
+@@ -0,0 +1,125 @@
++# Backend Memory Resilience
++
++Status: the maintained backend patch accounts for configured and observed memory, reclaims optional
++allocator and local Node state before external admission shedding, exports a shared pressure signal
++for downstream owner-specific patches, and preserves the finite cgroup limit as the hard boundary.
++All controls are disabled by default and require a readable, finite cgroup v2 memory limit when
++enabled.
++
++## Problem
++
++A self-hosted backend can retain substantial memory in several independent owners: Rust and native
++allocations, free allocator arena space, V8 isolate heaps and reusable contexts, the local Node
++executor, caches, thread stacks, and cgroup kernel memory. Process RSS, allocator accounting, and
++cgroup usage overlap rather than forming an additive breakdown. A hard cgroup limit alone therefore
++cannot identify which optional owner should be reclaimed, and external request shedding should not
++be the first response when warm state can be released safely.
++
++This patch owns the startup feasibility checks, process/allocator/cgroup telemetry, hysteretic
++reclamation and external HTTP shedding, allocator trim, and the shared pressure signal. It extends
++the maintained local Node generation-retirement patch with a pressure response and exposes the
++signal to later owner-specific patches.
++
++The maintained commit is applied after
++[`local_node_executor_resilience`](../local_node_executor_resilience/README.md), whose generation
++fencing and graceful retirement it reuses, and
++[`shared_base_http_admission`](../shared_base_http_admission/README.md), whose dependency-aware HTTP
++gate it extends. It does not require a context-reuse patch.
++
++## Pressure controller
++
++`LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED` enables internal reclamation. It enters when finite cgroup
++headroom is at or below `LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES` and exits only when
++headroom reaches `LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES`. Defaults are 6 GiB and
++8 GiB. The exit boundary must exceed the entry boundary and remain below `memory.max`.
++
++The existing external shedding controller remains independently gated by
++`LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED`, with default 3 GiB entry and 5 GiB exit headroom.
++When both controllers are enabled, the reclamation entry and exit boundaries must each preserve
++more headroom than the corresponding shedding boundary. Invalid relationships fail startup.
++
++The controller samples cgroup headroom every second. On an eligible reclamation sample it first
++evaluates allocator trim in bounded blocking work, then resamples the cgroup. It publishes the
++shared pressure signal only if headroom remains below the reclamation exit condition. A slow or
++failed trim cannot hide a later crossing of the external-shedding boundary. Losing the required
++cgroup source or observing a runtime limit that invalidates configured thresholds triggers
++controlled backend shutdown rather than silently disabling the safety dependency.
++
++## Allocator reclamation and telemetry
++
++`LOCAL_BACKEND_MALLOC_TRIM_ENABLED` enables explicit glibc `malloc_trim(0)` while reclamation is
++active. It requires reclamation to be enabled. A trim is evaluated only when `mallinfo2` reports at
++least `LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES` of logical free arena space, default 1 GiB, and no
++evaluation has occurred within `LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN_SECS`, default 300 seconds.
++
++`mallinfo2` aggregates glibc arenas, but its `fordblks` value is logical allocator free space. It is
++not proof that the same number of resident bytes can be returned. The Boolean `malloc_trim` result
++also does not quantify released memory. Each completed trim therefore records immediate signed
++changes in process RSS, process anonymous RSS, cgroup current usage, cgroup anonymous memory, and
++allocator free bytes. It also records duration and process page faults across the bounded sample.
++Unsupported allocators publish an explicit unsupported outcome and do nothing.
++
++Arena-count telemetry uses `malloc_info` with a fixed 4 MiB `fmemopen` buffer and runs once every
++five minutes. Oversized, malformed, or unsupported output is a telemetry failure; it cannot allocate
++an unbounded diagnostic buffer. Allocator sampling, arena counting, full process/cgroup reporting,
++and trim run in blocking work rather than occupying an asynchronous runtime worker.
++
++Trim failure is an optional-recovery failure. It is counted and logged, but it does not suppress the
++shared pressure signal or the Node consumer. A diagnostic or allocator failure must not disable the
++remaining reclamation actions while cgroup headroom is low.
++
++## Local Node reclamation
++
++The local Node watchdog observes the same pressure signal. After continuous pressure for
++`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS`, default 60 seconds, it gracefully retires the
++current generation only when a successful direct-child RSS sample is at or above
++`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`, default 2 GiB. The pressure RSS floor must be
++positive and strictly below the ordinary RSS retirement threshold.
++
++The ordinary RSS limit remains the first proactive decision, followed by cgroup pressure, imported
++package count, and generation age. Missing RSS telemetry, a smaller child, a shorter pressure
++interval, or a cleared signal cannot trigger pressure retirement. The existing generation fencing,
++admission close, active-request drain, health-failure preemption, direct-child termination, and
++reaping contract is unchanged. The new bounded retirement reason is `cgroup_pressure`.
++
++## Observability
++
++The patch extends the existing bounded memory families with:
++
++- `backend_allocator_arenas_info` and `backend_allocator_arena_telemetry_info`;
++- `backend_memory_reclamation_enabled_info`, `backend_memory_reclamation_active_info`,
++  `backend_memory_reclamation_headroom_threshold_bytes{boundary}`, and
++  `backend_memory_reclamation_transitions_total{state}`;
++- `backend_allocator_trim_enabled_info`, `backend_allocator_trim_active_info`,
++  `backend_allocator_trim_configuration_info{component}`,
++  `backend_allocator_trim_attempts_total{outcome}`, `backend_allocator_trim_seconds`,
++  `backend_allocator_trim_memory_change_bytes{component}`, and
++  `backend_allocator_trim_page_faults_total{kind}`;
++- `local_node_executor_memory_pressure_active_info`,
++  `local_node_executor_memory_pressure_rss_threshold_bytes`, and
++  `local_node_executor_memory_pressure_grace_seconds`; and
++- `cgroup_pressure` in the existing Node retirement and decision families.
++
++Trim outcomes are `returned_true`, `returned_false`, `unsupported`, and `sample_failure`. Falling
++below the logical-free threshold does not call `malloc_trim` and does not increment an attempt
++outcome. Signed result gauges retain the latest completed sample, so consumers must qualify them
++with a counter increment in the observation window. Arena and allocator availability gauges
++distinguish measured zero from unsupported or failed telemetry.
++
++## Activation and verification
++
++The reclamation, allocator-trim, and external-shedding switches default to `false`. Enabling either
++controller requires a finite cgroup v2 limit. Enabling trim additionally requires reclamation. All
++byte settings use strict nonnegative decimal parsing; trim minimum free space, trim cooldown, Node
++pressure RSS, and Node pressure grace must be positive. Changing the process environment requires a
++backend restart.
++
++Focused tests cover hysteresis, pressure-signal publication after trim evaluation, trim cooldown and
++signed results, bounded live glibc arena counting, Node RSS and grace requirements, and ordinary-RSS
++decision priority. Runtime verification must use emitted metrics to measure trim latency and memory
++changes, owner reclamation, Node retirement, and cgroup recovery. No fixed reclaimed-byte or latency
++benefit is assumed.
++
++Removing the patch restores the previous backend memory behavior. No schema or data change is
++involved, but an older image does not understand the new environment variables or emit the new
++metric families.
+diff --git a/patches/local_node_executor_resilience/README.md b/patches/local_node_executor_resilience/README.md
+index 1fa7c63e36c24e19e732b20978fa7354b72bceb9..a7627ed99b651682975e7050c45933deedbc4cc8 100644
+--- a/patches/local_node_executor_resilience/README.md
++++ b/patches/local_node_executor_resilience/README.md
+@@ -1,10 +1,14 @@
+ # Local Node Executor Resilience
+ 
+-This patch restores local Node-action liveness when the shared Node process
+-stops responding. The upstream local executor uses one Node process for the
+-complete deployment. A synchronous loop or event-loop stall in one action can
+-therefore stop every unrelated Node action while queries, mutations, V8 actions,
+-MySQL, and the backend health endpoint remain available.
++This implementation restores local Node-action liveness when the shared Node
++process stops responding and bounds healthy-generation lifetime when memory or
++non-evictable module identity grows. The upstream local executor uses one Node
++process for the complete deployment. A synchronous loop or event-loop stall in
++one action can therefore stop every unrelated Node action while queries,
++mutations, V8 actions, MySQL, and the backend health endpoint remain available.
++Repeated deployment analysis and execution can also retain ESM module graphs
++for the life of that process even after the corresponding disk-cache entry is
++deleted.
+ 
+ ## Failure mode
+ 
+@@ -38,7 +42,18 @@ number. A request retains the exact generation that accepted it. Request
+ timeout, response-stream timeout, request transport failure, a response with
+ `exitingProcess=true`, or watchdog failure can retire that generation. Backend
+ shutdown retires the current generation with `explicit_shutdown` and rejects
+-later invocations.
++later invocations. A healthy generation also begins graceful retirement when
++its sampled Linux direct-child RSS, age, or lifetime-unique imported
++source-package count reaches the configured threshold.
++
++Healthy retirement first closes admission while holding the generation-state
++mutex, then waits for active Rust requests to drain before using the same
++identity-fenced retirement and child-reaping path. The current child remains
++the only child until it has been reaped; a waiting request cannot start a
++replacement while the old child is still resident. The RSS threshold is a
++sampled graceful-retirement trigger and planning allowance, not a hard maximum.
++The child can grow between samples and while active requests drain, and the
++direct-child sample excludes descendants.
+ 
+ Retirement uses `Arc::ptr_eq` while holding the generation slot. A late timeout
+ or connection error from an old request cannot remove a replacement. Several
+@@ -113,6 +128,7 @@ process exit remain the fallbacks if runtime shutdown cancels the task.
+ Each active generation has one backend-owned watchdog task. The watchdog:
+ 
+ - waits one second between checks;
++- reads Linux direct-child RSS concurrently with `GET /health`;
+ - gives `GET /health` one second to complete and accepts at most 64 KiB of
+   response data;
+ - clears the miss count after a valid `status="ok"` response;
+@@ -136,6 +152,15 @@ The startup health check remains separate. Startup performs up to 50 checks at
+ 100 ms intervals and uses the same one-second per-check timeout before
+ publishing a generation.
+ 
++After every watchdog observation, proactive trigger precedence in the base patch is direct-child
++RSS, lifetime imported source-package count, then generation age. When the
++[`backend_memory_resilience`](../backend_memory_resilience/README.md) patch is also carried,
++sustained cgroup pressure with a material direct-child RSS sample follows the ordinary RSS check
++and precedes the package and age checks. These checks run even when the health endpoint is failing;
++the consecutive-health-miss decision follows them. A failed Linux RSS read records `failure` and
++skips only the RSS trigger for that iteration. Non-Linux builds record `unsupported` and do not
++enforce an RSS trigger. A successful sample records `success`.
++
+ ## Metrics and logs
+ 
+ The patch exports bounded backend metrics:
+@@ -155,22 +180,39 @@ The patch exports bounded backend metrics:
+ - `local_node_executor_waiting_requests`;
+ - `local_node_executor_request_starts_total`;
+ - `local_node_executor_request_completions_total{outcome}`;
+-- `local_node_executor_active_requests`.
+-
+-The retirement reason is one of `request_timeout`, `response_stream_timeout`,
+-`connection_error`, `process_exiting`, `health_check_failed`, or
+-`explicit_shutdown`. Child exit class is one of `success`, `failure`, or
+-`signal`. Request outcome is one of `success`, `user_error`, `invalid_response`,
+-`request_timeout`, `response_stream_timeout`, `connection_error`,
+-`transport_error`, `response_stream_error`, `http_error`, `args_too_large`, or
+-`internal_error`. Neither label contains function names, module paths, package
+-keys, request IDs, raw errors, or deployment-specific values. Labelled counters
+-are absent until the corresponding outcome occurs and can be evicted after
+-inactivity. Operator queries treat an absent bounded label as zero only when the
+-compatibility gauge or that metric family has an opening sample at the report
+-start. A contract first observed inside the window has partial coverage, so its
+-missing labels remain unknown. A completely absent family on an older backend
+-remains `not emitted`, not zero.
++- `local_node_executor_active_requests`;
++- `local_node_executor_old_space_limit_bytes`;
++- `local_node_executor_rss_retirement_threshold_bytes`;
++- `local_node_executor_memory_pressure_rss_threshold_bytes`;
++- `local_node_executor_memory_pressure_grace_seconds`;
++- `local_node_executor_memory_pressure_active_info`;
++- `local_node_executor_age_retirement_threshold_seconds`;
++- `local_node_executor_package_retirement_threshold_info`;
++- `local_node_executor_child_rss_bytes`;
++- `local_node_executor_child_rss_telemetry_info`;
++- `local_node_executor_child_rss_samples_total{outcome}`;
++- `local_node_executor_generation_draining_info`;
++- `local_node_executor_retirement_decisions_total{reason,decision}`;
++- `local_node_executor_imported_source_packages_info`.
++
++The base retirement reason is one of `request_timeout`, `response_stream_timeout`,
++`connection_error`, `process_exiting`, `health_check_failed`, `rss_limit`, `package_limit`,
++`age_limit`, or `explicit_shutdown`. Backend memory resilience additionally adds
++`cgroup_pressure`. Child exit
++class is one of `success`, `failure`, or `signal`. RSS sampling outcome is one
++of `success`, `failure`, or `unsupported`. A proactive retirement decision is
++`not_current`, `already_draining`, or `drain_started`. Request outcome is one of
++`success`, `user_error`, `invalid_response`, `request_timeout`,
++`response_stream_timeout`, `connection_error`, `transport_error`,
++`response_stream_error`, `http_error`, `args_too_large`, or `internal_error`.
++Neither label contains function names, module paths, package keys, request IDs,
++raw errors, or deployment-specific values. Labelled counters are absent until
++the corresponding outcome occurs and can be evicted after inactivity. Operator
++queries treat an absent bounded label as zero only when the compatibility gauge
++or that metric family has an opening sample at the report start. A contract
++first observed inside the window has partial coverage, so its missing labels
++remain unknown. A completely absent family on an older backend remains `not
++emitted`, not zero.
+ 
+ `connection_error` is the bounded generation-retirement reason for local
+ request submission and response-body transport failures. Request outcomes keep
+@@ -179,14 +221,22 @@ direct connect failures separate from other pre-header transport failures.
+ Retirement diagnostics identify request kind as `execute`, `analyze`, or
+ `build_deps`; watchdog and shutdown use `not_applicable`. Phase is one of
+ `before_response_headers`, `response_body`, `response_payload`, `health_check`,
+-or `shutdown`. Transport category is one of `timeout`, `connection_refused`,
+-`connection_reset`, `connection_aborted`, `not_connected`, `broken_pipe`,
+-`unexpected_eof`, `other_io`, `connect`, `body`, `request`, `other`, or
+-`not_applicable`. Child state is `running`, `already_exited`, or `probe_failed`;
+-the supervisor-kill label is boolean and final exit class retains the existing
+-`success`, `failure`, or `signal` contract. Replacement outcome is `ready`,
+-`startup_failed`, or `aborted_shutdown`. None of these metrics use generation as
+-a label.
++`watchdog`, or `shutdown`. Transport category is one of `timeout`,
++`connection_refused`, `connection_reset`, `connection_aborted`,
++`not_connected`, `broken_pipe`, `unexpected_eof`, `other_io`, `connect`,
++`body`, `request`, `other`, or `not_applicable`. Child state is `running`,
++`already_exited`, or `probe_failed`; the supervisor-kill label is boolean and
++final exit class retains the existing `success`, `failure`, or `signal`
++contract. Replacement outcome is `ready`, `startup_failed`, or
++`aborted_shutdown`. None of these metrics use generation as a label.
++
++Interpret `local_node_executor_child_rss_bytes` only while
++`local_node_executor_child_rss_telemetry_info` is one. A failed or unsupported
++sample changes freshness to zero but retains the last byte value. Configuration
++gauges are process configuration. Current generation age, RSS freshness,
++draining state, imported package count, and package/cache state reset when the
++generation is removed or replaced. Counters are process-local and require
++reset-aware deltas.
+ 
+ The waiting gauge covers requests waiting for generation selection or child
+ startup. The active gauge covers assigned requests across the current and
+@@ -205,6 +255,9 @@ gauges and converts process-local event totals into backend counter deltas:
+   `local_node_executor_retained_external_package_bytes`;
+ - `local_node_executor_active_source_package_owners_info` and
+   `local_node_executor_registered_stack_roots_info`;
++- `local_node_executor_imported_source_packages_info`, a monotonic
++  generation-lifetime count of source-package roots submitted to Node's dynamic
++  importer;
+ - source/external hit, publish, retire, and failed-publication events in
+   `local_node_executor_package_events_total{package_kind,operation}`;
+ - `local_node_executor_stack_format_invocations_total`,
+@@ -274,7 +327,16 @@ Focused Rust tests cover:
+   retaining them until the stream ends;
+ - rejecting negative timing values and inconsistent syscall counts in executor
+   responses instead of coercing them into valid metrics;
+-- shutdown retirement and child reaping.
++- shutdown retirement and child reaping;
++- inclusive and ordered RSS/package/age retirement decisions, with cgroup-pressure ordering in the
++  backend memory-resilience composition;
++- strict old-space/RSS configuration validation and Linux RSS parsing;
++- graceful admission closure and drain before proactive retirement;
++- continuing drain and child ownership after the initiating caller is
++  canceled;
++- fencing replacement startup until the retiring direct child is reaped;
++- lifetime imported-package counting that begins only at an actual dynamic
++  import attempt and survives disk-cache retirement.
+ 
+ The package patch owns the Node-side health aggregate, package-lifetime, and
+ stack-root tests. The production rollout verifies watchdog health responses,
+@@ -283,16 +345,35 @@ ordinary workload rather than a provider fixture.
+ 
+ ## Adoption and rollback
+ 
+-The liveness behavior is automatic after a backend image containing the patch
+-starts. It adds no deployment-specific configuration and does not require a
+-process pool. The atomic source-package patch is optional for timeout/watchdog
+-recovery and required only for package and stack metrics.
+-
+-Rollback restores the previous backend image. If the watchdog retires healthy
+-processes, rollback removes the complete resilience patch; there is no runtime
+-switch in the first adoption. Timeout recycling and watchdog retirement share
+-the same generation guard and child-termination contract, so carrying only an
+-unreviewed subset is not supported.
++Timeout and unhealthy-watchdog recovery are automatic after a backend image
++containing the lifecycle implementation starts. Healthy proactive retirement
++uses these startup knobs:
++
++- `LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB`;
++- `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`;
++- `LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS`;
++- `LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES`.
++
++The backend memory-resilience composition additionally uses:
++
++- `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`;
++- `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS`.
++
++The backend validates positive values and requires the V8 old-space allowance to remain strictly
++below the ordinary RSS retirement threshold. The memory-resilience composition also requires the
++pressure RSS threshold to remain strictly below that ordinary threshold. It passes old space to
++Node with `--max-old-space-size` before the script path. V8 old space excludes
++Buffers, native modules, executable code, allocator retention, and descendant
++processes. No process pool is required.
++
++Rollback restores the previous backend image and its complete tracked capacity environment. When
++the previous image already contains timeout and unhealthy generation retirement, rolling back the
++local Node resilience patch removes only the newer healthy RSS/package/age controls and their
++telemetry; it does not rewrite earlier deployed lifecycle history. Rolling back the separate
++backend memory-resilience patch removes its cgroup-pressure input without changing the base Node
++retirement mechanisms. Timeout recycling, unhealthy-watchdog retirement, and healthy proactive
++retirement share the same generation guard and child-termination contract, so carrying an
++unreviewed partial image is not supported.
+ 
+ The patch does not remove the one-process throughput ceiling or isolate
+ synchronous Node work across processes. A process pool remains a separate
+diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
+index 4ffc6da7d492b70e3434697084d75a43903137ee..aa1027a529f040fddffb1cea028a7feafc07593a 100644
+--- a/self-hosted/advanced/knobs.md
++++ b/self-hosted/advanced/knobs.md
+@@ -8,6 +8,135 @@ commonly overridden knobs from the host environment or Compose `.env` file.
+ Add other variables to the backend service's `environment` section in
+ [`docker-compose.yml`](../docker/docker-compose.yml).
+ 
++## Backend memory feasibility and local Node lifetime
++
++On Linux, startup checks a finite cgroup v2 `memory.max` before constructing the
++database caches, isolate pool, or local Node executor. The configured budget is
++the checked sum of:
++
++- `(ISOLATE_MAX_USER_HEAP_SIZE + ISOLATE_MAX_HEAP_EXTRA_SIZE) *
++  MAX_ISOLATE_WORKERS`;
++- `ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE * MAX_ISOLATE_WORKERS`;
++- `UDF_CACHE_MAX_SIZE` and `INDEX_CACHE_SIZE`;
++- `MODULE_CACHE_MAX_SIZE_BYTES`, `FUNRUN_INDEX_CACHE_SIZE`,
++  `FUNRUN_MODULE_CACHE_SIZE`, and `FUNRUN_CODE_CACHE_SIZE`;
++- `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`; and
++- `LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES`, which defaults to 2 GiB.
++
++The reserve covers allocations without a separate configured ceiling,
++including Rust data structures, allocator retention, thread stacks, page
++tables, and cgroup kernel memory. The backend rejects startup when this total
++exceeds a finite cgroup limit. It skips the feasibility failure when the cgroup
++memory controller is absent or unlimited. A malformed present controller file
++is a startup error.
++
++This calculation checks configuration feasibility; it is not current
++allocation and does not prove that every cache's weight exactly matches RSS.
++The Node budget entry is a planning allowance equal to a sampled Linux
++direct-child graceful-retirement trigger, not a hard maximum. The child can
++grow between samples and while active requests drain. Short-lived descendant
++processes created while building dependencies are not sampled and remain part
++of the native and kernel reserve.
++The backend publishes each bounded component, the configured total, finite
++limit availability, and finite-limit headroom as startup memory-budget metrics.
++The periodic process, allocator, and cgroup metrics remain the source for
++actual use.
++
++The local Node executor also has independent lifetime controls:
++
++- `LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB`, default `2048`;
++- `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`, default `3221225472` (3 GiB);
++- `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`, default `2147483648` (2 GiB);
++- `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS`, default `60`;
++- `LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS`, default `21600` (6 hours);
++- `LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES`, default `1000`.
++
++V8 old space excludes Buffers, native modules, executable code, and allocator
++retention, so the RSS threshold must remain larger and is validated
++independently. The age and lifetime-unique imported source-package thresholds
++bound growth that disk-cache eviction cannot reclaim from Node's ESM module
++graph. When any threshold is reached, the generation stops accepting new
++requests, waits for in-flight requests to finish, terminates and reaps the
++child, and lets the next request start a replacement generation.
++
++The watchdog normally observes direct-child RSS roughly every one to two
++seconds. An active invocation can delay retirement until its remaining Rust
++deadline expires, up to 605 seconds with the default Node action timeout, and
++termination/reaping can take longer. Non-Linux builds report RSS sampling as
++unsupported and do not use the RSS trigger. A failed Linux sample marks RSS
++telemetry unavailable and skips only that trigger for the iteration; age,
++package, and unhealthy-generation checks continue. The RSS byte gauge retains
++its last value while unavailable, so pair it with the RSS telemetry-availability
++gauge.
++
++The stock Compose file passes these controls through without setting
++different defaults. Changing one requires a backend restart.
++
++## Cgroup memory-pressure reclamation and admission
++
++`LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED` defaults to `false`. When enabled on Linux, the backend
++requires a readable finite cgroup v2 memory limit and enters internal reclamation when headroom
++reaches `LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES`, which defaults to 6 GiB. It clears
++the pressure signal only after headroom reaches
++`LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES`, which defaults to 8 GiB.
++
++On entry, the controller first evaluates an optional glibc trim and resamples cgroup headroom. If
++pressure remains, it publishes one shared signal. The local Node watchdog gracefully retires its
++generation only after the signal has remained active for
++`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS` and a successful direct-child RSS sample reaches
++`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`. The ordinary Node RSS limit remains the
++higher-priority retirement reason.
++
++`LOCAL_BACKEND_MALLOC_TRIM_ENABLED` also defaults to `false` and requires internal reclamation to
++be enabled. On glibc builds, an eligible pressure sample calls `malloc_trim(0)` in bounded blocking
++work only when `mallinfo2` reports at least `LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES` of logical
++arena free space, default 1 GiB. Evaluation is limited by
++`LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN_SECS`, default 300 seconds. Logical free space and the Boolean
++trim result do not prove resident bytes were released, so the backend records immediate signed
++changes in process RSS, anonymous RSS, cgroup usage, cgroup anonymous memory, and allocator free
++space, plus duration and page faults. Unsupported allocators report that trim is unavailable.
++
++The reclamation exit threshold must exceed its entry threshold and remain below the cgroup limit.
++When reclamation and external shedding are both enabled, both reclamation thresholds must preserve
++more headroom than the corresponding shedding thresholds. This makes optional-memory reclamation
++start before admission control.
++
++`LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED` defaults to `false`. When
++enabled on Linux, the backend requires a readable finite cgroup v2 memory limit
++and samples current usage once per second. It rejects new non-dependency HTTP
++requests with `503 BackendMemoryPressure` when headroom reaches
++`LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES`, which defaults to 3 GiB.
++Admission resumes only after headroom reaches
++`LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES`, which defaults to 5 GiB.
++The exit threshold must exceed the enter threshold and remain below the cgroup
++limit.
++
++The check runs before request-body handling and is repeated after the ordinary
++HTTP concurrency wait. `/version` and `/metrics` remain available. Node action
++callback paths carrying the callback-token header remain eligible for
++downstream authentication so already-running actions can complete their
++internal queries and mutations. Path and header presence are classified before
++the token is authenticated, so this exemption is not a denial-of-service
++boundary. The callback middleware still authenticates the token before handler
++body extraction.
++
++Only new HTTP requests pass through this gate. A new WebSocket handshake is
++eligible for rejection, but frames on an established sync WebSocket,
++already-admitted handlers, and scheduled, database, or other backend background
++work continue. The site proxy uses the same state and rejects before forwarding
++to the main listener.
++
++An enabled reclamation or shedding controller is a safety dependency. Losing its cgroup source or a
++runtime cgroup change that makes the thresholds invalid triggers controlled
++backend shutdown instead of silently disabling shedding. The active state,
++headroom, thresholds, transitions, failures, and rejected-request counts are
++published as bounded metrics.
++
++The stock Compose file passes the reclamation, trim, Node pressure, and shedding variables through
++without enabling either controller. Changing one requires a backend restart. See
++[`patches/backend_memory_resilience/README.md`](../../patches/backend_memory_resilience/README.md)
++for the complete metric and failure contract.
++
+ ## `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`
+ 
+ This limits concurrent application requests admitted by the backend HTTP
+diff --git a/self-hosted/docker/docker-compose.yml b/self-hosted/docker/docker-compose.yml
+index b042a8fa7d1144ead97e9860f89ec5f0ed4b5f23..5471a74d33a28a3b890db611d845c1ad9e1b42c9 100644
+--- a/self-hosted/docker/docker-compose.yml
++++ b/self-hosted/docker/docker-compose.yml
+@@ -12,6 +12,14 @@ services:
+     environment:
+       - V8_ACTION_USER_TIMEOUT_SECS
+       - NODE_ACTION_USER_TIMEOUT_SECS
++      - LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB
++      - LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES
++      - LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS
++      - LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES
++      - LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES
++      - LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED
++      - LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES
++      - LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES
+       - APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS
+       - APPLICATION_MAX_CONCURRENT_MUTATIONS=${APPLICATION_MAX_CONCURRENT_MUTATIONS:-16}
+       - APPLICATION_MAX_CONCURRENT_NODE_ACTIONS=${APPLICATION_MAX_CONCURRENT_NODE_ACTIONS:-16}

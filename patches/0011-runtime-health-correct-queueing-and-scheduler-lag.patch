@@ -1,0 +1,2507 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 15 Jul 2026 19:53:06 +0800
+Subject: [PATCH 11/24] runtime health: correct queueing and scheduler lag
+
+Describe per-bucket queued values as observed queueing rather than proof that a
+configured function concurrency limit was reached. A transient queued sample
+can be the normal interval between outstanding accounting and asynchronous
+permit acquisition.
+
+Track scheduled-function ready-state lag in a dedicated 15-second store with
+240 buckets and its own lock, while leaving the generic UDF metric store
+unchanged. Record every successful queue decision independently of the existing
+30-second structured-log coalescing, including refreshed queue heads while an
+executor is full, so cancellation or replacement cannot leave stale state for
+dashboard extrapolation.
+
+Normalize samples to their source-bucket starts and reconstruct lag at requested
+timestamps. Seed a query window from retained earlier state when scheduler
+errors prevent newer observations, and reset the dedicated timeline after a
+backward wall-clock step so pre-jump timestamps cannot manufacture lag or
+recovery.
+
+Record an unlabeled direct admission-lag histogram for each ordinary scheduled
+job admission attempt. Anchor it at the due-time decision and add monotonic scan
+elapsed so wall-clock movement during dispatch does not distort the sample.
+Keep the legacy ordinary and cron execution-lag histograms as sampled
+ready-queue measurements.
+
+Request and refresh the one-hour scheduler view at 15-second resolution,
+include the current aligned bucket, preserve missing samples as chart gaps, and
+format sub-second, second, and minute values explicitly. Align deployment
+markers, stories, operator documentation, and generated screenshots with those
+semantics.
+
+Add focused scheduler, MetricStore, rollback, retained-state, dashboard, and
+queueing regressions plus one operator README for the combined adoption unit.
+---
+ crates/application/src/cron_jobs/metrics.rs   |   5 +-
+ crates/application/src/cron_jobs/mod.rs       |  14 +-
+ crates/application/src/function_log.rs        | 372 +++++++++++++++---
+ .../application/src/scheduled_jobs/metrics.rs |  10 +-
+ crates/application/src/scheduled_jobs/mod.rs  | 133 +++++--
+ crates/udf_metrics/src/lib.rs                 |  33 +-
+ .../src/elements/SchedulerStatus.tsx          |  32 +-
+ .../ChartForFunctionRate.stories.tsx          |   4 +-
+ .../components/ChartForFunctionRate.tsx       | 121 ++++--
+ .../components/ConcurrencyStatus.test.tsx     | 185 +++++++++
+ .../health/components/ConcurrencyStatus.tsx   |  73 ++--
+ .../features/health/components/HealthView.tsx |   2 +-
+ .../dashboard-common/src/lib/appMetrics.ts    |  66 +++-
+ .../HealthSchedulerStatus.stories.tsx         |  12 +-
+ .../docs/dashboard/deployments/health.mdx     |   6 +-
+ ...mponents_health_scheduler_status_dark.webp | Bin 6868 -> 7304 bytes
+ ...ponents_health_scheduler_status_light.webp | Bin 6976 -> 7624 bytes
+ patches/dependency_capacity/README.md         |  13 +-
+ .../dependency_capacity/design_reference.md   |  17 +-
+ patches/runtime_health_dashboard/README.md    | 205 ++++++++++
+ 20 files changed, 1079 insertions(+), 224 deletions(-)
+ create mode 100644 npm-packages/dashboard-common/src/features/health/components/ConcurrencyStatus.test.tsx
+ create mode 100644 patches/runtime_health_dashboard/README.md
+
+diff --git a/crates/application/src/cron_jobs/metrics.rs b/crates/application/src/cron_jobs/metrics.rs
+index a7d94b259756b9b68db6dcd51e376751c18320ef..37bd203b02e7711cd5d762b1335e42be8251470c 100644
+--- a/crates/application/src/cron_jobs/metrics.rs
++++ b/crates/application/src/cron_jobs/metrics.rs
+@@ -38,7 +38,10 @@ pub fn log_cron_job_failure(e: &anyhow::Error) {
+     )
+ }
+ 
+-register_convex_histogram!(CRON_JOB_EXECUTION_LAG_SECONDS, "Cron job execution lag");
++register_convex_histogram!(
++    CRON_JOB_EXECUTION_LAG_SECONDS,
++    "Ready-queue lag sample in seconds for registered cron jobs"
++);
+ pub fn log_cron_job_execution_lag(lag: Duration) {
+     log_distribution(&CRON_JOB_EXECUTION_LAG_SECONDS, lag.as_secs_f64());
+ }
+diff --git a/crates/application/src/cron_jobs/mod.rs b/crates/application/src/cron_jobs/mod.rs
+index aa3429ecea3aa3df92932b60b5100c03c76983af..f63d5a130c73fcedadaa5729a71959218258932d 100644
+--- a/crates/application/src/cron_jobs/mod.rs
++++ b/crates/application/src/cron_jobs/mod.rs
+@@ -111,8 +111,6 @@ const CRON_LOG_MAX_LOG_LINE_LENGTH: usize = 1000;
+ pub struct CronJobExecutor<RT: Runtime> {
+     context: CronJobContext<RT>,
+     running_job_ids: HashSet<ResolvedDocumentId>,
+-    /// Some if there's at least one pending job. May be in the past!
+-    next_job_ready_time: Option<Timestamp>,
+     job_finished_tx: mpsc::Sender<ResolvedDocumentId>,
+     job_finished_rx: mpsc::Receiver<ResolvedDocumentId>,
+     execution_parallelism: usize,
+@@ -168,7 +166,6 @@ impl<RT: Runtime> CronJobExecutor<RT> {
+                 function_log,
+             },
+             running_job_ids: HashSet::new(),
+-            next_job_ready_time: None,
+             job_finished_tx,
+             job_finished_rx,
+             execution_parallelism,
+@@ -197,15 +194,18 @@ impl<RT: Runtime> CronJobExecutor<RT> {
+         let backend_state = BackendStateModel::new(&mut tx).get_backend_state().await?;
+         let is_backend_stopped = backend_state.is_stopped();
+ 
+-        self.next_job_ready_time = if is_backend_stopped {
++        let next_job_ready_time = if is_backend_stopped {
+             None
+-        } else if self.running_job_ids.len() == self.execution_parallelism {
+-            self.next_job_ready_time
+         } else {
++            // Refresh the first non-running queue entry even at the executor
++            // limit. Cancellation or replacement must not leave a stale ready
++            // time in the sampled lag histogram until another cron finishes.
++            // After initializing one head per namespace, a full executor
++            // advances past at most its bounded running-ID set.
+             self.query_and_start_jobs(&mut tx).await?
+         };
+ 
+-        let next_job_future = if let Some(next_job_ts) = self.next_job_ready_time {
++        let next_job_future = if let Some(next_job_ts) = next_job_ready_time {
+             let now = self.context.rt.generate_timestamp()?;
+             Either::Left(if next_job_ts < now {
+                 metrics::log_cron_job_execution_lag(now - next_job_ts);
+diff --git a/crates/application/src/function_log.rs b/crates/application/src/function_log.rs
+index 3b0c373319fd3c7a768b42d57d1c3dff26e98a38..7ad92570d4d3331a97a6d5a30d13f8a60096dcef 100644
+--- a/crates/application/src/function_log.rs
++++ b/crates/application/src/function_log.rs
+@@ -79,6 +79,7 @@ use udf::{
+ };
+ use udf_metrics::{
+     CounterBucket,
++    GaugeBucket,
+     MetricName,
+     MetricStore,
+     MetricStoreConfig,
+@@ -103,6 +104,9 @@ use value::{
+     sha256::Sha256Digest,
+ };
+ 
++const SCHEDULED_JOB_METRICS_BUCKET_WIDTH: Duration = Duration::from_secs(15);
++const SCHEDULED_JOB_METRICS_MAX_BUCKETS: usize = 240;
++
+ pub enum OutstandingFunctionState {
+     Running,
+     Queued,
+@@ -526,6 +530,7 @@ impl FromStr for TableRate {
+ #[derive(Clone)]
+ pub struct FunctionExecutionLog<RT: Runtime> {
+     inner: Arc<Mutex<Inner<RT>>>,
++    scheduled_job_metrics: Arc<Mutex<MetricStore>>,
+     usage_tracking: UsageCounter,
+     rt: RT,
+     concurrency_stats_logger: Arc<Mutex<Box<dyn SpawnHandle>>>,
+@@ -534,22 +539,29 @@ pub struct FunctionExecutionLog<RT: Runtime> {
+ impl<RT: Runtime> FunctionExecutionLog<RT> {
+     pub fn new(rt: RT, usage_tracking: UsageCounter, log_manager: Arc<dyn LogSender>) -> Self {
+         let base_ts = rt.system_time();
++        let metrics_config = MetricStoreConfig {
++            bucket_width: *knobs::UDF_METRICS_BUCKET_WIDTH,
++            max_buckets: *knobs::UDF_METRICS_MAX_BUCKETS,
++            histogram_min_duration: *knobs::UDF_METRICS_MIN_DURATION,
++            histogram_max_duration: *knobs::UDF_METRICS_MAX_DURATION,
++            histogram_significant_figures: *knobs::UDF_METRICS_SIGNIFICANT_FIGURES,
++        };
++        let scheduled_job_metrics_config = MetricStoreConfig {
++            bucket_width: SCHEDULED_JOB_METRICS_BUCKET_WIDTH,
++            max_buckets: SCHEDULED_JOB_METRICS_MAX_BUCKETS,
++            ..metrics_config
++        };
++        let scheduled_job_metrics = Arc::new(Mutex::new(MetricStore::new(
++            base_ts,
++            scheduled_job_metrics_config,
++        )));
+         let inner = Arc::new(Mutex::new(Inner {
+             rt: rt.clone(),
+             num_execution_completions: 0,
+             log: WithHeapSize::default(),
+             log_waiters: vec![].into(),
+             log_manager,
+-            metrics: MetricStore::new(
+-                base_ts,
+-                MetricStoreConfig {
+-                    bucket_width: *knobs::UDF_METRICS_BUCKET_WIDTH,
+-                    max_buckets: *knobs::UDF_METRICS_MAX_BUCKETS,
+-                    histogram_min_duration: *knobs::UDF_METRICS_MIN_DURATION,
+-                    histogram_max_duration: *knobs::UDF_METRICS_MAX_DURATION,
+-                    histogram_significant_figures: *knobs::UDF_METRICS_SIGNIFICANT_FIGURES,
+-                },
+-            ),
++            metrics: MetricStore::new(base_ts, metrics_config),
+         }));
+ 
+         let inner_for_task = inner.clone();
+@@ -603,6 +615,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
+ 
+         Self {
+             inner,
++            scheduled_job_metrics,
+             rt,
+             usage_tracking,
+             concurrency_stats_logger,
+@@ -1268,8 +1281,24 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
+         }
+     }
+ 
+-    /// Indicates that as of now (`timestamp`), the next scheduled job is at
+-    /// `next_job_ts` (None if there are no pending jobs)
++    /// Records that as of `timestamp`, the next scheduled job is at
++    /// `next_job_ts` (None if there are no pending jobs).
++    ///
++    /// Scheduler lag is extrapolated from this state, so callers must record
++    /// every observation rather than applying structured-log rate limits
++    /// here.
++    pub fn record_scheduled_job_lag(&self, next_job_ts: Option<SystemTime>, timestamp: SystemTime) {
++        let result = record_scheduled_job_lag_sample(
++            &mut self.scheduled_job_metrics.lock(),
++            next_job_ts,
++            timestamp,
++        );
++        if let Err(e) = result {
++            Inner::<RT>::log_metrics_error(e);
++        }
++    }
++
++    /// Emits rate-limited structured scheduler statistics.
+     pub fn log_scheduled_job_stats(
+         &self,
+         next_job_ts: Option<SystemTime>,
+@@ -1872,33 +1901,8 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
+     }
+ 
+     pub fn scheduled_job_lag(&self, window: MetricsWindow) -> anyhow::Result<Timeseries> {
+-        let metrics = {
+-            let inner = self.inner.lock();
+-            inner.metrics.clone()
+-        };
+-        let buckets = metrics
+-            .query_gauge(scheduled_job_next_ts_metric(), window.start..window.end)?
+-            .into_iter()
+-            .collect();
+-        let mut timeseries = window.resample_gauges(&metrics, buckets)?;
+-        // For buckets where no value is recorded, interpolate the previous known value
+-        // but increase it by the timestep (since lag naturally increases over
+-        // time)
+-        for i in 1..timeseries.len() {
+-            if timeseries[i].1.is_none()
+-                && let Some(prev) = timeseries[i - 1].1
+-            {
+-                let offset = timeseries[i].0.duration_since(timeseries[i - 1].0)?;
+-                timeseries[i].1 = Some(prev + offset.as_secs_f64());
+-            }
+-        }
+-        // Then clamp negative values to zero
+-        for (_, bucket) in &mut timeseries {
+-            if let Some(value) = bucket {
+-                *value = value.max(0.);
+-            }
+-        }
+-        Ok(timeseries)
++        let metrics = self.scheduled_job_metrics.lock().clone();
++        query_scheduled_job_lag(&window, &metrics)
+     }
+ 
+     /// Log the current number of outstanding functions as a gauge that tracks
+@@ -1935,10 +1939,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
+         let metric_names = metrics.metric_names_for_type(MetricType::Gauge);
+         for metric_name in metric_names {
+             if metric_name.starts_with("outstanding_functions:") {
+-                let buckets = metrics
+-                    .query_gauge(&metric_name, window.start..window.end)?
+-                    .into_iter()
+-                    .collect();
++                let buckets = metrics.query_gauge(&metric_name, window.start..window.end)?;
+                 let timeseries = window.resample_gauges(&metrics, buckets)?;
+                 result.insert(metric_name.to_string(), timeseries);
+             }
+@@ -2005,6 +2006,78 @@ fn cache_hit_percentage(hits: Option<f64>, misses: Option<f64>) -> Option<f64> {
+     }
+ }
+ 
++fn resample_scheduled_job_lag(
++    window: &MetricsWindow,
++    metrics: &MetricStore,
++    buckets: Vec<&GaugeBucket>,
++) -> anyhow::Result<Timeseries> {
++    let samples = buckets
++        .into_iter()
++        .map(|bucket| (metrics.bucket_start(bucket.index), f64::from(bucket.value)))
++        .collect_vec();
++    let mut next_sample = 0;
++    let mut latest_sample = None;
++    let mut result = Vec::with_capacity(window.num_buckets);
++
++    for output_index in 0..window.num_buckets {
++        let output_time = window.bucket_start(output_index)?;
++        while next_sample < samples.len() && samples[next_sample].0 <= output_time {
++            latest_sample = Some(samples[next_sample]);
++            next_sample += 1;
++        }
++        let value = match latest_sample {
++            Some((sample_time, sample_value)) => {
++                let elapsed = output_time.duration_since(sample_time)?;
++                Some((sample_value + elapsed.as_secs_f64()).max(0.0))
++            },
++            None => None,
++        };
++        result.push((output_time, value));
++    }
++    Ok(result)
++}
++
++fn query_scheduled_job_lag(
++    window: &MetricsWindow,
++    metrics: &MetricStore,
++) -> anyhow::Result<Timeseries> {
++    // A scheduler that errors before obtaining another queue decision has no new
++    // sample. Seed the window with its latest retained state so a known overdue
++    // queue does not disappear merely because the query's start moved past it.
++    let query_start = metrics.base_ts().min(window.start);
++    let buckets = metrics.query_gauge(scheduled_job_next_ts_metric(), query_start..window.end)?;
++    resample_scheduled_job_lag(window, metrics, buckets)
++}
++
++fn record_scheduled_job_lag_sample(
++    metrics: &mut MetricStore,
++    next_job_ts: Option<SystemTime>,
++    now: SystemTime,
++) -> Result<(), UdfMetricsError> {
++    let observed_value = next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(now, ts));
++    // MetricStore retains one gauge value per source bucket and associates it with
++    // the bucket start. Store lag at that timestamp so later interpolation
++    // reconstructs `output_time - next_job_ts` instead of treating a
++    // mid-bucket sample as if it occurred at the start and manufacturing lag
++    // after the scheduler caught up.
++    let bucket_start = metrics.bucket_start_containing(now);
++    let value = next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(bucket_start, ts));
++    match metrics.add_gauge(scheduled_job_next_ts_metric(), now, value) {
++        Ok(()) => Ok(()),
++        // Timestamp order no longer represents observation order after a backward
++        // wall-clock step. Reset this dedicated timeline so no pre-jump ready time
++        // remains available for extrapolation after the new observation.
++        Err(
++            UdfMetricsError::SamplePrecedesBaseTimestamp { .. }
++            | UdfMetricsError::SamplePrecedesCutoff { .. },
++        ) => {
++            metrics.reset_timeline(now);
++            metrics.add_gauge(scheduled_job_next_ts_metric(), now, observed_value)
++        },
++        Err(err) => Err(err),
++    }
++}
++
+ struct Inner<RT: Runtime> {
+     rt: RT,
+ 
+@@ -2075,7 +2148,7 @@ impl<RT: Runtime> Inner<RT> {
+             return;
+         }
+         LAST_LOGGED_ERROR.set(Some(now));
+-        tracing::error!("Failed to log execution metrics: {}", error);
++        tracing::error!("Failed to log application metrics: {}", error);
+         if let UdfMetricsError::InternalError(mut e) = error {
+             report_error_sync(&mut e);
+         }
+@@ -2154,7 +2227,6 @@ impl<RT: Runtime> Inner<RT> {
+         now: SystemTime,
+         num_running_jobs: u64,
+     ) -> anyhow::Result<()> {
+-        let name = scheduled_job_next_ts_metric();
+         // -Infinity means there is no scheduled job
+         let value = next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(now, ts));
+         if value > 0.0 {
+@@ -2174,17 +2246,6 @@ impl<RT: Runtime> Inner<RT> {
+                 },
+             }]);
+         }
+-        match self.metrics.add_gauge(name, now, value) {
+-            Ok(()) => (),
+-            Err(UdfMetricsError::SamplePrecedesCutoff { ts: _, cutoff }) => {
+-                // `now` was too old; automatically promote the sample to the cutoff time
+-                // instead
+-                let value =
+-                    next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(cutoff, ts));
+-                self.metrics.add_gauge(name, cutoff, value)?;
+-            },
+-            Err(err) => return Err(err.into()),
+-        }
+         Ok(())
+     }
+ 
+@@ -2213,6 +2274,205 @@ fn signed_duration_since(t1: SystemTime, t2: SystemTime) -> f32 {
+     }
+ }
+ 
++#[cfg(test)]
++mod scheduled_job_lag_tests {
++    use super::*;
++
++    fn scheduled_job_metrics(base: SystemTime) -> MetricStore {
++        MetricStore::new(
++            base,
++            MetricStoreConfig {
++                bucket_width: SCHEDULED_JOB_METRICS_BUCKET_WIDTH,
++                max_buckets: SCHEDULED_JOB_METRICS_MAX_BUCKETS,
++                histogram_min_duration: Duration::from_millis(1),
++                histogram_max_duration: Duration::from_secs(15 * 60),
++                histogram_significant_figures: 3,
++            },
++        )
++    }
++
++    #[test]
++    fn resampling_uses_lag_at_the_source_bucket_start() -> anyhow::Result<()> {
++        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
++        let mut metrics = scheduled_job_metrics(base);
++        let sample_time = SystemTime::UNIX_EPOCH + Duration::from_secs(45);
++        let next_job_time = SystemTime::UNIX_EPOCH + Duration::from_secs(46);
++        record_scheduled_job_lag_sample(&mut metrics, Some(next_job_time), sample_time)?;
++
++        let window = MetricsWindow {
++            start: SystemTime::UNIX_EPOCH + Duration::from_secs(30),
++            end: SystemTime::UNIX_EPOCH + Duration::from_secs(75),
++            num_buckets: 3,
++        };
++        let buckets =
++            metrics.query_gauge(scheduled_job_next_ts_metric(), window.start..window.end)?;
++        let result = resample_scheduled_job_lag(&window, &metrics, buckets)?;
++
++        assert_eq!(result[0].1, None);
++        assert_eq!(result[1].1, Some(0.0));
++        assert_eq!(result[2].1, Some(14.0));
++        Ok(())
++    }
++
++    #[test]
++    fn backward_clock_step_before_the_store_base_discards_pre_jump_state() -> anyhow::Result<()> {
++        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
++        let mut metrics = scheduled_job_metrics(base);
++        let latest_bucket_start = base + Duration::from_secs(30);
++        record_scheduled_job_lag_sample(
++            &mut metrics,
++            Some(base + Duration::from_secs(20)),
++            latest_bucket_start,
++        )?;
++
++        record_scheduled_job_lag_sample(
++            &mut metrics,
++            // Future relative to the post-jump clock, but earlier than the
++            // pre-jump store timeline.
++            Some(base - Duration::from_secs(5)),
++            base - Duration::from_secs(10),
++        )?;
++
++        let window = MetricsWindow {
++            start: base - Duration::from_secs(10),
++            end: base + Duration::from_secs(5),
++            num_buckets: 1,
++        };
++        let result = query_scheduled_job_lag(&window, &metrics)?;
++
++        assert_eq!(metrics.base_ts(), base - Duration::from_secs(10));
++        assert_eq!(result, vec![(base - Duration::from_secs(10), Some(0.0))]);
++        Ok(())
++    }
++
++    #[test]
++    fn backward_clock_step_before_the_latest_bucket_removes_stale_ready_time() -> anyhow::Result<()>
++    {
++        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
++        let mut metrics = scheduled_job_metrics(base);
++        let previous_ready_time = base + Duration::from_secs(5);
++        record_scheduled_job_lag_sample(&mut metrics, Some(previous_ready_time), base)?;
++        record_scheduled_job_lag_sample(
++            &mut metrics,
++            Some(previous_ready_time),
++            base + Duration::from_secs(30),
++        )?;
++
++        let post_jump_now = base + Duration::from_secs(10);
++        record_scheduled_job_lag_sample(
++            &mut metrics,
++            Some(base + Duration::from_secs(20)),
++            post_jump_now,
++        )?;
++
++        let window = MetricsWindow {
++            start: post_jump_now,
++            end: post_jump_now + SCHEDULED_JOB_METRICS_BUCKET_WIDTH,
++            num_buckets: 1,
++        };
++        let result = query_scheduled_job_lag(&window, &metrics)?;
++
++        // Retaining the pre-jump bucket would extrapolate five seconds of lag.
++        assert_eq!(metrics.base_ts(), post_jump_now);
++        assert_eq!(result, vec![(post_jump_now, Some(0.0))]);
++        Ok(())
++    }
++
++    #[test]
++    fn sub_interval_future_change_does_not_extrapolate_stale_lag() -> anyhow::Result<()> {
++        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
++        let mut metrics = scheduled_job_metrics(base);
++        let previous_ready_time = SystemTime::UNIX_EPOCH + Duration::from_secs(46);
++        record_scheduled_job_lag_sample(
++            &mut metrics,
++            Some(previous_ready_time),
++            SystemTime::UNIX_EPOCH + Duration::from_secs(40),
++        )?;
++
++        let next_ready_time = previous_ready_time + Duration::from_secs(10);
++        record_scheduled_job_lag_sample(
++            &mut metrics,
++            Some(next_ready_time),
++            SystemTime::UNIX_EPOCH + Duration::from_secs(41),
++        )?;
++
++        let window = MetricsWindow {
++            start: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
++            end: SystemTime::UNIX_EPOCH + Duration::from_secs(65),
++            num_buckets: 3,
++        };
++        let buckets =
++            metrics.query_gauge(scheduled_job_next_ts_metric(), window.start..window.end)?;
++        let result = resample_scheduled_job_lag(&window, &metrics, buckets)?;
++
++        // Extrapolating the previous ready time would report four seconds here.
++        assert_eq!(
++            result[2],
++            (SystemTime::UNIX_EPOCH + Duration::from_secs(50), Some(0.0))
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn empty_queue_does_not_extrapolate_stale_lag() -> anyhow::Result<()> {
++        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
++        let mut metrics = scheduled_job_metrics(base);
++        record_scheduled_job_lag_sample(
++            &mut metrics,
++            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(46)),
++            SystemTime::UNIX_EPOCH + Duration::from_secs(40),
++        )?;
++        record_scheduled_job_lag_sample(
++            &mut metrics,
++            None,
++            SystemTime::UNIX_EPOCH + Duration::from_secs(41),
++        )?;
++
++        let window = MetricsWindow {
++            start: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
++            end: SystemTime::UNIX_EPOCH + Duration::from_secs(65),
++            num_buckets: 3,
++        };
++        let buckets =
++            metrics.query_gauge(scheduled_job_next_ts_metric(), window.start..window.end)?;
++        let result = resample_scheduled_job_lag(&window, &metrics, buckets)?;
++
++        assert_eq!(
++            result[2],
++            (SystemTime::UNIX_EPOCH + Duration::from_secs(50), Some(0.0))
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn retained_state_before_the_window_continues_extrapolating() -> anyhow::Result<()> {
++        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
++        let mut metrics = scheduled_job_metrics(base);
++        let next_job_time = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
++        record_scheduled_job_lag_sample(
++            &mut metrics,
++            Some(next_job_time),
++            SystemTime::UNIX_EPOCH + Duration::from_secs(10),
++        )?;
++
++        let window = MetricsWindow {
++            start: SystemTime::UNIX_EPOCH + Duration::from_secs(3705),
++            end: SystemTime::UNIX_EPOCH + Duration::from_secs(3750),
++            num_buckets: 3,
++        };
++        let result = query_scheduled_job_lag(&window, &metrics)?;
++
++        assert_eq!(
++            result[0],
++            (
++                SystemTime::UNIX_EPOCH + Duration::from_secs(3705),
++                Some(3685.0)
++            )
++        );
++        Ok(())
++    }
++}
++
+ #[derive(Default)]
+ pub struct UdfMetricSummary {
+     // Aggregated metrics for backwards compatibility.
+diff --git a/crates/application/src/scheduled_jobs/metrics.rs b/crates/application/src/scheduled_jobs/metrics.rs
+index 7ef87c46e3e30c55bfd340ca5f0751332f70d6b2..116687cf0b691e204471ccfec869744b6bd48b82 100644
+--- a/crates/application/src/scheduled_jobs/metrics.rs
++++ b/crates/application/src/scheduled_jobs/metrics.rs
+@@ -53,12 +53,20 @@ pub fn log_scheduled_job_failure(e: &anyhow::Error, prev_failures: u32) {
+ 
+ register_convex_histogram!(
+     SCHEDULED_JOB_EXECUTION_LAG_SECONDS,
+-    "Schedule job execution lag"
++    "Rate-limited ready-queue lag sample in seconds for ordinary scheduled jobs"
+ );
+ pub fn log_scheduled_job_execution_lag(lag: Duration) {
+     log_distribution(&SCHEDULED_JOB_EXECUTION_LAG_SECONDS, lag.as_secs_f64());
+ }
+ 
++register_convex_histogram!(
++    SCHEDULED_JOB_ADMISSION_LAG_SECONDS,
++    "Seconds from an ordinary scheduled job's target time to each scheduler admission attempt"
++);
++pub fn log_scheduled_job_admission_lag(lag: Duration) {
++    log_distribution(&SCHEDULED_JOB_ADMISSION_LAG_SECONDS, lag.as_secs_f64());
++}
++
+ register_convex_histogram!(
+     SCHEDULED_JOB_NUM_RUNNING_TOTAL,
+     "Number of currently executing scheduled jobs"
+diff --git a/crates/application/src/scheduled_jobs/mod.rs b/crates/application/src/scheduled_jobs/mod.rs
+index ab9182f2cd264141edeaa6eddc94b0f4ec470ad7..fd13cee0ef56a45e2ff4ea5c370020ac1ac784fe 100644
+--- a/crates/application/src/scheduled_jobs/mod.rs
++++ b/crates/application/src/scheduled_jobs/mod.rs
+@@ -122,6 +122,32 @@ use crate::{
+     function_log::FunctionExecutionLog,
+ };
+ 
++const SCHEDULED_JOB_STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
++
++fn should_log_scheduled_job_stats(
++    last_ready_time: Option<SystemTime>,
++    next_ready_time: Option<SystemTime>,
++    now: SystemTime,
++    last_stats_log: SystemTime,
++) -> bool {
++    let ready_time_changed = match (last_ready_time, next_ready_time) {
++        (None, None) => false,
++        (Some(previous), Some(next)) => {
++            let abs_diff = previous
++                .duration_since(next)
++                .unwrap_or_else(|e| e.duration());
++            abs_diff >= SCHEDULED_JOB_STATS_LOG_INTERVAL
++        },
++        // Always log if transitioning between Some and None.
++        _ => true,
++    };
++    let overdue_heartbeat = next_ready_time.is_some_and(|t| t <= now)
++        && now
++            .duration_since(last_stats_log)
++            .is_ok_and(|d| d >= SCHEDULED_JOB_STATS_LOG_INTERVAL);
++    ready_time_changed || overdue_heartbeat
++}
++
+ mod metrics;
+ 
+ pub(crate) const SCHEDULED_JOB_EXECUTED: &str = "scheduled_job_executed";
+@@ -176,8 +202,6 @@ pub struct ScheduledJobExecutor<RT: Runtime> {
+     context: ScheduledJobContext<RT>,
+     deployment_name: String,
+     running_job_ids: HashSet<ResolvedDocumentId>,
+-    /// Some if there's at least one pending job. May be in the past!
+-    next_job_ready_time: Option<Timestamp>,
+     job_finished_tx: mpsc::Sender<ResolvedDocumentId>,
+     job_finished_rx: mpsc::Receiver<ResolvedDocumentId>,
+     execution_parallelism: usize,
+@@ -240,7 +264,6 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
+             },
+             deployment_name,
+             running_job_ids: HashSet::new(),
+-            next_job_ready_time: None,
+             job_finished_tx,
+             job_finished_rx,
+             execution_parallelism,
+@@ -290,42 +313,38 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
+         let backend_state = BackendStateModel::new(&mut tx).get_backend_state().await?;
+         let is_backend_stopped = backend_state.is_stopped();
+ 
+-        self.next_job_ready_time = if is_backend_stopped {
++        let next_job_ready_time = if is_backend_stopped {
+             // If the backend is stopped we shouldn't poll. Our subscription will notify us
+             // when the backend is started again.
+             None
+-        } else if self.running_job_ids.len() == self.execution_parallelism {
+-            // A scheduled job may have been added, but we can't do anything because we're
+-            // still running jobs at our concurrency limit.
+-            self.next_job_ready_time
+         } else {
+-            // Great! we have enough remaining concurrency and our backend is running, start
+-            // new job(s) if we can and update our next ready time.
++            // Query even at the executor concurrency limit. The query will not dispatch
++            // another job, but it must refresh the queue head after
++            // cancellation or replacement so the dashboard does not extrapolate
++            // a stale ready time. After initializing one head per namespace, a
++            // full executor advances past at most its bounded running-ID set.
+             let root = get_sampled_span(
+                 &self.deployment_name,
+                 "scheduler/query_and_start_jobs",
+                 &mut self.context.rt.rng(),
+             );
+             self.query_and_start_jobs(&mut tx).in_span(root).await?
+-        };
++        }
++        .map(SystemTime::from);
+ 
+         let now = self.context.rt.system_time();
+-        let next_job_ready_time = self.next_job_ready_time.map(SystemTime::from);
+-        // Only log stats if:
+-        // - next_job_ready_time differs by >=30 seconds from the last logged value; or
+-        // - we're lagging and >=30 seconds have elapsed
+-        let should_log = match (self.last_logged_ready_time, next_job_ready_time) {
+-            (None, None) => false,
+-            (Some(t1), Some(t2)) => {
+-                let abs_diff = t1.duration_since(t2).unwrap_or_else(|e| e.duration());
+-                abs_diff >= Duration::from_secs(30)
+-            },
+-            // always log if transitioning between Some and None
+-            _ => true,
+-        } || (next_job_ready_time.is_some_and(|t| t <= now)
+-            && now
+-                .duration_since(self.last_stats_log)
+-                .is_ok_and(|d| d >= Duration::from_secs(30)));
++        // The app-metrics endpoint extrapolates from the latest observed ready time.
++        // Keep this cheap in-memory state current independently of rate-limited
++        // structured logs.
++        self.context
++            .function_log
++            .record_scheduled_job_lag(next_job_ready_time, now);
++        let should_log = should_log_scheduled_job_stats(
++            self.last_logged_ready_time,
++            next_job_ready_time,
++            now,
++            self.last_stats_log,
++        );
+         if should_log {
+             self.log_scheduled_job_stats(next_job_ready_time, now);
+             self.last_logged_ready_time = next_job_ready_time;
+@@ -418,6 +437,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
+         tx: &mut Transaction<RT>,
+     ) -> anyhow::Result<Option<Timestamp>> {
+         let now = self.context.rt.generate_timestamp()?;
++        let scan_started = self.context.rt.monotonic_now();
+         let mut job_stream = self.context.stream_jobs_to_run(tx);
+         while let Some((job_id, job)) = job_stream.try_next().await? {
+             self.context
+@@ -439,6 +459,19 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
+                 return Ok(Some(next_ts));
+             }
+ 
++            // Anchor lag to the wall-clock due-time decision, then advance it with
++            // monotonic elapsed time. A wall-clock step during the scan must not erase
++            // or inflate lag that the scheduler already observed.
++            let admission_lag = (now - next_ts)
++                .checked_add(
++                    self.context
++                        .rt
++                        .monotonic_now()
++                        .saturating_duration_since(scan_started),
++                )
++                .context("Scheduled job admission lag overflow")?;
++            metrics::log_scheduled_job_admission_lag(admission_lag);
++
+             let context = self.context.clone();
+             let tx = self.job_finished_tx.clone();
+ 
+@@ -1249,3 +1282,49 @@ impl<RT: Runtime> ScheduledJobGarbageCollector<RT> {
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::time::UNIX_EPOCH;
++
++    use super::*;
++
++    #[test]
++    fn scheduled_job_stats_keep_sub_interval_catch_up_coalesced() {
++        let now = UNIX_EPOCH + Duration::from_secs(100);
++        assert!(!should_log_scheduled_job_stats(
++            Some(now - Duration::from_secs(1)),
++            Some(now + Duration::from_secs(1)),
++            now,
++            now - Duration::from_secs(1),
++        ));
++    }
++
++    #[test]
++    fn scheduled_job_stats_keep_sub_interval_future_changes_coalesced() {
++        let now = UNIX_EPOCH + Duration::from_secs(100);
++        assert!(!should_log_scheduled_job_stats(
++            Some(now + Duration::from_secs(10)),
++            Some(now + Duration::from_secs(20)),
++            now,
++            now - Duration::from_secs(1),
++        ));
++    }
++
++    #[test]
++    fn scheduled_job_stats_keep_existing_interval_triggers() {
++        let now = UNIX_EPOCH + Duration::from_secs(100);
++        assert!(should_log_scheduled_job_stats(
++            Some(now + Duration::from_secs(10)),
++            Some(now + Duration::from_secs(40)),
++            now,
++            now - Duration::from_secs(1),
++        ));
++        assert!(should_log_scheduled_job_stats(
++            Some(now - Duration::from_secs(1)),
++            Some(now - Duration::from_secs(1)),
++            now,
++            now - SCHEDULED_JOB_STATS_LOG_INTERVAL,
++        ));
++    }
++}
+diff --git a/crates/udf_metrics/src/lib.rs b/crates/udf_metrics/src/lib.rs
+index 3978b00258f7e28940e6a9587a31f720a37fae4e..d62a151e81795fecde3fa70cee19261dac744ba5 100644
+--- a/crates/udf_metrics/src/lib.rs
++++ b/crates/udf_metrics/src/lib.rs
+@@ -2,22 +2,24 @@
+ //! storing many sparse metrics with a low retention time (default: 1 hour) and
+ //! relatively coarse aggregation buckets (default: 1 minute).
+ //!
+-//! We support two types of metrics:
++//! We support three types of metrics:
+ //!
+ //! - Counter: A simple counter that records some summable quantity associated
+ //!   with an event.
++//! - Gauge: A value that is overwritten or maximized within an aggregation
++//!   bucket.
+ //! - Histogram: A histogram that records the distribution of a duration between
+ //!   1ms and 15m at millisecond resolution.
+ //!
+ //! # Implementation notes
+ //! The data structure keeps a `base_ts` for its creation time and partitions
+-//! time into one minute "buckets" of the form
+-//! `[base_ts + i * 1m, base_ts + (i + 1) * 1m)`. For memory efficiency, buckets
+-//! only store their index, not the full timestamp.
++//! time into configured-width buckets of the form
++//! `[base_ts + i * width, base_ts + (i + 1) * width)`. For memory efficiency,
++//! buckets only store their index, not the full timestamp.
+ //!
+-//! Non empty buckets are stored in two slabs: one for counters and one for
+-//! histograms. Metrics must be strictly either counters or histograms, and it's
+-//! an error to log a histogram sample to a counter bucket.
++//! Non-empty buckets are stored in separate counter, gauge, and histogram
++//! slabs. Each metric has exactly one type, and logging a sample of another
++//! type is an error.
+ //!
+ //! We maintain two indexes on the bucket slabs for efficient querying: one on
+ //! `(bucket_index, metric_key)` for efficiently finding buckets ordered by
+@@ -156,9 +158,7 @@ pub struct MetricStore {
+     histogram_buckets: Slab<HistogramBucket>,
+     gauge_buckets: Slab<GaugeBucket>,
+ 
+-    // NB: Both of these indexes have bucket keys that point either to `counter_buckets`
+-    // or `histogram_buckets`: Since a single metric has to either be a counter or a
+-    // histogram, we can look at `metrics` to know which bucket slab to look at.
++    // Bucket keys in both indexes point into the slab selected by the metric's type.
+     bucket_by_start: OrdMap<(BucketIndex, MetricKey), BucketKey>,
+     bucket_by_metric: OrdMap<(MetricKey, BucketIndex), BucketKey>,
+ }
+@@ -561,10 +561,16 @@ impl MetricStore {
+         (since_base.as_nanos() / self.config.bucket_width.as_nanos()) as u32
+     }
+ 
+-    fn bucket_start(&self, index: BucketIndex) -> SystemTime {
++    /// Return the start timestamp for a storage bucket index.
++    pub fn bucket_start(&self, index: BucketIndex) -> SystemTime {
+         self.base_ts + (index * self.config.bucket_width)
+     }
+ 
++    /// Return the start of the storage bucket containing `ts`.
++    pub fn bucket_start_containing(&self, ts: SystemTime) -> SystemTime {
++        self.bucket_start(self.saturating_bucket_index(ts))
++    }
++
+     fn prune_buckets(&mut self) -> anyhow::Result<()> {
+         let Some(((max_bucket_index, _), _)) = self.bucket_by_start.get_max() else {
+             return Ok(());
+@@ -615,6 +621,11 @@ impl MetricStore {
+     pub fn base_ts(&self) -> SystemTime {
+         self.base_ts
+     }
++
++    /// Discard all samples and begin a new timestamp-ordered timeline.
++    pub fn reset_timeline(&mut self, base_ts: SystemTime) {
++        *self = Self::new(base_ts, self.config);
++    }
+ }
+ 
+ #[derive(Debug, thiserror::Error)]
+diff --git a/npm-packages/dashboard-common/src/elements/SchedulerStatus.tsx b/npm-packages/dashboard-common/src/elements/SchedulerStatus.tsx
+index f6cd39ab15b2e893cc704218c3b1d878ee3d23a2..66ea2946f0d54f631612051f39d817e92ea0a0e6 100644
+--- a/npm-packages/dashboard-common/src/elements/SchedulerStatus.tsx
++++ b/npm-packages/dashboard-common/src/elements/SchedulerStatus.tsx
+@@ -1,7 +1,11 @@
+-import { formatDistance } from "date-fns";
+ import { cn } from "@ui/cn";
+ import { HealthCard } from "@common/elements/HealthCard";
+-import { useSchedulerLag } from "@common/lib/appMetrics";
++import {
++  formatSchedulerLag,
++  SCHEDULER_LAG_CRITICAL_SECONDS,
++  SCHEDULER_LAG_WARNING_SECONDS,
++  useSchedulerLag,
++} from "@common/lib/appMetrics";
+ import { ChartForFunctionRate } from "@common/features/health/components/ChartForFunctionRate";
+ import { ChartData } from "@common/lib/charts/types";
+ 
+@@ -10,23 +14,24 @@ export function SchedulerStatus({
+   lag: lagProp,
+ }: {
+   small?: boolean;
+-  lag?: ChartData | null | undefined;
++  lag?: ChartData | null;
+ }) {
+   const lagFromHook = useSchedulerLag();
+   const lag = lagProp ?? lagFromHook;
+-  const lagData = lag?.data as Array<{ time: string; lag: number }> | undefined;
+-  const behindBySeconds =
+-    60 * ((lagData && lagData[lagData.length - 1]?.lag) || 0);
++  const lagData = lag?.data as
++    | Array<{ time: string; lag: number | null }>
++    | undefined;
++  const behindBySeconds = lagData?.[lagData.length - 1]?.lag ?? 0;
+ 
+   const health =
+-    behindBySeconds <= 20
++    behindBySeconds <= SCHEDULER_LAG_WARNING_SECONDS
+       ? "healthy"
+-      : behindBySeconds > 300
+-        ? "error"
+-        : "warning";
++      : behindBySeconds > SCHEDULER_LAG_CRITICAL_SECONDS
++      ? "error"
++      : "warning";
+ 
+   if (small) {
+-    if (!health || health === "healthy") {
++    if (health === "healthy") {
+       return null;
+     }
+     return (
+@@ -42,8 +47,7 @@ export function SchedulerStatus({
+         <div className="truncate text-center text-pretty text-content-secondary">
+           <div className="flex gap-1">
+             <p className="text-content-secondary">
+-              Scheduling is behind by{" "}
+-              {formatDistance(0, behindBySeconds * 1000)}.
++              Scheduling is behind by {formatSchedulerLag(behindBySeconds)}.
+             </p>
+           </div>
+         </div>
+@@ -53,7 +57,7 @@ export function SchedulerStatus({
+   return (
+     <HealthCard
+       title="Scheduler Status"
+-      tip="The status of function scheduling. Scheduling is unhealthy when functions are executing after their scheduled time."
++      tip="The ready-queue lag for scheduled functions. Sustained lag means a pending function remained ready past its target time."
+     >
+       <ChartForFunctionRate chartData={lag} kind="schedulerStatus" />
+     </HealthCard>
+diff --git a/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.stories.tsx b/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.stories.tsx
+index 88305d1e8f6a6ddd4751410c572e5a4f25b91aec..aa32a0c6c4b9afb09d8340e12821a0dff4607403 100644
+--- a/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.stories.tsx
++++ b/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.stories.tsx
+@@ -81,8 +81,8 @@ export const SchedulerStatus: Story = {
+     chartData: {
+       ...chartData,
+       data: points.map((row) => ({
+-        time: row.time,
+-        scheduler: Math.round((row.queryA / 10) * 10),
++        time: row.time.replace(" PM", ":00 PM"),
++        scheduler: Math.round(row.queryA),
+       })),
+       lineKeys: [
+         { key: "scheduler", name: "scheduler", color: "var(--chart-line-1)" },
+diff --git a/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.tsx b/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.tsx
+index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc649993174 100644
+--- a/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.tsx
++++ b/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.tsx
+@@ -16,6 +16,10 @@ import {
+ import { ChartTooltip } from "@common/elements/ChartTooltip";
+ import { useDeploymentAuditLogs } from "@common/lib/useDeploymentAuditLog";
+ import { timeLabelForMinute, formatNumberCompact } from "@common/lib/format";
++import {
++  formatSchedulerLag,
++  SCHEDULER_LAG_BUCKET_MILLIS,
++} from "@common/lib/appMetrics";
+ import { ChartData } from "@common/lib/charts/types";
+ import { DeploymentTimes } from "@common/features/health/components/DeploymentTimes";
+ import { Button } from "@ui/Button";
+@@ -147,17 +151,24 @@ export function ChartForFunctionRate({
+   const auditLogs = useDeploymentAuditLogs(startDate.getTime(), {
+     actions: ["push_config", "push_config_with_components"],
+   });
+-  const deploysByMinute = auditLogs?.map(
+-    (log) => {
+-      const creationDate = new Date(log._creationTime);
++  const deployments = auditLogs?.map((log) => {
++    const creationDate = new Date(log._creationTime);
++    const bucketedCreationDate =
++      kind === "schedulerStatus"
++        ? new Date(
++            Math.floor(creationDate.getTime() / SCHEDULER_LAG_BUCKET_MILLIS) *
++              SCHEDULER_LAG_BUCKET_MILLIS,
++          )
++        : creationDate;
+ 
+-      return {
+-        hour: format(creationDate, "h:mm a"),
+-        timestamp: log._creationTime,
+-      };
+-    },
+-    {} as Record<string, { hour: string; timestamp: number }[]>,
+-  );
++    return {
++      hour: format(
++        bucketedCreationDate,
++        kind === "schedulerStatus" ? "h:mm:ss a" : "h:mm a",
++      ),
++      timestamp: log._creationTime,
++    };
++  });
+   return (
+     <div className="size-full min-h-52 **:outline-none!">
+       <LoadingTransition
+@@ -174,7 +185,9 @@ export function ChartForFunctionRate({
+       >
+         {chartData === null ? (
+           <div className="flex h-45 w-full items-center justify-center px-12 text-center text-sm text-content-secondary">
+-            {`Data will appear here as your ${kind === "cacheHitRate" ? "queries" : "functions"} are called.`}
++            {`Data will appear here as your ${
++              kind === "cacheHitRate" ? "queries" : "functions"
++            } are called.`}
+           </div>
+         ) : chartData === undefined ? null : (
+           <div ref={chartRef} style={{ width: "99%", height: "99%" }}>
+@@ -186,7 +199,7 @@ export function ChartForFunctionRate({
+                 }}
+               >
+                 {/* Show a reference line for each time bucket that had a deployment */}
+-                {deploysByMinute?.map(({ hour, timestamp }) => (
++                {deployments?.map(({ hour, timestamp }) => (
+                   <ReferenceLine
+                     key={timestamp}
+                     x={hour}
+@@ -211,10 +224,11 @@ export function ChartForFunctionRate({
+                     kind === "functionCalls" ||
+                     kind === "subscriptionInvalidations"
+                       ? formatNumberCompact(value as number)
+-                      : kind === "schedulerStatus" ||
+-                          kind === "functionConcurrency"
+-                        ? value
+-                        : `${value.toFixed((value as number) % 1 === 0 ? 0 : 2)}%`
++                      : kind === "schedulerStatus"
++                      ? formatSchedulerLag(value as number)
++                      : kind === "functionConcurrency"
++                      ? value
++                      : `${value.toFixed((value as number) % 1 === 0 ? 0 : 2)}%`
+                   }
+                   domain={
+                     kind !== "schedulerStatus" &&
+@@ -276,10 +290,16 @@ export function ChartForFunctionRate({
+                             kind === "subscriptionInvalidations" ? (
+                               "Other"
+                             ) : (
+-                              `All${[].length > 1 ? " other" : ""} ${kind === "cacheHitRate" ? "queries" : "functions"}`
++                              `All${
++                                chartData.lineKeys.length > 1 ? " other" : ""
++                              } ${
++                                kind === "cacheHitRate"
++                                  ? "queries"
++                                  : "functions"
++                              }`
+                             )
+                           ) : kind === "schedulerStatus" ? (
+-                            "Lag Time (minutes)"
++                            "Lag Time"
+                           ) : kind === "functionConcurrency" ? (
+                             line.key
+                           ) : kind === "subscriptionInvalidations" ? (
+@@ -306,7 +326,7 @@ export function ChartForFunctionRate({
+                       {...props}
+                       chartRef={chartRef}
+                       content={({ active, payload, label }: any) => {
+-                        const deploymentTimes = deploysByMinute
++                        const deploymentTimes = deployments
+                           ?.filter((deploy) => deploy.hour === label)
+                           .map((deploy) =>
+                             format(new Date(deploy.timestamp), "pp"),
+@@ -323,8 +343,8 @@ export function ChartForFunctionRate({
+                                 a.dataKey === "_rest"
+                                   ? 1
+                                   : b.dataKey === "_rest"
+-                                    ? -1
+-                                    : 0,
++                                  ? -1
++                                  : 0,
+                               )
+                               .map((dataPoint: any) => ({
+                                 ...dataPoint,
+@@ -335,7 +355,13 @@ export function ChartForFunctionRate({
+                                         kind === "subscriptionInvalidations" ? (
+                                           "Other"
+                                         ) : (
+-                                          `All${payload.length > 1 ? " other" : ""} ${kind === "cacheHitRate" ? "queries" : "functions"}`
++                                          `All${
++                                            payload.length > 1 ? " other" : ""
++                                          } ${
++                                            kind === "cacheHitRate"
++                                              ? "queries"
++                                              : "functions"
++                                          }`
+                                         )
+                                       ) : kind === "schedulerStatus" ? (
+                                         "Lag Time"
+@@ -356,21 +382,38 @@ export function ChartForFunctionRate({
+                                     </div>
+                                     <div className="shrink-0 text-right">
+                                       {kind === "schedulerStatus"
+-                                        ? `${(dataPoint.value as number).toLocaleString()} minutes`
++                                        ? formatSchedulerLag(
++                                            dataPoint.value as number,
++                                          )
+                                         : kind === "functionConcurrency" ||
+-                                            kind === "functionCalls"
+-                                          ? `${formatNumberCompact(dataPoint.value as number)} ${(dataPoint.value as number) === 1 ? "call" : "calls"}`
+-                                          : kind === "subscriptionInvalidations"
+-                                            ? `${formatNumberCompact(dataPoint.value as number)} ${(dataPoint.value as number) === 1 ? "invalidation" : "invalidations"}`
+-                                            : `${(
+-                                                dataPoint.value as number
+-                                              ).toFixed(
+-                                                (dataPoint.value as number) %
+-                                                  1 ===
+-                                                  0
+-                                                  ? 0
+-                                                  : 2,
+-                                              )}%`}
++                                          kind === "functionCalls"
++                                        ? `${formatNumberCompact(
++                                            dataPoint.value as number,
++                                          )} ${
++                                            kind === "functionConcurrency"
++                                              ? "function"
++                                              : "call"
++                                          }${
++                                            (dataPoint.value as number) === 1
++                                              ? ""
++                                              : "s"
++                                          }`
++                                        : kind === "subscriptionInvalidations"
++                                        ? `${formatNumberCompact(
++                                            dataPoint.value as number,
++                                          )} ${
++                                            (dataPoint.value as number) === 1
++                                              ? "invalidation"
++                                              : "invalidations"
++                                          }`
++                                        : `${(
++                                            dataPoint.value as number
++                                          ).toFixed(
++                                            (dataPoint.value as number) % 1 ===
++                                              0
++                                              ? 0
++                                              : 2,
++                                          )}%`}
+                                     </div>
+                                   </span>
+                                 ),
+@@ -380,7 +423,11 @@ export function ChartForFunctionRate({
+                                 deploymentTimes={deploymentTimes}
+                               />
+                             }
+-                            label={timeLabelForMinute(label)}
++                            label={
++                              kind === "schedulerStatus"
++                                ? label
++                                : timeLabelForMinute(label)
++                            }
+                             showLegend
+                           />
+                         );
+diff --git a/npm-packages/dashboard-common/src/features/health/components/ConcurrencyStatus.test.tsx b/npm-packages/dashboard-common/src/features/health/components/ConcurrencyStatus.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..688f0ce075cca399a2a07f2d63ff6df53de46ed0
+--- /dev/null
++++ b/npm-packages/dashboard-common/src/features/health/components/ConcurrencyStatus.test.tsx
+@@ -0,0 +1,185 @@
++import { render, renderHook } from "@testing-library/react";
++import {
++  useFunctionConcurrency,
++  useSchedulerLag,
++} from "@common/lib/appMetrics";
++import { ChartData } from "@common/lib/charts/types";
++import { useConcurrencyStatus } from "./ConcurrencyStatus";
++
++jest.mock("@common/lib/appMetrics", () => ({
++  ...jest.requireActual("@common/lib/appMetrics"),
++  useFunctionConcurrency: jest.fn(),
++  useSchedulerLag: jest.fn(),
++}));
++
++const mockUseFunctionConcurrency = jest.mocked(useFunctionConcurrency);
++const mockUseSchedulerLag = jest.mocked(useSchedulerLag);
++
++function chartData(functionType: string, values: number[]): ChartData {
++  return {
++    data: values.map((value, index) => ({
++      time: `${index}`,
++      [functionType]: value,
++    })),
++    xAxisKey: "time",
++    lineKeys: [
++      { key: functionType, name: functionType, color: "var(--chart-line-1)" },
++    ],
++  };
++}
++
++function concurrencyIssues({
++  functionType,
++  queued,
++  running,
++}: {
++  functionType: string;
++  queued: number[];
++  running: number[];
++}) {
++  mockUseFunctionConcurrency.mockReturnValue({
++    queued: chartData(functionType, queued),
++    running: chartData(functionType, running),
++  });
++
++  return renderHook(() => useConcurrencyStatus()).result.current.issues;
++}
++
++beforeEach(() => {
++  mockUseSchedulerLag.mockReturnValue({
++    data: [],
++    xAxisKey: "time",
++    lineKeys: [{ key: "lag", name: "Lag", color: "var(--brand-yellow)" }],
++  });
++});
++
++test("reports transient queueing with low running concurrency without claiming a limit hit", () => {
++  expect(
++    concurrencyIssues({
++      functionType: "Actions",
++      queued: [0, 1, 0],
++      running: [5, 7, 4],
++    }),
++  ).toEqual([
++    {
++      severity: "warning",
++      message: "Queueing observed for Actions in the last hour",
++      type: "concurrency",
++    },
++  ]);
++});
++
++test("keeps high-running queueing visible without claiming a configured-limit hit", () => {
++  expect(
++    concurrencyIssues({
++      functionType: "Queries",
++      queued: [0, 3, 0],
++      running: [120, 124, 122],
++    }),
++  ).toEqual([
++    {
++      severity: "warning",
++      message: "Queueing observed for Queries in the last hour",
++      type: "concurrency",
++    },
++  ]);
++});
++
++test("reports queueing in the latest minute", () => {
++  expect(
++    concurrencyIssues({
++      functionType: "Mutations",
++      queued: [0, 0, 1],
++      running: [4, 5, 6],
++    }),
++  ).toEqual([
++    {
++      severity: "warning",
++      message: "Queueing observed for Mutations in the latest minute",
++      type: "concurrency",
++    },
++  ]);
++});
++
++test("keeps the queue warning visible when running concurrency is absent", () => {
++  mockUseFunctionConcurrency.mockReturnValue({
++    queued: chartData("Actions", [0, 0, 1]),
++    running: null,
++  });
++
++  const { result } = renderHook(() => useConcurrencyStatus());
++  const view = render(<>{result.current.closedDescription}</>);
++
++  expect(
++    view.getByText("Queueing observed for Actions in the latest minute"),
++  ).toBeVisible();
++});
++
++test("keeps the queue warning visible when scheduler lag is absent", () => {
++  mockUseSchedulerLag.mockReturnValue(undefined);
++  mockUseFunctionConcurrency.mockReturnValue({
++    queued: chartData("Actions", [0, 0, 1]),
++    running: null,
++  });
++
++  const { result } = renderHook(() => useConcurrencyStatus());
++  const view = render(<>{result.current.closedDescription}</>);
++
++  expect(
++    view.getByText("Queueing observed for Actions in the latest minute"),
++  ).toBeVisible();
++});
++
++test("keeps a scheduler failure visible when concurrency data is absent", () => {
++  mockUseSchedulerLag.mockReturnValue({
++    data: [{ time: "0", lag: 360 }],
++    xAxisKey: "time",
++    lineKeys: [{ key: "lag", name: "Lag", color: "var(--brand-yellow)" }],
++  });
++  mockUseFunctionConcurrency.mockReturnValue({ queued: null, running: null });
++
++  const { result } = renderHook(() => useConcurrencyStatus());
++  const view = render(<>{result.current.closedDescription}</>);
++
++  expect(view.getByText("Scheduler is 6 min behind")).toBeVisible();
++});
++
++test("reports sub-minute scheduler lag without rounding it to a minute", () => {
++  mockUseSchedulerLag.mockReturnValue({
++    data: [{ time: "0", lag: 45 }],
++    xAxisKey: "time",
++    lineKeys: [{ key: "lag", name: "Lag", color: "var(--brand-yellow)" }],
++  });
++  mockUseFunctionConcurrency.mockReturnValue({ queued: null, running: null });
++
++  const { result } = renderHook(() => useConcurrencyStatus());
++  const view = render(<>{result.current.closedDescription}</>);
++
++  expect(view.getByText("Scheduler is 45 s behind")).toBeVisible();
++});
++
++test("does not infer scheduler recovery from a missing latest sample", () => {
++  mockUseSchedulerLag.mockReturnValue({
++    data: [
++      { time: "0", lag: 45 },
++      { time: "1", lag: null },
++    ],
++    xAxisKey: "time",
++    lineKeys: [{ key: "lag", name: "Lag", color: "var(--brand-yellow)" }],
++  });
++  mockUseFunctionConcurrency.mockReturnValue({ queued: null, running: null });
++
++  expect(
++    renderHook(() => useConcurrencyStatus()).result.current.issues,
++  ).toEqual([]);
++});
++
++test("reports no concurrency issue when no queueing was observed", () => {
++  expect(
++    concurrencyIssues({
++      functionType: "Actions (Node)",
++      queued: [0, 0, 0],
++      running: [5, 6, 4],
++    }),
++  ).toEqual([]);
++});
+diff --git a/npm-packages/dashboard-common/src/features/health/components/ConcurrencyStatus.tsx b/npm-packages/dashboard-common/src/features/health/components/ConcurrencyStatus.tsx
+index cbbb790c905767c883b4acc5814a6ceb1a570cc5..09e0d2fd4cd3eca85d38d08a38123a8cc3308670 100644
+--- a/npm-packages/dashboard-common/src/features/health/components/ConcurrencyStatus.tsx
++++ b/npm-packages/dashboard-common/src/features/health/components/ConcurrencyStatus.tsx
+@@ -4,6 +4,9 @@ import {
+   ExclamationTriangleIcon,
+ } from "@radix-ui/react-icons";
+ import {
++  formatSchedulerLag,
++  SCHEDULER_LAG_CRITICAL_SECONDS,
++  SCHEDULER_LAG_WARNING_SECONDS,
+   useSchedulerLag,
+   useFunctionConcurrency,
+ } from "@common/lib/appMetrics";
+@@ -33,16 +36,34 @@ export function useConcurrencyStatus(
+ 
+     // Check scheduler status
+     if (lag && lag.data.length > 0) {
+-      const currentLag = lag.data[lag.data.length - 1].lag;
+-      const wasBehind = lag.data.some((d) => d.lag > 0);
++      const currentLagSeconds = lag.data[lag.data.length - 1].lag;
++      const wasBehind = lag.data.some(
++        (d) => d.lag !== null && d.lag > SCHEDULER_LAG_WARNING_SECONDS,
++      );
+ 
+-      if (currentLag > 1) {
++      if (
++        currentLagSeconds !== null &&
++        currentLagSeconds > SCHEDULER_LAG_CRITICAL_SECONDS
++      ) {
+         result.push({
+           severity: "critical",
+-          message: `Scheduler is ${currentLag} minutes behind`,
++          message: `Scheduler is ${formatSchedulerLag(
++            currentLagSeconds,
++          )} behind`,
++          type: "scheduler",
++        });
++      } else if (
++        currentLagSeconds !== null &&
++        currentLagSeconds > SCHEDULER_LAG_WARNING_SECONDS
++      ) {
++        result.push({
++          severity: "warning",
++          message: `Scheduler is ${formatSchedulerLag(
++            currentLagSeconds,
++          )} behind`,
+           type: "scheduler",
+         });
+-      } else if (wasBehind && currentLag === 0) {
++      } else if (currentLagSeconds !== null && wasBehind) {
+         result.push({
+           severity: "warning",
+           message: "Scheduler was behind but has recovered",
+@@ -51,34 +72,29 @@ export function useConcurrencyStatus(
+       }
+     }
+ 
+-    // Check concurrency limits for each function type (only if enabled)
+-    if (showConcurrencyIssues && queued && running) {
++    // Report observed queueing without treating it as proof that a configured
++    // concurrency limit was reached. The metrics do not include those limits.
++    if (showConcurrencyIssues && queued) {
+       const queuedData = queued.data as Array<Record<string, number>>;
+-      const runningData = running.data as Array<Record<string, number>>;
+ 
+       for (const lineKey of queued.lineKeys) {
+         const functionType = lineKey.name;
+-        const currentQueued =
++        const latestBucketQueued =
+           queuedData[queuedData.length - 1]?.[functionType] ?? 0;
+         const hasBeenQueued = queuedData.some(
+           (d) => (d[functionType] ?? 0) > 0,
+         );
+ 
+-        // Check if currently maxed out - queued functions with running at capacity
+-        if (currentQueued > 0) {
+-          const currentRunning =
+-            runningData[runningData.length - 1]?.[functionType] ?? 0;
+-          if (currentRunning > 0) {
+-            result.push({
+-              severity: "critical",
+-              message: `${functionType} currently at concurrency limit`,
+-              type: "concurrency",
+-            });
+-          }
++        if (latestBucketQueued > 0) {
++          result.push({
++            severity: "warning",
++            message: `Queueing observed for ${functionType} in the latest minute`,
++            type: "concurrency",
++          });
+         } else if (hasBeenQueued) {
+           result.push({
+             severity: "warning",
+-            message: `${functionType} hit concurrency limit`,
++            message: `Queueing observed for ${functionType} in the last hour`,
+             type: "concurrency",
+           });
+         }
+@@ -86,16 +102,15 @@ export function useConcurrencyStatus(
+     }
+ 
+     return result;
+-  }, [lag, queued, running, showConcurrencyIssues]);
++  }, [lag, queued, showConcurrencyIssues]);
+ 
+   const closedDescription = useMemo(() => {
+-    // Don't show anything until necessary data has loaded
+-    if (!lag) {
+-      return null;
+-    }
+-
+-    // If concurrency issues are enabled, wait for all data to load
+-    if (showConcurrencyIssues && (!queued || !running)) {
++    // Missing data must not hide an issue established by another series. Wait
++    // for every relevant series only before showing the healthy chart count.
++    if (
++      issues.length === 0 &&
++      (!lag || (showConcurrencyIssues && (!queued || !running)))
++    ) {
+       return null;
+     }
+ 
+diff --git a/npm-packages/dashboard-common/src/features/health/components/HealthView.tsx b/npm-packages/dashboard-common/src/features/health/components/HealthView.tsx
+index 3c39a7b710d0e82d220f6d7305056d580643ba8a..83b12b180d5f1e77ef89786ed9cb340cbc7dbebb 100644
+--- a/npm-packages/dashboard-common/src/features/health/components/HealthView.tsx
++++ b/npm-packages/dashboard-common/src/features/health/components/HealthView.tsx
+@@ -116,7 +116,7 @@ export function HealthView({
+                     </HealthCard>
+                     <HealthCard
+                       title="Queued Functions"
+-                      tip="The maximum number of functions waiting to be ran in a given minute. Functions are queued when the concurrency limit has been reached. If a function is queued for too long, it will discarded."
++                      tip="The maximum number of functions waiting to start in a given minute. Queueing alone does not show that a configured concurrency limit was reached."
+                     >
+                       <ChartForFunctionRate
+                         chartData={queued}
+diff --git a/npm-packages/dashboard-common/src/lib/appMetrics.ts b/npm-packages/dashboard-common/src/lib/appMetrics.ts
+index 135f58abfa920b28b420505e6eaeb34a223c360f..3e9f7e69a0142bc0a58e8a1c81ec029fdceb5127 100644
+--- a/npm-packages/dashboard-common/src/lib/appMetrics.ts
++++ b/npm-packages/dashboard-common/src/lib/appMetrics.ts
+@@ -116,18 +116,41 @@ export class PermissionDeniedError extends Error {
+   }
+ }
+ 
++export const SCHEDULER_LAG_WARNING_SECONDS = 20;
++export const SCHEDULER_LAG_CRITICAL_SECONDS = 300;
++export const SCHEDULER_LAG_BUCKET_MILLIS = 15_000;
++const SCHEDULER_LAG_WINDOW_MILLIS = 60 * 60 * 1000;
++
++export function formatSchedulerLag(seconds: number) {
++  if (seconds < 1) {
++    return `${Math.round(seconds * 1000)} ms`;
++  }
++  if (seconds < 60) {
++    return `${Math.round(seconds)} s`;
++  }
++  return `${Number((seconds / 60).toFixed(seconds < 600 ? 1 : 0))} min`;
++}
++
+ export function useSchedulerLag() {
+   const url = "/api/app_metrics/scheduled_job_lag";
+   const isDisconnected = useDeploymentIsDisconnected();
+   const deploymentUrl = useDeploymentUrl();
+   const authHeader = useDeploymentAuthHeader();
+   const fetcher = async () => {
+-    const start = new Date(Date.now() - 60 * 60 * 1000); // 1 hour ago
+-    const end = new Date();
++    const currentBucketStartMillis =
++      Math.floor(Date.now() / SCHEDULER_LAG_BUCKET_MILLIS) *
++      SCHEDULER_LAG_BUCKET_MILLIS;
++    // MetricsWindow returns bucket starts and excludes `end`. Include the current
++    // bucket start instead of making the summary one full bucket older.
++    const endMillis = currentBucketStartMillis + SCHEDULER_LAG_BUCKET_MILLIS;
++    const end = new Date(endMillis);
++    const start = new Date(endMillis - SCHEDULER_LAG_WINDOW_MILLIS);
+     const windowArgs = {
+       start: serializeDate(start),
+       end: serializeDate(end),
+-      num_buckets: 60,
++      // Scheduler lag is operationally meaningful below one minute. Keep enough resolution to
++      // distinguish a short admission delay from a sustained scheduled-function backlog.
++      num_buckets: SCHEDULER_LAG_WINDOW_MILLIS / SCHEDULER_LAG_BUCKET_MILLIS,
+     };
+     const window = JSON.stringify(windowArgs);
+     const params = { window };
+@@ -140,23 +163,18 @@ export function useSchedulerLag() {
+   };
+ 
+   const { data: d } = useSWR(isDisconnected ? null : url, fetcher, {
+-    refreshInterval: 60 * 1000,
++    refreshInterval: SCHEDULER_LAG_BUCKET_MILLIS,
+   });
+   if (!d) {
+     return undefined;
+   }
+   const buckets = responseToTimeseries(d as TimeseriesResponse);
+-  const data = buckets.map((value) =>
+-    value.metric
+-      ? {
+-          time: format(value.time, "h:mm a"),
+-          lag: Math.round(value.metric / 60),
+-        }
+-      : {
+-          time: format(value.time, "h:mm a"),
+-          lag: 0,
+-        },
+-  );
++  const data = buckets.map((value) => ({
++    time: format(value.time, "h:mm:ss a"),
++    // A recorded empty queue is returned as zero. Keep a genuinely missing
++    // backend sample as a gap instead of presenting unknown state as healthy.
++    lag: value.metric === null ? null : Math.max(value.metric, 0),
++  }));
+   return {
+     data,
+     xAxisKey: "time",
+@@ -194,7 +212,11 @@ export function useTopKFunctionMetrics(
+   k: number = 3,
+   numBuckets: number = 60,
+ ) {
+-  const url = `/api/app_metrics/${kind === "cacheHitPercentage" ? "cache_hit_percentage_top_k" : "failure_percentage_top_k"}`;
++  const url = `/api/app_metrics/${
++    kind === "cacheHitPercentage"
++      ? "cache_hit_percentage_top_k"
++      : "failure_percentage_top_k"
++  }`;
+   const cacheKey = `${useTopKCacheKey(kind)}?k=${k}&numBuckets=${numBuckets}`;
+   const isDisconnected = useDeploymentIsDisconnected();
+   const deploymentUrl = useDeploymentUrl();
+@@ -252,10 +274,10 @@ export function useTopKFunctionMetrics(
+         typeof metric === "number"
+           ? metric
+           : hadDataAt > -1
+-            ? kind === "cacheHitPercentage"
+-              ? 100
+-              : 0
+-            : null;
++          ? kind === "cacheHitPercentage"
++            ? 100
++            : 0
++          : null;
+     }
+     data.push(dataPoint);
+   }
+@@ -522,7 +544,9 @@ export function useSubscriptionInvalidationsTopK(
+   const isDisconnected = useDeploymentIsDisconnected();
+   const deploymentUrl = useDeploymentUrl();
+   const authHeader = useDeploymentAuthHeader();
+-  const cacheKey = `${deploymentUrl}${url}?k=${k}${opts ? `&path=${opts.udfIdentifier}` : ""}`;
++  const cacheKey = `${deploymentUrl}${url}?k=${k}${
++    opts ? `&path=${opts.udfIdentifier}` : ""
++  }`;
+ 
+   const fetcher = async () => {
+     const start = new Date(Date.now() - 60 * 60 * 1000);
+diff --git a/npm-packages/dashboard/src/docs/components/HealthSchedulerStatus.stories.tsx b/npm-packages/dashboard/src/docs/components/HealthSchedulerStatus.stories.tsx
+index d154be2a0b1c6ec95e5cd10e15f9b182d30a7249..b3293db88a0ea89edb8b53907025f4679337cf08 100644
+--- a/npm-packages/dashboard/src/docs/components/HealthSchedulerStatus.stories.tsx
++++ b/npm-packages/dashboard/src/docs/components/HealthSchedulerStatus.stories.tsx
+@@ -31,12 +31,12 @@ const mockConnectedDeployment = {
+ const healthyLag: ChartData = {
+   xAxisKey: "time",
+   data: [
+-    { time: "12:00 PM", lag: 0 },
+-    { time: "12:10 PM", lag: 0 },
+-    { time: "12:20 PM", lag: 0 },
+-    { time: "12:30 PM", lag: 0 },
+-    { time: "12:40 PM", lag: 0 },
+-    { time: "12:50 PM", lag: 0 },
++    { time: "12:00:00 PM", lag: 0 },
++    { time: "12:10:00 PM", lag: 0 },
++    { time: "12:20:00 PM", lag: 0 },
++    { time: "12:30:00 PM", lag: 0 },
++    { time: "12:40:00 PM", lag: 0 },
++    { time: "12:50:00 PM", lag: 0 },
+   ],
+   lineKeys: [{ key: "lag", name: "Lag", color: "var(--chart-line-1)" }],
+ };
+diff --git a/npm-packages/docs/docs/dashboard/deployments/health.mdx b/npm-packages/docs/docs/dashboard/deployments/health.mdx
+index 819869a197329e7b792ea08b7d9723a431239b1a..fe80d6ca1aff7129f86209c09cbd3d5762b754ca 100644
+--- a/npm-packages/docs/docs/dashboard/deployments/health.mdx
++++ b/npm-packages/docs/docs/dashboard/deployments/health.mdx
+@@ -40,8 +40,10 @@ Cache hit rate only applies to query functions.
+ />
+ 
+ The scheduler status card shows the status of the
+-[scheduler](/scheduling/scheduled-functions). If the scheduler falls behind due
+-to too many scheduled tasks, the status will display the lag time in minutes.
++[scheduler](/scheduling/scheduled-functions). If a pending function remains
++ready after its scheduled time, the card displays the ready-queue lag in
++milliseconds, seconds, or minutes. A gap means that no backend sample was
++available; it does not represent zero lag.
+ 
+ ## Last Deployed
+ 
+diff --git a/npm-packages/docs/static/screenshots/storybook/components_health_scheduler_status_dark.webp b/npm-packages/docs/static/screenshots/storybook/components_health_scheduler_status_dark.webp
+index c5d511b4f0e919f39e12ab33cbd5317fc2d7d614..1fa0615a9dd4a1d6698cdfb27fe283cbe3617add 100644
+GIT binary patch
+literal 7304
+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
+HAP@K-JRftl
+
+literal 6868
+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
+
+diff --git a/npm-packages/docs/static/screenshots/storybook/components_health_scheduler_status_light.webp b/npm-packages/docs/static/screenshots/storybook/components_health_scheduler_status_light.webp
+index 69f7cf26f521a421022055da69403bd798a97fd1..018a4c0f54e43246101184d1d8f3cf4e917365a8 100644
+GIT binary patch
+literal 7624
+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
+K=Sx{W!2bY0Nfk8!
+
+literal 6976
+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
+YsJ3s0ov>?coqc@7|3gZVJdGOv7pAVMi~s-t
+
+diff --git a/patches/dependency_capacity/README.md b/patches/dependency_capacity/README.md
+index ca579052e58b5b2c56eec094d043b9aaf5ad3d47..5a63b8ccdc05acd6ade03b5b33109ac114c43634 100644
+--- a/patches/dependency_capacity/README.md
++++ b/patches/dependency_capacity/README.md
+@@ -179,8 +179,11 @@ initializes its gauge to zero, and cancellation or exit resets it to zero so app
+ cannot leave stale process occupancy. A completion for an unowned job, or duplicate IDs in one
+ ordinary batch, fails the executor iteration after applying valid completions and publishing the
+ resulting occupancy instead of silently accepting the broken ownership transition. The gauges
+-complement the existing execution-lag histograms and the legacy sampled ordinary-occupancy
+-histogram without adding function, module, or job identifiers.
++complement the sampled ready-queue lag histograms, the direct ordinary scheduled-job admission-lag
++histogram, and the legacy sampled ordinary-occupancy histogram without adding function, module, or
++job identifiers. Both executors refresh the first non-running queue entry while their execution
++slots are full, so cancellation or replacement cannot leave an obsolete ready time in those
++sampled histograms until another job finishes.
+ 
+ ## Metrics
+ 
+@@ -202,8 +205,10 @@ Use these bounded metric families together:
+   dependency cache leaders;
+ - `scheduled_job_execution_parallelism_info` for the resolved per-executor scheduled-job limit;
+ - `scheduled_job_num_running_info` and `cron_job_num_running_info` for source current occupancy;
+-- `scheduled_job_execution_lag_seconds` and `cron_job_execution_lag_seconds` for start lag in each
+-  executor.
++- `scheduled_job_execution_lag_seconds` and `cron_job_execution_lag_seconds` for sampled
++  ready-queue lag in each executor;
++- `scheduled_job_admission_lag_seconds` for direct target-time-to-admission lag on each ordinary
++  scheduled-job admission attempt.
+ 
+ Dependency enqueue without dispatch indicates a downstream capacity or scheduling problem.
+ Dependency expiry or rejection is the liveness failure signal. Reserve use without failures is
+diff --git a/patches/dependency_capacity/design_reference.md b/patches/dependency_capacity/design_reference.md
+index ce6a9121da7afa6468b5fd3c1af0c1164f69de0c..8369327acb61b7b7ee216b5f2ac0f77f60c385d1 100644
+--- a/patches/dependency_capacity/design_reference.md
++++ b/patches/dependency_capacity/design_reference.md
+@@ -615,11 +615,18 @@ each start, each cron completion notification, and each drained ordinary-
+ completion batch. Duplicate or unowned completion notifications fail before a
+ false occupancy is accepted; valid completions in the same batch are applied
+ and the resulting occupancy is published before the error propagates. External
+-scrapes can still miss states shorter than the scrape interval. Compare the gauges with
+-`scheduled_job_execution_lag_seconds` and `cron_job_execution_lag_seconds`
+-respectively. The legacy `scheduled_job_num_running_total` histogram is
+-event-sampled and should not be interpreted as a time-weighted occupancy
+-distribution.
++scrapes can still miss states shorter than the scrape interval. Compare the
++gauges with `scheduled_job_execution_lag_seconds` and
++`cron_job_execution_lag_seconds` respectively. Those histograms sample
++ready-queue state and are not direct start measurements.
++`scheduled_job_admission_lag_seconds` directly records
++target-time-to-admission lag for each ordinary scheduled-job admission attempt;
++registered cron jobs do not currently have the matching direct admission
++metric. The legacy `scheduled_job_num_running_total` histogram is event-sampled
++and should not be interpreted as a time-weighted occupancy distribution.
++Both executors refresh the first non-running queue entry while their execution
++slots are full, so cancellation or replacement cannot leave an obsolete ready
++time in either sampled lag histogram until another job finishes.
+ 
+ Use `isolate_scheduler_dependency_reserve_dispatch_total{pool_name}` as direct
+ evidence that an ancestor-unblocking request was dispatched while pre-dispatch
+diff --git a/patches/runtime_health_dashboard/README.md b/patches/runtime_health_dashboard/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..60f841d11aef0c8a0665977971866b10a82f3bcb
+--- /dev/null
++++ b/patches/runtime_health_dashboard/README.md
+@@ -0,0 +1,205 @@
++# Runtime health dashboard semantics
++
++## Summary
++
++This patch makes the self-hosted dashboard describe measured queueing and
++scheduled-function lag without claiming stronger capacity failures than the
++available metrics establish. It also separates scheduler-state sampling from
++rate-limited log publication and records direct scheduled-job admission lag.
++
++It is a generic self-hosting patch. It does not contain application function
++names, route names, or deployment-specific limits.
++
++## Motivation
++
++The stock health view can misclassify two normal runtime transitions:
++
++- Function concurrency increments outstanding work before an asynchronous permit
++  acquisition. A one-sample queued value therefore does not prove that the
++  configured concurrency limit was reached.
++- Scheduled-function lag is queried in one-minute buckets, rounded to whole
++  minutes, and refreshed once per minute. The backend extrapolates its last
++  reported ready time across trailing buckets, but records that state through
++  the same call that rate-limits structured scheduler logs. If the scheduler
++  advances to another future ready time less than 30 seconds later, the updated
++  state can be suppressed and the old timestamp can appear overdue even though
++  the scheduler is waiting for the newer timestamp.
++
++The second issue is especially misleading because the log stream stores whole
++lag seconds while the health graph stores rounded minutes. An operator can see
++`1` in the graph while scheduler logs and direct admission-lag telemetry show no
++corresponding one-second backlog.
++
++## Behavior
++
++### Function concurrency
++
++The health summary reports queueing as queueing. It distinguishes queueing in
++the latest bucket from queueing earlier in the one-hour window and does not say
++that a configured limit was reached. Actual capacity conclusions still require
++the configured limit, permit timeout, scheduler rejection, and queue evidence.
++
++### Scheduled-function lag
++
++Every scheduler iteration that obtains a ready-time decision records that
++observation in the in-memory app-metrics store before applying the
++structured-log predicate.
++Structured scheduler events retain their existing 30-second ready-time-change
++and overdue-heartbeat coalescing. Suppressed log publication no longer leaves
++stale state available to dashboard extrapolation.
++
++An iteration that errors before obtaining a queue decision leaves the last
++successful observation in place because no fresher queue state is available.
++The endpoint seeds each requested window with the latest retained earlier
++sample, so repeated scheduler errors cannot make a known overdue state disappear
++when the one-hour window advances past that sample.
++
++The executor refreshes the pending queue head even while all of its execution
++slots are occupied. Cancellation or replacement can therefore move the head to
++a later ready time without leaving the previous time available for
++extrapolation until a running job finishes.
++
++Each full-executor refresh initializes one index head per scheduled-job
++namespace, then advances past at most the parallelism-bounded running-ID set
++before returning the first non-running entry. The database scan completes
++before the separate scheduler-lag store is locked for its in-memory update, so
++the refresh neither holds that lock across asynchronous work nor introduces a
++reverse lock order.
++
++If a backward wall-clock step places an app-metrics sample before the store's
++startup time or latest writable bucket, the dedicated store discards its
++pre-jump timeline and restarts at the new observation. This removes every old
++ready time from extrapolation while preserving the lag observed at the new
++wall-clock time. Historical points before the reset become unavailable because
++their timestamp ordering no longer represents observation ordering.
++
++Scheduler lag uses a dedicated source store retaining at most 240 15-second
++buckets, or one hour while sampling continues. The generic UDF metric store
++remains at its existing one-minute resolution and memory shape. A sample is
++stored as lag at the source bucket start rather than lag at the instant the
++sample arrived. The endpoint can then reconstruct
++`output_time - next_job_time` for each requested point without treating a
++mid-bucket sample as if it occurred at the bucket start. This prevents a healthy
++negative catch-up sample from turning into increasing positive lag during
++resampling.
++
++The latest observation in a 15-second source bucket replaces any earlier
++observation in that bucket. This is state sampling, not event counting: it can
++remove a shorter-lived earlier lag state, but it cannot double-count it. Direct
++admission telemetry retains each admission attempt independently.
++
++The backend also records `scheduled_job_admission_lag_seconds` once for each
++ordinary scheduled-job admission attempt, immediately before background
++dispatch. This unlabeled histogram measures the delay from that attempt's
++target timestamp to scheduler admission. A retried job contributes one sample
++for each admission attempt. Downstream action admission and user-code start have
++separate timing boundaries. The scheduler anchors lag to the wall-clock
++due-time decision and adds monotonic elapsed time until dispatch, so a wall-clock
++step during the queue scan cannot erase or inflate already observed lag. The
++extrapolated ready-time series remains useful for a scheduler that stops making
++progress, while the direct histogram provides an independent execution-path
++measurement.
++
++The existing `scheduled_job_execution_lag_seconds` histogram remains a
++rate-limited sample of ready-queue state. Despite its legacy name, it is not a
++direct execution-start measurement.
++
++The dashboard:
++
++- requests 15-second buckets across the existing one-hour view;
++- refreshes every 15 seconds;
++- aligns the query window, chart timestamps, and deployment markers to those
++  15-second buckets and includes the current bucket start;
++- retains lag in seconds instead of rounding to whole minutes;
++- leaves missing backend samples as gaps instead of rendering them as zero lag;
++- formats sub-second, second, and minute values with explicit units;
++- treats lag through 20 seconds as healthy, over 20 seconds as warning, and over
++  five minutes as critical;
++- reports recovery only after a materially delayed sample, not after any
++  positive floating-point value.
++
++These thresholds preserve the stock scheduler-status intent while making the
++underlying values and units visible.
++
++The dashboard makes four times as many requests and receives four times as many
++points as the old minute view, or roughly sixteen times the transfer rate for
++this one small metric response. The backend cost remains bounded to one
++240-bucket gauge store per process and one unlabeled admission-lag histogram;
++no application label or UDF metric family is multiplied. The scheduled-lag
++store has its own lock, so updating it does not contend on the function-log and
++generic UDF-metrics lock. Each in-order update overwrites at most one value in
++one writable source bucket. A backward-time reset discards at most 240 buckets,
++and neither path emits an external log event.
++
++## Deployment
++
++The backend and dashboard changes should normally be shipped together. The
++backend change improves the app-metrics timeseries for every dashboard client.
++The dashboard change is wire-compatible with an older backend because the
++endpoint already returns seconds, but an older backend still has one-minute
++source buckets and can temporarily extrapolate a stale ready time. The full
++15-second contract therefore requires both halves.
++
++Deploying the dashboard image does not require replacing the Convex backend.
++Deploying the backend half follows the normal self-hosted backend image rollout
++and should be grouped with another needed backend release rather than performed
++solely for this display correction.
++
++## Verification
++
++Verify with a window containing both ordinary scheduled traffic and a short
++executor-full period:
++
++- the graph displays millisecond or second values without rounding them to one
++  minute;
++- adjacent points and deployment markers have distinct, aligned second-level
++  timestamps;
++- the status summary uses the current aligned 15-second bucket rather than the
++  preceding bucket;
++- a catch-up transition returns promptly to zero;
++- moving the next future ready time by less than the structured-log interval
++  cannot leave the previous timestamp available for extrapolation;
++- structured scheduler logs retain their prior 30-second coalescing behavior;
++- changing or canceling the pending queue head while the ordinary executor is
++  full refreshes the extrapolated ready time;
++- a catch-up sample arriving partway through a source bucket cannot become
++  positive lag solely from resampling;
++- a backward wall-clock step, including one before the metric store's startup
++  time, does not suppress overdue-to-future recovery or render discarded
++  pre-jump history as healthy samples;
++- repeated scheduler errors do not make the last known overdue state disappear
++  when it moves before the requested one-hour window;
++- genuine sustained lag continues increasing and crosses warning and critical
++  thresholds;
++- `scheduled_job_admission_lag_seconds` records one observation per ordinary
++  scheduler admission attempt, remains independent of ready-time extrapolation,
++  and does not lose already observed lag on a wall-clock rollback;
++- queueing warnings do not say that a concurrency limit was reached;
++- direct admission-lag histograms, scheduler log events, and the dashboard
++  timeseries agree on the order of magnitude.
++
++## Rejected alternatives
++
++### Keep minute buckets and only change the label
++
++This leaves short but operationally useful lag invisible and does not correct
++the false one-minute point.
++
++### Remove backend extrapolation entirely
++
++Extrapolation is useful when the oldest overdue job remains unchanged and the
++scheduler itself is not advancing. Removing it would under-report a genuinely
++stuck scheduler.
++
++### Emit external logs on every scheduler loop
++
++That would remove ambiguity but produce unnecessary log volume during busy
++workloads. The app-metrics state is cheap and must reflect every scheduler
++observation because it is extrapolated. Structured logs remain rate-limited, and
++the direct admission histogram records only scheduler admission attempts.
++
++### Infer saturation from queued work alone
++
++Queueing can be a normal asynchronous handoff. Saturation requires
++configured-limit and failure or wait evidence that the dashboard endpoint does
++not currently carry.

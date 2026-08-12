@@ -1,0 +1,3466 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Fri, 17 Jul 2026 15:39:18 +0800
+Subject: [PATCH 14/24] schema validation: isolate progress OCC from app writes
+
+Stop pending-schema failure and overwrite transactions from reading or deleting the transitioning schema hot progress row. Make the exact active _schemas document and Pending state the ordering fence for every progress initialization and checkpoint, so schema transitions win without weakening serializability.
+
+Clean failed and overwritten progress outside application transactions with read-only discovery and namespace-local exact-key batches. Recheck current schema ownership before reading or deleting progress, and fence cleanup and lifecycle lookups against recreated schema and progress table generations, retained inactive tablets, and reused developer IDs.
+
+Reject simultaneous Pending and Validated schemas throughout submission, overwrite, enforcement, worker and snapshot-import discovery, validation, activation, and active-schema clearing. Deduplicate historical snapshot-import namespaces and add real-committer regressions for race ordering, stale lifecycle and cleanup requests, table recreation, restart cleanup, retention, and dashboard visibility.
+
+Keep exact zero totals visible and retain upstream original-snapshot denominator semantics. Use a one-document minimum checkpoint threshold for an exact zero and the bounded 500-document cadence only when table counts are unavailable.
+---
+ Cargo.lock                                    |    1 +
+ crates/application/Cargo.toml                 |    1 +
+ crates/application/src/schema_worker/mod.rs   |  230 ++-
+ crates/application/src/schema_worker/tests.rs | 1257 +++++++++++++++++
+ .../src/snapshot_import/schema_constraints.rs |   20 +-
+ .../src/bootstrap_model/schema/mod.rs         |  338 +++--
+ .../schema_validation_progress/mod.rs         |  179 ++-
+ .../schema_validation_progress/types.rs       |   44 +-
+ .../features/data/components/ShowSchema.tsx   |    3 +-
+ .../_system/frontend/getSchemas.test.ts       |  263 ++++
+ .../convex/_system/frontend/getSchemas.ts     |   54 +-
+ patches/README.md                             |   15 +-
+ .../schema_validation_progress_occ/README.md  |  427 ++++++
+ 13 files changed, 2623 insertions(+), 209 deletions(-)
+ create mode 100644 crates/application/src/schema_worker/tests.rs
+ create mode 100644 npm-packages/system-udfs/convex/_system/frontend/getSchemas.test.ts
+ create mode 100644 patches/schema_validation_progress_occ/README.md
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 6852683ff09e66717e686db87bd0925c5e9103df..7680f332e2e92e15458a474afe3675e904705293 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -391,6 +391,7 @@ dependencies = [
+  "short_future",
+  "slugify",
+  "smallvec",
++ "sqlite",
+  "storage",
+  "storage_zip_reader",
+  "streaming_export",
+diff --git a/crates/application/Cargo.toml b/crates/application/Cargo.toml
+index db1168d616dfea0d25730c8843261b6f986f93c5..506e708611459c2309170ffc49e9c09db42c0ddc 100644
+--- a/crates/application/Cargo.toml
++++ b/crates/application/Cargo.toml
+@@ -154,6 +154,7 @@ runtime = { workspace = true, features = ["testing"] }
+ search = { workspace = true, features = ["testing"] }
+ search_index_workers = { workspace = true, features = ["testing"] }
+ shape_inference = { workspace = true, features = ["testing"] }
++sqlite = { workspace = true }
+ storage = { workspace = true, features = ["testing"] }
+ storage_zip_reader = { workspace = true, features = ["testing"] }
+ streaming_export = { workspace = true, features = ["testing"] }
+diff --git a/crates/application/src/schema_worker/mod.rs b/crates/application/src/schema_worker/mod.rs
+index 7d2a7c26d81b3819269f453a681d8688d0400102..7417953016eeae6b80f6cdec4c05590ef5c4c449 100644
+--- a/crates/application/src/schema_worker/mod.rs
++++ b/crates/application/src/schema_worker/mod.rs
+@@ -28,15 +28,21 @@ use database::{
+     IndexModel,
+     SchemaModel,
+     SchemaValidationProgressModel,
++    SchemasTable,
+     Snapshot,
+     TableShape,
+     TableShapes,
+     Token,
+     Transaction,
+     SCHEMAS_TABLE,
++    SCHEMA_VALIDATION_PROGRESS_TABLE,
+ };
+ use errors::ErrorMetadataAnyhowExt;
+ use futures::{
++    future::{
++        select,
++        Either,
++    },
+     pin_mut,
+     Future,
+     TryStreamExt,
+@@ -62,12 +68,15 @@ use value::{
+ use crate::metrics::log_worker_starting;
+ 
+ mod metrics;
++#[cfg(test)]
++mod tests;
+ 
+ const INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+ const MAX_BACKOFF: Duration = Duration::from_secs(5);
+ const INITIAL_COMMIT_BACKOFF: Duration = Duration::from_millis(10);
+ const MAX_COMMIT_BACKOFF: Duration = Duration::from_secs(2);
+ const MAX_COMMIT_FAILURES: u32 = 3;
++const MAX_PROGRESS_CLEANUP_DELETIONS_PER_TRANSACTION: usize = 16;
+ 
+ pub struct SchemaWorker<RT: Runtime> {
+     runtime: RT,
+@@ -88,6 +97,9 @@ pub struct PendingSchemaValidation {
+ 
+ pub struct SchemaValidationResult {
+     pub token: Token,
++    /// Present when there was no pending work and progress cleanup should wake
++    /// the worker if a mixed-version backend writes another inactive row.
++    pub cleanup_token: Option<Token>,
+     /// For each pending schema that was validated, the tables whose documents
+     /// were walked. Tables whose shape are a subset of the schema should not be
+     /// walked.
+@@ -104,6 +116,7 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                 let result: anyhow::Result<()> = async {
+                     let SchemaValidationResult {
+                         token,
++                        cleanup_token,
+                         walked_tables,
+                     } = Box::pin(worker.run()).await?;
+                     let num_walked: usize = walked_tables.values().map(|tables| tables.len()).sum();
+@@ -114,10 +127,27 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                             walked_tables.len()
+                         );
+                     }
+-                    worker
+-                        .database
+-                        .subscribe_and_wait_for_invalidation(token)
+-                        .await?;
++                    if let Some(cleanup_token) = cleanup_token {
++                        let schema_invalidation =
++                            worker.database.subscribe_and_wait_for_invalidation(token);
++                        let progress_invalidation = worker
++                            .database
++                            .subscribe_and_wait_for_invalidation(cleanup_token);
++                        pin_mut!(schema_invalidation, progress_invalidation);
++                        match select(schema_invalidation, progress_invalidation).await {
++                            Either::Left((result, _)) => {
++                                result?;
++                            },
++                            Either::Right((result, _)) => {
++                                result?;
++                            },
++                        }
++                    } else {
++                        worker
++                            .database
++                            .subscribe_and_wait_for_invalidation(token)
++                            .await?;
++                    }
+                     Ok(())
+                 }
+                 .await;
+@@ -137,12 +167,27 @@ impl<RT: Runtime> SchemaWorker<RT> {
+         tx: &mut Transaction<RT>,
+     ) -> anyhow::Result<Vec<PendingSchemaValidation>> {
+         let mut pending_schema_work = Vec::new();
+-        let namespaces: Vec<_> = tx.table_mapping().namespaces_for_name(&SCHEMAS_TABLE);
++        // table_mapping() records a dependency on the global _tables tablet, so
++        // creating the first schema table for a new component wakes this worker.
++        // TableMapping retains historical tablet mappings, so visit each component
++        // namespace only once even if its system tables were recreated.
++        let namespaces: BTreeSet<_> = tx
++            .table_mapping()
++            .namespaces_for_name(&SCHEMAS_TABLE)
++            .into_iter()
++            .collect();
+         for namespace in namespaces {
+             if let Some((id, db_schema)) = SchemaModel::new(tx, namespace)
+                 .get_by_state(SchemaState::Pending)
+                 .await?
+             {
++                anyhow::ensure!(
++                    SchemaModel::new(tx, namespace)
++                        .get_by_state(SchemaState::Validated)
++                        .await?
++                        .is_none(),
++                    "Invalid schema state: both pending and validated schemas exist"
++                );
+                 tracing::debug!("SchemaWorker found a pending schema and is validating it...");
+                 let timer = schema_validation_timer();
+                 let table_mapping = tx.table_mapping().namespace(namespace);
+@@ -176,6 +221,7 @@ impl<RT: Runtime> SchemaWorker<RT> {
+         let ts = tx.begin_timestamp();
+         let pending_validations = SchemaWorker::pending_schema_validations(&mut tx).await?;
+         let token = tx.into_token()?;
++        let cleanup_token = self.delete_inactive_schema_validation_progress().await?;
+ 
+         let mut walked_tables = BTreeMap::new();
+         if pending_validations.is_empty() {
+@@ -183,6 +229,7 @@ impl<RT: Runtime> SchemaWorker<RT> {
+             tracing::debug!("SchemaWorker waiting...");
+             return Ok(SchemaValidationResult {
+                 token,
++                cleanup_token: Some(cleanup_token),
+                 walked_tables,
+             });
+         }
+@@ -216,6 +263,10 @@ impl<RT: Runtime> SchemaWorker<RT> {
+         tracing::debug!("SchemaWorker waiting...");
+         Ok(SchemaValidationResult {
+             token,
++            // Every processed pending schema either changes state or loses to a
++            // concurrent state change, which invalidates the pending-work token and
++            // immediately starts a no-work pass that subscribes to cleanup.
++            cleanup_token: None,
+             walked_tables,
+         })
+     }
+@@ -272,14 +323,18 @@ impl<RT: Runtime> SchemaWorker<RT> {
+         } = pending_validation;
+         tracing::info!("SchemaWorker: Tables to check: {:?}", tables_to_validate);
+ 
+-        let mut schema_validation_progress_tracker = SchemaValidationProgressTracker::new(
++        let Some(mut schema_validation_progress_tracker) = SchemaValidationProgressTracker::new(
+             self.database.clone(),
+             namespace,
+             tables_to_validate.clone().into_iter().cloned().collect(),
+             id,
+             total_docs,
+         )
+-        .await?;
++        .await?
++        else {
++            timer.finish_with("canceled");
++            return Ok(());
++        };
+         let tablet_ids = tables_to_validate
+             .into_iter()
+             .map(|table_name| table_mapping.name_to_tablet()(table_name.clone()))
+@@ -303,8 +358,8 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                 while let Some(LatestDocument { value: doc, .. }) = stream.try_next().await? {
+                     log_document_validated();
+                     log_document_bytes(doc.size());
+-                    // If we finish with an error, we should delete progress. In all the
+-                    // mark_failed, mark_success or whatever methods.
++                    // The failed schema state fences later progress checkpoints; cleanup
++                    // runs outside the schema-failing transaction.
+                     if let Err(schema_error) = db_schema.check_existing_document(
+                         &doc,
+                         table_name.clone(),
+@@ -312,9 +367,9 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                         &virtual_system_mapping,
+                     ) {
+                         let mut backoff = Backoff::new(INITIAL_COMMIT_BACKOFF, MAX_COMMIT_BACKOFF);
+-                        while backoff.failures() < MAX_COMMIT_FAILURES {
++                        let schema_is_failed = loop {
+                             let mut tx = self.database.begin_system().await?;
+-                            SchemaModel::new(&mut tx, namespace)
++                            let schema_is_failed = SchemaModel::new(&mut tx, namespace)
+                                 .mark_failed(id, schema_error.clone())
+                                 .await?;
+                             if let Err(e) = self
+@@ -324,6 +379,13 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                             {
+                                 if e.is_occ() {
+                                     let delay = backoff.fail(&mut self.runtime.rng());
++                                    if backoff.failures() >= MAX_COMMIT_FAILURES {
++                                        return Err(e.context(format!(
++                                            "Schema worker failed to mark schema as failed after \
++                                             {} OCC conflicts",
++                                            backoff.failures()
++                                        )));
++                                    }
+                                     tracing::error!(
+                                         "Schema worker failed to commit ({e}), retrying after \
+                                          {delay:?}"
+@@ -333,8 +395,15 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                                     return Err(e);
+                                 }
+                             } else {
+-                                break;
++                                break schema_is_failed;
+                             }
++                        };
++
++                        // A replacement can win after this worker found the invalid
++                        // document. Do not report that overwritten generation as failed.
++                        if !schema_is_failed {
++                            timer.finish_with("canceled");
++                            return Ok(());
+                         }
+ 
+                         tracing::info!("Schema is invalid");
+@@ -351,16 +420,38 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                     // not match the pending schema or by the submission of a new pending
+                     // schema.
+                     if !progress_exists {
++                        timer.finish_with("canceled");
+                         return Ok(());
+                     }
+                 }
+             }
+             table_iterator.unregister_table(tablet_id)?;
+         }
+-        schema_validation_progress_tracker
++        if !schema_validation_progress_tracker
+             .record_validation_finished()
+-            .await?;
++            .await?
++        {
++            timer.finish_with("canceled");
++            return Ok(());
++        }
+         let mut tx = self.database.begin(Identity::system()).await?;
++        let schemas_table_exists = tx
++            .table_mapping()
++            .namespace(namespace)
++            .name_exists(&SCHEMAS_TABLE);
++        let exact_schema_is_pending = if schemas_table_exists {
++            tx.get_system::<SchemasTable>(namespace, id.developer_id)
++                .await?
++                .is_some_and(|schema| schema.id() == id && schema.state == SchemaState::Pending)
++        } else {
++            false
++        };
++        if !exact_schema_is_pending {
++            // Failure, replacement, duplicate validation, or retention pruning
++            // can win after the final progress flush.
++            timer.finish_with("canceled");
++            return Ok(());
++        }
+         if let Err(error) = SchemaModel::new(&mut tx, namespace)
+             .mark_validated(id)
+             .await
+@@ -371,13 +462,82 @@ impl<RT: Runtime> SchemaWorker<RT> {
+             tracing::info!("Schema not marked valid");
+             return Err(error);
+         }
+-        self.database
++        if let Err(error) = self
++            .database
+             .commit_with_write_source(tx, "schema_worker_mark_valid")
+-            .await?;
++            .await
++        {
++            // This transaction only fences the exact pending schema. OCC means a
++            // concurrent lifecycle transition canceled this validation.
++            if error.is_occ() {
++                timer.finish_with("canceled");
++                return Ok(());
++            }
++            return Err(error);
++        }
+         tracing::info!("Schema is valid");
+         timer.finish();
+         Ok(())
+     }
++
++    async fn delete_inactive_schema_validation_progress(&self) -> anyhow::Result<Token> {
++        let (inactive_progress, cleanup_token) = {
++            let mut tx = self.database.begin_system().await?;
++            let namespaces: BTreeSet<_> = tx
++                .table_mapping()
++                .namespaces_for_name(&SCHEMA_VALIDATION_PROGRESS_TABLE)
++                .into_iter()
++                .collect();
++            let mut inactive_progress = BTreeMap::new();
++            for namespace in namespaces {
++                // Deleted components leave historical tablet mappings until
++                // retention removes them. Their inactive progress tables are
++                // already owned by tablet cleanup and cannot be queried here.
++                if !tx
++                    .table_mapping()
++                    .namespace(namespace)
++                    .name_exists(&SCHEMA_VALIDATION_PROGRESS_TABLE)
++                {
++                    continue;
++                }
++                let progress_documents = SchemaValidationProgressModel::new(&mut tx, namespace)
++                    .inactive_schema_validation_progress()
++                    .await?;
++                if !progress_documents.is_empty() {
++                    inactive_progress.insert(namespace, progress_documents);
++                }
++            }
++            let cleanup_token = tx.into_token()?;
++            (inactive_progress, cleanup_token)
++        };
++        let mut num_deleted = 0;
++        for (namespace, progress_documents) in inactive_progress {
++            // Discovery is read-only. Write transactions are namespace-local and
++            // point-check discovered document IDs and their owning schema IDs, so
++            // they carry no progress-index or schema-history range dependencies.
++            for progress_documents in
++                progress_documents.chunks(MAX_PROGRESS_CLEANUP_DELETIONS_PER_TRANSACTION)
++            {
++                let mut tx = self.database.begin_system().await?;
++                let deleted = SchemaValidationProgressModel::new(&mut tx, namespace)
++                    .delete_schema_validation_progress_documents(progress_documents)
++                    .await?;
++                if deleted == 0 {
++                    continue;
++                }
++                self.database
++                    .commit_with_write_source(tx, "schema_validation_progress_cleanup")
++                    .await?;
++                num_deleted += deleted;
++            }
++        }
++        if num_deleted > 0 {
++            tracing::info!(
++                "SchemaWorker deleted {num_deleted} inactive schema validation progress records"
++            );
++        }
++        Ok(cleanup_token)
++    }
+ }
+ 
+ /// Tracks progress of schema validation for the tables that need to be
+@@ -402,31 +562,28 @@ impl<RT: Runtime> SchemaValidationProgressTracker<RT> {
+         tables_to_validate: BTreeSet<TableName>,
+         schema_id: ResolvedDocumentId,
+         total_docs: Option<u64>,
+-    ) -> anyhow::Result<Self> {
++    ) -> anyhow::Result<Option<Self>> {
+         let mut tx = database.begin(Identity::system()).await?;
+         let mut model = SchemaValidationProgressModel::new(&mut tx, namespace);
+-        model
++        let initialized = model
+             .initialize_schema_validation_progress(schema_id, total_docs)
+             .await?;
+         database
+             .commit_with_write_source(tx, "schema_validation_tracker_initialized")
+             .await?;
+-        // Update schema validation progress every 5% or 500 documents, whichever is
+-        // lower, to avoid slowing down schema validation with too many writes.
+-        let update_threshold = NonZeroU64::new(
+-            total_docs
+-                .map(|total| std::cmp::min(500, (total as f64 * 0.05).ceil() as u64))
+-                .unwrap_or(500),
+-        )
+-        .unwrap_or(NonZeroU64::MIN);
+-        Ok(Self {
++        if !initialized {
++            return Ok(None);
++        }
++        let update_threshold = NonZeroU64::new(Self::checkpoint_threshold(total_docs))
++            .expect("schema validation checkpoint threshold must be nonzero");
++        Ok(Some(Self {
+             database,
+             namespace,
+             tables_to_validate,
+             schema_id,
+             update_threshold,
+             docs_validated: 0,
+-        })
++        }))
+     }
+ 
+     fn total_docs_at_ts(&self, ts: RepeatableTimestamp) -> anyhow::Result<Option<u64>> {
+@@ -434,8 +591,15 @@ impl<RT: Runtime> SchemaValidationProgressTracker<RT> {
+         count_total_docs(&snapshot, self.tables_to_validate.iter(), self.namespace)
+     }
+ 
+-    /// Records that a document has been validated, writing to the db iff if we
+-    /// have hit the update threshold, otherwise tracking progress in memory.
++    fn checkpoint_threshold(total_docs: Option<u64>) -> u64 {
++        match total_docs {
++            None => 500,
++            Some(total) => total.div_ceil(20).clamp(1, 500),
++        }
++    }
++
++    /// Records that a document has been validated, writing to the database only
++    /// after reaching the update threshold and otherwise tracking it in memory.
+     async fn record_document_validated(&mut self) -> anyhow::Result<bool> {
+         self.docs_validated += 1;
+         if self.docs_validated % self.update_threshold != 0 {
+@@ -461,7 +625,7 @@ impl<RT: Runtime> SchemaValidationProgressTracker<RT> {
+ 
+     /// Flushes the remaining schema validation progress to the database after
+     /// schema validation is finished.
+-    async fn record_validation_finished(self) -> anyhow::Result<()> {
++    async fn record_validation_finished(self) -> anyhow::Result<bool> {
+         tracing::debug!(
+             "Finalizing schema validation progress with docs_validated: {}",
+             self.docs_validated
+@@ -469,13 +633,13 @@ impl<RT: Runtime> SchemaValidationProgressTracker<RT> {
+         let mut tx = self.database.begin_system().await?;
+         let total_docs = self.total_docs_at_ts(tx.begin_timestamp())?;
+         let mut model = SchemaValidationProgressModel::new(&mut tx, self.namespace);
+-        model
++        let progress_exists = model
+             .update_schema_validation_progress(self.schema_id, self.docs_validated, total_docs)
+             .await?;
+         self.database
+             .commit_with_write_source(tx, "schema_validation_progress_finished")
+             .await?;
+-        Ok(())
++        Ok(progress_exists)
+     }
+ }
+ 
+diff --git a/crates/application/src/schema_worker/tests.rs b/crates/application/src/schema_worker/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..800cdb850fa6977a4681c606ac3ccecff282db67
+--- /dev/null
++++ b/crates/application/src/schema_worker/tests.rs
+@@ -0,0 +1,1257 @@
++use std::{
++    future::Future,
++    pin::Pin,
++    sync::{
++        atomic::{
++            AtomicU64,
++            Ordering,
++        },
++        Arc,
++    },
++    time::{
++        Duration,
++        SystemTime,
++    },
++};
++
++use anyhow::Context;
++use common::{
++    bootstrap_model::schema::{
++        SchemaMetadata,
++        SchemaState,
++    },
++    db_schema,
++    object_validator,
++    pause::PauseClient,
++    persistence::Persistence,
++    runtime::{
++        new_unlimited_rate_limiter,
++        Runtime,
++        SpawnHandle,
++    },
++    schemas::{
++        validator::{
++            FieldValidator,
++            Validator,
++        },
++        DatabaseSchema,
++        DocumentSchema,
++        SchemaValidationError,
++    },
++    shutdown::ShutdownSignal,
++    virtual_system_mapping::VirtualSystemMapping,
++};
++use database::{
++    Database,
++    SchemaModel,
++    SchemaValidationProgressMetadata,
++    SchemaValidationProgressModel,
++    SchemaValidationProgressTable,
++    SchemasTable,
++    SystemMetadataModel,
++    TableModel,
++    Transaction,
++    UserFacingModel,
++    COMPONENTS_TABLE,
++    SCHEMAS_TABLE,
++    SCHEMA_VALIDATION_PROGRESS_TABLE,
++};
++use errors::ErrorMetadataAnyhowExt;
++use futures::future::FusedFuture;
++use indexing::index_cache::IndexCache;
++use keybroker::Identity;
++use model::{
++    initialize_application_system_table,
++    DEFAULT_TABLE_NUMBERS,
++};
++use rand::RngCore;
++use runtime::prod::ProdRuntime;
++use search::searcher::SearcherStub;
++use sqlite::SqlitePersistence;
++use value::{
++    obj,
++    ConvexObject,
++    DeveloperDocumentId,
++    ResolvedDocumentId,
++    TableName,
++    TableNamespace,
++};
++
++use super::{
++    SchemaValidationProgressTracker,
++    SchemaWorker,
++};
++
++const TEST_NAMESPACE: TableNamespace = TableNamespace::root_component();
++const RETENTION_AGE: Duration = Duration::from_secs(2 * 60 * 60);
++
++#[derive(Clone)]
++struct SchemaTestRuntime {
++    inner: ProdRuntime,
++    wall_clock_offset_seconds: Arc<AtomicU64>,
++}
++
++impl SchemaTestRuntime {
++    fn new(inner: ProdRuntime) -> Self {
++        Self {
++            inner,
++            wall_clock_offset_seconds: Arc::new(AtomicU64::new(0)),
++        }
++    }
++
++    fn advance_wall_clock(&self, duration: Duration) {
++        self.wall_clock_offset_seconds
++            .fetch_add(duration.as_secs(), Ordering::SeqCst);
++    }
++
++    fn block_on<F: Future>(&self, name: &'static str, future: F) -> F::Output {
++        self.inner.block_on(name, future)
++    }
++}
++
++impl Runtime for SchemaTestRuntime {
++    fn wait(&self, duration: Duration) -> Pin<Box<dyn FusedFuture<Output = ()> + Send + 'static>> {
++        self.inner.wait(duration)
++    }
++
++    fn spawn(
++        &self,
++        name: &'static str,
++        future: impl Future<Output = ()> + Send + 'static,
++    ) -> Box<dyn SpawnHandle> {
++        self.inner.spawn(name, future)
++    }
++
++    fn spawn_thread<Fut: Future<Output = ()>, F: FnOnce() -> Fut + Send + 'static>(
++        &self,
++        name: &str,
++        future: F,
++    ) -> Box<dyn SpawnHandle> {
++        self.inner.spawn_thread(name, future)
++    }
++
++    fn system_time(&self) -> SystemTime {
++        self.inner.system_time()
++            + Duration::from_secs(self.wall_clock_offset_seconds.load(Ordering::SeqCst))
++    }
++
++    fn monotonic_now(&self) -> tokio::time::Instant {
++        self.inner.monotonic_now()
++    }
++
++    fn rng(&self) -> Box<dyn RngCore> {
++        self.inner.rng()
++    }
++
++    fn pause_client(&self) -> PauseClient {
++        self.inner.pause_client()
++    }
++}
++
++fn run_schema_test<F, Fut>(name: &'static str, test: F) -> anyhow::Result<()>
++where
++    F: FnOnce(SchemaTestRuntime) -> Fut,
++    Fut: Future<Output = anyhow::Result<()>>,
++{
++    let tokio = ProdRuntime::init_tokio()?;
++    let runtime = SchemaTestRuntime::new(ProdRuntime::new(&tokio));
++    runtime.block_on(name, test(runtime.clone()))
++}
++
++async fn new_test_database(
++    runtime: SchemaTestRuntime,
++) -> anyhow::Result<Database<SchemaTestRuntime>> {
++    // ba16e0638 removed the public in-memory database fixture. SQLite plus the
++    // production Database constructor is the narrowest remaining fixture that
++    // still exercises real transaction read sets and the OCC committer.
++    let persistence: Arc<dyn Persistence> = Arc::new(SqlitePersistence::new(":memory:")?);
++    let (deleted_tablet_sender, _deleted_tablet_receiver) = tokio::sync::mpsc::channel(16);
++    Database::load(
++        persistence,
++        runtime.clone(),
++        Arc::new(SearcherStub),
++        ShutdownSignal::panic(),
++        VirtualSystemMapping::default(),
++        IndexCache::new(1 << 20).new_handle(),
++        Arc::new(new_unlimited_rate_limiter(runtime)),
++        deleted_tablet_sender,
++    )
++    .await
++}
++
++async fn commit(
++    database: &Database<SchemaTestRuntime>,
++    transaction: Transaction<SchemaTestRuntime>,
++    write_source: &'static str,
++) -> anyhow::Result<()> {
++    database
++        .commit_with_write_source(transaction, write_source)
++        .await?;
++    Ok(())
++}
++
++fn restrictive_schema(table_name: &TableName) -> anyhow::Result<DatabaseSchema> {
++    Ok(db_schema!(
++        table_name => DocumentSchema::Union(vec![object_validator!(
++            "required" => FieldValidator::required_field_type(Validator::Int64)
++        )]),
++    ))
++}
++
++async fn submit_active_and_pending_schema(
++    database: &Database<SchemaTestRuntime>,
++    table_name: &TableName,
++) -> anyhow::Result<ResolvedDocumentId> {
++    let mut tx = database.begin_system().await?;
++    let active_schema = db_schema!(table_name => DocumentSchema::Any);
++    let (active_id, active_state) = SchemaModel::new(&mut tx, TEST_NAMESPACE)
++        .submit_pending(active_schema)
++        .await?;
++    assert_eq!(active_state, SchemaState::Pending);
++    SchemaModel::new(&mut tx, TEST_NAMESPACE)
++        .mark_validated(active_id)
++        .await?;
++    SchemaModel::new(&mut tx, TEST_NAMESPACE)
++        .mark_active(active_id)
++        .await?;
++
++    let (pending_id, pending_state) = SchemaModel::new(&mut tx, TEST_NAMESPACE)
++        .submit_pending(restrictive_schema(table_name)?)
++        .await?;
++    assert_eq!(pending_state, SchemaState::Pending);
++    commit(database, tx, "test_schema_setup").await?;
++    Ok(pending_id)
++}
++
++async fn submit_pending_schema(
++    database: &Database<SchemaTestRuntime>,
++    table_name: &TableName,
++) -> anyhow::Result<ResolvedDocumentId> {
++    let mut tx = database.begin_system().await?;
++    let (schema_id, state) = SchemaModel::new(&mut tx, TEST_NAMESPACE)
++        .submit_pending(db_schema!(table_name => DocumentSchema::Any))
++        .await?;
++    assert_eq!(state, SchemaState::Pending);
++    commit(database, tx, "test_pending_schema_submitted").await?;
++    Ok(schema_id)
++}
++
++async fn initialize_progress(
++    database: &Database<SchemaTestRuntime>,
++    schema_id: ResolvedDocumentId,
++) -> anyhow::Result<()> {
++    let mut tx = database.begin_system().await?;
++    assert!(
++        SchemaValidationProgressModel::new(&mut tx, TEST_NAMESPACE)
++            .initialize_schema_validation_progress(schema_id, Some(10))
++            .await?
++    );
++    commit(database, tx, "test_progress_initialized").await
++}
++
++async fn schema_state(
++    tx: &mut Transaction<SchemaTestRuntime>,
++    schema_id: ResolvedDocumentId,
++) -> anyhow::Result<Option<SchemaState>> {
++    tx.get(schema_id)
++        .await?
++        .map(|document| {
++            let metadata = SchemaMetadata::try_from(document.into_value().into_value())?;
++            Ok(metadata.state)
++        })
++        .transpose()
++}
++
++async fn progress(
++    tx: &mut Transaction<SchemaTestRuntime>,
++    schema_id: ResolvedDocumentId,
++) -> anyhow::Result<Option<Arc<common::document::ParsedDocument<SchemaValidationProgressMetadata>>>>
++{
++    SchemaValidationProgressModel::new(tx, TEST_NAMESPACE)
++        .existing_schema_validation_progress(schema_id)
++        .await
++}
++
++async fn mark_failed(
++    tx: &mut Transaction<SchemaTestRuntime>,
++    schema_id: ResolvedDocumentId,
++    table_name: &TableName,
++) -> anyhow::Result<bool> {
++    SchemaModel::new(tx, TEST_NAMESPACE)
++        .mark_failed(
++            schema_id,
++            SchemaValidationError::TableCannotBeDeleted {
++                table_name: table_name.clone(),
++            },
++        )
++        .await
++}
++
++async fn insert_schema_failing_document(
++    tx: &mut Transaction<SchemaTestRuntime>,
++    table_name: &TableName,
++) -> anyhow::Result<DeveloperDocumentId> {
++    UserFacingModel::new(tx, TEST_NAMESPACE)
++        .insert(table_name.clone(), ConvexObject::empty())
++        .await
++}
++
++#[test]
++fn schema_validation_progress_update_does_not_abort_schema_failure() -> anyhow::Result<()> {
++    run_schema_test(
++        "schema_validation_progress_update_does_not_abort_schema_failure",
++        |runtime| async move {
++            let database = new_test_database(runtime).await?;
++            let table_name: TableName = "documents".parse()?;
++            let schema_id = submit_active_and_pending_schema(&database, &table_name).await?;
++            initialize_progress(&database, schema_id).await?;
++
++            // Begin and fully stage the application write first. The pending schema
++            // is Failed locally, but remains Pending to other transactions.
++            let mut application_tx = database.begin(Identity::Unknown(None)).await?;
++            let document_id =
++                insert_schema_failing_document(&mut application_tx, &table_name).await?;
++            assert!(matches!(
++                schema_state(&mut application_tx, schema_id).await?,
++                Some(SchemaState::Failed { .. })
++            ));
++
++            // Commit a checkpoint after the application transaction began. Before
++            // this fix, mark_failed had read this row and the following commit made
++            // the single application commit lose OCC.
++            let mut progress_tx = database.begin_system().await?;
++            assert!(
++                SchemaValidationProgressModel::new(&mut progress_tx, TEST_NAMESPACE)
++                    .update_schema_validation_progress(schema_id, 1, Some(10))
++                    .await?
++            );
++            commit(&database, progress_tx, "schema_validation_progress_updated").await?;
++
++            // No outer retry helper: this is the already-open transaction's only
++            // commit attempt.
++            commit(&database, application_tx, "test_schema_failing_write").await?;
++
++            let mut verify_tx = database.begin_system().await?;
++            assert!(matches!(
++                schema_state(&mut verify_tx, schema_id).await?,
++                Some(SchemaState::Failed { .. })
++            ));
++            let resolved_document_id =
++                verify_tx.resolve_developer_id(&document_id, TEST_NAMESPACE)?;
++            assert!(verify_tx.get(resolved_document_id).await?.is_some());
++            assert_eq!(
++                progress(&mut verify_tx, schema_id)
++                    .await?
++                    .expect("failure cleanup is deferred")
++                    .num_docs_validated,
++                1
++            );
++            Ok(())
++        },
++    )
++}
++
++#[test]
++fn schema_validation_progress_checkpoint_loses_to_schema_failure() -> anyhow::Result<()> {
++    run_schema_test(
++        "schema_validation_progress_checkpoint_loses_to_schema_failure",
++        |runtime| async move {
++            let database = new_test_database(runtime).await?;
++            let table_name: TableName = "documents".parse()?;
++            let schema_id = submit_active_and_pending_schema(&database, &table_name).await?;
++            initialize_progress(&database, schema_id).await?;
++
++            // The checkpoint reads the exact schema document while it is Pending,
++            // then stages a progress replacement without committing.
++            let mut stale_progress_tx = database.begin_system().await?;
++            assert!(
++                SchemaValidationProgressModel::new(&mut stale_progress_tx, TEST_NAMESPACE)
++                    .update_schema_validation_progress(schema_id, 1, Some(10))
++                    .await?
++            );
++
++            let mut application_tx = database.begin(Identity::Unknown(None)).await?;
++            let document_id =
++                insert_schema_failing_document(&mut application_tx, &table_name).await?;
++            commit(&database, application_tx, "test_schema_failing_write").await?;
++
++            // The failure transaction never reads progress, so its _schemas write is
++            // the only possible conflict with this stale checkpoint transaction.
++            let error = database
++                .commit_with_write_source(stale_progress_tx, "schema_validation_progress_updated")
++                .await
++                .expect_err("a checkpoint based on Pending must lose to Failed");
++            assert!(error.is_occ(), "expected OCC, got {error:#}");
++            assert_eq!(
++                error
++                    .occ_info()
++                    .expect("OCC metadata")
++                    .write_source
++                    .as_deref(),
++                Some("test_schema_failing_write")
++            );
++
++            let mut verify_tx = database.begin_system().await?;
++            assert!(matches!(
++                schema_state(&mut verify_tx, schema_id).await?,
++                Some(SchemaState::Failed { .. })
++            ));
++            let resolved_document_id =
++                verify_tx.resolve_developer_id(&document_id, TEST_NAMESPACE)?;
++            assert!(verify_tx.get(resolved_document_id).await?.is_some());
++            assert_eq!(
++                progress(&mut verify_tx, schema_id)
++                    .await?
++                    .expect("physical cleanup has not run")
++                    .num_docs_validated,
++                0,
++                "the stale checkpoint must not publish"
++            );
++            Ok(())
++        },
++    )
++}
++
++#[test]
++fn schema_validation_progress_tracker_respects_lifecycle_states() -> anyhow::Result<()> {
++    run_schema_test(
++        "schema_validation_progress_tracker_respects_lifecycle_states",
++        |runtime| async move {
++            let database = new_test_database(runtime).await?;
++            let table_name: TableName = "documents".parse()?;
++
++            let overwritten_id = submit_pending_schema(&database, &table_name).await?;
++            initialize_progress(&database, overwritten_id).await?;
++            let mut overwrite_tx = database.begin_system().await?;
++            let replacement_table: TableName = "replacement".parse()?;
++            let (replacement_id, state) = SchemaModel::new(&mut overwrite_tx, TEST_NAMESPACE)
++                .submit_pending(db_schema!(&replacement_table => DocumentSchema::Any))
++                .await?;
++            assert_eq!(state, SchemaState::Pending);
++            commit(&database, overwrite_tx, "test_pending_schema_overwritten").await?;
++
++            let mut before_stale_init = database.begin_system().await?;
++            assert!(progress(&mut before_stale_init, overwritten_id)
++                .await?
++                .is_some());
++            drop(before_stale_init);
++
++            let mut stale_init_tx = database.begin_system().await?;
++            assert!(
++                !SchemaValidationProgressModel::new(&mut stale_init_tx, TEST_NAMESPACE)
++                    .initialize_schema_validation_progress(overwritten_id, Some(10))
++                    .await?
++            );
++            commit(&database, stale_init_tx, "test_stale_tracker_initialized").await?;
++            let mut verify_overwrite_tx = database.begin_system().await?;
++            assert!(progress(&mut verify_overwrite_tx, overwritten_id)
++                .await?
++                .is_none());
++            assert_eq!(
++                schema_state(&mut verify_overwrite_tx, replacement_id).await?,
++                Some(SchemaState::Pending)
++            );
++            drop(verify_overwrite_tx);
++
++            let mut stale_failure_tx = database.begin_system().await?;
++            assert!(
++                !mark_failed(&mut stale_failure_tx, overwritten_id, &table_name).await?,
++                "a replacement must not be reported as a schema failure"
++            );
++            commit(
++                &database,
++                stale_failure_tx,
++                "test_overwrite_wins_schema_failure_race",
++            )
++            .await?;
++
++            let mut missing_progress_tx = database.begin_system().await?;
++            assert!(
++                !SchemaValidationProgressModel::new(&mut missing_progress_tx, TEST_NAMESPACE)
++                    .update_schema_validation_progress(replacement_id, 1, Some(10))
++                    .await?
++            );
++            commit(
++                &database,
++                missing_progress_tx,
++                "test_missing_progress_cancels_tracker",
++            )
++            .await?;
++
++            initialize_progress(&database, replacement_id).await?;
++            let mut completed_progress_tx = database.begin_system().await?;
++            assert!(
++                SchemaValidationProgressModel::new(&mut completed_progress_tx, TEST_NAMESPACE,)
++                    .update_schema_validation_progress(replacement_id, 7, Some(10))
++                    .await?
++            );
++            commit(&database, completed_progress_tx, "test_completed_progress").await?;
++
++            let mut overflowing_progress_tx = database.begin_system().await?;
++            let overflow_error =
++                SchemaValidationProgressModel::new(&mut overflowing_progress_tx, TEST_NAMESPACE)
++                    .update_schema_validation_progress(replacement_id, u64::MAX, Some(10))
++                    .await
++                    .expect_err("progress addition must not wrap");
++            assert!(overflow_error
++                .to_string()
++                .contains("numDocsValidated overflowed while updating progress"));
++
++            let mut validated_tx = database.begin_system().await?;
++            SchemaModel::new(&mut validated_tx, TEST_NAMESPACE)
++                .mark_validated(replacement_id)
++                .await?;
++            commit(&database, validated_tx, "test_schema_validated").await?;
++
++            let duplicate_tracker = SchemaValidationProgressTracker::new(
++                database.clone(),
++                TEST_NAMESPACE,
++                [replacement_table].into_iter().collect(),
++                replacement_id,
++                Some(10),
++            )
++            .await?;
++            assert!(duplicate_tracker.is_none());
++            let mut verify_validated_tx = database.begin_system().await?;
++            let completed_progress = progress(&mut verify_validated_tx, replacement_id)
++                .await?
++                .expect("Validated preserves completed progress");
++            assert_eq!(completed_progress.num_docs_validated, 7);
++            drop(verify_validated_tx);
++
++            let mut active_tx = database.begin_system().await?;
++            SchemaModel::new(&mut active_tx, TEST_NAMESPACE)
++                .mark_active(replacement_id)
++                .await?;
++            commit(&database, active_tx, "test_schema_activated").await?;
++            let mut verify_active_tx = database.begin_system().await?;
++            assert_eq!(
++                schema_state(&mut verify_active_tx, replacement_id).await?,
++                Some(SchemaState::Active)
++            );
++            assert!(progress(&mut verify_active_tx, replacement_id)
++                .await?
++                .is_none());
++            drop(verify_active_tx);
++
++            // Even an idempotent activation must reject contradictory in-progress
++            // state before deleting mixed-version progress for the active schema.
++            let mut contradictory_tx = database.begin_system().await?;
++            SystemMetadataModel::new(&mut contradictory_tx, TEST_NAMESPACE)
++                .insert(
++                    &SCHEMA_VALIDATION_PROGRESS_TABLE,
++                    SchemaValidationProgressMetadata {
++                        schema_id: replacement_id.developer_id,
++                        num_docs_validated: 3,
++                        total_docs: Some(10),
++                    }
++                    .try_into()?,
++                )
++                .await?;
++            for state in [SchemaState::Pending, SchemaState::Validated] {
++                SystemMetadataModel::new(&mut contradictory_tx, TEST_NAMESPACE)
++                    .insert(
++                        &SCHEMAS_TABLE,
++                        SchemaMetadata::new(state, db_schema!())?.try_into()?,
++                    )
++                    .await?;
++            }
++            let activation_error = SchemaModel::new(&mut contradictory_tx, TEST_NAMESPACE)
++                .mark_active(replacement_id)
++                .await
++                .expect_err("activation must reject contradictory in-progress schemas");
++            assert!(activation_error
++                .to_string()
++                .contains("both pending and validated schemas exist"));
++            let clear_error = SchemaModel::new(&mut contradictory_tx, TEST_NAMESPACE)
++                .clear_active()
++                .await
++                .expect_err("clearing active must reject contradictory in-progress schemas");
++            assert!(clear_error
++                .to_string()
++                .contains("both pending and validated schemas exist"));
++            assert!(progress(&mut contradictory_tx, replacement_id)
++                .await?
++                .is_some());
++            Ok(())
++        },
++    )
++}
++
++#[test]
++fn schema_validation_progress_checkpoint_threshold_is_never_zero() {
++    assert_eq!(
++        SchemaValidationProgressTracker::<SchemaTestRuntime>::checkpoint_threshold(None),
++        500
++    );
++    assert_eq!(
++        SchemaValidationProgressTracker::<SchemaTestRuntime>::checkpoint_threshold(Some(0)),
++        1
++    );
++    assert_eq!(
++        SchemaValidationProgressTracker::<SchemaTestRuntime>::checkpoint_threshold(Some(1)),
++        1
++    );
++    assert_eq!(
++        SchemaValidationProgressTracker::<SchemaTestRuntime>::checkpoint_threshold(Some(10_000)),
++        500
++    );
++}
++
++#[test]
++fn schema_validation_worker_finishes_and_preserves_progress_until_activation() -> anyhow::Result<()>
++{
++    run_schema_test(
++        "schema_validation_worker_finishes_and_preserves_progress_until_activation",
++        |runtime| async move {
++            let database = new_test_database(runtime.clone()).await?;
++            let table_name: TableName = "completed_validation".parse()?;
++            let mut setup_tx = database.begin_system().await?;
++            let (schema_id, state) = SchemaModel::new(&mut setup_tx, TEST_NAMESPACE)
++                .submit_pending(restrictive_schema(&table_name)?)
++                .await?;
++            assert_eq!(state, SchemaState::Pending);
++            UserFacingModel::new(&mut setup_tx, TEST_NAMESPACE)
++                .insert(table_name.clone(), obj!("required" => 1_i64)?)
++                .await?;
++            commit(&database, setup_tx, "test_validation_setup").await?;
++
++            let worker = SchemaWorker {
++                runtime,
++                database: database.clone(),
++            };
++            worker.run().await?;
++
++            let mut validated_tx = database.begin_system().await?;
++            assert_eq!(
++                schema_state(&mut validated_tx, schema_id).await?,
++                Some(SchemaState::Validated)
++            );
++            let completed_progress = progress(&mut validated_tx, schema_id)
++                .await?
++                .expect("successful validation preserves completed progress");
++            assert_eq!(completed_progress.num_docs_validated, 1);
++            drop(validated_tx);
++
++            let duplicate_tracker = SchemaValidationProgressTracker::new(
++                database.clone(),
++                TEST_NAMESPACE,
++                [table_name].into_iter().collect(),
++                schema_id,
++                Some(1),
++            )
++            .await?;
++            assert!(duplicate_tracker.is_none());
++            let mut duplicate_verify_tx = database.begin_system().await?;
++            assert_eq!(
++                progress(&mut duplicate_verify_tx, schema_id)
++                    .await?
++                    .expect("duplicate worker must preserve completed progress")
++                    .num_docs_validated,
++                1
++            );
++            drop(duplicate_verify_tx);
++
++            let mut activation_tx = database.begin_system().await?;
++            SchemaModel::new(&mut activation_tx, TEST_NAMESPACE)
++                .mark_active(schema_id)
++                .await?;
++            commit(&database, activation_tx, "test_completed_schema_activated").await?;
++
++            let mut active_verify_tx = database.begin_system().await?;
++            assert_eq!(
++                schema_state(&mut active_verify_tx, schema_id).await?,
++                Some(SchemaState::Active)
++            );
++            assert!(progress(&mut active_verify_tx, schema_id).await?.is_none());
++            Ok(())
++        },
++    )
++}
++
++#[test]
++fn schema_validation_progress_restart_cleans_all_inactive_progress() -> anyhow::Result<()> {
++    run_schema_test(
++        "schema_validation_progress_restart_cleans_all_inactive_progress",
++        |runtime| async move {
++            let database = new_test_database(runtime.clone()).await?;
++            let failed_table: TableName = "failed".parse()?;
++            let failed_id = submit_pending_schema(&database, &failed_table).await?;
++            initialize_progress(&database, failed_id).await?;
++            let mut fail_tx = database.begin_system().await?;
++            assert!(mark_failed(&mut fail_tx, failed_id, &failed_table).await?);
++            commit(&database, fail_tx, "test_schema_failed").await?;
++
++            let overwritten_table: TableName = "overwritten".parse()?;
++            let overwritten_id = submit_pending_schema(&database, &overwritten_table).await?;
++            initialize_progress(&database, overwritten_id).await?;
++            let mut overwrite_tx = database.begin_system().await?;
++            assert!(
++                SchemaModel::new(&mut overwrite_tx, TEST_NAMESPACE)
++                    .overwrite_all()
++                    .await?
++            );
++            commit(&database, overwrite_tx, "test_schema_overwritten").await?;
++
++            // Old unfenced workers can recreate progress after activation during a
++            // mixed-version rollout. Cleanup must not rely on terminal schema state.
++            let active_table: TableName = "active".parse()?;
++            let active_id = submit_pending_schema(&database, &active_table).await?;
++            let mut activate_tx = database.begin_system().await?;
++            SchemaModel::new(&mut activate_tx, TEST_NAMESPACE)
++                .mark_validated(active_id)
++                .await?;
++            SchemaModel::new(&mut activate_tx, TEST_NAMESPACE)
++                .mark_active(active_id)
++                .await?;
++            commit(&database, activate_tx, "test_schema_activated").await?;
++            let mut stale_active_progress_tx = database.begin_system().await?;
++            SystemMetadataModel::new(&mut stale_active_progress_tx, TEST_NAMESPACE)
++                .insert(
++                    &SCHEMA_VALIDATION_PROGRESS_TABLE,
++                    SchemaValidationProgressMetadata {
++                        schema_id: active_id.developer_id,
++                        num_docs_validated: 3,
++                        total_docs: Some(10),
++                    }
++                    .try_into()?,
++                )
++                .await?;
++            commit(
++                &database,
++                stale_active_progress_tx,
++                "test_old_worker_recreated_active_progress",
++            )
++            .await?;
++
++            // An old backend can prune a terminal schema before a new worker's
++            // deferred cleanup. The progress scan must also remove that orphan.
++            let missing_table: TableName = "missing".parse()?;
++            let missing_id = submit_pending_schema(&database, &missing_table).await?;
++            initialize_progress(&database, missing_id).await?;
++            let mut prune_tx = database.begin_system().await?;
++            assert!(mark_failed(&mut prune_tx, missing_id, &missing_table).await?);
++            SystemMetadataModel::new(&mut prune_tx, TEST_NAMESPACE)
++                .delete(missing_id)
++                .await?;
++            commit(&database, prune_tx, "test_old_backend_pruned_schema").await?;
++
++            let validated_table: TableName = "validated".parse()?;
++            let validated_id = submit_pending_schema(&database, &validated_table).await?;
++            initialize_progress(&database, validated_id).await?;
++            let mut validated_tx = database.begin_system().await?;
++            SchemaModel::new(&mut validated_tx, TEST_NAMESPACE)
++                .mark_validated(validated_id)
++                .await?;
++            commit(&database, validated_tx, "test_schema_validated").await?;
++
++            let mut before_restart_tx = database.begin_system().await?;
++            assert!(progress(&mut before_restart_tx, failed_id).await?.is_some());
++            assert!(progress(&mut before_restart_tx, overwritten_id)
++                .await?
++                .is_some());
++            assert!(progress(&mut before_restart_tx, active_id).await?.is_some());
++            assert!(progress(&mut before_restart_tx, missing_id)
++                .await?
++                .is_some());
++            assert!(progress(&mut before_restart_tx, validated_id)
++                .await?
++                .is_some());
++            drop(before_restart_tx);
++
++            // A new worker instance has no in-memory tracker ownership. Its first
++            // pass discovers inactive progress read-only, then point-deletes only
++            // those progress documents.
++            let restarted_worker = SchemaWorker {
++                runtime,
++                database: database.clone(),
++            };
++            restarted_worker.run().await?;
++
++            let mut verify_tx = database.begin_system().await?;
++            assert!(progress(&mut verify_tx, failed_id).await?.is_none());
++            assert!(progress(&mut verify_tx, overwritten_id).await?.is_none());
++            assert!(progress(&mut verify_tx, active_id).await?.is_none());
++            assert!(progress(&mut verify_tx, missing_id).await?.is_none());
++            assert!(progress(&mut verify_tx, validated_id).await?.is_some());
++            drop(verify_tx);
++
++            let cleanup_token = restarted_worker
++                .run()
++                .await?
++                .cleanup_token
++                .expect("a clean no-work pass subscribes to progress cleanup");
++
++            // An old worker can write after the new worker's cleanup discovery
++            // without changing schema state. The cleanup token must wake the new
++            // worker instead of leaving this active-schema row until another push.
++            let mut late_stale_progress_tx = database.begin_system().await?;
++            SystemMetadataModel::new(&mut late_stale_progress_tx, TEST_NAMESPACE)
++                .insert(
++                    &SCHEMA_VALIDATION_PROGRESS_TABLE,
++                    SchemaValidationProgressMetadata {
++                        schema_id: active_id.developer_id,
++                        num_docs_validated: 4,
++                        total_docs: Some(10),
++                    }
++                    .try_into()?,
++                )
++                .await?;
++            commit(
++                &database,
++                late_stale_progress_tx,
++                "test_old_worker_wrote_after_cleanup_discovery",
++            )
++            .await?;
++            tokio::time::timeout(
++                Duration::from_secs(1),
++                database.subscribe_and_wait_for_invalidation(cleanup_token),
++            )
++            .await
++            .context("late inactive progress did not invalidate the cleanup token")??;
++
++            restarted_worker.run().await?;
++            let mut late_cleanup_verify_tx = database.begin_system().await?;
++            assert!(progress(&mut late_cleanup_verify_tx, active_id)
++                .await?
++                .is_none());
++            assert!(progress(&mut late_cleanup_verify_tx, validated_id)
++                .await?
++                .is_some());
++            Ok(())
++        },
++    )
++}
++
++#[test]
++fn schema_validation_progress_cleanup_handles_deleted_component_tables() -> anyhow::Result<()> {
++    run_schema_test(
++        "schema_validation_progress_cleanup_handles_deleted_component_tables",
++        |runtime| async move {
++            let database = new_test_database(runtime.clone()).await?;
++            let worker = SchemaWorker {
++                runtime,
++                database: database.clone(),
++            };
++            let namespace_discovery_token = worker.run().await?.token;
++            let table_name: TableName = "deleted_component".parse()?;
++            let mut setup_tx = database.begin_system().await?;
++            let namespace_id =
++                SystemMetadataModel::new_global(&mut setup_tx).allocate_internal_id()?;
++            let namespace_table_number = setup_tx
++                .table_mapping()
++                .namespace(TEST_NAMESPACE)
++                .id(&COMPONENTS_TABLE)?
++                .table_number;
++            let namespace = TableNamespace::ByComponent(DeveloperDocumentId::new(
++                namespace_table_number,
++                namespace_id,
++            ));
++            initialize_application_system_table(
++                &mut setup_tx,
++                &SchemasTable,
++                namespace,
++                &DEFAULT_TABLE_NUMBERS,
++            )
++            .await?;
++            initialize_application_system_table(
++                &mut setup_tx,
++                &SchemaValidationProgressTable,
++                namespace,
++                &DEFAULT_TABLE_NUMBERS,
++            )
++            .await?;
++            let (schema_id, state) = SchemaModel::new(&mut setup_tx, namespace)
++                .submit_pending(db_schema!(&table_name => DocumentSchema::Any))
++                .await?;
++            assert_eq!(state, SchemaState::Pending);
++            assert!(
++                SchemaValidationProgressModel::new(&mut setup_tx, namespace)
++                    .initialize_schema_validation_progress(schema_id, Some(10))
++                    .await?
++            );
++            SchemaModel::new(&mut setup_tx, namespace)
++                .mark_validated(schema_id)
++                .await?;
++            commit(&database, setup_tx, "test_component_schema_setup").await?;
++            tokio::time::timeout(
++                Duration::from_secs(1),
++                database.subscribe_and_wait_for_invalidation(namespace_discovery_token),
++            )
++            .await
++            .context("new component namespace did not invalidate schema discovery")??;
++
++            // Mixed-version or interrupted maintenance can leave an active
++            // progress table after its schema table is gone.
++            let mut delete_schema_tx = database.begin_system().await?;
++            TableModel::new(&mut delete_schema_tx)
++                .delete_active_table(namespace, SCHEMAS_TABLE.clone())
++                .await?;
++            commit(&database, delete_schema_tx, "test_schema_table_deleted").await?;
++
++            // Recreate the schema table first, but leave it empty while cleanup
++            // discovers the old progress row. Fencing only on the recreated table
++            // generation is insufficient for this ordering.
++            let mut recreate_schema_table_tx = database.begin_system().await?;
++            initialize_application_system_table(
++                &mut recreate_schema_table_tx,
++                &SchemasTable,
++                namespace,
++                &DEFAULT_TABLE_NUMBERS,
++            )
++            .await?;
++            commit(
++                &database,
++                recreate_schema_table_tx,
++                "test_schema_table_recreated_empty",
++            )
++            .await?;
++
++            let inactive_progress = {
++                let mut cleanup_discovery_tx = database.begin_system().await?;
++                let discovered =
++                    SchemaValidationProgressModel::new(&mut cleanup_discovery_tx, namespace)
++                        .inactive_schema_validation_progress()
++                        .await?;
++                assert_eq!(discovered.len(), 1);
++                discovered
++            };
++
++            // A recreated system table can reuse its table number. Even if a
++            // replacement schema also reuses the old internal ID, the old resolved
++            // schema ID must not authorize writes to the replacement's progress.
++            let mut recreate_schema_tx = database.begin_system().await?;
++            let recreated_schema_id = SystemMetadataModel::new(&mut recreate_schema_tx, namespace)
++                .insert_with_internal_id(
++                    &SCHEMAS_TABLE,
++                    schema_id.developer_id.internal_id(),
++                    SchemaMetadata::new(
++                        SchemaState::Pending,
++                        db_schema!(&table_name => DocumentSchema::Any),
++                    )?
++                    .try_into()?,
++                )
++                .await?;
++            assert_eq!(recreated_schema_id.developer_id, schema_id.developer_id);
++            assert_ne!(recreated_schema_id.tablet_id, schema_id.tablet_id);
++            assert!(
++                SchemaValidationProgressModel::new(&mut recreate_schema_tx, namespace)
++                    .initialize_schema_validation_progress(recreated_schema_id, Some(10))
++                    .await?
++            );
++            commit(&database, recreate_schema_tx, "test_schema_table_recreated").await?;
++
++            let mut recreated_state_tx = database.begin_system().await?;
++            assert_eq!(
++                SchemaModel::new(&mut recreated_state_tx, namespace)
++                    .get_by_state(SchemaState::Pending)
++                    .await?
++                    .map(|(id, _schema)| id),
++                Some(recreated_schema_id)
++            );
++            assert!(
++                SchemaModel::new(&mut recreated_state_tx, namespace)
++                    .get_by_state(SchemaState::Validated)
++                    .await?
++                    .is_none(),
++                "the inactive generation must not leak cached unique schema state"
++            );
++            drop(recreated_state_tx);
++
++            // Cleanup discovered against the empty recreated table must recheck the
++            // exact schema key and preserve progress that initialization has since
++            // assigned to the replacement pending schema.
++            let mut stale_cleanup_tx = database.begin_system().await?;
++            assert_eq!(
++                SchemaValidationProgressModel::new(&mut stale_cleanup_tx, namespace)
++                    .delete_schema_validation_progress_documents(&inactive_progress)
++                    .await?,
++                0
++            );
++            drop(stale_cleanup_tx);
++
++            // Recreating the progress table can also reuse its table number and
++            // document internal ID. A stale cleanup list must still address only
++            // the old physical progress-table generation.
++            let old_progress_id = inactive_progress[0].0;
++            let mut recreate_progress_table_tx = database.begin_system().await?;
++            let old_progress_tablet_id = recreate_progress_table_tx
++                .table_mapping()
++                .namespace(namespace)
++                .id(&SCHEMA_VALIDATION_PROGRESS_TABLE)?
++                .tablet_id;
++            TableModel::new(&mut recreate_progress_table_tx)
++                .delete_table_by_id_bypassing_schema_enforcement(old_progress_tablet_id)
++                .await?;
++            initialize_application_system_table(
++                &mut recreate_progress_table_tx,
++                &SchemaValidationProgressTable,
++                namespace,
++                &DEFAULT_TABLE_NUMBERS,
++            )
++            .await?;
++            let recreated_progress_id =
++                SystemMetadataModel::new(&mut recreate_progress_table_tx, namespace)
++                    .insert_with_internal_id(
++                        &SCHEMA_VALIDATION_PROGRESS_TABLE,
++                        old_progress_id.developer_id.internal_id(),
++                        SchemaValidationProgressMetadata {
++                            schema_id: recreated_schema_id.developer_id,
++                            num_docs_validated: 0,
++                            total_docs: Some(10),
++                        }
++                        .try_into()?,
++                    )
++                    .await?;
++            assert_eq!(
++                recreated_progress_id.developer_id,
++                old_progress_id.developer_id
++            );
++            assert_ne!(recreated_progress_id.tablet_id, old_progress_id.tablet_id);
++            commit(
++                &database,
++                recreate_progress_table_tx,
++                "test_schema_progress_table_recreated",
++            )
++            .await?;
++
++            let mut old_progress_cleanup_tx = database.begin_system().await?;
++            assert_eq!(
++                SchemaValidationProgressModel::new(&mut old_progress_cleanup_tx, namespace)
++                    .delete_schema_validation_progress_documents(&inactive_progress)
++                    .await?,
++                0
++            );
++            drop(old_progress_cleanup_tx);
++
++            // A stale finish request can still address the retained old tablet by
++            // resolved ID. It must not activate that generation or delete progress
++            // belonging to the recreated pending schema.
++            let mut stale_activation_tx = database.begin_system().await?;
++            let stale_activation_error = SchemaModel::new(&mut stale_activation_tx, namespace)
++                .mark_active(schema_id)
++                .await
++                .expect_err("an inactive schema-table generation cannot be activated");
++            assert!(stale_activation_error
++                .to_string()
++                .contains("No document found for schema ID"));
++            drop(stale_activation_tx);
++
++            let mut old_generation_checkpoint_tx = database.begin_system().await?;
++            assert!(
++                !SchemaValidationProgressModel::new(&mut old_generation_checkpoint_tx, namespace,)
++                    .update_schema_validation_progress(schema_id, 1, Some(10))
++                    .await?
++            );
++            commit(
++                &database,
++                old_generation_checkpoint_tx,
++                "test_old_schema_generation_checkpoint_stopped",
++            )
++            .await?;
++            let mut verify_recreated_progress_tx = database.begin_system().await?;
++            assert_eq!(
++                SchemaValidationProgressModel::new(&mut verify_recreated_progress_tx, namespace)
++                    .existing_schema_validation_progress(recreated_schema_id)
++                    .await?
++                    .expect("replacement generation keeps its progress")
++                    .num_docs_validated,
++                0
++            );
++            drop(verify_recreated_progress_tx);
++
++            // Once the recreated schema table is gone, its stale checkpoint stops
++            // and removes the orphan from the still-active progress table.
++            let mut delete_recreated_schema_tx = database.begin_system().await?;
++            TableModel::new(&mut delete_recreated_schema_tx)
++                .delete_active_table(namespace, SCHEMAS_TABLE.clone())
++                .await?;
++            commit(
++                &database,
++                delete_recreated_schema_tx,
++                "test_recreated_schema_table_deleted",
++            )
++            .await?;
++            let mut stale_checkpoint_tx = database.begin_system().await?;
++            assert!(
++                !SchemaValidationProgressModel::new(&mut stale_checkpoint_tx, namespace)
++                    .update_schema_validation_progress(recreated_schema_id, 1, Some(10))
++                    .await?
++            );
++            commit(
++                &database,
++                stale_checkpoint_tx,
++                "test_deleted_component_checkpoint",
++            )
++            .await?;
++            let mut verify_cleanup_tx = database.begin_system().await?;
++            assert!(
++                SchemaValidationProgressModel::new(&mut verify_cleanup_tx, namespace)
++                    .existing_schema_validation_progress(recreated_schema_id)
++                    .await?
++                    .is_none()
++            );
++            drop(verify_cleanup_tx);
++
++            // Historical mappings remain after the whole component namespace is
++            // deactivated. Worker discovery must skip the inactive progress table;
++            // tablet retention now owns any remaining physical documents.
++            let mut delete_progress_tx = database.begin_system().await?;
++            TableModel::new(&mut delete_progress_tx)
++                .delete_active_table(namespace, SCHEMA_VALIDATION_PROGRESS_TABLE.clone())
++                .await?;
++            commit(
++                &database,
++                delete_progress_tx,
++                "test_schema_progress_table_deleted",
++            )
++            .await?;
++
++            let mut after_table_deletion_tx = database.begin_system().await?;
++            assert!(
++                !SchemaValidationProgressModel::new(&mut after_table_deletion_tx, namespace)
++                    .update_schema_validation_progress(schema_id, 1, Some(10))
++                    .await?
++            );
++            commit(
++                &database,
++                after_table_deletion_tx,
++                "test_deleted_component_checkpoint_stopped",
++            )
++            .await?;
++
++            worker.run().await?;
++            Ok(())
++        },
++    )
++}
++
++#[test]
++fn schema_validation_progress_history_pruning_deletes_orphans() -> anyhow::Result<()> {
++    run_schema_test(
++        "schema_validation_progress_history_pruning_deletes_orphans",
++        |runtime| async move {
++            let database = new_test_database(runtime.clone()).await?;
++            let old_table: TableName = "old_terminal".parse()?;
++            let old_schema_id = submit_pending_schema(&database, &old_table).await?;
++            initialize_progress(&database, old_schema_id).await?;
++            let mut old_failure_tx = database.begin_system().await?;
++            assert!(mark_failed(&mut old_failure_tx, old_schema_id, &old_table).await?);
++            commit(&database, old_failure_tx, "test_old_schema_failed").await?;
++
++            runtime.advance_wall_clock(RETENTION_AGE);
++
++            let current_table: TableName = "current_terminal".parse()?;
++            let current_schema_id = submit_pending_schema(&database, &current_table).await?;
++            let mut current_failure_tx = database.begin_system().await?;
++            assert!(mark_failed(&mut current_failure_tx, current_schema_id, &current_table).await?);
++            commit(&database, current_failure_tx, "test_current_schema_failed").await?;
++
++            let mut verify_tx = database.begin_system().await?;
++            assert_eq!(schema_state(&mut verify_tx, old_schema_id).await?, None);
++            assert!(progress(&mut verify_tx, old_schema_id).await?.is_none());
++            assert!(matches!(
++                schema_state(&mut verify_tx, current_schema_id).await?,
++                Some(SchemaState::Failed { .. })
++            ));
++            drop(verify_tx);
++
++            // A worker can lose an OCC to replacement and retry after a later
++            // schema transition has pruned the old terminal generation.
++            let mut stale_worker_tx = database.begin_system().await?;
++            assert!(!mark_failed(&mut stale_worker_tx, old_schema_id, &old_table).await?);
++            commit(
++                &database,
++                stale_worker_tx,
++                "test_stale_worker_after_schema_pruning",
++            )
++            .await?;
++            Ok(())
++        },
++    )
++}
++
++#[test]
++fn old_schema_failure_and_overwrite_do_not_read_hot_progress() -> anyhow::Result<()> {
++    run_schema_test(
++        "old_schema_failure_and_overwrite_do_not_read_hot_progress",
++        |runtime| async move {
++            let database = new_test_database(runtime.clone()).await?;
++            let failing_table: TableName = "old_failure".parse()?;
++            let failing_schema_id = submit_pending_schema(&database, &failing_table).await?;
++            initialize_progress(&database, failing_schema_id).await?;
++            runtime.advance_wall_clock(RETENTION_AGE);
++
++            let mut failure_tx = database.begin_system().await?;
++            assert!(mark_failed(&mut failure_tx, failing_schema_id, &failing_table).await?);
++            let mut concurrent_progress_tx = database.begin_system().await?;
++            assert!(
++                SchemaValidationProgressModel::new(&mut concurrent_progress_tx, TEST_NAMESPACE,)
++                    .update_schema_validation_progress(failing_schema_id, 1, Some(10))
++                    .await?
++            );
++            commit(
++                &database,
++                concurrent_progress_tx,
++                "schema_validation_progress_updated",
++            )
++            .await?;
++            commit(&database, failure_tx, "test_old_schema_failure").await?;
++            let mut failure_verify_tx = database.begin_system().await?;
++            assert!(matches!(
++                schema_state(&mut failure_verify_tx, failing_schema_id).await?,
++                Some(SchemaState::Failed { .. })
++            ));
++            assert_eq!(
++                progress(&mut failure_verify_tx, failing_schema_id)
++                    .await?
++                    .expect("the current old schema is retained for deferred cleanup")
++                    .num_docs_validated,
++                1
++            );
++            drop(failure_verify_tx);
++
++            let overwriting_table: TableName = "old_overwrite".parse()?;
++            let overwriting_schema_id =
++                submit_pending_schema(&database, &overwriting_table).await?;
++            initialize_progress(&database, overwriting_schema_id).await?;
++            runtime.advance_wall_clock(RETENTION_AGE);
++
++            let mut overwrite_tx = database.begin_system().await?;
++            let replacement_table: TableName = "new_pending".parse()?;
++            let (replacement_id, replacement_state) =
++                SchemaModel::new(&mut overwrite_tx, TEST_NAMESPACE)
++                    .submit_pending(db_schema!(&replacement_table => DocumentSchema::Any))
++                    .await?;
++            assert_eq!(replacement_state, SchemaState::Pending);
++            let mut second_progress_tx = database.begin_system().await?;
++            assert!(
++                SchemaValidationProgressModel::new(&mut second_progress_tx, TEST_NAMESPACE)
++                    .update_schema_validation_progress(overwriting_schema_id, 1, Some(10))
++                    .await?
++            );
++            commit(
++                &database,
++                second_progress_tx,
++                "schema_validation_progress_updated",
++            )
++            .await?;
++            commit(&database, overwrite_tx, "test_old_schema_overwrite").await?;
++
++            let mut verify_tx = database.begin_system().await?;
++            assert!(matches!(
++                schema_state(&mut verify_tx, failing_schema_id).await?,
++                Some(SchemaState::Failed { .. }) | None
++            ));
++            assert_eq!(
++                schema_state(&mut verify_tx, overwriting_schema_id).await?,
++                Some(SchemaState::Overwritten)
++            );
++            assert_eq!(
++                schema_state(&mut verify_tx, replacement_id).await?,
++                Some(SchemaState::Pending)
++            );
++            Ok(())
++        },
++    )
++}
+diff --git a/crates/application/src/snapshot_import/schema_constraints.rs b/crates/application/src/snapshot_import/schema_constraints.rs
+index 6d924c1545d12d7a011af253b701a781159c2b6e..0f1e9352f764c9461e05577419e588af737c0517 100644
+--- a/crates/application/src/snapshot_import/schema_constraints.rs
++++ b/crates/application/src/snapshot_import/schema_constraints.rs
+@@ -155,19 +155,19 @@ pub type SchemasForImport = Vec<(
+ pub async fn schemas_for_import<RT: Runtime>(
+     tx: &mut Transaction<RT>,
+ ) -> anyhow::Result<SchemasForImport> {
+-    let mut namespaces = tx.table_mapping().namespaces_for_name(&SCHEMAS_TABLE);
+-    namespaces.sort();
++    let namespaces: BTreeSet<_> = tx
++        .table_mapping()
++        .namespaces_for_name(&SCHEMAS_TABLE)
++        .into_iter()
++        .collect();
+     let mut schemas = vec![];
+     for namespace in namespaces {
+         let mut schema_model = SchemaModel::new(tx, namespace);
+-        for schema_state in [
+-            SchemaState::Active,
+-            SchemaState::Validated,
+-            SchemaState::Pending,
+-        ] {
+-            if let Some(schema) = schema_model.get_by_state(schema_state.clone()).await? {
+-                schemas.push((namespace, schema_state, schema));
+-            }
++        if let Some(schema) = schema_model.get_by_state(SchemaState::Active).await? {
++            schemas.push((namespace, SchemaState::Active, schema));
++        }
++        if let Some((id, schema, state)) = schema_model.get_in_progress_schema().await? {
++            schemas.push((namespace, state, (id, schema)));
+         }
+     }
+     Ok(schemas)
+diff --git a/crates/database/src/bootstrap_model/schema/mod.rs b/crates/database/src/bootstrap_model/schema/mod.rs
+index 2eb0e96237f655228b907f263f0cef644bcb7f38..ab8b5310374ee520a78738ab4a861d107a0910cc 100644
+--- a/crates/database/src/bootstrap_model/schema/mod.rs
++++ b/crates/database/src/bootstrap_model/schema/mod.rs
+@@ -16,7 +16,10 @@ use common::{
+         SchemaMetadata,
+         SchemaState,
+     },
+-    document::ResolvedDocument,
++    document::{
++        ParsedDocument,
++        ResolvedDocument,
++    },
+     runtime::Runtime,
+     schemas::{
+         DatabaseSchema,
+@@ -54,6 +57,7 @@ pub static SCHEMA_STATE_FIELD: LazyLock<FieldPath> =
+     LazyLock::new(|| "state".parse().expect("invalid state field"));
+ 
+ const MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS: Duration = Duration::from_secs(60 * 60); // 1 hour
++const MAX_SCHEMA_HISTORY_DELETIONS_PER_TRANSACTION: usize = 16;
+ 
+ pub struct SchemasTable;
+ impl SystemTable for SchemasTable {
+@@ -123,29 +127,40 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+         &mut self,
+         active_table_to_delete: TableName,
+     ) -> anyhow::Result<()> {
++        // Check the combined invariant before an active-schema error can mask it.
++        let in_progress_schema = self.get_in_progress_schema().await?;
+         if let Some((_id, active_schema)) = self.get_by_state(SchemaState::Active).await?
+             && let Err(schema_error) =
+                 active_schema.check_delete_table(active_table_to_delete.clone())
+         {
+             anyhow::bail!(schema_error.to_error_metadata());
+         }
++        if let Some((id, in_progress_schema, _state)) = in_progress_schema
++            && let Err(enforcement_error) =
++                in_progress_schema.check_delete_table(active_table_to_delete)
++        {
++            anyhow::ensure!(
++                self.mark_failed(id, enforcement_error.into()).await?,
++                "In-progress schema changed state within one enforcement transaction"
++            );
++        }
++
++        Ok(())
++    }
++
++    pub async fn get_in_progress_schema(
++        &mut self,
++    ) -> anyhow::Result<Option<(ResolvedDocumentId, Arc<DatabaseSchema>, SchemaState)>> {
+         let pending_schema = self.get_by_state(SchemaState::Pending).await?;
+         let validated_schema = self.get_by_state(SchemaState::Validated).await?;
+         match (pending_schema, validated_schema) {
+-            (None, None) => {},
+-            (Some((id, in_progress_schema)), None) | (None, Some((id, in_progress_schema))) => {
+-                if let Err(enforcement_error) =
+-                    in_progress_schema.check_delete_table(active_table_to_delete)
+-                {
+-                    self.mark_failed(id, enforcement_error.into()).await?;
+-                }
+-            },
++            (None, None) => Ok(None),
++            (Some((id, schema)), None) => Ok(Some((id, schema, SchemaState::Pending))),
++            (None, Some((id, schema))) => Ok(Some((id, schema, SchemaState::Validated))),
+             (Some(_), Some(_)) => {
+                 anyhow::bail!("Invalid schema state: both pending and validated schemas exist")
+             },
+         }
+-
+-        Ok(())
+     }
+ 
+     /// You probably want to use `enforce`.
+@@ -159,6 +174,8 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+         table_mapping_for_schema: &NamespacedTableMapping,
+     ) -> anyhow::Result<()> {
+         let table_name = table_mapping_for_schema.tablet_name(document.id().tablet_id)?;
++        // Check the combined invariant before an active-schema error can mask it.
++        let in_progress_schema = self.get_in_progress_schema().await?;
+         if let Some((_id, active_schema)) = self.get_by_state(SchemaState::Active).await?
+             && let Err(schema_error) = active_schema.check_new_document(
+                 document,
+@@ -169,28 +186,45 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+         {
+             anyhow::bail!(schema_error.to_error_metadata());
+         }
+-        let pending_schema = self.get_by_state(SchemaState::Pending).await?;
+-        let validated_schema = self.get_by_state(SchemaState::Validated).await?;
+-        match (pending_schema, validated_schema) {
+-            (None, None) => {},
+-            (Some((id, in_progress_schema)), None) | (None, Some((id, in_progress_schema))) => {
+-                if let Err(enforcement_error) = in_progress_schema.check_new_document(
+-                    document,
+-                    table_name,
+-                    table_mapping_for_schema,
+-                    self.tx.virtual_system_mapping(),
+-                ) {
+-                    self.mark_failed(id, enforcement_error.into()).await?;
+-                }
+-            },
+-            (Some(_), Some(_)) => {
+-                anyhow::bail!("Invalid schema state: both pending and validated schemas exist")
+-            },
++        if let Some((id, in_progress_schema, _state)) = in_progress_schema
++            && let Err(enforcement_error) = in_progress_schema.check_new_document(
++                document,
++                table_name,
++                table_mapping_for_schema,
++                self.tx.virtual_system_mapping(),
++            )
++        {
++            anyhow::ensure!(
++                self.mark_failed(id, enforcement_error.into()).await?,
++                "In-progress schema changed state within one enforcement transaction"
++            );
+         }
+ 
+         Ok(())
+     }
+ 
++    async fn get_exact_schema(
++        &mut self,
++        document_id: ResolvedDocumentId,
++    ) -> anyhow::Result<Option<Arc<ParsedDocument<SchemaMetadata>>>> {
++        // A resolved ID can still read a retained inactive tablet. Resolve through
++        // the active system table first so a stale lifecycle request cannot act on
++        // a recreated schema-table generation.
++        if !self
++            .tx
++            .table_mapping()
++            .namespace(self.namespace)
++            .name_exists(&SCHEMAS_TABLE)
++        {
++            return Ok(None);
++        }
++        Ok(self
++            .tx
++            .get_system::<SchemasTable>(self.namespace, document_id.developer_id)
++            .await?
++            .filter(|schema| schema.id() == document_id))
++    }
++
+     pub async fn get_by_state(
+         &mut self,
+         state: SchemaState,
+@@ -200,7 +234,19 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+             "Getting schema by state is only permitted for Pending, Validated, or Active states, \
+              since Failed or Overwritten states may have multiple documents."
+         );
+-        self.tx.get_schema_by_state(self.namespace, state)
++        let Some(schema_tablet_id) = self
++            .tx
++            .table_mapping()
++            .namespace(self.namespace)
++            .id_if_exists(&SCHEMAS_TABLE)
++        else {
++            return Ok(None);
++        };
++        let schema = self.tx.get_schema_by_state(self.namespace, state)?;
++        // SchemaRegistry retains unique-state entries by namespace when a system
++        // table is recreated. Its read dependency uses the current tablet, but the
++        // cached result can still belong to the retained inactive generation.
++        Ok(schema.filter(|(id, _schema)| id.tablet_id == schema_tablet_id))
+     }
+ 
+     #[fastrace::trace]
+@@ -216,40 +262,25 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+                     .await?;
+             }
+         }
+-        if let Some((id, active_schema)) = self.get_by_state(SchemaState::Active).await?
++        let active_schema = self.get_by_state(SchemaState::Active).await?;
++        let in_progress_schema = self.get_in_progress_schema().await?;
++        if let Some((id, active_schema)) = active_schema
+             && *active_schema == schema
+         {
+-            if let Some((id, _pending_schema)) = self.get_by_state(SchemaState::Pending).await? {
+-                self.mark_overwritten(id).await?;
+-            }
+-            if let Some((id, _validated_schema)) = self.get_by_state(SchemaState::Validated).await?
+-            {
+-                self.mark_overwritten(id).await?;
++            if let Some((in_progress_id, _in_progress_schema, state)) = in_progress_schema {
++                self.mark_overwritten(in_progress_id, state).await?;
++                self.delete_old_failed_and_overwritten_schemas(&[in_progress_id])
++                    .await?;
+             }
+             return Ok((id, SchemaState::Active));
+         }
+-        match (
+-            self.get_by_state(SchemaState::Pending).await?,
+-            self.get_by_state(SchemaState::Validated).await?,
+-        ) {
+-            (Some(_), Some(_)) => {
+-                anyhow::bail!("Invalid schema state: both pending and validated schemas exist")
+-            },
+-            (Some((id, existing_schema)), None) => {
+-                if *existing_schema == schema {
+-                    return Ok((id, SchemaState::Pending));
+-                } else {
+-                    self.mark_overwritten(id).await?;
+-                }
+-            },
+-            (None, Some((id, existing_schema))) => {
+-                if *existing_schema == schema {
+-                    return Ok((id, SchemaState::Validated));
+-                } else {
+-                    self.mark_overwritten(id).await?;
+-                }
+-            },
+-            (None, None) => {},
++        if let Some((id, existing_schema, state)) = in_progress_schema {
++            if *existing_schema == schema {
++                return Ok((id, state));
++            }
++            self.mark_overwritten(id, state).await?;
++            self.delete_old_failed_and_overwritten_schemas(&[id])
++                .await?;
+         }
+ 
+         let schema_metadata = SchemaMetadata::new(SchemaState::Pending, schema)?;
+@@ -261,13 +292,15 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+ 
+     pub async fn mark_validated(&mut self, document_id: ResolvedDocumentId) -> anyhow::Result<()> {
+         let doc = self
+-            .tx
+-            .get(document_id)
++            .get_exact_schema(document_id)
+             .await?
+             .context("Schema to mark as validated must exist.")?;
+-        let schema = SchemaMetadata::try_from(doc.into_value().into_value())?;
+-        match schema.state {
++        match &doc.state {
+             SchemaState::Pending => {
++                anyhow::ensure!(
++                    self.get_by_state(SchemaState::Validated).await?.is_none(),
++                    "Invalid schema state: both pending and validated schemas exist"
++                );
+                 SystemMetadataModel::new(self.tx, self.namespace)
+                     .patch(
+                         document_id,
+@@ -297,11 +330,10 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+         schema_id: ResolvedDocumentId,
+     ) -> anyhow::Result<SchemaMetadata> {
+         let doc = self
+-            .tx
+-            .get(schema_id)
++            .get_exact_schema(schema_id)
+             .await?
+             .ok_or_else(|| anyhow::anyhow!("No document found for schema ID {schema_id}"))?;
+-        let schema = SchemaMetadata::try_from(doc.into_value().into_value())?;
++        let schema = Arc::unwrap_or_clone(doc).into_value();
+         match schema.state {
+             SchemaState::Pending => {
+                 anyhow::bail!("Expected schema to be Validated, but it's Pending {schema_id}")
+@@ -324,13 +356,29 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+     pub async fn mark_active(&mut self, document_id: ResolvedDocumentId) -> anyhow::Result<()> {
+         // Make sure it's already Validated or Active.
+         let schema = self.get_validated_or_active(document_id).await?;
+-        let mut model = SchemaValidationProgressModel::new(self.tx, self.namespace);
+-        model.delete_schema_validation_progress(document_id).await?;
++        // Check the combined in-progress invariant before the Active no-op can
++        // delete mixed-version progress or hide contradictory lifecycle state.
++        let in_progress_schema = self.get_in_progress_schema().await?;
+         match schema.state {
+-            // Already active: no-op
+-            SchemaState::Active => Ok(()),
++            // Already active: clean any mixed-version progress and otherwise no-op.
++            SchemaState::Active => {
++                SchemaValidationProgressModel::new(self.tx, self.namespace)
++                    .delete_schema_validation_progress(document_id)
++                    .await?;
++                Ok(())
++            },
+             // If it's validated, mark as active.
+             SchemaState::Validated => {
++                anyhow::ensure!(
++                    matches!(
++                        in_progress_schema,
++                        Some((id, _, SchemaState::Validated)) if id == document_id
++                    ),
++                    "Schema to mark active is not the current validated schema"
++                );
++                SchemaValidationProgressModel::new(self.tx, self.namespace)
++                    .delete_schema_validation_progress(document_id)
++                    .await?;
+                 self.clear_active().await?;
+                 SystemMetadataModel::new(self.tx, self.namespace)
+                     .patch(
+@@ -348,19 +396,22 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+ 
+     #[async_recursion]
+     /// Mark pending or validated schemas as failed. Error if the schema is
+-    /// already active, and do nothing if it is already overwritten or failed.
++    /// already active. Returns whether the exact schema is failed after this
++    /// call; an overwritten schema or a terminal schema removed by retention
++    /// returns false.
+     pub async fn mark_failed(
+         &mut self,
+         document_id: ResolvedDocumentId,
+         error: SchemaValidationError,
+-    ) -> anyhow::Result<()> {
+-        let doc = self
+-            .tx
+-            .get(document_id)
+-            .await?
+-            .context("Schema to mark as failed must exist.")?;
+-        let schema = SchemaMetadata::try_from(doc.into_value().into_value())?;
+-        match schema.state {
++    ) -> anyhow::Result<bool> {
++        let Some(doc) = self.get_exact_schema(document_id).await? else {
++            // A schema worker retries in a new transaction. A replacement older
++            // than the retention window can be pruned between those attempts.
++            // Enforcement callers use one snapshot and reject this result as an
++            // internal inconsistency.
++            return Ok(false);
++        };
++        let schema_is_failed = match doc.state.clone() {
+             SchemaState::Pending | SchemaState::Validated => {
+                 let error_message = error.to_string();
+                 let table_name = match error {
+@@ -384,91 +435,124 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+                         )?,
+                     )
+                     .await?;
++                true
+             },
+             SchemaState::Active => {
+                 anyhow::bail!("Active schemas cannot be marked as failed.")
+             },
+-            SchemaState::Failed { .. } | SchemaState::Overwritten => {},
+-        }
+-        self.delete_old_failed_and_overwritten_schemas().await?;
+-        let mut model = SchemaValidationProgressModel::new(self.tx, self.namespace);
+-        model.delete_schema_validation_progress(document_id).await?;
+-        Ok(())
++            SchemaState::Failed { .. } => true,
++            SchemaState::Overwritten => false,
++        };
++        self.delete_old_failed_and_overwritten_schemas(&[document_id])
++            .await?;
++        // User writes can fail a pending schema. Do not make those transactions read
++        // the hot progress row: tracker checkpoints fence on this schema state and the
++        // schema worker removes inactive progress after cancellation or restart.
++        Ok(schema_is_failed)
+     }
+ 
+     pub async fn overwrite_all(&mut self) -> anyhow::Result<bool> {
+-        let mut is_any_schema_overwritten = false;
+-        for state in [
+-            SchemaState::Pending,
+-            SchemaState::Active,
+-            SchemaState::Validated,
+-        ] {
+-            is_any_schema_overwritten =
+-                self.overwrite_by_state(state).await? || is_any_schema_overwritten;
++        let mut schemas_to_overwrite = Vec::new();
++        if let Some((id, _schema, state)) = self.get_in_progress_schema().await? {
++            schemas_to_overwrite.push((id, state));
++        }
++        if let Some((id, _schema)) = self.get_by_state(SchemaState::Active).await? {
++            schemas_to_overwrite.push((id, SchemaState::Active));
++        }
++        for (id, state) in &schemas_to_overwrite {
++            self.mark_overwritten(*id, state.clone()).await?;
++        }
++        if !schemas_to_overwrite.is_empty() {
++            let schemas_to_keep: Vec<_> = schemas_to_overwrite.iter().map(|(id, _)| *id).collect();
++            self.delete_old_failed_and_overwritten_schemas(&schemas_to_keep)
++                .await?;
+         }
+-        Ok(is_any_schema_overwritten)
++        Ok(!schemas_to_overwrite.is_empty())
+     }
+ 
+     pub async fn clear_active(&mut self) -> anyhow::Result<()> {
+-        self.overwrite_by_state(SchemaState::Active)
+-            .await
+-            .map(|_| ())
+-    }
+-
+-    async fn overwrite_by_state(&mut self, state: SchemaState) -> anyhow::Result<bool> {
+-        if let Some((id, _schema)) = self.get_by_state(state).await? {
+-            self.mark_overwritten(id).await?;
+-            Ok(true)
+-        } else {
+-            Ok(false)
++        // Applying no schema is still a lifecycle transition. Do not overwrite
++        // the active schema while preserving contradictory in-progress state.
++        self.get_in_progress_schema().await?;
++        if let Some((id, _schema)) = self.get_by_state(SchemaState::Active).await? {
++            self.mark_overwritten(id, SchemaState::Active).await?;
++            self.delete_old_failed_and_overwritten_schemas(&[id])
++                .await?;
+         }
++        Ok(())
+     }
+ 
+-    /// Deletes failed and overwritten schemas older than an hour, returning the
+-    /// number of documents deleted. Keeps schemas table small.
+-    async fn delete_old_failed_and_overwritten_schemas(&mut self) -> anyhow::Result<usize> {
++    /// Deletes a bounded batch of failed and overwritten schemas older than an
++    /// hour. Keeps schemas table small without making a schema transition own
++    /// an unbounded cleanup.
++    async fn delete_old_failed_and_overwritten_schemas(
++        &mut self,
++        schemas_to_keep: &[ResolvedDocumentId],
++    ) -> anyhow::Result<()> {
++        let oldest_schema_to_keep = (*self
++            .tx
++            .begin_timestamp()
++            .sub(MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS)
++            .context("Should be able to subtract an hour from creation time")?)
++        .try_into()?;
++        let namespace = self.namespace;
+         let mut num_deleted = 0;
+-        for schema_doc in self
++        let creation_time_index = SystemIndex::<SchemasTable>::by_creation_time();
++        let mut schemas = self
+             .tx
+-            .query_system(
+-                self.namespace,
+-                &SystemIndex::<SchemasTable>::by_creation_time(),
+-            )?
+-            .all()
+-            .await?
+-        {
++            .query_system(namespace, &creation_time_index)?
++            .build();
++        while let Some(schema_doc) = schemas.next().await? {
+             // Only delete failed and overwritten schemas
+             match schema_doc.state {
+                 SchemaState::Failed { .. } | SchemaState::Overwritten => {},
+                 SchemaState::Active | SchemaState::Pending | SchemaState::Validated => continue,
+             }
++            // A schema changed by this transaction may still have a live checkpoint
++            // from before the transition. Keep it for out-of-transaction cleanup.
++            if schemas_to_keep.contains(&schema_doc.id()) {
++                continue;
++            }
+             // Break if the schemas are not old enough to be deleted
+-            if schema_doc.creation_time()
+-                > (*self
+-                    .tx
+-                    .begin_timestamp()
+-                    .sub(MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS)
+-                    .context("Should be able to subtract an hour from creation time")?)
+-                .try_into()?
+-            {
++            if schema_doc.creation_time() > oldest_schema_to_keep {
+                 break;
+             }
+-            SystemMetadataModel::new(self.tx, self.namespace)
++            // Unprotected schemas were terminal before this transaction began, so a
++            // state-fenced worker cannot publish another checkpoint for them.
++            SchemaValidationProgressModel::new(schemas.tx(), namespace)
++                .delete_schema_validation_progress(schema_doc.id())
++                .await?;
++            SystemMetadataModel::new(schemas.tx(), namespace)
+                 .delete(schema_doc.id())
+                 .await?;
+             num_deleted += 1;
++            if num_deleted >= MAX_SCHEMA_HISTORY_DELETIONS_PER_TRANSACTION {
++                break;
++            }
+         }
+-        Ok(num_deleted)
++        Ok(())
+     }
+ 
+-    async fn mark_overwritten(&mut self, id: ResolvedDocumentId) -> anyhow::Result<()> {
++    async fn mark_overwritten(
++        &mut self,
++        id: ResolvedDocumentId,
++        previous_state: SchemaState,
++    ) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            previous_state.is_unique(),
++            "Only a unique schema state can be overwritten",
++        );
+         SystemMetadataModel::new(self.tx, self.namespace)
+             .patch(
+                 id,
+                 patch_value!("state" => Some(SchemaState::Overwritten.try_into()?))?,
+             )
+             .await?;
+-        self.delete_old_failed_and_overwritten_schemas().await?;
++        if previous_state == SchemaState::Pending {
++            // Pending-schema replacement must win over progress bookkeeping. The
++            // state-fenced tracker or the schema worker's next pass removes this row.
++            return Ok(());
++        }
+         let mut model = SchemaValidationProgressModel::new(self.tx, self.namespace);
+         model.delete_schema_validation_progress(id).await?;
+         Ok(())
+diff --git a/crates/database/src/bootstrap_model/schema_validation_progress/mod.rs b/crates/database/src/bootstrap_model/schema_validation_progress/mod.rs
+index 2de0f8671aca882dcb372c3db3197d200648a30a..fd46b35af4458fd1e4e50014cc20ee23e587c390 100644
+--- a/crates/database/src/bootstrap_model/schema_validation_progress/mod.rs
++++ b/crates/database/src/bootstrap_model/schema_validation_progress/mod.rs
+@@ -5,7 +5,9 @@ use std::sync::{
+     LazyLock,
+ };
+ 
++use anyhow::Context;
+ use common::{
++    bootstrap_model::schema::SchemaState,
+     document::{
+         ParsedDocument,
+         CREATION_TIME_FIELD_PATH,
+@@ -13,6 +15,7 @@ use common::{
+     runtime::Runtime,
+ };
+ use value::{
++    DeveloperDocumentId,
+     FieldPath,
+     ResolvedDocumentId,
+     TableName,
+@@ -25,8 +28,10 @@ use crate::{
+         SystemTable,
+     },
+     SchemaValidationProgressMetadata,
++    SchemasTable,
+     SystemMetadataModel,
+     Transaction,
++    SCHEMAS_TABLE,
+ };
+ 
+ pub const SCHEMA_VALIDATION_PROGRESS_TABLE: TableName =
+@@ -78,11 +83,16 @@ impl<'a, RT: Runtime> SchemaValidationProgressModel<'a, RT> {
+             .await
+     }
+ 
++    /// Initialize progress only if this exact schema is still pending. Returns
++    /// false when a stale worker should stop.
+     pub async fn initialize_schema_validation_progress(
+         &mut self,
+         schema_id: ResolvedDocumentId,
+         total_docs: Option<u64>,
+-    ) -> anyhow::Result<ResolvedDocumentId> {
++    ) -> anyhow::Result<bool> {
++        if !self.schema_allows_progress_write(schema_id).await? {
++            return Ok(false);
++        }
+         let maybe_existing_metadata = self.existing_schema_validation_progress(schema_id).await?;
+         let mut system_model = SystemMetadataModel::new(self.tx, self.namespace);
+         let new_metadata = SchemaValidationProgressMetadata {
+@@ -94,17 +104,19 @@ impl<'a, RT: Runtime> SchemaValidationProgressModel<'a, RT> {
+             system_model
+                 .replace(existing_metadata.id(), new_metadata.try_into()?)
+                 .await?;
+-            Ok(existing_metadata.id())
++            Ok(true)
+         } else {
+             system_model
+                 .insert(&SCHEMA_VALIDATION_PROGRESS_TABLE, new_metadata.try_into()?)
+-                .await
++                .await?;
++            Ok(true)
+         }
+     }
+ 
+     /// Update the schema validation progress for a schema, adding
+     /// `num_docs_validated` to the existing progress.
+-    /// Returns false if there is no existing progress metadata to update.
++    /// Returns false if the schema is no longer pending or there is no existing
++    /// progress metadata to update.
+     pub async fn update_schema_validation_progress(
+         &mut self,
+         schema_id: ResolvedDocumentId,
+@@ -112,34 +124,181 @@ impl<'a, RT: Runtime> SchemaValidationProgressModel<'a, RT> {
+         // Only used if total_docs is missing
+         total_docs: Option<u64>,
+     ) -> anyhow::Result<bool> {
+-        let maybe_existing_metadata = self.existing_schema_validation_progress(schema_id).await?;
+-        let mut system_model = SystemMetadataModel::new(self.tx, self.namespace);
+-        let Some(existing_metadata) = maybe_existing_metadata else {
++        // The schema read is the generation fence. A concurrent failure may commit
++        // without reading progress; this transaction must then lose OCC instead of
++        // publishing progress for a failed schema.
++        if !self.schema_allows_progress_write(schema_id).await? {
++            return Ok(false);
++        }
++        let Some(existing_metadata) = self.existing_schema_validation_progress(schema_id).await?
++        else {
+             return Ok(false);
+         };
+ 
+-        let num_docs_validated = existing_metadata.num_docs_validated + num_docs_validated;
++        let num_docs_validated = existing_metadata
++            .num_docs_validated
++            .checked_add(num_docs_validated)
++            .context("numDocsValidated overflowed while updating progress")?;
+         let new_metadata = SchemaValidationProgressMetadata {
+             schema_id: schema_id.developer_id,
+             total_docs: existing_metadata.total_docs.or(total_docs),
+             num_docs_validated,
+         };
+-        system_model
++        SystemMetadataModel::new(self.tx, self.namespace)
+             .replace(existing_metadata.id(), new_metadata.try_into()?)
+             .await?;
+         Ok(true)
+     }
+ 
++    /// Resolve progress documents whose schema is inactive or missing.
++    pub async fn inactive_schema_validation_progress(
++        &mut self,
++    ) -> anyhow::Result<Vec<(ResolvedDocumentId, DeveloperDocumentId)>> {
++        let schemas_table_exists = self
++            .tx
++            .table_mapping()
++            .namespace(self.namespace)
++            .name_exists(&SCHEMAS_TABLE);
++        let progress_documents = self
++            .tx
++            .query_system(
++                self.namespace,
++                &SystemIndex::<SchemaValidationProgressTable>::by_creation_time(),
++            )?
++            .all()
++            .await?;
++        let mut inactive_progress_ids = Vec::new();
++        for progress in progress_documents {
++            let schema = if schemas_table_exists {
++                self.tx
++                    .get_system::<SchemasTable>(self.namespace, progress.schema_id)
++                    .await?
++            } else {
++                None
++            };
++            if !matches!(
++                schema.as_deref().map(|schema| &schema.state),
++                Some(SchemaState::Pending | SchemaState::Validated)
++            ) {
++                inactive_progress_ids.push((progress.id(), progress.schema_id));
++            }
++        }
++        Ok(inactive_progress_ids)
++    }
++
++    /// Delete exact progress documents. Callers bound the slice so cleanup
++    /// transactions cannot accumulate a deployment-wide write set. The by-ID
++    /// reads also make concurrent cleanup idempotent without querying either
++    /// table's secondary indexes.
++    pub async fn delete_schema_validation_progress_documents(
++        &mut self,
++        progress_ids: &[(ResolvedDocumentId, DeveloperDocumentId)],
++    ) -> anyhow::Result<usize> {
++        // Component deletion deactivates the whole table atomically. Retention owns
++        // its remaining documents, so a cleanup batch discovered just before that
++        // transition has no current progress records to delete.
++        let namespaced_table_mapping = self.tx.table_mapping().namespace(self.namespace);
++        let Some(progress_tablet_id) =
++            namespaced_table_mapping.id_if_exists(&SCHEMA_VALIDATION_PROGRESS_TABLE)
++        else {
++            return Ok(0);
++        };
++        let schemas_table_exists = namespaced_table_mapping.name_exists(&SCHEMAS_TABLE);
++        let mut num_deleted = 0;
++        for &(progress_id, schema_id) in progress_ids {
++            // A recreated progress table owns different resolved document IDs,
++            // even if its table number and document internal IDs are reused.
++            if progress_id.tablet_id != progress_tablet_id {
++                continue;
++            }
++            // Discovery can observe an empty recreated schema table before a new
++            // pending schema reuses this developer ID and takes ownership of the
++            // progress row. Recheck the exact schema key in the delete transaction;
++            // a concurrent insertion then either wins this check or invalidates it.
++            // Check schema first so a stale batch does not read a live validation's
++            // hot progress row while deleting unrelated terminal rows.
++            let schema = if schemas_table_exists {
++                self.tx
++                    .get_system::<SchemasTable>(self.namespace, schema_id)
++                    .await?
++            } else {
++                None
++            };
++            if matches!(
++                schema.as_deref().map(|schema| &schema.state),
++                Some(SchemaState::Pending | SchemaState::Validated)
++            ) {
++                continue;
++            }
++            let Some(progress) = self
++                .tx
++                .get_system::<SchemaValidationProgressTable>(
++                    self.namespace,
++                    progress_id.developer_id,
++                )
++                .await?
++            else {
++                continue;
++            };
++            anyhow::ensure!(
++                progress.id() == progress_id,
++                "Schema validation progress document changed tables during cleanup"
++            );
++            anyhow::ensure!(
++                progress.schema_id == schema_id,
++                "Schema validation progress document changed schema ownership during cleanup"
++            );
++            SystemMetadataModel::new(self.tx, self.namespace)
++                .delete(progress_id)
++                .await?;
++            num_deleted += 1;
++        }
++        Ok(num_deleted)
++    }
++
+     pub async fn delete_schema_validation_progress(
+         &mut self,
+         schema_id: ResolvedDocumentId,
+     ) -> anyhow::Result<()> {
+         if let Some(existing_metadata) = self.existing_schema_validation_progress(schema_id).await?
+         {
+-            SystemMetadataModel::new_global(self.tx)
++            SystemMetadataModel::new(self.tx, self.namespace)
+                 .delete(existing_metadata.id())
+                 .await?;
+         }
+         Ok(())
+     }
++
++    async fn schema_allows_progress_write(
++        &mut self,
++        schema_id: ResolvedDocumentId,
++    ) -> anyhow::Result<bool> {
++        // This exact-document read makes the schema generation and state the
++        // ordering boundary for every progress write.
++        let namespaced_table_mapping = self.tx.table_mapping().namespace(self.namespace);
++        let schemas_table_exists = namespaced_table_mapping.name_exists(&SCHEMAS_TABLE);
++        let progress_table_exists =
++            namespaced_table_mapping.name_exists(&SCHEMA_VALIDATION_PROGRESS_TABLE);
++        let schema = if schemas_table_exists {
++            self.tx
++                .get_system::<SchemasTable>(self.namespace, schema_id.developer_id)
++                .await?
++        } else {
++            None
++        };
++        match schema.as_deref() {
++            // A recreated system table can reuse its table number. The full
++            // resolved ID keeps an old worker from writing progress for a new
++            // physical schema-table generation with the same developer ID.
++            Some(schema) if schema.id() != schema_id => Ok(false),
++            Some(schema) if schema.state == SchemaState::Pending => Ok(true),
++            Some(schema) if schema.state == SchemaState::Validated => Ok(false),
++            Some(_) | None => {
++                if progress_table_exists {
++                    self.delete_schema_validation_progress(schema_id).await?;
++                }
++                Ok(false)
++            },
++        }
++    }
+ }
+diff --git a/crates/database/src/bootstrap_model/schema_validation_progress/types.rs b/crates/database/src/bootstrap_model/schema_validation_progress/types.rs
+index eba086b28df58718215a1e153dfa61f4167efb2f..0ed480f922e4537e2dde2e3b98a46c0069e1f828 100644
+--- a/crates/database/src/bootstrap_model/schema_validation_progress/types.rs
++++ b/crates/database/src/bootstrap_model/schema_validation_progress/types.rs
+@@ -1,3 +1,4 @@
++use anyhow::Context;
+ use serde::{
+     Deserialize,
+     Serialize,
+@@ -8,12 +9,13 @@ use value::{
+ };
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+-/// Schema validation progress is written by the SchemaWorker for `Pending` and
+-/// `Validated` schemas. `Active`, `Overwritten`, and `Failed` schemas should
+-/// not have `SchemaValidationProgressMetadata` documents.
++/// Schema validation progress is written only while a schema is `Pending` and
++/// remains while it is `Validated`. It can remain temporarily after the schema
++/// becomes terminal until schema-worker cleanup removes it.
+ pub struct SchemaValidationProgressMetadata {
+-    /// The ID of the schema being validated. Should correspond to a document in
+-    /// the _schemas table in `Pending` state.
++    /// The ID of the schema being validated. It normally identifies a `Pending`
++    /// or `Validated` schema, but can identify a terminal or pruned schema
++    /// until deferred cleanup runs.
+     pub schema_id: DeveloperDocumentId,
+     /// The number of documents that have been validated so far.
+     pub num_docs_validated: u64,
+@@ -33,13 +35,22 @@ pub struct SerializedSchemaValidationProgressMetadata {
+     pub total_docs: Option<i64>,
+ }
+ 
+-impl From<SchemaValidationProgressMetadata> for SerializedSchemaValidationProgressMetadata {
+-    fn from(metadata: SchemaValidationProgressMetadata) -> Self {
+-        SerializedSchemaValidationProgressMetadata {
++impl TryFrom<SchemaValidationProgressMetadata> for SerializedSchemaValidationProgressMetadata {
++    type Error = anyhow::Error;
++
++    fn try_from(metadata: SchemaValidationProgressMetadata) -> anyhow::Result<Self> {
++        Ok(SerializedSchemaValidationProgressMetadata {
+             schema_id: metadata.schema_id.to_string(),
+-            num_docs_validated: metadata.num_docs_validated as i64,
+-            total_docs: metadata.total_docs.map(|x| x as i64),
+-        }
++            num_docs_validated: metadata
++                .num_docs_validated
++                .try_into()
++                .context("numDocsValidated exceeds the stored integer range")?,
++            total_docs: metadata
++                .total_docs
++                .map(i64::try_from)
++                .transpose()
++                .context("totalDocs exceeds the stored integer range")?,
++        })
+     }
+ }
+ 
+@@ -49,8 +60,15 @@ impl TryFrom<SerializedSchemaValidationProgressMetadata> for SchemaValidationPro
+     fn try_from(serialized: SerializedSchemaValidationProgressMetadata) -> anyhow::Result<Self> {
+         Ok(SchemaValidationProgressMetadata {
+             schema_id: serialized.schema_id.parse()?,
+-            num_docs_validated: serialized.num_docs_validated as u64,
+-            total_docs: serialized.total_docs.map(|x| x as u64),
++            num_docs_validated: serialized
++                .num_docs_validated
++                .try_into()
++                .context("numDocsValidated must be nonnegative")?,
++            total_docs: serialized
++                .total_docs
++                .map(u64::try_from)
++                .transpose()
++                .context("totalDocs must be nonnegative")?,
+         })
+     }
+ }
+diff --git a/npm-packages/dashboard-common/src/features/data/components/ShowSchema.tsx b/npm-packages/dashboard-common/src/features/data/components/ShowSchema.tsx
+index 932a091a79c2ac50ee188faa5c74f82b096c1233..064af338fa81843ee8f9e8275ce5d635c89f8a22 100644
+--- a/npm-packages/dashboard-common/src/features/data/components/ShowSchema.tsx
++++ b/npm-packages/dashboard-common/src/features/data/components/ShowSchema.tsx
+@@ -104,7 +104,8 @@ export function ShowSchema({
+                   ? "Schema validation in progress..."
+                   : "Code push in progress..."}
+                 {schemaValidationProgress &&
+-                  schemaValidationProgress.totalDocs !== null && (
++                  schemaValidationProgress.totalDocs !== null &&
++                  schemaValidationProgress.totalDocs > 0 && (
+                     <div className="grow sm:px-6">
+                       <ProgressBarWithPercent
+                         // totalDocs is not necessarily taken from the same snapshot as the snapshot being iterated over to increment numDocsValidated
+diff --git a/npm-packages/system-udfs/convex/_system/frontend/getSchemas.test.ts b/npm-packages/system-udfs/convex/_system/frontend/getSchemas.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..34cbdd2d7fa3e1797bfd21276459f44e66b4dcf6
+--- /dev/null
++++ b/npm-packages/system-udfs/convex/_system/frontend/getSchemas.test.ts
+@@ -0,0 +1,263 @@
++import { describe, expect, test, vi } from "vitest";
++import type { QueryCtx } from "../../_generated/server";
++
++vi.mock("../server", () => import("../__mocks__/server"));
++
++import getSchemas, { schemaValidationProgress } from "./getSchemas";
++
++type SchemaState =
++  | "pending"
++  | "validated"
++  | "active"
++  | "failed"
++  | "overwritten";
++
++type SchemaDocument = {
++  _id: string;
++  state: { state: SchemaState };
++};
++
++type ProgressDocument = {
++  schemaId: string;
++  numDocsValidated: bigint;
++  totalDocs: bigint | null;
++};
++
++type Equality = {
++  field: string;
++  value: unknown;
++};
++
++function databaseReader(
++  schemas: SchemaDocument[],
++  progress: ProgressDocument[],
++): QueryCtx["db"] {
++  const query = (tableName: string) => ({
++    withIndex(
++      indexName: string,
++      defineRange: (range: {
++        eq(field: string, value: unknown): unknown;
++      }) => unknown,
++    ) {
++      let equality: Equality | undefined;
++      const range = {
++        eq(field: string, value: unknown) {
++          equality = { field, value };
++          return range;
++        },
++      };
++      defineRange(range);
++      return {
++        async unique() {
++          if (!equality) {
++            throw new Error("Expected an exact index equality");
++          }
++          const { field, value } = equality;
++          if (tableName === "_schemas") {
++            expect(indexName).toBe("by_state");
++            expect(field).toBe("state");
++            const matches = schemas.filter(
++              (schema) =>
++                JSON.stringify(schema.state) === JSON.stringify(value),
++            );
++            if (matches.length > 1) {
++              throw new Error("Expected a unique schema state");
++            }
++            return matches[0] ?? null;
++          }
++          if (tableName === "_schema_validation_progress") {
++            expect(indexName).toBe("by_schema_id");
++            expect(field).toBe("schemaId");
++            const matches = progress.filter(
++              (progressDocument) => progressDocument.schemaId === value,
++            );
++            if (matches.length > 1) {
++              throw new Error("Expected unique progress for a schema");
++            }
++            return matches[0] ?? null;
++          }
++          throw new Error(`Unexpected private system table ${tableName}`);
++        },
++      };
++    },
++  });
++
++  return {
++    system: { query },
++  } as unknown as QueryCtx["db"];
++}
++
++async function queryProgress(
++  schemas: SchemaDocument[],
++  progress: ProgressDocument[],
++) {
++  return await schemaValidationProgress._handler(
++    { db: databaseReader(schemas, progress) } as QueryCtx,
++    {},
++  );
++}
++
++async function querySchemas(schemas: SchemaDocument[]) {
++  return await getSchemas._handler(
++    { db: databaseReader(schemas, []) } as QueryCtx,
++    {},
++  );
++}
++
++test("getSchemas rejects contradictory in-progress schema states", async () => {
++  await expect(
++    querySchemas([
++      { _id: "pending-schema", state: { state: "pending" } },
++      { _id: "validated-schema", state: { state: "validated" } },
++    ]),
++  ).rejects.toThrow("Unexpectedly found both pending and validated schemas");
++});
++
++describe("schemaValidationProgress", () => {
++  test("returns progress for the exact pending schema", async () => {
++    const result = await queryProgress(
++      [
++        { _id: "pending-schema", state: { state: "pending" } },
++        { _id: "failed-schema", state: { state: "failed" } },
++      ],
++      [
++        {
++          schemaId: "failed-schema",
++          numDocsValidated: BigInt(99),
++          totalDocs: BigInt(100),
++        },
++        {
++          schemaId: "pending-schema",
++          numDocsValidated: BigInt(4),
++          totalDocs: BigInt(10),
++        },
++      ],
++    );
++
++    expect(result).toEqual({ numDocsValidated: 4, totalDocs: 10 });
++  });
++
++  test("preserves a zero total document count", async () => {
++    const result = await queryProgress(
++      [{ _id: "pending-schema", state: { state: "pending" } }],
++      [
++        {
++          schemaId: "pending-schema",
++          numDocsValidated: BigInt(0),
++          totalDocs: BigInt(0),
++        },
++      ],
++    );
++
++    expect(result).toEqual({ numDocsValidated: 0, totalDocs: 0 });
++  });
++
++  test("rejects contradictory in-progress schema states", async () => {
++    await expect(
++      queryProgress(
++        [
++          { _id: "pending-schema", state: { state: "pending" } },
++          { _id: "validated-schema", state: { state: "validated" } },
++        ],
++        [
++          {
++            schemaId: "pending-schema",
++            numDocsValidated: BigInt(4),
++            totalDocs: BigInt(10),
++          },
++        ],
++      ),
++    ).rejects.toThrow("Unexpectedly found both pending and validated schemas");
++  });
++
++  test.each([
++    { numDocsValidated: BigInt(-1), totalDocs: BigInt(10) },
++    { numDocsValidated: BigInt(1), totalDocs: BigInt(-1) },
++  ])("rejects negative stored progress counts", async (storedProgress) => {
++    await expect(
++      queryProgress(
++        [{ _id: "pending-schema", state: { state: "pending" } }],
++        [{ schemaId: "pending-schema", ...storedProgress }],
++      ),
++    ).rejects.toThrow("Schema validation progress counts must be nonnegative");
++  });
++
++  test.each([
++    {
++      numDocsValidated: BigInt(Number.MAX_SAFE_INTEGER) + BigInt(1),
++      totalDocs: BigInt(10),
++    },
++    {
++      numDocsValidated: BigInt(1),
++      totalDocs: BigInt(Number.MAX_SAFE_INTEGER) + BigInt(1),
++    },
++  ])(
++    "rejects progress counts outside the safe integer range",
++    async (storedProgress) => {
++      await expect(
++        queryProgress(
++          [{ _id: "pending-schema", state: { state: "pending" } }],
++          [{ schemaId: "pending-schema", ...storedProgress }],
++        ),
++      ).rejects.toThrow(
++        "Schema validation progress counts exceed the safe integer range",
++      );
++    },
++  );
++
++  test("does not return progress belonging to a different schema", async () => {
++    const result = await queryProgress(
++      [{ _id: "pending-schema", state: { state: "pending" } }],
++      [
++        {
++          schemaId: "stale-schema",
++          numDocsValidated: BigInt(9),
++          totalDocs: BigInt(10),
++        },
++      ],
++    );
++
++    expect(result).toBeNull();
++  });
++
++  test("switches visibility to replacement pending schema progress", async () => {
++    const result = await queryProgress(
++      [
++        { _id: "old-schema", state: { state: "overwritten" } },
++        { _id: "new-schema", state: { state: "pending" } },
++      ],
++      [
++        {
++          schemaId: "old-schema",
++          numDocsValidated: BigInt(9),
++          totalDocs: BigInt(10),
++        },
++        {
++          schemaId: "new-schema",
++          numDocsValidated: BigInt(1),
++          totalDocs: BigInt(20),
++        },
++      ],
++    );
++
++    expect(result).toEqual({ numDocsValidated: 1, totalDocs: 20 });
++  });
++
++  test.each(["validated", "failed", "overwritten", "active"] as const)(
++    "hides physically retained progress after the schema is no longer pending (%s)",
++    async (state) => {
++      const result = await queryProgress(
++        [{ _id: "non-pending-schema", state: { state } }],
++        [
++          {
++            schemaId: "non-pending-schema",
++            numDocsValidated: BigInt(9),
++            totalDocs: BigInt(10),
++          },
++        ],
++      );
++
++      expect(result).toBeNull();
++    },
++  );
++});
+diff --git a/npm-packages/system-udfs/convex/_system/frontend/getSchemas.ts b/npm-packages/system-udfs/convex/_system/frontend/getSchemas.ts
+index 98dbefa6ae8a033cd2edeb8fd66a03b15178b183..37f3a84663a96a0d2f1dab6d07dd5c928920de8a 100644
+--- a/npm-packages/system-udfs/convex/_system/frontend/getSchemas.ts
++++ b/npm-packages/system-udfs/convex/_system/frontend/getSchemas.ts
+@@ -1,15 +1,16 @@
+-import { DatabaseReader } from "../../_generated/server";
+-import { Doc } from "../../_generated/dataModel";
++import type { DatabaseReader } from "../../_generated/server";
+ import { queryPrivateSystem } from "../secretSystemTables";
+ import { v } from "convex/values";
+ 
+-type SchemaMetadata = Doc<"_schemas">;
++const maxSafeInteger = BigInt(Number.MAX_SAFE_INTEGER);
+ 
+-export const getSchemaByState = async (
++type UniqueSchemaState = "pending" | "validated" | "active";
++
++export const getSchemaByState = (
+   db: DatabaseReader,
+-  state: SchemaMetadata["state"]["state"],
++  state: UniqueSchemaState,
+ ) =>
+-  await db
++  db
+     .query("_schemas")
+     .withIndex("by_state", (q) => q.eq("state", { state }))
+     .unique();
+@@ -20,9 +21,11 @@ export default queryPrivateSystem("ViewData")({
+     active?: string;
+     inProgress?: string;
+   }> {
+-    const active = await getSchemaByState(db, "active");
+-    const pending = await getSchemaByState(db, "pending");
+-    const validated = await getSchemaByState(db, "validated");
++    const [active, pending, validated] = await Promise.all([
++      getSchemaByState(db, "active"),
++      getSchemaByState(db, "pending"),
++      getSchemaByState(db, "validated"),
++    ]);
+ 
+     if (pending && validated) {
+       throw new Error("Unexpectedly found both pending and validated schemas");
+@@ -30,7 +33,7 @@ export default queryPrivateSystem("ViewData")({
+ 
+     return {
+       active: active?.schema,
+-      inProgress: pending?.schema || validated?.schema,
++      inProgress: pending?.schema ?? validated?.schema,
+     };
+   },
+ });
+@@ -40,7 +43,13 @@ export const schemaValidationProgress = queryPrivateSystem("ViewData")({
+   handler: async function ({
+     db,
+   }): Promise<{ numDocsValidated: number; totalDocs: number | null } | null> {
+-    const pending = await getSchemaByState(db, "pending");
++    const [pending, validated] = await Promise.all([
++      getSchemaByState(db, "pending"),
++      getSchemaByState(db, "validated"),
++    ]);
++    if (pending && validated) {
++      throw new Error("Unexpectedly found both pending and validated schemas");
++    }
+     if (!pending) {
+       return null;
+     }
+@@ -51,11 +60,28 @@ export const schemaValidationProgress = queryPrivateSystem("ViewData")({
+     if (!schemaValidationProgressDoc) {
+       return null;
+     }
++    if (
++      schemaValidationProgressDoc.numDocsValidated < BigInt(0) ||
++      (schemaValidationProgressDoc.totalDocs !== null &&
++        schemaValidationProgressDoc.totalDocs < BigInt(0))
++    ) {
++      throw new Error("Schema validation progress counts must be nonnegative");
++    }
++    if (
++      schemaValidationProgressDoc.numDocsValidated > maxSafeInteger ||
++      (schemaValidationProgressDoc.totalDocs !== null &&
++        schemaValidationProgressDoc.totalDocs > maxSafeInteger)
++    ) {
++      throw new Error(
++        "Schema validation progress counts exceed the safe integer range",
++      );
++    }
+     return {
+       numDocsValidated: Number(schemaValidationProgressDoc.numDocsValidated),
+-      totalDocs: schemaValidationProgressDoc.totalDocs
+-        ? Number(schemaValidationProgressDoc.totalDocs)
+-        : null,
++      totalDocs:
++        schemaValidationProgressDoc.totalDocs !== null
++          ? Number(schemaValidationProgressDoc.totalDocs)
++          : null,
+     };
+   },
+ });
+diff --git a/patches/README.md b/patches/README.md
+index afed78b97cc8a7760a1e2685cf47e67d49e8e8c2..2e14fa5459c1e69e56c9b05e14044cb394a0c853 100644
+--- a/patches/README.md
++++ b/patches/README.md
+@@ -5,7 +5,7 @@ They are operator adoption units, not one all-or-nothing fork. Read the owning e
+ a patch, preserve its prerequisites, and verify the effective configuration and metrics after every
+ backend replacement.
+ 
+-The current backend source chain has 13 commits and 13 operator essays, one commit per backend
++The current backend source chain has 14 commits and 14 operator essays, one commit per backend
+ adoption unit. Lane-aware queueing and its optional deployment extension are one queue-control
+ patch. The matching degradable-query client half is maintained in `convex-js`; it shares the
+ protocol and adoption essay but is not another commit in this backend chain.
+@@ -30,6 +30,19 @@ protocol and adoption essay but is not another commit in this backend chain.
+ - Activation: only through the privileged repair endpoint; dry-run is the default.
+ - Rollback: do not execute a stale plan. There is no generic undo after destructive finalization.
+ 
++## Schema reliability
++
++### [Isolate schema-validation progress OCC](schema_validation_progress_occ/README.md)
++
++- Purpose: prevent progress checkpoints from repeatedly aborting app writes that fail a pending
++  schema while preserving schema-state fencing, bounded restart/history cleanup, and dashboard
++  progress.
++- Prerequisites: deploy the matching dashboard zero-total guard before the backend, or upgrade the
++  backend and dashboard together.
++- Activation: automatic during schema validation after the coordinated backend/dashboard rollout.
++- Rollback: restore the backend before the dashboard; no data or configuration rollback is
++  required, but the previous backend restores the original contention risk.
++
+ ## Build and runtime packaging
+ 
+ ### [Backend build improvements](backend_build_improvements/README.md)
+diff --git a/patches/schema_validation_progress_occ/README.md b/patches/schema_validation_progress_occ/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b5904dc41985951017ce109d894e4e7d7fa3523
+--- /dev/null
++++ b/patches/schema_validation_progress_occ/README.md
+@@ -0,0 +1,427 @@
++# Isolate Schema-Validation Progress from Application Writes
++
++This patch prevents schema-validation progress checkpoints from repeatedly
++aborting application mutations that discover an incompatibility with a schema
++being deployed.
++
++The fix preserves optimistic concurrency control (OCC). It does not exempt
++private system tables from conflict detection and does not add another retry
++loop. Instead, it makes the schema document, rather than the frequently updated
++progress document, the ordering point between schema validation and live
++application writes.
++
++## Background
++
++### Schema deployment lifecycle
++
++Convex stores schema metadata separately for each namespace: the root
++application and each component have their own schema lifecycle. A newly
++submitted schema normally enters the `Pending` state in the private `_schemas`
++system table.
++
++`SchemaWorker` is a background loop in `convex-backend`. It finds pending
++schemas and determines which tables need a full document walk. A table can be
++skipped when either the active schema or the stored inferred table shape already
++proves that every document is compatible with the submitted schema. The worker
++reads every document in the remaining tables from a stable snapshot.
++
++The normal lifecycle is:
++
++```text
++Pending -> Validated -> Active
++Pending or Validated -> Failed
++Pending or Validated -> Overwritten
++Active -> Overwritten
++```
++
++- `Validated` means that the document walk completed, but the deployment has not
++  yet activated the schema.
++- `Failed` means that an existing document or a live application write did not
++  match the submitted schema.
++- `Overwritten` means that a newer deployment replaced an in-progress schema, or
++  that a previously active schema was replaced or cleared.
++
++The relevant implementation starts in
++[`SchemaWorker`](../../crates/application/src/schema_worker/mod.rs) and
++[`SchemaModel`](../../crates/database/src/bootstrap_model/schema/mod.rs).
++
++### Persisted validation progress
++
++For each schema being checked, Convex stores a document in the private
++`_schema_validation_progress` table. It contains:
++
++- the ID of the schema being validated;
++- `numDocsValidated`, the number of documents checked so far; and
++- `totalDocs`, an approximate total derived from table counts at the document
++  walk's original snapshot when those counts are available.
++
++The progress document is for the whole schema, even when validation walks
++several tables. It does not contain a scan cursor. The worker's document
++iterator owns the scan position in memory.
++
++The worker writes a progress checkpoint after approximately 5% of the documents,
++capped at 500:
++
++```text
++min(max(ceil(totalDocs / 20), 1), 500)
++```
++
++When the total is unavailable, the threshold is 500. An exact zero uses the
++nonzero minimum of 1; because it comes from the same snapshot as the walk, no
++document is available to trigger a periodic checkpoint. A sufficiently large
++validation replaces the same progress document after every 500 compatible
++documents. The initial write, periodic replacements, and final flush use these
++write-source names:
++
++- `schema_validation_tracker_initialized`;
++- `schema_validation_progress_updated`; and
++- `schema_validation_progress_finished`.
++
++Persisted progress has three responsibilities:
++
++1. The dashboard can report approximate validation progress.
++2. The existence of the row is a cancellation signal for a running worker.
++3. The schema ID distinguishes one deployment generation from a later
++   replacement.
++
++The row must remain available through `Pending` and `Validated`. It is no longer
++live after the schema becomes `Active`, `Failed`, or `Overwritten`.
++
++### Live writes also check the in-progress schema
++
++Every inserted, replaced, or patched document is checked against the active
++schema. While a schema is `Pending` or `Validated`, Convex also checks the new
++version of the document against that in-progress schema.
++
++If the document violates the active schema, the application mutation is invalid
++and fails. If it satisfies the active schema but violates the in-progress
++schema, the application mutation remains valid. Convex allows the document write
++to proceed and, in the same transaction, changes the in-progress schema to
++`Failed`. This lets a live write report an incompatibility before the background
++scan encounters a similar document.
++
++This behavior is implemented by `SchemaModel::enforce`, which is called from the
++transaction write path. The application document and the schema failure are
++intentionally atomic.
++
++## The OCC defect
++
++Before this patch, `SchemaModel::mark_failed` also deleted the failed schema's
++progress document. Deletion first queried
++`_schema_validation_progress.by_schema_id` and then read the matching document.
++An application transaction that disproved the in-progress schema therefore
++acquired read dependencies on the progress index entry and progress document.
++
++At the same time, `SchemaWorker` periodically replaced that document. The
++following ordering could repeat across every application retry:
++
++1. An application transaction begins.
++2. It stages a document that is valid under the active schema but invalid under
++   the pending schema.
++3. It stages the pending schema's transition to `Failed` and reads the progress
++   row in order to delete it.
++4. Before the application transaction commits, `SchemaWorker` commits another
++   progress checkpoint.
++5. The application commit fails OCC because its progress read is stale.
++6. The backend retries the application mutation, which reads the same hot
++   progress row again.
++
++If checkpoint commits are more frequent than the application mutation's commit
++opportunities, the mutation can exhaust its bounded OCC retry budget. This is a
++timing-dependent failure, but the underlying defect is the unnecessary
++read/write overlap.
++
++The OCC metadata names `schema_validation_progress_updated` because that is the
++write which invalidated the application transaction's read set. System-table
++conflicts can omit an application table name, which is expected here.
++
++One progress commit can invalidate several concurrent mutations, and one
++mutation attempt can overlap several progress commits. A count of OCC records
++naming this write source is therefore not a count of checkpoints or validated
++documents.
++
++`schema_worker_mark_failed` describes a different race. That transaction changes
++`_schemas`, which live writes read while enforcing active and in-progress
++schemas. It is not the recurring hot progress-row conflict fixed here.
++
++## Required behavior
++
++The patch must preserve all of the following:
++
++- A document accepted by the active schema can commit even when it disproves the
++  in-progress schema.
++- That document and the transition of the exact in-progress schema to `Failed`
++  remain atomic.
++- Progress can be initialized or updated only for the exact schema that is still
++  `Pending`.
++- A checkpoint cannot publish progress after failure, overwrite, activation, or
++  schema-table recreation.
++- Completed progress remains available while the schema is `Validated`, until
++  activation removes it.
++- A missing progress document continues to cancel a worker for a still-pending
++  schema.
++- Failed, overwritten, missing, and otherwise orphaned progress is eventually
++  deleted, including after a backend restart.
++- Dashboard progress disappears as soon as the schema is no longer pending,
++  without waiting for physical cleanup.
++- Components and recreated system tables cannot cause a stale worker or cleanup
++  pass to act on a newer schema generation.
++
++## Design
++
++### Use schema state as the ordering point
++
++Schema failure and pending-schema overwrite no longer read or delete the
++transitioning schema's current progress document. They update the authoritative
++schema lifecycle state without adding the hot progress row to their read set.
++
++In the other direction, every progress initialization and checkpoint now reads
++the exact schema document before it reads or writes progress. The operation
++proceeds only if that exact schema is still `Pending`.
++
++This produces a safe result regardless of commit order:
++
++| First commit                                     | Result                                                                                                                      |
++| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
++| Progress checkpoint                              | The schema-failing application transaction has no progress dependency and can commit immediately afterward.                 |
++| Schema failure or overwrite                      | The checkpoint's schema read is stale, so the checkpoint loses OCC and cannot publish progress for the terminal schema.     |
++| Activation                                       | Progress writers have already stopped at `Validated`; activation removes completed progress synchronously.                  |
++| Replacement schema or recreated `_schemas` table | The stale worker's exact schema identity no longer matches, so it stops without changing progress owned by the replacement. |
++
++No special conflict exemption is needed. A stale progress transaction loses
++ordinary OCC on its schema read.
++
++The progress transaction is not retried locally. Retrying it would add another
++contention loop and would be unnecessary after the schema has left `Pending`.
++
++The central changes are in:
++
++- [`SchemaModel::mark_failed`](../../crates/database/src/bootstrap_model/schema/mod.rs),
++  which no longer touches the current hot progress row;
++- [`SchemaValidationProgressModel`](../../crates/database/src/bootstrap_model/schema_validation_progress/mod.rs),
++  which checks the exact schema state before initializing or updating progress;
++  and
++- [`SchemaValidationProgressTracker`](../../crates/application/src/schema_worker/mod.rs),
++  which stops cleanly when the state fence rejects a stale worker.
++
++### Clean terminal progress outside application transactions
++
++Deferring deletion removes the conflict from application writes, but it creates
++a cleanup responsibility. There are two cleanup paths:
++
++- Activation removes progress synchronously. A schema reaches `Validated` only
++  after live progress writers have stopped, so this path does not race periodic
++  checkpoints.
++- `Failed`, `Overwritten`, and orphaned progress is removed by `SchemaWorker`
++  outside the application transaction that changed the schema state.
++
++On each pass, the worker uses a read-only transaction to discover inactive
++progress. It preserves rows owned by `Pending` and `Validated` schemas and
++classifies rows owned by `Active`, `Failed`, `Overwritten`, missing, or inactive
++schemas as cleanup candidates.
++
++Discovery is separate from deletion. The worker then deletes concrete document
++IDs in namespace-local batches of at most 16. Each write transaction rechecks
++the current schema owner and the exact progress document before deleting it.
++These point checks avoid broad progress-index or schema-history dependencies and
++make cleanup safe when another worker, a component lifecycle change, or a new
++deployment races the batch.
++
++Cleanup is idempotent and has no single owner. Multiple backend instances may
++discover the same row; normal OCC or an already-absent point read resolves that
++race.
++
++When no schema work exists, `SchemaWorker` subscribes to both schema changes and
++progress changes. This matters during mixed-version rollout: if an old backend
++writes progress for a terminal schema, the late progress write wakes a patched
++worker even though `_schemas` did not change. Creating the first schema tables
++for a new component also invalidates the worker's table-mapping dependency and
++wakes it.
++
++### Fence physical table generations
++
++A developer document ID alone is not sufficient for stale-worker safety. Convex
++can retain an old system-table tablet while a new physical `_schemas` or
++`_schema_validation_progress` table reuses a table number and document internal
++ID.
++
++The patch therefore compares full resolved document IDs, including the physical
++tablet generation. Schema lifecycle operations resolve through the currently
++active `_schemas` table, and cached schema-state results are filtered to that
++table. A stale worker or lifecycle request cannot act on a retained schema from
++an inactive tablet or delete progress that has been reassigned to a new
++generation.
++
++Deleted component namespaces are handled separately:
++
++- If the progress table is still active but the schema table is gone, its
++  progress is orphaned and eligible for cleanup.
++- If the component's system tables are already inactive, tablet retention owns
++  their remaining documents and the worker skips them.
++
++These cases are uncommon, but they are part of the same rule: progress belongs
++to one exact schema generation, not merely to a reusable developer ID.
++
++### Keep schema-history pruning bounded
++
++Failure and overwrite transactions may also prune old terminal schemas. The
++schema being changed by the current transaction is protected from pruning so
++that history cleanup cannot pull its hot progress row back into the application
++transaction.
++
++A later lifecycle transaction may remove older terminal schemas and their exact
++progress rows. Each call removes at most 16 old terminal schemas in one
++namespace. This keeps application write sets bounded while ensuring that
++deferred progress does not outlive all record of its owning schema.
++
++## Related correctness fixes
++
++The patch also closes several lifecycle and progress edge cases needed to make
++deferred cleanup safe:
++
++- Schema submission, bulk overwrite, enforcement, worker discovery, activation,
++  snapshot import, and the schema system UDFs reject the invalid state where
++  `Pending` and `Validated` schemas coexist.
++- A worker reports `Schema is invalid` only after the exact schema has
++  successfully reached `Failed`. If a replacement wins first, the old validation
++  is canceled instead.
++- A worker that loses the race after its final progress flush stops instead of
++  reporting a false validation result.
++- The checkpoint threshold never becomes zero when `totalDocs` is zero.
++- Stored progress counts reject negative values and integer overflow.
++- The system UDF preserves an exact `totalDocs = 0`; the dashboard avoids
++  division by zero and displays progress only for the exact pending schema.
++
++There is no schema or progress document-format migration. Existing valid rows
++remain compatible.
++
++## Why simpler mitigations are insufficient
++
++- **Write progress less often:** reduces the probability of the race but
++  preserves the same read/write overlap.
++- **Increase mutation retries:** gives the same conflict more opportunities to
++  repeat and does not correct the dependency.
++- **Ignore system-table writes during OCC validation:** weakens serializability
++  and can allow a stale worker to publish progress after a lifecycle transition.
++- **Delete progress later in the same transaction:** statement order does not
++  change a transaction's combined read set.
++- **Retry progress commits locally:** adds another contention loop and obscures
++  the fact that a terminal schema should stop the worker.
++- **Remove persisted progress:** loses dashboard visibility and the existing
++  cancellation signal.
++- **Store progress on `_schemas`:** turns every checkpoint into a write to the
++  schema document read by live enforcement and lifecycle operations.
++- **Only defer deletion:** without the exact schema-state and generation fence,
++  an old worker can recreate or update progress after failure or replacement.
++  Without restart cleanup, deferred rows can remain indefinitely after a crash.
++
++## Operator rollout
++
++No database migration, configuration change, or traffic pause is required.
++
++The adoption unit changes the backend-embedded system UDF and the shared
++dashboard component in addition to the backend. The new system UDF preserves an
++exact `totalDocs = 0`, while the previous dashboard can divide that value by
++zero. Upgrade the dashboard first, or upgrade the dashboard and backend
++together. The new dashboard remains compatible with the previous system UDF,
++which exposed zero as `null`.
++
++After replacing the backend, run both a compatible schema push and an
++intentionally incompatible push in staging or a canary while representative
++writes continue. Verify that:
++
++- compatible validation reaches `Validated` and activation;
++- an application write accepted by the active schema can fail the pending schema
++  and still commit;
++- application OCC retries are no longer attributed to
++  `schema_validation_tracker_initialized`, `schema_validation_progress_updated`,
++  or `schema_validation_progress_finished`;
++- no progress checkpoint becomes visible after the schema reaches `Failed` or
++  `Overwritten`;
++- dashboard progress remains visible while the schema is pending and disappears
++  when it leaves `Pending`; and
++- a worker restart removes terminal or orphaned progress.
++
++Do not use eventual success after an outer client retry as the only acceptance
++criterion. The patch is intended to remove the inner progress conflict, not
++merely to hide it behind another retry.
++
++### Mixed-version rollout
++
++The data format is compatible, but behavior is not uniform while patched and
++unpatched backend instances overlap. An old instance can still make application
++writes read and delete the hot progress row, and an old worker can write
++progress without the new schema-state fence.
++
++Patched cleanup repairs late mixed-version leftovers, but acceptance
++measurements should begin only after old backend instances and their schema
++workers have drained.
++
++### Rollback
++
++Roll back the backend before rolling back the dashboard. The new dashboard can
++consume the old system-UDF response; the old dashboard is unsafe with the new
++exact-zero response.
++
++No data or configuration rollback is required. Returning to the previous backend
++restores the original OCC risk. If possible, allow a patched worker to complete
++a cleanup pass before the rollback; the previous worker has no general
++inactive-progress cleanup pass.
++
++## Verification
++
++The primary regression test uses real database transactions and the real OCC
++committer:
++
++1. Commit a pending schema and initialize its progress row.
++2. Begin an application transaction that inserts a document accepted by the
++   active schema and rejected by the pending schema. Let it stage both the
++   document and the schema failure without committing.
++3. Begin and commit a later progress checkpoint for the same schema.
++4. Commit the application transaction once, without an outer retry helper.
++5. Verify that the application document exists and the schema is `Failed`.
++6. Run the next checkpoint or cleanup pass and verify that stale progress is
++   removed and the old worker stops.
++
++Before the patch, step 4 fails OCC because the application transaction read the
++progress row. After the patch, it succeeds because progress is absent from that
++transaction's read set.
++
++The reverse-order regression begins a checkpoint transaction, commits the schema
++failure first, and then verifies that the checkpoint loses OCC on its schema
++read. Additional tests cover:
++
++- progress initialization after overwrite;
++- preservation through `Validated` and deletion on activation;
++- cleanup after restart and late mixed-version progress writes;
++- component creation, deletion, and namespace isolation;
++- schema and progress table recreation with reused developer IDs;
++- bounded terminal-history pruning;
++- zero and malformed progress counts;
++- contradictory schema lifecycle states; and
++- dashboard visibility for pending, validated, failed, replaced, and zero-total
++  schemas.
++
++The focused source files are:
++
++- [`schema_worker/tests.rs`](../../crates/application/src/schema_worker/tests.rs);
++- [`getSchemas.test.ts`](../../npm-packages/system-udfs/convex/_system/frontend/getSchemas.test.ts);
++- [`getSchemas.ts`](../../npm-packages/system-udfs/convex/_system/frontend/getSchemas.ts);
++  and
++- [`ShowSchema.tsx`](../../npm-packages/dashboard-common/src/features/data/components/ShowSchema.tsx).
++
++Run the focused checks and package build gates before publishing an image:
++
++```sh
++cargo test -p application schema_worker::tests
++
++cd npm-packages/system-udfs
++npm run test -- convex/_system/frontend/getSchemas.test.ts
++cd ../..
++
++just rush build -t system-udfs
++just rush build -t dashboard-common
++```
++
++Also run the repository's normal Rust formatting, lint, and release-build gates
++for the affected packages.

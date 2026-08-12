@@ -1,0 +1,1626 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Fri, 24 Jul 2026 17:19:25 +0800
+Subject: [PATCH 18/24] scheduler: admit durable actions before claim
+
+Prepare scheduled and registered-cron actions while their durable jobs remain Pending. Add a two-way execution-start barrier so V8 owns normal queue, active-permit, and selected-worker capacity, and Node completes application-side preparation, before a fresh exact-state transaction commits Pending to InProgress.
+
+Keep polling the prepared execution while the claim is in flight so a known-lost reservation is never released. Preserve conservative InProgress recovery for ambiguous or post-claim failures, and do not reintroduce the rejected InProgress to Pending ABA retry.
+
+Add bounded admission and claim metrics, focused barrier coverage, patch-train integration notes, rollout guidance, and rejected-alternative analysis.
+---
+ .../application_function_runner/metrics.rs    |  42 ++
+ .../src/application_function_runner/mod.rs    | 158 ++++++
+ crates/application/src/cron_jobs/mod.rs       |  67 ++-
+ crates/application/src/scheduled_jobs/mod.rs  |  83 ++--
+ .../src/in_process_function_runner.rs         |   3 +
+ crates/function_runner/src/lib.rs             |   2 +
+ crates/function_runner/src/server.rs          | 123 +++++
+ crates/isolate/src/client.rs                  |   3 +
+ crates/isolate/src/isolate_worker.rs          | 142 ++++--
+ patches/README.md                             |  32 +-
+ patches/dependency_capacity/README.md         |   5 +
+ patches/isolate_queue_control/README.md       |  21 +-
+ patches/scheduled_action_admission/README.md  | 455 ++++++++++++++++++
+ 13 files changed, 1030 insertions(+), 106 deletions(-)
+ create mode 100644 patches/scheduled_action_admission/README.md
+
+diff --git a/crates/application/src/application_function_runner/metrics.rs b/crates/application/src/application_function_runner/metrics.rs
+index b2334260ae062c0b8adff91e3da8714f4c8601b2..40c30df2e9b1d04fa8f7aceab1b1f0bd7fa14e4d 100644
+--- a/crates/application/src/application_function_runner/metrics.rs
++++ b/crates/application/src/application_function_runner/metrics.rs
+@@ -8,6 +8,7 @@ use metrics::{
+     log_distribution_with_labels,
+     register_convex_counter,
+     register_convex_histogram,
++    CancelableTimer,
+     StaticMetricLabel,
+     StatusTimer,
+     STATUS_LABEL,
+@@ -21,6 +22,47 @@ pub enum UdfExecutorResult {
+     SystemError(&'static str),
+ }
+ 
++#[derive(Clone, Copy)]
++pub enum DurableActionSource {
++    Scheduled,
++    Cron,
++}
++
++impl DurableActionSource {
++    fn metric_label(self) -> StaticMetricLabel {
++        StaticMetricLabel::new(
++            "source",
++            match self {
++                Self::Scheduled => "scheduled",
++                Self::Cron => "cron",
++            },
++        )
++    }
++}
++
++register_convex_histogram!(
++    DURABLE_ACTION_ADMISSION_WAIT_SECONDS,
++    "Time a durable scheduled action waits to reach its execution admission boundary before its \
++     claim",
++    &[STATUS_LABEL[0], "source"]
++);
++pub fn durable_action_admission_timer(source: DurableActionSource) -> CancelableTimer {
++    let mut timer = CancelableTimer::new(&DURABLE_ACTION_ADMISSION_WAIT_SECONDS);
++    timer.add_label(source.metric_label());
++    timer
++}
++
++register_convex_histogram!(
++    DURABLE_ACTION_CLAIM_SECONDS,
++    "Time to verify and commit a durable scheduled action claim after execution admission",
++    &[STATUS_LABEL[0], "source"]
++);
++pub fn durable_action_claim_timer(source: DurableActionSource) -> CancelableTimer {
++    let mut timer = CancelableTimer::new(&DURABLE_ACTION_CLAIM_SECONDS);
++    timer.add_label(source.metric_label());
++    timer
++}
++
+ register_convex_counter!(
+     UDF_EXECUTOR_RESULT_TOTAL,
+     "Number of queries against the module cache",
+diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
+index 362b251b31eb71a734d0c97c91bf18257e405f89..14997fd2ba5defdd0e6631cd589b9ef952dd0e20 100644
+--- a/crates/application/src/application_function_runner/mod.rs
++++ b/crates/application/src/application_function_runner/mod.rs
+@@ -95,6 +95,8 @@ use errors::{
+ use file_storage::TransactionalFileStorage;
+ use function_runner::{
+     server::{
++        function_execution_start_barrier,
++        FunctionExecutionStartGate,
+         FunctionMetadata,
+         HttpActionMetadata,
+     },
+@@ -208,7 +210,10 @@ use vector::{
+     VectorSearch,
+ };
+ 
++pub(crate) use self::metrics::DurableActionSource;
+ use self::metrics::{
++    durable_action_admission_timer,
++    durable_action_claim_timer,
+     function_waiter_timer,
+     log_occ_retries,
+     log_outstanding_functions,
+@@ -337,6 +342,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+                     path_and_args,
+                 }),
+                 None,
++                None,
+                 scheduler_dependency,
+                 false,
+             )
+@@ -354,6 +360,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+         log_line_sender: mpsc::UnboundedSender<LogLine>,
+         context: ExecutionContext,
+         wait_for_permit: bool,
++        function_execution_start: Option<FunctionExecutionStartGate>,
+         scheduler_dependency: SchedulerDependencyClass,
+     ) -> anyhow::Result<ActionOutcome> {
+         let (_, outcome) = self
+@@ -367,6 +374,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+                     path_and_args,
+                 }),
+                 None,
++                function_execution_start,
+                 scheduler_dependency,
+                 wait_for_permit,
+             )
+@@ -396,6 +404,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+                 Some(log_line_sender),
+                 None,
+                 Some(http_action_metadata),
++                None,
+                 SchedulerDependencyClass::Independent,
+                 false,
+             )
+@@ -426,6 +435,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+         log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
+         function_metadata: Option<FunctionMetadata>,
+         http_action_metadata: Option<HttpActionMetadata>,
++        function_execution_start: Option<FunctionExecutionStartGate>,
+         scheduler_dependency: SchedulerDependencyClass,
+         wait_for_permit: bool,
+     ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
+@@ -467,6 +477,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+                 self.default_system_env_vars.clone(),
+                 in_memory_index_last_modified,
+                 context,
++                function_execution_start,
+                 scheduler_dependency,
+             )
+             .await?;
+@@ -1378,6 +1389,140 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+         context: ExecutionContext,
+         wait_for_permit: bool,
+         scheduler_dependency: SchedulerDependencyClass,
++    ) -> anyhow::Result<ActionCompletion> {
++        self.run_action_no_udf_log_with_execution_start(
++            path,
++            arguments,
++            identity,
++            caller,
++            usage_tracking,
++            context,
++            wait_for_permit,
++            None,
++            scheduler_dependency,
++        )
++        .await
++    }
++
++    /// Prepares an action, waits until it reaches its environment-specific
++    /// admission boundary, commits the caller-provided durable claim, and only
++    /// then starts user code.
++    #[fastrace::trace]
++    pub(crate) async fn run_action_no_udf_log_after_admission<T>(
++        &self,
++        path: PublicFunctionPath,
++        arguments: SerializedArgs,
++        identity: Identity,
++        caller: FunctionCaller,
++        usage_tracking: FunctionUsageTracker,
++        context: ExecutionContext,
++        wait_for_permit: bool,
++        scheduler_dependency: SchedulerDependencyClass,
++        source: DurableActionSource,
++        claim: impl std::future::Future<Output = anyhow::Result<Option<T>>>,
++    ) -> anyhow::Result<Option<(ActionCompletion, T)>> {
++        let (mut start_controller, start_gate) = function_execution_start_barrier();
++        let admission_timer = durable_action_admission_timer(source);
++        let mut action_future = Box::pin(self.run_action_no_udf_log_with_execution_start(
++            path,
++            arguments,
++            identity,
++            caller,
++            usage_tracking,
++            context,
++            wait_for_permit,
++            Some(start_gate),
++            scheduler_dependency,
++        ));
++
++        let ready_result = select! {
++            biased;
++            result = &mut action_future => {
++                match result {
++                    Err(error) => {
++                        admission_timer.finish_with(error.metric_status_label_value());
++                        return Err(error);
++                    },
++                    Ok(_) => {
++                        admission_timer.finish_with("invariant_violation");
++                        anyhow::bail!("Action completed before reaching its execution start barrier");
++                    },
++                }
++            },
++            result = start_controller.wait_until_ready() => result,
++        };
++        if let Err(start_error) = ready_result {
++            return match action_future.await {
++                Err(error) => {
++                    admission_timer.finish_with(error.metric_status_label_value());
++                    Err(error)
++                },
++                Ok(_) => {
++                    admission_timer.finish_with("invariant_violation");
++                    Err(start_error)
++                },
++            };
++        }
++        admission_timer.finish(true);
++
++        let claim_timer = durable_action_claim_timer(source);
++        // A selected V8 worker can disappear after signaling ready. Keep
++        // observing the prepared execution while the claim is in flight so a
++        // reservation known to be lost is never released. Dropping an already
++        // submitted commit can still have an ambiguous result, which remains on
++        // the conservative at-most-once recovery path.
++        let claim_result = select! {
++            biased;
++            result = &mut action_future => {
++                match result {
++                    Err(error) => {
++                        claim_timer.finish_with("execution_lost");
++                        return Err(error);
++                    },
++                    Ok(_) => {
++                        claim_timer.finish_with("invariant_violation");
++                        anyhow::bail!(
++                            "Action completed while waiting for its durable execution claim"
++                        );
++                    },
++                }
++            },
++            result = claim => result,
++        };
++        let claim = match claim_result {
++            Ok(Some(claim)) => {
++                claim_timer.finish(true);
++                claim
++            },
++            Ok(None) => {
++                claim_timer.finish_with("state_changed");
++                return Ok(None);
++            },
++            Err(error) => {
++                claim_timer.finish_with(error.metric_status_label_value());
++                return Err(error);
++            },
++        };
++
++        // From this point onward the durable claim is visible. If the runtime
++        // disappears before or after this handoff, existing at-most-once recovery
++        // treats the action as possibly started.
++        start_controller.start()?;
++        let completion = action_future.await?;
++        Ok(Some((completion, claim)))
++    }
++
++    async fn run_action_no_udf_log_with_execution_start(
++        &self,
++        path: PublicFunctionPath,
++        arguments: SerializedArgs,
++        identity: Identity,
++        caller: FunctionCaller,
++        usage_tracking: FunctionUsageTracker,
++        context: ExecutionContext,
++        wait_for_permit: bool,
++        function_execution_start: Option<FunctionExecutionStartGate>,
++        scheduler_dependency: SchedulerDependencyClass,
+     ) -> anyhow::Result<ActionCompletion> {
+         let result = self
+             .run_action_inner(
+@@ -1388,6 +1533,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                 usage_tracking,
+                 context,
+                 wait_for_permit,
++                function_execution_start,
+                 scheduler_dependency,
+             )
+             .await;
+@@ -1421,6 +1567,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+         usage_tracking: FunctionUsageTracker,
+         context: ExecutionContext,
+         wait_for_permit: bool,
++        mut function_execution_start: Option<FunctionExecutionStartGate>,
+         scheduler_dependency: SchedulerDependencyClass,
+     ) -> anyhow::Result<ActionCompletion> {
+         if path.is_system() && !(identity.is_admin() || identity.is_system()) {
+@@ -1449,6 +1596,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                 (path_and_args, returns_validator)
+             },
+             Err(js_error) => {
++                if let Some(start_gate) = function_execution_start.take() {
++                    start_gate.wait().await?;
++                }
+                 return Ok(ActionCompletion {
+                     outcome: ValidatedActionOutcome::from_error(
+                         js_error,
+@@ -1497,6 +1647,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                         log_line_sender,
+                         context.clone(),
+                         wait_for_permit,
++                        function_execution_start,
+                         scheduler_dependency,
+                     )
+                     .boxed();
+@@ -1622,6 +1773,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                     encoded_parent_trace: EncodedSpan::from_parent().0,
+                 };
+ 
++                if let Some(start_gate) = function_execution_start {
++                    start_gate.wait().await?;
++                }
++
+                 let node_outcome_future = self
+                     .node_actions
+                     .execute(request, log_line_sender, source_maps_callback)
+@@ -1686,6 +1841,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                 })
+             },
+             ModuleEnvironment::Invalid => {
++                if let Some(start_gate) = function_execution_start {
++                    start_gate.wait().await?;
++                }
+                 Err(anyhow::anyhow!("Attempting to run an invalid function"))
+             },
+         };
+diff --git a/crates/application/src/cron_jobs/mod.rs b/crates/application/src/cron_jobs/mod.rs
+index f63d5a130c73fcedadaa5729a71959218258932d..8fd48cede3f430d51e0b77234aef6c13dd1bd5a0 100644
+--- a/crates/application/src/cron_jobs/mod.rs
++++ b/crates/application/src/cron_jobs/mod.rs
+@@ -88,7 +88,10 @@ use value::{
+ };
+ 
+ use crate::{
+-    application_function_runner::ApplicationFunctionRunner,
++    application_function_runner::{
++        ApplicationFunctionRunner,
++        DurableActionSource,
++    },
+     function_log::FunctionExecutionLog,
+ };
+ 
+@@ -666,7 +669,8 @@ impl<RT: Runtime> CronJobContext<RT> {
+         let identity = tx.identity().clone();
+         let (_, component_path) = self.get_job_component(&mut tx, job.id).await?;
+         let caller = FunctionCaller::Cron;
+-        match job.state {
++        drop(tx);
++        match &job.state {
+             CronJobState::Pending => {
+                 // Create a new request & execution ID
+                 let request_id = RequestId::new();
+@@ -676,27 +680,37 @@ impl<RT: Runtime> CronJobContext<RT> {
+                 );
+                 sentry::configure_scope(|scope| context.add_sentry_tags(scope));
+ 
+-                // Set state to in progress
+-                let mut updated_job = job.clone();
+-                updated_job.state = CronJobState::InProgress {
+-                    request_id: context.request_id.clone(),
+-                    execution_id: context.execution_id,
++                let expected_job = job.clone();
++                let claim_context = context.clone();
++                let claim = async {
++                    let Some(mut tx) = self
++                        .new_transaction_for_job_state(&expected_job, usage_tracker.clone())
++                        .await?
++                    else {
++                        return Ok(None);
++                    };
++                    let mut updated_job = expected_job.clone();
++                    updated_job.state = CronJobState::InProgress {
++                        request_id: claim_context.request_id.clone(),
++                        execution_id: claim_context.execution_id,
++                    };
++                    CronModel::new(&mut tx, component)
++                        .update_job_state(updated_job.cron_next_run())
++                        .await?;
++                    self.database
++                        .commit_with_write_source(tx, "cron_in_progress")
++                        .await?;
++                    Ok(Some(updated_job))
+                 };
+-                CronModel::new(&mut tx, component)
+-                    .update_job_state(updated_job.cron_next_run())
+-                    .await?;
+-                self.database
+-                    .commit_with_write_source(tx, "cron_in_progress")
+-                    .await?;
+ 
+-                // Execute the action
++                // Reserve the runtime before making the at-most-once claim visible.
+                 let path = CanonicalizedComponentFunctionPath {
+                     component: component_path,
+                     udf_path: job.cron_spec.udf_path.clone(),
+                 };
+-                let completion = self
++                let Some((completion, updated_job)) = self
+                     .runner
+-                    .run_action_no_udf_log(
++                    .run_action_no_udf_log_after_admission(
+                         PublicFunctionPath::Component(path),
+                         job.cron_spec.udf_args.clone(),
+                         identity.clone(),
+@@ -705,8 +719,14 @@ impl<RT: Runtime> CronJobContext<RT> {
+                         context.clone(),
+                         true,
+                         SchedulerDependencyClass::Independent,
++                        DurableActionSource::Cron,
++                        claim,
+                     )
+-                    .await?;
++                    .await?
++                else {
++                    // The registered cron definition changed while admission waited.
++                    return Ok(());
++                };
+                 let execution_time_f64 = completion.execution_time.as_secs_f64();
+                 let truncated_log_lines = self.truncate_log_lines(completion.log_lines.clone());
+ 
+@@ -746,9 +766,16 @@ impl<RT: Runtime> CronJobContext<RT> {
+                     .await;
+             },
+             CronJobState::InProgress {
+-                ref request_id,
+-                ref execution_id,
++                request_id,
++                execution_id,
+             } => {
++                let Some(mut tx) = self
++                    .new_transaction_for_job_state(&job, usage_tracker.clone())
++                    .await?
++                else {
++                    // Continue without updating since the job state has changed.
++                    return Ok(());
++                };
+                 // This case can happen if there is a system error while executing
+                 // the action or if backend exits after executing the action but
+                 // before updating the state. Since we execute actions at most once,
+@@ -789,7 +816,7 @@ impl<RT: Runtime> CronJobContext<RT> {
+ 
+                 let path = CanonicalizedComponentFunctionPath {
+                     component: component_path,
+-                    udf_path: job.cron_spec.udf_path,
++                    udf_path: job.cron_spec.udf_path.clone(),
+                 };
+                 let mut err = err.into();
+                 self.function_log
+diff --git a/crates/application/src/scheduled_jobs/mod.rs b/crates/application/src/scheduled_jobs/mod.rs
+index fd13cee0ef56a45e2ff4ea5c370020ac1ac784fe..65b9aeee7563305221e2fe9591f5aba6cbfa1ce7 100644
+--- a/crates/application/src/scheduled_jobs/mod.rs
++++ b/crates/application/src/scheduled_jobs/mod.rs
+@@ -118,7 +118,10 @@ use value::{
+ };
+ 
+ use crate::{
+-    application_function_runner::ApplicationFunctionRunner,
++    application_function_runner::{
++        ApplicationFunctionRunner,
++        DurableActionSource,
++    },
+     function_log::FunctionExecutionLog,
+ };
+ 
+@@ -999,15 +1002,8 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+         usage_tracker: FunctionUsageTracker,
+     ) -> anyhow::Result<()> {
+         let identity = tx.identity().clone();
+-        let Some((mut tx, metadata)) = self
+-            .new_transaction_for_job_state(job_id, &job, usage_tracker.clone())
+-            .await?
+-        else {
+-            // Continue without updating since the job state has changed
+-            return Ok(());
+-        };
+-        let namespace = tx.table_mapping().tablet_namespace(job_id.tablet_id)?;
+-        match job.state {
++        drop(tx);
++        match &job.state {
+             ScheduledJobState::Pending => {
+                 // Create a new request & execution ID
+                 let request_id = RequestId::new();
+@@ -1017,24 +1013,38 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+                 );
+                 sentry::configure_scope(|scope| context.add_sentry_tags(scope));
+ 
+-                // Set state to in progress
+-                let mut updated_job = metadata.clone();
+-                updated_job.state = ScheduledJobState::InProgress {
+-                    request_id: context.request_id.clone(),
+-                    execution_id: context.execution_id,
++                let expected_job = job.clone();
++                let claim_context = context.clone();
++                let claim = async {
++                    let Some((mut tx, metadata)) = self
++                        .new_transaction_for_job_state(job_id, &expected_job, usage_tracker.clone())
++                        .await?
++                    else {
++                        return Ok(None);
++                    };
++                    let namespace = tx.table_mapping().tablet_namespace(job_id.tablet_id)?;
++                    let mut updated_job = metadata;
++                    updated_job.state = ScheduledJobState::InProgress {
++                        request_id: claim_context.request_id.clone(),
++                        execution_id: claim_context.execution_id,
++                    };
++                    SchedulerModel::new(&mut tx, namespace)
++                        .replace(job_id, updated_job.clone())
++                        .await?;
++                    self.database
++                        .commit_with_write_source(tx, "scheduled_job_progress")
++                        .await?;
++                    Ok(Some(updated_job))
+                 };
+-                SchedulerModel::new(&mut tx, namespace)
+-                    .replace(job_id, updated_job.clone())
+-                    .await?;
+-                self.database
+-                    .commit_with_write_source(tx, "scheduled_job_progress")
+-                    .await?;
+ 
+-                // Execute the action
++                // The action holds its environment-specific admission while `claim`
++                // verifies Pending and commits InProgress. For V8 this includes an
++                // eligible worker and active execution permit. User code cannot start
++                // until that monotonic claim succeeds.
+                 let path = job.path.clone();
+-                let completion = self
++                let Some((completion, updated_job)) = self
+                     .runner
+-                    .run_action_no_udf_log(
++                    .run_action_no_udf_log_after_admission(
+                         PublicFunctionPath::Component(path),
+                         job.udf_args()?,
+                         identity,
+@@ -1043,8 +1053,15 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+                         context.clone(),
+                         true,
+                         SchedulerDependencyClass::Independent,
++                        DurableActionSource::Scheduled,
++                        claim,
+                     )
+-                    .await?;
++                    .await?
++                else {
++                    // Cancellation or replacement changed the exact Pending job
++                    // while this execution waited for admission.
++                    return Ok(());
++                };
+                 let state = match &completion.outcome.result {
+                     Ok(_) => ScheduledJobState::Success,
+                     Err(e) => ScheduledJobState::Failed(e.to_string()),
+@@ -1069,9 +1086,17 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+                     .await;
+             },
+             ScheduledJobState::InProgress {
+-                ref request_id,
+-                ref execution_id,
++                request_id,
++                execution_id,
+             } => {
++                let Some((mut tx, _metadata)) = self
++                    .new_transaction_for_job_state(job_id, &job, usage_tracker.clone())
++                    .await?
++                else {
++                    // Continue without updating since the job state has changed.
++                    return Ok(());
++                };
++                let namespace = tx.table_mapping().tablet_namespace(job_id.tablet_id)?;
+                 // This case can happen if there is a system error while executing
+                 // the action or if backend exits after executing the action but
+                 // before updating the state. Since we execute actions at most once,
+@@ -1146,8 +1171,8 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+             .then_some((tx, metadata)))
+     }
+ 
+-    // Completes an action in separate transaction. Returns false if the action
+-    // state has changed.
++    // Completes an action in a separate transaction. A changed state is treated
++    // as already handled by the winning operation.
+     async fn complete_action(
+         &self,
+         job_id: ResolvedDocumentId,
+diff --git a/crates/function_runner/src/in_process_function_runner.rs b/crates/function_runner/src/in_process_function_runner.rs
+index 6814e784083a0a5fba7a39f3e6a0a6571eed50d1..79c0782f14d63b0c998b1aaf52531b98d92af36a 100644
+--- a/crates/function_runner/src/in_process_function_runner.rs
++++ b/crates/function_runner/src/in_process_function_runner.rs
+@@ -96,6 +96,7 @@ use crate::{
+     server::{
+         validate_run_function_result,
+         DeploymentStorage,
++        FunctionExecutionStartGate,
+         FunctionMetadata,
+         FunctionRunnerCore,
+         HttpActionMetadata,
+@@ -258,6 +259,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
+         default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
+         in_memory_index_last_modified: BTreeMap<IndexId, Timestamp>,
+         context: ExecutionContext,
++        function_execution_start: Option<FunctionExecutionStartGate>,
+         scheduler_dependency: SchedulerDependencyClass,
+     ) -> anyhow::Result<(
+         Option<FunctionFinalTransaction>,
+@@ -300,6 +302,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
+             fetch_client: self.fetch_client.clone(),
+             log_line_sender,
+             function_started_sender: None,
++            function_execution_start,
+             udf_type,
+             identity,
+             existing_writes,
+diff --git a/crates/function_runner/src/lib.rs b/crates/function_runner/src/lib.rs
+index cd61703cf92ce25891499358abcee5d9ac0ee804..3645b01e62d763dd685ee5671480090dc285bcca 100644
+--- a/crates/function_runner/src/lib.rs
++++ b/crates/function_runner/src/lib.rs
+@@ -56,6 +56,7 @@ use model::{
+     udf_config::types::UdfConfig,
+ };
+ use server::{
++    FunctionExecutionStartGate,
+     FunctionMetadata,
+     HttpActionMetadata,
+ };
+@@ -95,6 +96,7 @@ pub trait FunctionRunner<RT: Runtime>: Send + Sync + 'static {
+         default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
+         in_memory_index_last_modified: BTreeMap<IndexId, Timestamp>,
+         context: ExecutionContext,
++        function_execution_start: Option<FunctionExecutionStartGate>,
+         scheduler_dependency: SchedulerDependencyClass,
+     ) -> anyhow::Result<(
+         Option<FunctionFinalTransaction>,
+diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
+index 83dd72690b971c180386bab2b977fe15e075ffe2..bf9ce03d55a4eed78f391efa5aff60cb6a68242a 100644
+--- a/crates/function_runner/src/server.rs
++++ b/crates/function_runner/src/server.rs
+@@ -114,6 +114,68 @@ use crate::{
+     FunctionWrites,
+ };
+ 
++/// Scheduler-side ownership of a function execution start barrier.
++///
++/// The paired [`FunctionExecutionStartGate`] is passed down with an action and
++/// signals after that action reaches its environment-specific admission
++/// boundary. Dropping this controller before `start` cancels the prepared
++/// execution.
++pub struct FunctionExecutionStartController {
++    ready_receiver: oneshot::Receiver<()>,
++    start_sender: oneshot::Sender<()>,
++}
++
++impl FunctionExecutionStartController {
++    pub async fn wait_until_ready(&mut self) -> anyhow::Result<()> {
++        (&mut self.ready_receiver)
++            .await
++            .context("Function execution ended before reaching its start barrier")
++    }
++
++    pub fn start(self) -> anyhow::Result<()> {
++        self.start_sender
++            .send(())
++            .map_err(|_| anyhow::anyhow!("Function execution ended before its start was released"))
++    }
++}
++
++/// Runtime-side ownership of a function execution start barrier.
++pub struct FunctionExecutionStartGate {
++    ready_sender: oneshot::Sender<()>,
++    start_receiver: oneshot::Receiver<()>,
++}
++
++impl FunctionExecutionStartGate {
++    pub async fn wait(self) -> anyhow::Result<()> {
++        self.ready_sender.send(()).map_err(|_| {
++            anyhow::anyhow!("Function execution start controller was dropped before admission")
++        })?;
++        self.start_receiver
++            .await
++            .context("Function execution start controller was dropped before release")
++    }
++
++    fn into_channels(self) -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
++        (self.ready_sender, self.start_receiver)
++    }
++}
++
++pub fn function_execution_start_barrier(
++) -> (FunctionExecutionStartController, FunctionExecutionStartGate) {
++    let (ready_sender, ready_receiver) = oneshot::channel();
++    let (start_sender, start_receiver) = oneshot::channel();
++    (
++        FunctionExecutionStartController {
++            ready_receiver,
++            start_sender,
++        },
++        FunctionExecutionStartGate {
++            ready_sender,
++            start_receiver,
++        },
++    )
++}
++
+ pub struct RunRequestArgs {
+     pub key_broker: FunctionRunnerKeyBroker,
+     pub index_reader: Arc<dyn IndexReader>,
+@@ -125,6 +187,7 @@ pub struct RunRequestArgs {
+     pub fetch_client: Arc<dyn FetchClient>,
+     pub log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
+     pub function_started_sender: Option<oneshot::Sender<()>>,
++    pub function_execution_start: Option<FunctionExecutionStartGate>,
+     pub udf_type: UdfType,
+     pub identity: Identity,
+     pub existing_writes: FunctionWrites,
+@@ -331,6 +394,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+             fetch_client,
+             log_line_sender,
+             function_started_sender,
++            function_execution_start,
+             udf_type,
+             identity,
+             existing_writes,
+@@ -389,6 +453,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+ 
+         match udf_type {
+             UdfType::Query | UdfType::Mutation => {
++                anyhow::ensure!(
++                    function_execution_start.is_none(),
++                    "Database functions cannot have an action execution start barrier"
++                );
+                 let FunctionMetadata {
+                     path_and_args,
+                     journal,
+@@ -427,6 +495,8 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                     function_metadata.context("Missing function metadata for action")?;
+                 let log_line_sender =
+                     log_line_sender.context("Missing log line sender for action")?;
++                let function_execution_start =
++                    function_execution_start.map(FunctionExecutionStartGate::into_channels);
+                 let outcome = self
+                     .isolate_client
+                     .execute_action(
+@@ -439,6 +509,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                         environment_data,
+                         deployment_name,
+                         function_started_sender,
++                        function_execution_start,
+                         scheduler_dependency,
+                     )
+                     .await?;
+@@ -449,6 +520,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                 ))
+             },
+             UdfType::HttpAction => {
++                anyhow::ensure!(
++                    function_execution_start.is_none(),
++                    "HTTP actions cannot have a scheduled action execution start barrier"
++                );
+                 anyhow::ensure!(
+                     scheduler_dependency == SchedulerDependencyClass::Independent,
+                     "HTTP actions cannot be dependency-unblocking scheduler requests"
+@@ -607,3 +682,51 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+             .await
+     }
+ }
++
++#[cfg(test)]
++mod execution_start_tests {
++    use super::function_execution_start_barrier;
++
++    #[tokio::test]
++    async fn gate_waits_for_controller_release() {
++        let (mut controller, gate) = function_execution_start_barrier();
++        let gate_task = tokio::spawn(gate.wait());
++
++        controller.wait_until_ready().await.unwrap();
++        assert!(!gate_task.is_finished());
++        controller.start().unwrap();
++        gate_task.await.unwrap().unwrap();
++    }
++
++    #[tokio::test]
++    async fn dropping_controller_cancels_gate() {
++        let (controller, gate) = function_execution_start_barrier();
++        drop(controller);
++
++        let error = gate.wait().await.unwrap_err();
++        assert!(error.to_string().contains("dropped before admission"));
++    }
++
++    #[tokio::test]
++    async fn dropping_controller_after_admission_cancels_gate() {
++        let (mut controller, gate) = function_execution_start_barrier();
++        let gate_task = tokio::spawn(gate.wait());
++
++        controller.wait_until_ready().await.unwrap();
++        drop(controller);
++
++        let error = gate_task.await.unwrap().unwrap_err();
++        assert!(error.to_string().contains("dropped before release"));
++    }
++
++    #[tokio::test]
++    async fn dropping_gate_cancels_controller_wait() {
++        let (mut controller, gate) = function_execution_start_barrier();
++        drop(gate);
++
++        let error = controller.wait_until_ready().await.unwrap_err();
++        assert!(error
++            .to_string()
++            .contains("before reaching its start barrier"));
++    }
++}
+diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
+index db50801f79099f3f817bbcf01208417b1fabed23..e387287e56e9c6ee488da256392900392297b717 100644
+--- a/crates/isolate/src/client.rs
++++ b/crates/isolate/src/client.rs
+@@ -973,6 +973,7 @@ pub enum RequestType<RT: Runtime> {
+         fetch_client: Arc<dyn FetchClient>,
+         log_line_sender: mpsc::UnboundedSender<LogLine>,
+         function_started_sender: Option<oneshot::Sender<()>>,
++        function_execution_start: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+     },
+     HttpAction {
+         request: HttpActionRequest<RT>,
+@@ -1568,6 +1569,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+         environment_data: EnvironmentData<RT>,
+         instance_name: String,
+         function_started_sender: Option<oneshot::Sender<()>>,
++        function_execution_start: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+         scheduler_dependency: SchedulerDependencyClass,
+     ) -> anyhow::Result<ActionOutcome> {
+         let (tx, rx) = oneshot::channel();
+@@ -1585,6 +1587,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+             log_line_sender,
+             environment_data,
+             function_started_sender,
++            function_execution_start,
+         };
+         self.send_request(Request::new_with_scheduler_dependency(
+             instance_name,
+diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
+index 7144381e44f226128070fb62b31db7c83ddeb1cc..2357184d56db548db6cb7184a4bcdb4a276b636b 100644
+--- a/crates/isolate/src/isolate_worker.rs
++++ b/crates/isolate/src/isolate_worker.rs
+@@ -1,3 +1,4 @@
++use anyhow::Context;
+ use async_trait::async_trait;
+ use common::{
+     runtime::Runtime,
+@@ -5,6 +6,7 @@ use common::{
+ };
+ use futures::FutureExt;
+ use sync_types::CanonicalizedUdfPath;
++use tokio::sync::oneshot;
+ use tracing::Instrument;
+ use udf::{
+     metrics::is_developer_ok,
+@@ -136,54 +138,64 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
+                 fetch_client,
+                 log_line_sender,
+                 function_started_sender,
++                function_execution_start,
+             } => {
+                 drop(queue_timer);
+-                let timer = service_request_timer(&UdfType::Action);
+                 let path = request.params.path_and_args.path();
+-                record_component_function_path(path);
+                 let udf_path = path.udf_path.to_owned();
+                 let component = path.component.to_owned();
+                 let component_path = path.component_path.clone();
+                 let log_string = format!("Action: {udf_path:?}");
+-                let environment = ActionEnvironment::new(
+-                    self.rt.clone(),
+-                    component,
+-                    udf_path,
+-                    component_path,
+-                    environment_data,
+-                    request.identity,
+-                    request.transaction,
+-                    action_callbacks,
+-                    fetch_client,
+-                    log_line_sender,
+-                    None,
+-                    heap_stats.clone(),
+-                    request.context,
+-                );
+-                let r = environment
+-                    .run_action(
+-                        isolate,
+-                        context_cache,
+-                        permit,
+-                        &mut isolate_clean,
+-                        request.params.clone(),
+-                        response.closed().boxed(),
+-                        function_started_sender,
+-                    )
+-                    .await;
++                if let Err(error) =
++                    wait_for_function_execution_start(function_execution_start).await
++                {
++                    // No isolate state has been touched. Let the worker return to the
++                    // reusable pool after the canceled reservation releases its permit.
++                    isolate_clean = true;
++                    let _ = response.send(Err(error));
++                } else {
++                    let timer = service_request_timer(&UdfType::Action);
++                    record_component_function_path(path);
++                    let environment = ActionEnvironment::new(
++                        self.rt.clone(),
++                        component,
++                        udf_path,
++                        component_path,
++                        environment_data,
++                        request.identity,
++                        request.transaction,
++                        action_callbacks,
++                        fetch_client,
++                        log_line_sender,
++                        None,
++                        heap_stats.clone(),
++                        request.context,
++                    );
++                    let r = environment
++                        .run_action(
++                            isolate,
++                            context_cache,
++                            permit,
++                            &mut isolate_clean,
++                            request.params.clone(),
++                            response.closed().boxed(),
++                            function_started_sender,
++                        )
++                        .await;
+ 
+-                let status = match &r {
+-                    Ok(outcome) => {
+-                        if outcome.result.is_ok() {
+-                            RequestStatus::Success
+-                        } else {
+-                            RequestStatus::DeveloperError
+-                        }
+-                    },
+-                    Err(_) => RequestStatus::SystemError,
+-                };
+-                finish_service_request_timer(timer, status);
+-                let _ = response.send(r);
++                    let status = match &r {
++                        Ok(outcome) => {
++                            if outcome.result.is_ok() {
++                                RequestStatus::Success
++                            } else {
++                                RequestStatus::DeveloperError
++                            }
++                        },
++                        Err(_) => RequestStatus::SystemError,
++                    };
++                    finish_service_request_timer(timer, status);
++                    let _ = response.send(r);
++                }
+                 log_string
+             },
+             RequestType::Analyze {
+@@ -357,6 +369,20 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
+     }
+ }
+ 
++async fn wait_for_function_execution_start(
++    execution_start: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
++) -> anyhow::Result<()> {
++    let Some((ready_sender, start_receiver)) = execution_start else {
++        return Ok(());
++    };
++    ready_sender.send(()).map_err(|_| {
++        anyhow::anyhow!("Function execution start controller was dropped before admission")
++    })?;
++    start_receiver
++        .await
++        .context("Function execution start controller was dropped before release")
++}
++
+ #[async_trait(?Send)]
+ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+     #[fastrace::trace]
+@@ -394,3 +420,39 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+         self.rt.clone()
+     }
+ }
++
++#[cfg(test)]
++mod execution_start_tests {
++    use super::wait_for_function_execution_start;
++
++    #[tokio::test]
++    async fn selected_worker_waits_for_start_release() {
++        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
++        let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
++        let wait_task = tokio::spawn(wait_for_function_execution_start(Some((
++            ready_sender,
++            start_receiver,
++        ))));
++
++        ready_receiver.await.unwrap();
++        assert!(!wait_task.is_finished());
++        start_sender.send(()).unwrap();
++        wait_task.await.unwrap().unwrap();
++    }
++
++    #[tokio::test]
++    async fn selected_worker_cancels_when_start_is_not_released() {
++        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
++        let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
++        let wait_task = tokio::spawn(wait_for_function_execution_start(Some((
++            ready_sender,
++            start_receiver,
++        ))));
++
++        ready_receiver.await.unwrap();
++        drop(start_sender);
++
++        let error = wait_task.await.unwrap().unwrap_err();
++        assert!(error.to_string().contains("dropped before release"));
++    }
++}
+diff --git a/patches/README.md b/patches/README.md
+index fd875575db4614393392998693aca90447a3eb53..41b6333ab7cdee1d6076d8ac7e4bf8a75d3db4cd 100644
+--- a/patches/README.md
++++ b/patches/README.md
+@@ -5,10 +5,11 @@ They are operator adoption units, not one all-or-nothing fork. Read the owning e
+ a patch, preserve its prerequisites, and verify the effective configuration and metrics after every
+ backend replacement.
+ 
+-The maintained backend source chain keeps one commit per operator adoption unit. Lane-aware
+-queueing and its optional deployment extension are one queue-control patch. The matching
+-degradable-query client half is maintained in `convex-js`; it shares the protocol and adoption essay
+-but is not another commit in this backend chain.
++The maintained backend source chain keeps each product patch in its own operator-adoption commit;
++repository-maintenance commits can remain separate. Lane-aware queueing and its optional deployment
++extension are one queue-control patch. The matching degradable-query client half is maintained in
++`convex-js`; it shares the protocol and adoption essay but is not another commit in this backend
++chain.
+ 
+ ## Snapshot and import reliability
+ 
+@@ -145,6 +146,17 @@ but is not another commit in this backend chain.
+ - Rollback: disable the deployment lane first, then lane-aware queueing if necessary; both require a
+   backend restart and leave the dependency-capacity patch intact.
+ 
++### [Scheduled action admission before durable claim](scheduled_action_admission/README.md)
++
++- Purpose: admit scheduled and cron actions to environment-specific execution capacity before
++  committing their monotonic at-most-once `Pending -> InProgress` claim.
++- Prerequisites: the maintained dependency-capacity and isolate queue-control commits; lane-aware
++  queueing may remain disabled.
++- Activation: automatic for scheduled and cron actions after the patched backend starts; no new
++  knob or data migration is required.
++- Rollback: restore the prior backend image. Existing `InProgress` jobs retain conservative
++  at-most-once recovery, and must not be moved back to `Pending`.
++
+ ### [Runtime health dashboard semantics](runtime_health_dashboard/README.md)
+ 
+ - Purpose: report observed queueing without unsupported saturation claims and display
+@@ -234,13 +246,15 @@ These files preserve the full earlier analysis without creating additional opera
+ 
+ 1. Apply standalone import, build, and Node-package reliability fixes as needed.
+ 2. Deploy dependency capacity before lane-aware queueing or the deployment lane.
+-3. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
++3. Deploy scheduled-action pre-claim admission after those scheduler patches; it protects both the
++   legacy CoDel and lane-aware queue paths.
++4. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
+    own wait and occupancy signals.
+-4. Establish observability before enabling application context-reuse markers or HTTP reuse.
+-5. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
++5. Establish observability before enabling application context-reuse markers or HTTP reuse.
++6. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
+    after cold-miss evidence.
+-6. Deliver matching backend and client protocol before enabling degradable frontend behavior.
+-7. Change one independent capacity or semantic opt-in at a time unless the documented policy
++7. Deliver matching backend and client protocol before enabling degradable frontend behavior.
++8. Change one independent capacity or semantic opt-in at a time unless the documented policy
+    explicitly requires a coupled rollout and rollback order.
+ 
+ Do not use module, function, route, client, deployment, or tenant names in generic backend logic or
+diff --git a/patches/dependency_capacity/README.md b/patches/dependency_capacity/README.md
+index 5a63b8ccdc05acd6ade03b5b33109ac114c43634..ec915b32a3de5a8fd86e867e821d85b83c6cc189 100644
+--- a/patches/dependency_capacity/README.md
++++ b/patches/dependency_capacity/README.md
+@@ -235,6 +235,11 @@ can wait at later application and isolate stages while retaining its HTTP permit
+ not the dependency definition or capacity arithmetic. The deployment control-plane lane remains
+ inside shared base and can never consume dependency overflow.
+ 
++[`scheduled_action_admission/README.md`](../scheduled_action_admission/README.md) uses the
++application, queue, active-permit, and worker boundaries from this patch to reserve a concrete
++scheduled action before its durable at-most-once claim. Scheduled roots remain independent and
++never consume dependency overflow.
++
+ HTTP and database context reuse can reduce service time, but neither changes dependency ownership.
+ Degradable query admission can reduce independent demand, but a client declaration cannot grant
+ dependency status.
+diff --git a/patches/isolate_queue_control/README.md b/patches/isolate_queue_control/README.md
+index fe54f0cd3ff177102e6b490bc1c7582b86be3d96..92889fd22a62db0d93e9902c63d9f06b6dafa811 100644
+--- a/patches/isolate_queue_control/README.md
++++ b/patches/isolate_queue_control/README.md
+@@ -355,10 +355,14 @@ strict configuration, and bounded metrics. Production verification uses an ordin
+ traffic; a dedicated deployment stress fixture is not required.
+ 
+ Rejected designs include treating deployment as a dependency, unconditional priority, a second
+-queue or worker pool, immediate worker reservation, borrowing dependency reserve, globally longer
+-ordinary deadlines, deployment-wide shedding switches, larger total queues, HTTP-path or module-name
+-classification, and relying on retries alone. Each either weakens liveness/fairness, adds substantial
+-state, or fails to classify the typed work the isolate scheduler actually executes.
++queue or worker pool, immediate deployment/control-plane worker reservation before normal
++selection, borrowing dependency reserve, globally longer ordinary deadlines, deployment-wide
++shedding switches, larger total queues, HTTP-path or module-name classification, and relying on
++retries alone. Each either weakens liveness/fairness, adds substantial state, or fails to classify
++the typed work the isolate scheduler actually executes. The separate
++[`scheduled-action admission patch`](../scheduled_action_admission/README.md) does not reserve idle
++capacity for a class: after a concrete scheduled action wins normal admission, it briefly holds
++that selected worker while committing the action's durable at-most-once claim.
+ 
+ ## Resource cost and current evidence
+ 
+@@ -399,10 +403,11 @@ reuse and lane control as separate opt-ins so a latency or memory regression
+ has an unambiguous rollback. Context reuse can be disabled without changing
+ queue state; queue control can be disabled without changing context semantics.
+ 
+-`FUNRUN_ISOLATE_ACTIVE_THREADS` remains a CPU-execution gate below worker
+-assignment. A request can retain a worker while not holding an active-thread
+-permit. Queue delay control cannot create CPU capacity or reserve active-thread
+-permits for dependencies.
++`FUNRUN_ISOLATE_ACTIVE_THREADS` remains a separate CPU-execution gate. An external request acquires
++its initial low-priority active-thread permit before worker assignment. Once execution begins, it
++can temporarily release that permit during an asynchronous wait while retaining the assigned
++worker, then use the existing high-priority reacquisition path. Queue delay control cannot create
++CPU capacity or reserve active-thread permits for dependencies.
+ 
+ Query coalescing and application dependency gates run before the isolate queue.
+ They must continue propagating dependency role so a child does not wait behind
+diff --git a/patches/scheduled_action_admission/README.md b/patches/scheduled_action_admission/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..a2b9a2325614d1ce55e10f2368aac50e19e39833
+--- /dev/null
++++ b/patches/scheduled_action_admission/README.md
+@@ -0,0 +1,455 @@
++# Admit Scheduled Actions Before Their Durable Claim
++
++## Summary
++
++This patch prevents runtime admission failures from consuming the at-most-once execution of an
++ordinary scheduled action or registered cron action. It prepares and admits the action while its
++durable job remains `Pending`, commits the exact job's monotonic `Pending -> InProgress` transition
++only after the execution reaches its environment-specific admission boundary, and then releases
++the prepared execution to user code. Executable paths own the capacity described below;
++deterministic validation failures reach a no-runtime boundary because they need no worker.
++
++The coordination is a two-way, process-local start barrier. For V8 actions the barrier is reached
++after the application action permit, isolate queue admission, active-JavaScript permit, and an
++eligible isolate worker are all owned. For Node actions it is reached after application admission
++and application-side request preparation, immediately before calling `NodeActions::execute`.
++Failure before `ready` drops the preparation while the job is still pending. A changed job or
++failed claim also drops the prepared execution without starting user code; existing retry behavior
++applies when the claim is definitely not visible, while an ambiguous visible claim retains
++conservative recovery.
++
++The patch does not change at-most-once recovery after `InProgress` is visible. A process can still
++fail after the claim commit and before or after the barrier release, and the scheduler still cannot
++prove whether external effects occurred. Such a job remains `InProgress` and is conservatively
++completed as the existing generic transient action failure.
++
++This is a distinct adoption unit downstream of dependency capacity (`8e8ad8b8a`) and isolate queue
++control (`8dc75417e`). It uses their application, queue, active-permit, worker, and cancellation
++boundaries but does not change their capacities or policy. In particular, scheduled roots remain
++`SchedulerDependencyClass::Independent`; they do not borrow ancestor-unblocking overflow.
++
++## Background
++
++### Durable action lifecycle
++
++Convex can retry a scheduled mutation because the mutation transaction is atomic. Actions are
++different: user code can perform external effects that cannot be rolled back or identified by the
++database commit protocol. Scheduled and cron actions therefore use a conservative at-most-once
++lifecycle.
++
++For an ordinary scheduled action the relevant states are:
++
++```text
++Pending -> InProgress -> Success
++                      -> Failed
++```
++
++Registered cron actions use the same `Pending -> InProgress` claim and then record the run result
++and advance the cron schedule. Both executors attach a request ID and execution ID to the
++`InProgress` state. If a later scheduler pass finds the job there, it cannot distinguish these
++histories:
++
++- the action never reached user code;
++- user code started but produced no external effect;
++- user code completed external effects and the backend failed before recording completion; or
++- completion recording itself failed.
++
++The safe common treatment is to avoid another execution. The existing scheduler marks the run
++failed with `Transient error while executing action` and restores the stored request and execution
++IDs for logging. A zero-runtime generic failure is therefore evidence of an abandoned
++`InProgress` claim, not evidence that JavaScript necessarily began.
++
++This monotonic state machine is implemented in
++[`scheduled_jobs/mod.rs`](../../crates/application/src/scheduled_jobs/mod.rs) and
++[`cron_jobs/mod.rs`](../../crates/application/src/cron_jobs/mod.rs).
++
++### Runtime admission below the scheduler
++
++Before user JavaScript can run, a V8 action crosses several independent boundaries:
++
++1. the scheduled-job executor's source parallelism limit;
++2. the application V8-action limiter;
++3. the isolate scheduler's bounded external queue;
++4. scheduler eligibility, including worker, per-client, and independent-action limits;
++5. the low-priority active-JavaScript permit wait; and
++6. assignment to an eligible isolate worker.
++
++Dependency capacity can add bounded overflow for work that releases an isolate-holding ancestor.
++A scheduled root has no such ancestor, so it correctly remains in shared capacity and can be
++rejected by the normal queue contract. With lane-aware queueing enabled, an independent scheduled
++action can encounter `queue_full`, `delay_control_shed`, `hard_expired`, caller cancellation,
++scheduler closure, or worker failure. With lane-aware queueing disabled, the legacy CoDel path can
++still reject or expire it. The active-JavaScript permit wait also retains the external queue's
++absolute deadline.
++
++Node actions use a separate application limiter and executor transport. Their preparation includes
++loading the current source package, environment, signed package URLs, and callback credentials.
++The Node process has no equivalent in-process isolate-worker handoff, so its barrier is immediately
++before `NodeActions::execute` rather than inside the child process.
++
++`SCHEDULED_JOB_EXECUTION_PARALLELISM` limits source tasks, not V8 CPU slots. A value such as 64 can
++be intentional when many actions spend most of their lifetime awaiting `fetch()` or other I/O,
++and it covers Node and V8 actions as well as mutations. It is not required to equal an eight-worker
++independent-action cap.
++
++## Failure mode
++
++Before this patch, both schedulers committed `Pending -> InProgress` before calling the application
++function runner. All runtime admission happened after the durable at-most-once claim:
++
++```text
++read exact Pending job
++commit InProgress
++wait for application permit
++enqueue in isolate scheduler
++wait for active-JavaScript permit and worker
++start JavaScript
++```
++
++A queue rejection or runtime shutdown between the commit and JavaScript start returned a system
++error to the scheduled-job executor. Its retry path compared the original `Pending` job with the
++now-`InProgress` row, correctly refused to change it, and reported the error. A later scheduler pass
++then converted the abandoned claim to the generic transient failure. The action was not retried
++because the durable state could no longer prove that it had not started.
++
++This explains why an isolated failure can occur without sustained overload or a visibly full
++queue. Adaptive delay control acts on measured dispatch delay, not only physical depth, and both
++queue implementations retain finite expiry and closure paths. More importantly, the scheduler had
++made an ordinary pre-execution rejection irreversible by claiming the action too early. The defect
++was the ordering between two valid mechanisms, not necessarily an incorrectly sized queue or a
++malfunctioning load-shedding controller.
++
++## Required invariants
++
++The patch preserves these properties:
++
++- `Pending -> InProgress` remains monotonic. There is no transition back to `Pending`.
++- User action code cannot start before the exact durable claim commits successfully.
++- The claim is not attempted until the action reaches its environment-specific admission
++  boundary.
++- Queueing, admission, preparation, or validation system failures before that boundary leave the
++  job pending for its existing retry contract.
++- The fresh claim transaction verifies the expected pending job's mutable execution metadata, not
++  only its document ID or state tag.
++- Cancellation or state change before a successful claim drops the prepared execution and releases
++  its application permit, active permit, and worker.
++- Scheduled roots remain independent and use neither dependency queue reserve nor dependency worker
++  reserve.
++- A successful claim followed by process loss remains conservatively at most once; the patch does
++  not infer that a missing completion is safe to retry.
++- No metric label includes a job, function, module, component, request, deployment, client, or
++  tenant identifier.
++
++## Design
++
++### Two-way start barrier
++
++[`function_runner/server.rs`](../../crates/function_runner/src/server.rs) defines a paired
++controller and gate backed by two one-shot channels:
++
++- the runtime-owned gate sends `ready` and waits for `start`;
++- the scheduler-owned controller waits for `ready` and, only after the claim, sends `start`.
++
++Dropping either side closes the corresponding channel. The drop behavior is the cancellation
++protocol: no detached task, cancellation token, durable reservation row, or compensating state
++transition is required.
++
++The existing `function_started_sender` remains separate. It is a one-way notification used after
++V8 request state has started and cannot prevent JavaScript from advancing. The new gate must stop
++the execution, so reusing the old sender without an acknowledgment channel would leave the same
++claim race.
++
++The gate is optional on the general `FunctionRunner` interface. Queries, mutations, ordinary
++actions, and HTTP actions keep their previous behavior. Database functions and HTTP actions reject
++an unexpected gate as an invariant violation. Only the scheduled and cron action call sites create
++one.
++
++### Exact event sequence
++
++For a pending durable action the new sequence is:
++
++```text
++read and classify the exact Pending job
++drop the scheduler's original transaction
++create request and execution IDs
++begin action preparation while the job remains Pending
++reach the environment-specific execution admission boundary
++runtime sends ready and waits
++open a fresh transaction
++verify the job still matches the expected Pending execution metadata
++commit Pending -> InProgress with the prepared request and execution IDs
++scheduler sends start
++begin user execution
++record Success or Failed using the exact InProgress job
++```
++
++The original scheduler transaction is deliberately dropped before admission. The claim transaction
++is created only after `ready`, so it has a current read set and a short lifetime. Ordinary scheduled
++jobs compare the fresh metadata with the expected job and use the fresh transaction's namespace
++mapping. That comparison covers path, state, schedule timestamps, and attempt counters. It does not
++compare the metadata's `args_id` or legacy inline argument bytes: normal model paths insert argument
++storage once, never replace it, and delete it only with the job. If that immutability contract
++changes, the matcher and claim token must change with it. Cron jobs compare the complete registered
++cron job, including its definition, arguments, run time, and state. Cancellation or replacement
++during admission therefore makes the claim return `state_changed` and cancels the prepared
++execution.
++
++Action preparation still uses the function runner's repeatable database snapshot. A deployment can
++change module state while the action waits, just as a normal queued invocation can outlive a later
++deployment. The prepared invocation executes the validated snapshot only if the durable job itself
++still matches at claim time. The patch does not add module generation to scheduled-job identity or
++hold a deployment transaction open as a second durable fence.
++
++### V8 admission boundary
++
++The V8 gate travels through
++[`application_function_runner/mod.rs`](../../crates/application/src/application_function_runner/mod.rs),
++the in-process `FunctionRunner`, and
++[`isolate/client.rs`](../../crates/isolate/src/client.rs). The isolate scheduler first performs its
++normal queue selection and acquires the initial active-JavaScript permit. It assigns the request to
++an eligible worker with the normal active-class accounting. Only then does
++[`isolate_worker.rs`](../../crates/isolate/src/isolate_worker.rs) signal `ready`.
++
++The selected worker waits before constructing `ActionEnvironment`, starting V8 request state, or
++creating the action timeout. Consequently the claim transaction does not consume user JavaScript
++timeout and no module evaluation or user callback can begin across the barrier. The worker and its
++active permit remain owned for the short claim, which makes the reservation real rather than an
++advisory scheduler counter.
++
++If the controller disappears while the worker waits, the gate returns an error before touching
++isolate request state. The worker marks the isolate clean, sends the canceled response, and returns
++through the normal worker-completion path. Existing guards release active accounting and the
++active-JavaScript permit. There is no worker or permit leak and no context is published for reuse.
++
++The controller also keeps polling the action response while the database claim is in flight. If a
++selected worker or scheduler disappears after `ready` but before the claim result, the controller
++drops the claim future and never sends `start`. A commit already accepted by the database can still
++become visible after its response path is dropped; that ambiguity is handled exactly like any other
++possibly visible claim and is never used as permission to retry or release execution.
++
++After release, the worker still constructs `ActionEnvironment`, rechecks isolate cleanliness,
++starts request state and its timeout, and creates the V8 request scope before evaluating the
++module. Those runtime-start steps can still fail before the first user instruction, as can the
++process itself. They are on the post-claim side of the at-most-once boundary and retain the
++existing conservative result.
++
++### Node and invalid-action behavior
++
++A Node action performs database and package preparation and acquires the Node action application
++permit while the durable job remains pending. It signals `ready` after the complete
++`ExecuteRequest` is built and immediately before `node_actions.execute`. Dropping the controller
++releases that permit without sending the request.
++
++This boundary prevents application admission and application-side package, environment, and
++request-preparation failures from consuming the durable claim. After release,
++`NodeActions::execute` still serializes the executor request, checks executor shutdown, may acquire
++or start the local Node generation, and sends the HTTP request. The barrier cannot reserve capacity
++inside the separate Node process or prove where a startup or transport failure occurred relative to
++user code. Those failures remain on the conservative post-claim side even when the request never
++reached the child. Package URLs are also signed before `ready`; an unusually slow claim can leave
++them expired by the time the executor downloads the package, which is another conservative
++post-claim failure. Moving the protocol into the Node child would be a separate cross-process
++design.
++
++A path or argument validation result that is already a deterministic developer error does not need
++an isolate or Node worker. It still waits on the gate at the application boundary so the durable
++claim precedes the failed action completion. An invalid module environment also consumes the gate
++before returning its existing system error, placing that result on the conservative post-claim
++side. A system error during validation instead ends the action future before `ready` and leaves the
++job pending.
++
++## Cancellation and failure matrix
++
++| Point | Durable state | Prepared execution | Result |
++| --- | --- | --- | --- |
++| Validation or preparation system error before `ready` | `Pending` | Dropped | Existing scheduler retry |
++| Queue full, CoDel/lane shedding, hard expiry, or scheduler closure | `Pending` | Never admitted or dropped | Existing scheduler retry |
++| Caller or executor task canceled before `ready` | `Pending` | Gate/controller drop releases ownership | Later scheduler attempt may proceed |
++| Exact job changes before claim | Changed by the winning operation | Selected execution canceled | No stale action starts |
++| Selected execution is lost while the claim is in flight | `Pending` if the claim is definitely not visible; otherwise possibly `InProgress` | Never released | Pending jobs use the existing retry; a visible claim uses conservative recovery |
++| Claim loses OCC or returns another commit error | `Pending` if the commit is definitely not visible; otherwise possibly `InProgress` | Selected execution canceled without release | Pending jobs use the existing retry; a visible claim uses conservative recovery |
++| Claim commits, then `start` delivery fails | `InProgress` | Worker is gone or closing | Existing conservative transient failure |
++| Backend exits after commit and before release | `InProgress` | Lost with process | Existing conservative transient failure |
++| Backend exits after JavaScript starts | `InProgress` | Execution outcome unknown | Existing conservative transient failure |
++| Completion transaction temporarily fails | `InProgress` | Action already completed | Existing completion retry loop |
++
++Executor-task cancellation concurrent with the claim has one unavoidable boundary. If task
++cancellation wins before the database commit, dropping the controller cancels the prepared
++execution and the row stays pending. If the commit becomes visible first—even if the caller does
++not observe its return—the row is `InProgress` and must be treated as possibly executed. This is
++the same uncertainty as a process failure after commit and is why the patch does not promise
++exactly once.
++
++After a visible ordinary scheduled-job claim, the existing cancellation API can change
++`InProgress` to `Canceled` before the controller sends `start`. Cancellation does not abort an
++already claimed action, so the controller can still release it and the later completion observes
++the changed state without overwriting `Canceled`. This race already existed across the larger
++pre-patch interval between claim and execution; the barrier preserves that cancellation contract.
++
++A returned commit error is not itself proof that the transaction stayed invisible. The committer
++can lose its result path after accepting work, and a persistence failure can have an uncertain
++durability result. The controller never releases the prepared execution on an error. If the claim
++did become visible, the existing `InProgress` recovery therefore remains deliberately conservative.
++
++The action future is polled while waiting for `ready` and while the claim is in flight. A
++pre-admission error therefore wins without running the claim, and a lost admitted execution stops
++the controller from releasing it. A successful action completion before release is an invariant
++violation because every action environment must consume the optional gate before completing.
++
++## Timing and metrics
++
++The patch adds two bounded histograms:
++
++- `durable_action_admission_wait_seconds{source,status}` measures from starting durable action
++  preparation until the environment signals `ready`;
++- `durable_action_claim_seconds{source,status}` measures fresh exact-state verification and claim
++  commit after admission.
++
++`source` is only `scheduled` or `cron`. Admission status normally uses `success`, `canceled`, or the
++bounded system error classification. Claim status additionally uses `state_changed` or
++`execution_lost`; an impossible action completion before the barrier uses `invariant_violation`.
++Dropping either timer before an explicit result records `canceled` rather than misclassifying task
++cancellation as a system error.
++
++These histograms supplement rather than replace application-permit, isolate queue, scheduler,
++active-permit, Node executor, database commit, sampled ready-queue lag, and ordinary scheduler
++admission-lag metrics. Admission time includes validation and environment preparation as well as
++actual permit and queue waits. Use the inner metrics to localize a high sample. Claim time should
++normally remain close to one short database transaction; persistent growth indicates database or
++contention pressure while admitted runtime capacity is being held.
++
++The V8 service timer and JavaScript timeout begin after barrier release, so claim latency is not
++charged as V8 service or user execution. The application action's end-to-end elapsed time and
++outer function-runner timers do include the brief claim interval. Node executor timing starts only
++after release, while the action's outer elapsed time includes preparation and claim. This split is
++intentional and should be preserved when interpreting cron execution duration.
++
++## Interaction with capacity and queue control
++
++The dependency-capacity patch supplies the application limits, independent-action cap, queue and
++worker arithmetic, active ownership, and cancellation-safe permit handling used by this patch. The
++new barrier adds no overflow. A selected scheduled V8 action holds exactly the capacities it would
++hold while beginning execution; it merely pauses for one fresh database claim.
++
++The queue-control patch determines whether external isolate admission uses legacy CoDel or the
++optional lane-aware policy. Either policy can reject before dispatch, and this patch makes both
++forms retryable by moving them before the durable claim. It does not exempt scheduled actions from
++adaptive shedding, lengthen deadlines, increase queue size, or add a scheduled lane.
++
++This brief reservation is different from reserving shared-base workers for a deployment or another
++class before a concrete request is selected. It neither lowers ordinary capacity nor leaves idle
++capacity unused. Under heavy claim latency, however, admitted scheduled actions can temporarily
++hold several workers while committing. Operators should use the new claim histogram and database
++signals before changing any capacity knob.
++
++`SCHEDULED_JOB_EXECUTION_PARALLELISM`, `APPLICATION_MAX_CONCURRENT_V8_ACTIONS`,
++`MAX_ISOLATE_ACTION_WORKERS`, `MAX_ISOLATE_WORKERS`, and `FUNRUN_ISOLATE_ACTIVE_THREADS` retain their
++separate meanings. Matching them numerically would collapse useful I/O concurrency and would not
++remove queue-full, expiry, shutdown, or Node-executor failures.
++
++## Mixed-version rollout
++
++The patch changes no stored schema, job representation, request ID format, or completion state. A
++patched scheduler can process jobs created by an older backend, and an older scheduler can process
++jobs created by a patched backend. `InProgress` recovery is identical on both versions.
++
++Behavior is not uniformly protected while versions overlap. An older scheduler can still claim a
++pending action before runtime admission and expose the original failure window. Begin acceptance
++measurements only after old scheduled-job and cron executor tasks have drained or their processes
++have stopped.
++
++The barrier is process-local and is implemented only by the in-process function runner used by the
++self-hosted backend. A future remote function-runner implementation would need an explicit
++admission/continue protocol rather than silently discarding the optional gate.
++
++## Adoption and rollback
++
++Apply this patch after the dependency-capacity and isolate queue-control commits in the maintained
++source chain. The lane-aware policy may remain disabled; the legacy CoDel path benefits as well. No
++new knob is required and activation is automatic after all scheduler processes use the patched
++image.
++
++Before rollout, record scheduled and cron generic transient action failures, sampled ready-queue
++lag, ordinary scheduler admission lag, application action waits, queue rejection/expiry, active
++worker classes, active-JavaScript waits, and database commit latency. After rollout, verify
++successful admission and claim samples for both sources and confirm that pre-dispatch queue
++failures leave jobs pending for retry rather than creating zero-runtime abandoned claims.
++
++Rollback restores the previous backend image. No data or configuration rollback is required. A
++job already in `InProgress` keeps the same conservative recovery semantics across rollback; do not
++manually move it back to `Pending`.
++
++## Verification
++
++Focused unit tests cover:
++
++- a runtime gate remaining blocked after `ready` until the controller releases it;
++- controller drop before admission;
++- controller drop after admission but before release;
++- gate drop while the controller waits; and
++- isolate-worker wait and cancellation behavior.
++
++The affected Rust packages compile together through the application crate. Production verification
++must additionally exercise both ordinary scheduled and cron actions under a controlled queue wait,
++observe `Pending` until runtime admission, observe `InProgress` before JavaScript effects, and
++confirm that a forced pre-admission rejection is retried without an abandoned claim. A post-claim
++process-stop test should continue producing the existing generic transient failure; changing that
++result would violate the at-most-once boundary.
++
++Run the focused checks before publishing an image:
++
++```sh
++scripts/run_cargo.sh test -p function_runner execution_start_tests
++scripts/run_cargo.sh test -p isolate execution_start_tests
++scripts/run_cargo.sh check -p application
++```
++
++Also run the repository's normal formatting, clippy, build, and broader test gates for the affected
++packages before release.
++
++## Rejected alternatives
++
++- **Move `InProgress` back to `Pending` after a pre-execution failure.** This creates an ABA state
++  transition. A stale executor, cancellation, replacement, or delayed completion can no longer
++  identify which `Pending` generation it observes. It also breaks the established semantic rule
++  that `InProgress` means execution may have crossed an irreversible external-effect boundary.
++- **Retry after the durable claim when the runtime reports it did not start.** A one-way error or
++  missing start notification is not durable proof. Process loss can occur after JavaScript starts
++  and before the report, so this can duplicate external effects. The two-way barrier instead keeps
++  retryable failures on the pre-claim side.
++- **Exempt scheduled actions only from adaptive delay shedding.** Lane shedding is only one failure
++  path. Queue-full rejection, legacy CoDel expiry, finite hard expiry, active-permit timeout,
++  scheduler closure, worker failure, and application-side Node preparation failures would still
++  consume an early claim. Removing shedding also weakens overload protection without repairing the
++  ordering defect.
++- **Classify scheduled roots as dependencies.** A scheduled root releases no isolate-holding
++  ancestor. Letting it consume dependency queue, application, or worker overflow can delay the
++  actual descendants that reserve exists to unblock and still does not guarantee admission.
++- **Set scheduled parallelism, the application V8 limit, or all action limits to the isolate action
++  cap.** These controls govern different resources. Scheduled and Node actions often wait on I/O,
++  so a source limit of 64 with eight independent isolate workers can be intentional. Equal values
++  neither reserve a worker nor remove finite queue and shutdown failures.
++- **Reduce `SCHEDULED_JOB_EXECUTION_PARALLELISM`.** Lower fan-out can reduce incident frequency, but
++  it also reduces useful Node and I/O overlap and leaves every admitted action exposed to the same
++  irreversible pre-execution window.
++- **Increase queue depth or deadlines.** Larger buffers retain more work and longer deadlines defer
++  failure; neither creates service capacity or removes queue-full, shutdown, and worker-loss paths.
++- **Create a dedicated scheduled-action pool or permanent worker quota.** A second pool fragments
++  capacity, needs its own per-client, active-permit, shutdown, and Node policy, and can sit idle
++  while ordinary work queues. The short barrier uses a worker selected by the existing fair
++  scheduler and releases it immediately after one claim.
++- **Reserve a worker as soon as the scheduled executor sees a pending job.** Reservation before
++  normal application admission and queue selection bypasses the capacity model and requires a new
++  cancellation-safe reservation scheduler. This patch reserves only an already admitted request.
++- **Signal readiness after JavaScript starts.** User code may perform an external effect in its
++  first instruction. Committing the claim after that signal would make `Pending` coexist with a
++  possibly executed action and permit duplication after a crash.
++- **Hold the original durable transaction while waiting for capacity.** Queue waits can be long.
++  Holding the transaction lengthens snapshot lifetime, increases OCC exposure, and still requires a
++  final exact-state check. A fresh short claim transaction after admission gives the database one
++  clear ordering point.
++- **Add a durable `Preparing` state.** A new state would require schema, cancellation, restart,
++  garbage-collection, dashboard, and mixed-version semantics. If `Preparing` were retryable after a
++  crash it would still need proof that JavaScript had not started; if it were not retryable it would
++  reproduce the abandoned-claim failure under another name. The process-local barrier supplies the
++  needed proof before the existing claim without expanding the durable state machine.

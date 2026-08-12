@@ -1,0 +1,1455 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Sat, 11 Jul 2026 14:04:19 +0800
+Subject: [PATCH 05/24] isolate: make HTTP action context reuse optional
+
+Add an opt-in cache for evaluated HTTP-action V8 contexts keyed by component module path. Reinstall fresh request-owned state for every invocation, validate saved initialization reads before reuse, and discard contexts after execution errors, termination, pending task promises, or incompatible request state.
+
+Reset request byte accounting across reuse and preserve module/global state only behind REUSE_HTTP_ACTION_CONTEXTS. Document semantics, invalidation, memory shape, observability interaction, measured impact, and rollback in patches/reuse_http_action_contexts/README.md.
+---
+ crates/common/src/knobs.rs                    |   7 +
+ crates/isolate/src/context_cache.rs           | 176 +++++++++-
+ crates/isolate/src/environment/action/mod.rs  | 202 ++++++++++--
+ .../isolate/src/environment/action/phase.rs   | 184 +++++++++--
+ crates/isolate/src/environment/udf/mod.rs     |  70 +---
+ crates/isolate/src/request_scope.rs           |  32 ++
+ crates/isolate/src/termination.rs             |   3 +
+ patches/reuse_http_action_contexts/README.md  | 310 ++++++++++++++++++
+ self-hosted/docker/docker-compose.yml         |   1 +
+ 9 files changed, 843 insertions(+), 142 deletions(-)
+ create mode 100644 patches/reuse_http_action_contexts/README.md
+
+diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
+index edbee7b4aaea701e72a2533edcdcd32ec39cc337..17401e12f14e37d902afc16dad0f4211b5af3193 100644
+--- a/crates/common/src/knobs.rs
++++ b/crates/common/src/knobs.rs
+@@ -926,6 +926,13 @@ pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS",
+ /// heap.
+ pub static REUSE_ISOLATES: LazyLock<bool> = LazyLock::new(|| env_config("REUSE_ISOLATES", true));
+ 
++/// If true, HTTP actions may reuse a V8 context with an already-evaluated HTTP
++/// router module. This is off by default because it preserves module-level JS
++/// state across HTTP action requests. See patches/reuse_http_action_contexts.md
++/// for the self-hosted tradeoff.
++pub static REUSE_HTTP_ACTION_CONTEXTS: LazyLock<bool> =
++    LazyLock::new(|| env_config("REUSE_HTTP_ACTION_CONTEXTS", false));
++
+ /// Duration in seconds before an idle isolate is recreated
+ pub static ISOLATE_IDLE_TIMEOUT: LazyLock<Duration> =
+     LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_IDLE_TIMEOUT_SECONDS", 600)));
+diff --git a/crates/isolate/src/context_cache.rs b/crates/isolate/src/context_cache.rs
+index c33c3e835714dc2093e2f56c927f929298b168b7..707277fdd437f2f67ed2d84b95712544cf7c99ac 100644
+--- a/crates/isolate/src/context_cache.rs
++++ b/crates/isolate/src/context_cache.rs
+@@ -1,12 +1,17 @@
+ use std::sync::Arc;
+ 
++use ::metrics::IntoLabel;
+ use common::{
+     components::CanonicalizedComponentModulePath,
+     interval::IntervalSet,
++    knobs::REUSE_HTTP_ACTION_CONTEXTS,
+     runtime::Runtime,
+     types::TabletIndexName,
+ };
+-use database::TransactionReadSet;
++use database::{
++    Transaction,
++    TransactionReadSet,
++};
+ use deno_core::v8::{
+     self,
+     scope,
+@@ -39,6 +44,12 @@ enum SavedContext {
+         module_map: ModuleMap,
+         read_set: ContextReadSet,
+     },
++    HttpAction {
++        module_path: CanonicalizedComponentModulePath,
++        context: v8::Global<v8::Context>,
++        module_map: ModuleMap,
++        read_set: ContextReadSet,
++    },
+ }
+ 
+ pub struct ContextCache {
+@@ -54,7 +65,12 @@ pub struct CachedContexts {
+ }
+ 
+ struct CachedContextsInner {
+-    saved_database_udf_context: Option<CanonicalizedComponentModulePath>,
++    saved_context: Option<CachedContext>,
++}
++
++enum CachedContext {
++    DatabaseUdf(CanonicalizedComponentModulePath),
++    HttpAction(CanonicalizedComponentModulePath),
+ }
+ 
+ pub(crate) struct ContextReadSet {
+@@ -74,7 +90,7 @@ impl ContextCache {
+             saved_context: None,
+             cached_contexts: Arc::new(CachedContexts {
+                 inner: Mutex::new(CachedContextsInner {
+-                    saved_database_udf_context: None,
++                    saved_context: None,
+                 }),
+             }),
+         }
+@@ -89,12 +105,15 @@ impl ContextCache {
+     }
+ 
+     pub(crate) fn has_saved_context(&mut self) -> bool {
+-        matches!(self.saved_context, Some(SavedContext::DatabaseUdf { .. }))
++        matches!(
++            self.saved_context,
++            Some(SavedContext::DatabaseUdf { .. } | SavedContext::HttpAction { .. })
++        )
+     }
+ 
+     pub(crate) fn clear(&mut self) {
+         self.saved_context = None;
+-        self.cached_contexts.inner.lock().saved_database_udf_context = None;
++        self.cached_contexts.inner.lock().saved_context = None;
+     }
+ 
+     pub(crate) fn get_or_create_fresh_context<'s>(
+@@ -102,8 +121,11 @@ impl ContextCache {
+         scope: &v8::PinScope<'s, '_, ()>,
+     ) -> v8::Local<'s, v8::Context> {
+         let saved_context = self.saved_context.take();
+-        self.cached_contexts.inner.lock().saved_database_udf_context = None;
+-        if let Some(SavedContext::DatabaseUdf { .. }) = saved_context {
++        self.cached_contexts.inner.lock().saved_context = None;
++        if matches!(
++            &saved_context,
++            Some(SavedContext::DatabaseUdf { .. } | SavedContext::HttpAction { .. })
++        ) {
+             LocalSpan::add_event(Event::new("clobbered_saved_context"));
+         }
+         if let Some(SavedContext::Fresh(context)) = saved_context {
+@@ -126,7 +148,25 @@ impl ContextCache {
+             module_map,
+             read_set,
+         });
+-        self.cached_contexts.inner.lock().saved_database_udf_context = Some(module_path);
++        self.cached_contexts.inner.lock().saved_context =
++            Some(CachedContext::DatabaseUdf(module_path));
++    }
++
++    pub(crate) fn save_http_action_context(
++        &mut self,
++        module_path: CanonicalizedComponentModulePath,
++        context: v8::Global<v8::Context>,
++        module_map: ModuleMap,
++        read_set: ContextReadSet,
++    ) {
++        self.saved_context = Some(SavedContext::HttpAction {
++            module_path: module_path.clone(),
++            context,
++            module_map,
++            read_set,
++        });
++        self.cached_contexts.inner.lock().saved_context =
++            Some(CachedContext::HttpAction(module_path));
+     }
+ 
+     pub(crate) fn take_reused_context(
+@@ -148,13 +188,112 @@ impl ContextCache {
+             else {
+                 unreachable!()
+             };
+-            self.cached_contexts.inner.lock().saved_database_udf_context = None;
++            self.cached_contexts.inner.lock().saved_context = None;
++            Some((context, module_map, read_set))
++        } else {
++            None
++        }
++    }
++
++    pub(crate) fn take_http_action_context(
++        &mut self,
++        module_path: &CanonicalizedComponentModulePath,
++    ) -> Option<(v8::Global<v8::Context>, ModuleMap, ContextReadSet)> {
++        if let Some(SavedContext::HttpAction {
++            module_path: saved_path,
++            ..
++        }) = &self.saved_context
++            && saved_path == module_path
++        {
++            let Some(SavedContext::HttpAction {
++                module_path: _,
++                context,
++                module_map,
++                read_set,
++            }) = self.saved_context.take()
++            else {
++                unreachable!()
++            };
++            self.cached_contexts.inner.lock().saved_context = None;
+             Some((context, module_map, read_set))
+         } else {
+             None
+         }
+     }
+ 
++    #[fastrace::trace]
++    pub(crate) async fn validate_and_apply_context_read_set<RT: Runtime>(
++        tx: &mut Transaction<RT>,
++        read_set: &ContextReadSet,
++    ) -> anyhow::Result<bool> {
++        let mut reusable = scopeguard::guard(false, |reusable| {
++            LocalSpan::add_property(|| ("reuse_success", reusable.as_label()));
++        });
++        for (namespace, tablet_index_name, table_name, intervals, hash) in &read_set.range_hashes {
++            let tablet = *tablet_index_name.table();
++            if !tx.table_mapping().tablet_id_exists(tablet) {
++                return Ok(false);
++            }
++            let (new_namespace, _, new_table_name) =
++                tx.table_mapping().get_table_metadata(tablet)?;
++            anyhow::ensure!(namespace == new_namespace, "{tablet} changed namespace?");
++            anyhow::ensure!(table_name == new_table_name, "{tablet} changed name?");
++            let Some(new_hash) = tx
++                .hash_index_interval_no_deps(tablet_index_name, table_name, intervals)
++                .await?
++            else {
++                return Ok(false);
++            };
++            if new_hash != *hash {
++                return Ok(false);
++            }
++        }
++        *reusable = true;
++        // All hashes match, so merge the saved reads into the request transaction
++        // before running code compiled from the cached context.
++        tx.apply_reads(read_set.read_set.clone());
++        Ok(true)
++    }
++
++    #[fastrace::trace]
++    pub(crate) async fn capture_context_read_set<RT: Runtime>(
++        read_set: TransactionReadSet,
++        tx: &mut Transaction<RT>,
++    ) -> anyhow::Result<Option<ContextReadSet>> {
++        anyhow::ensure!(
++            read_set.read_set().iter_search().count() == 0,
++            "searches can't be done during init"
++        );
++        let mut range_hashes = vec![];
++        for (tablet_index_name, reads) in read_set.read_set().iter_indexed() {
++            let &(namespace, _table_number, ref table_name) = tx
++                .table_mapping()
++                .get_table_metadata(*tablet_index_name.table())?;
++            anyhow::ensure!(
++                table_name.is_system(),
++                "context init read non-system table {table_name}?"
++            );
++            let table_name = table_name.clone();
++            let Some(hash) = tx
++                .hash_index_interval_no_deps(tablet_index_name, &table_name, &reads.intervals)
++                .await?
++            else {
++                return Ok(None);
++            };
++            range_hashes.push((
++                namespace,
++                tablet_index_name.clone(),
++                table_name,
++                reads.intervals.clone(),
++                hash,
++            ));
++        }
++        Ok(Some(ContextReadSet {
++            read_set,
++            range_hashes,
++        }))
++    }
++
+     pub fn cached_contexts(&self) -> &Arc<CachedContexts> {
+         &self.cached_contexts
+     }
+@@ -165,12 +304,23 @@ impl CachedContexts {
+         let this = self.inner.lock();
+         match &request.inner {
+             RequestType::Udf { request: inner, .. } if inner.path_and_args.reuse_context() => {
+-                request
+-                    .module()
+-                    .is_some_and(|m| this.saved_database_udf_context.as_ref() == Some(&m))
++                request.module().is_some_and(|module| {
++                    matches!(
++                        &this.saved_context,
++                        Some(CachedContext::DatabaseUdf(saved_module)) if saved_module == &module
++                    )
++                })
++            },
++            RequestType::HttpAction { .. } if *REUSE_HTTP_ACTION_CONTEXTS => {
++                request.module().is_some_and(|module| {
++                    matches!(
++                        &this.saved_context,
++                        Some(CachedContext::HttpAction(saved_module)) if saved_module == &module
++                    )
++                })
+             },
+             // Prefer routing other requests to isolates that don't have warmed contexts
+-            _ => this.saved_database_udf_context.is_none(),
++            _ => this.saved_context.is_none(),
+         }
+     }
+ }
+diff --git a/crates/isolate/src/environment/action/mod.rs b/crates/isolate/src/environment/action/mod.rs
+index f2d27c1f74049491659c8e622fef7fcb1b7ca28d..c4f634f393b7e7bcb1fea7adcacfcbdf632d611e 100644
+--- a/crates/isolate/src/environment/action/mod.rs
++++ b/crates/isolate/src/environment/action/mod.rs
+@@ -18,6 +18,7 @@ use std::{
+ use anyhow::anyhow;
+ use common::{
+     components::{
++        CanonicalizedComponentModulePath,
+         ComponentId,
+         ComponentPath,
+     },
+@@ -31,6 +32,7 @@ use common::{
+     knobs::{
+         FUNCTION_MAX_ARGS_SIZE,
+         FUNCTION_MAX_RESULT_SIZE,
++        REUSE_HTTP_ACTION_CONTEXTS,
+         V8_ACTION_SYSTEM_TIMEOUT,
+         V8_ACTION_USER_TIMEOUT,
+     },
+@@ -223,6 +225,7 @@ pub struct ActionEnvironment<RT: Runtime> {
+     total_log_lines: usize,
+     log_line_sender: mpsc::UnboundedSender<LogLine>,
+     http_response_streamer: Option<HttpActionResponseStreamer>,
++    http_action_had_execution_error: bool,
+ 
+     rt: RT,
+ 
+@@ -242,10 +245,7 @@ pub struct ActionEnvironment<RT: Runtime> {
+ 
+ impl<RT: Runtime> Drop for ActionEnvironment<RT> {
+     fn drop(&mut self) {
+-        self.pending_task_sender.close();
+-        if let Some(mut running_tasks) = self.running_tasks.take() {
+-            running_tasks.shutdown();
+-        }
++        self.shutdown_task_executor();
+     }
+ }
+ 
+@@ -303,6 +303,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+             total_log_lines: 0,
+             log_line_sender,
+             http_response_streamer,
++            http_action_had_execution_error: false,
+ 
+             next_task_id: TaskId(0),
+             pending_task_sender,
+@@ -345,16 +346,59 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+         let udf_path = &component_function_path.udf_path;
+ 
+         let heap_stats = self.heap_stats.clone();
+-        let (handle, state, mut timeout) =
++        let (handle, mut state, mut timeout) =
+             isolate.start_request(context_cache, permit, self).await?;
+         if let Some(tx) = function_started {
+             _ = tx.send(());
+         }
+         scope!(let handle_scope, isolate.isolate());
+-        let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
+-        let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
+-
+-        let mut isolate_context = RequestScope::new(context_scope, handle.clone(), state, true)?;
++        let reusable_module_path = CanonicalizedComponentModulePath {
++            component: component_function_path.component,
++            module_path: udf_path.module().clone(),
++        };
++        let mut context_scope;
++        let mut reused_http_action_context = false;
++        let reused_context = if *REUSE_HTTP_ACTION_CONTEXTS
++            && let Some((context, module_map, read_set)) =
++                context_cache.take_http_action_context(&reusable_module_path)
++        {
++            // Cached HTTP action contexts keep evaluated JS modules. Validate the
++            // initialization reads so deploys, env var changes, and resource changes
++            // force a fresh context instead of serving stale code.
++            if state
++                .environment
++                .phase
++                .validate_context_read_set(&read_set)
++                .await?
++            {
++                Some((context, module_map, read_set))
++            } else {
++                None
++            }
++        } else {
++            None
++        };
++        let mut context_read_set = None;
++        let mut isolate_context = if let Some((context, module_map, read_set)) = reused_context {
++            reused_http_action_context = true;
++            context_read_set = Some(read_set);
++            let v8_context = v8::Local::new(handle_scope, context);
++            context_scope = v8::ContextScope::new(handle_scope, v8_context);
++            RequestScope::with_existing_context(
++                &mut context_scope,
++                handle.clone(),
++                state,
++                true,
++                module_map,
++            )
++        } else {
++            if *REUSE_HTTP_ACTION_CONTEXTS {
++                state.environment.phase.snoop_reads()?;
++            }
++            let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
++            context_scope = v8::ContextScope::new(handle_scope, v8_context);
++            RequestScope::new(&mut context_scope, handle.clone(), state, true)?
++        };
+ 
+         let request_head = request.head.clone();
+ 
+@@ -366,16 +410,45 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+             request,
+         )
+         .await;
+-        // Override the returned result if we hit a termination error.
+-        let termination_error = handle
+-            .take_termination_error(Some(heap_stats.get()), &format!("http action: {udf_path}"));
+ 
++        {
++            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
++            scope.state_mut()?.environment.shutdown_task_executor();
++        }
+         // Perform a microtask checkpoint one last time before taking the environment
+         // to ensure the microtask queue is empty. Otherwise, JS from this request may
+         // leak to a subsequent one on isolate reuse.
+         isolate_context.checkpoint();
+         *isolate_clean = true;
+ 
++        // Check termination after the final checkpoint because that checkpoint can run
++        // user microtasks and invoke native functions.
++        let termination_error = handle
++            .take_termination_error(Some(heap_stats.get()), &format!("http action: {udf_path}"));
++        let clean_termination = matches!(&termination_error, Ok(Ok(..)));
++        let has_pending_request_work = if *REUSE_HTTP_ACTION_CONTEXTS {
++            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
++            !scope
++                .pending_unhandled_promise_rejections()
++                .exceptions
++                .is_empty()
++                || !scope.pending_dynamic_imports_mut().imports.is_empty()
++                || scope.state()?.has_pending_stream_work_for_context_reuse()
++        } else {
++            false
++        };
++
++        let candidate_module_map = if *REUSE_HTTP_ACTION_CONTEXTS {
++            isolate_context.take_module_map()
++        } else {
++            None
++        };
++        let candidate_v8_context = if *REUSE_HTTP_ACTION_CONTEXTS {
++            let v8_scope = isolate_context.scope();
++            Some(v8::Global::new(v8_scope, v8_scope.get_current_context()))
++        } else {
++            None
++        };
+         self = isolate_context.take_environment();
+         let execution_time = timeout.into_function_execution_time(UdfType::HttpAction);
+         let http_response_streamer = self
+@@ -401,6 +474,34 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+                 result = Err(e);
+             },
+         }
++        // A streamed response can still leave request-owned task promises, streams,
++        // dynamic imports, unhandled rejections, or a termination that was converted
++        // into an HTTP stream outcome. Do not cache that context while its Rust state
++        // is being dropped.
++        let can_save_http_action_context = *REUSE_HTTP_ACTION_CONTEXTS
++            && clean_termination
++            && !has_pending_request_work
++            && !self.has_pending_task_promises()
++            && !self.http_action_had_execution_error
++            && matches!(&result, Ok((_, HttpActionResult::Streamed)));
++        let candidate_context_read_set = if can_save_http_action_context {
++            match context_read_set.take() {
++                Some(read_set) => Some(read_set),
++                None => self.phase.take_context_read_set()?,
++            }
++        } else {
++            None
++        };
++        let reusable_context = match (
++            candidate_module_map,
++            candidate_v8_context,
++            candidate_context_read_set,
++        ) {
++            (Some(module_map), Some(v8_context), Some(read_set)) => {
++                Some((module_map, v8_context, read_set))
++            },
++            _ => None,
++        };
+         let user_execution_time = execution_time.elapsed;
+         self.add_warnings_to_log_lines_http_action(execution_time, total_bytes_sent)?;
+         let (route, result) = result?;
+@@ -414,6 +515,20 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+             http_module_path.npm_version().clone(),
+             user_execution_time,
+         );
++        // Do not publish the context until every fallible request-finalization step
++        // has succeeded. A caller that receives an error must never leave a warmed
++        // context behind from that request.
++        if let Some((module_map, v8_context, read_set)) = reusable_context {
++            if reused_http_action_context {
++                tracing::debug!("Reusing HTTP action context for {reusable_module_path:?}");
++            }
++            context_cache.save_http_action_context(
++                reusable_module_path,
++                v8_context,
++                module_map,
++                read_set,
++            );
++        }
+         Ok(outcome)
+     }
+ 
+@@ -563,7 +678,9 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+         };
+         let sender_closed =
+             Box::pin(futures::stream::once(sender_closed_fut).filter_map(|_| async move { None }));
+-        let stream_id = state.create_request_stream()?;
++        // The abort signal is not the HTTP request body. Registering it as the
++        // request stream would replace the body byte counter used in OOM errors.
++        let stream_id = state.create_http_action_abort_stream()?;
+         state
+             .environment
+             .send_stream(stream_id, Some(sender_closed));
+@@ -619,6 +736,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+                     return Ok(());
+                 }
+                 if streamer.total_bytes_sent() + b.len() > HTTP_ACTION_BODY_LIMIT {
++                    environment.http_action_had_execution_error = true;
+                     let e = JsError::from_message(format!(
+                         "HttpResponseTooLarge: HTTP actions support responses up to {}",
+                         HTTP_ACTION_BODY_LIMIT.format_size(BINARY)
+@@ -637,13 +755,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+                     let _ = streamer.send_part(HttpActionResponsePart::BodyChunk(b))?;
+                 }
+             },
+-            Err(e) => environment.trace_system(SystemWarning {
+-                level: LogLevel::Error,
+-                messages: vec![e.to_string()],
+-                system_log_metadata: SystemLogMetadata {
+-                    code: "error:httpAction".to_string(),
+-                },
+-            })?,
++            Err(e) => {
++                // Once streaming starts, run_inner reports later handler and body
++                // stream failures through this callback and otherwise returns success.
++                // Preserve the failure for the context reuse eligibility check.
++                environment.http_action_had_execution_error = true;
++                environment.trace_system(SystemWarning {
++                    level: LogLevel::Error,
++                    messages: vec![e.to_string()],
++                    system_log_metadata: SystemLogMetadata {
++                        code: "error:httpAction".to_string(),
++                    },
++                })?
++            },
+         };
+         Ok(())
+     }
+@@ -695,6 +819,10 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+         )
+         .await;
+ 
++        {
++            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
++            scope.state_mut()?.environment.shutdown_task_executor();
++        }
+         // Perform a microtask checkpoint one last time before taking the environment
+         // to ensure the microtask queue is empty. Otherwise, JS from this request may
+         // leak to a subsequent one on isolate reuse.
+@@ -1199,13 +1327,6 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+             timeout.permit = Some(permit);
+             handle.check_terminated()?;
+         };
+-        // Drain all remaining async syscalls that are not sleeps in case the
+-        // developer forgot to await them.
+-        let environment = &mut scope.state_mut()?.environment;
+-        environment.pending_task_sender.close();
+-        if let Some(mut running_tasks) = environment.running_tasks.take() {
+-            running_tasks.shutdown();
+-        }
+         Ok(result)
+     }
+ 
+@@ -1312,6 +1433,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+         counts
+     }
+ 
++    fn has_pending_task_promises(&self) -> bool {
++        // Include sleeps. They are not developer-warning-worthy dangling ops, but
++        // their JS promises still belong to this request for context reuse.
++        !self.task_promise_resolvers.is_empty()
++    }
++
++    fn shutdown_task_executor(&mut self) {
++        self.pending_task_sender.close();
++        if let Some(mut running_tasks) = self.running_tasks.take() {
++            running_tasks.shutdown();
++        }
++    }
++
+     fn start_task(
+         &mut self,
+         request: TaskRequestEnum,
+@@ -1321,13 +1455,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+         let task_id = self.next_task_id.increment();
+         self.task_promise_resolvers
+             .insert(task_id, (resolver, request.to_type()));
+-        self.pending_task_sender
++        if self
++            .pending_task_sender
+             .send(TaskRequest {
+                 task_id,
+                 variant: request,
+                 parent_trace: EncodedSpan::from_parent(),
+             })
+-            .expect("TaskExecutor went away?");
++            .is_err()
++        {
++            let removed = self.task_promise_resolvers.remove(&task_id);
++            anyhow::ensure!(removed.is_some(), "Task promise resolver disappeared");
++            anyhow::bail!("TaskExecutor went away?");
++        }
+         Ok(())
+     }
+ 
+@@ -1401,15 +1541,13 @@ impl<RT: Runtime> IsolateEnvironment<RT> for ActionEnvironment<RT> {
+         anyhow::bail!("get_all_table_mappings unsupported in actions")
+     }
+ 
+-    // We lookup all modules' sources upfront when initializing the action
+-    // environment, so this function always returns immediately.
+     async fn lookup_source(
+         &mut self,
+         path: &str,
+         timeout: &mut Timeout<RT>,
+     ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>> {
+         let user_module_path: ModulePath = path.parse()?;
+-        let result = self.phase.get_module(&user_module_path, timeout)?;
++        let result = self.phase.get_module(&user_module_path, timeout).await?;
+         Ok(result)
+     }
+ 
+diff --git a/crates/isolate/src/environment/action/phase.rs b/crates/isolate/src/environment/action/phase.rs
+index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..9406faef18d72440f057f5ee2b2fc85b7112f918 100644
+--- a/crates/isolate/src/environment/action/phase.rs
++++ b/crates/isolate/src/environment/action/phase.rs
+@@ -1,6 +1,10 @@
+ use std::{
+     collections::BTreeMap,
+     mem,
++    ops::{
++        Deref,
++        DerefMut,
++    },
+     str::FromStr,
+     sync::Arc,
+     time::Duration,
+@@ -27,6 +31,7 @@ use common::{
+ };
+ use database::{
+     BootstrapComponentsModel,
++    SnoopedTransaction,
+     Transaction,
+ };
+ use errors::ErrorMetadata;
+@@ -44,7 +49,10 @@ use model::{
+         types::ModuleMetadata,
+         ModuleModel,
+     },
+-    source_packages::SourcePackageModel,
++    source_packages::{
++        types::SourcePackage,
++        SourcePackageModel,
++    },
+     udf_config::UdfConfigModel,
+ };
+ use parking_lot::Mutex;
+@@ -67,6 +75,10 @@ use value::{
+ };
+ 
+ use crate::{
++    context_cache::{
++        ContextCache,
++        ContextReadSet,
++    },
+     environment::{
+         action::task::TaskRequestEnum,
+         helpers::{
+@@ -110,7 +122,7 @@ struct ComponentEnvCtx {
+ 
+ enum ActionPreloaded<RT: Runtime> {
+     Created {
+-        tx: Transaction<RT>,
++        tx: MaybeSnooped<RT>,
+         module_loader: Arc<dyn ModuleCache<RT>>,
+         default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
+         resources: Arc<Mutex<BTreeMap<Reference, Resource>>>,
+@@ -119,6 +131,8 @@ enum ActionPreloaded<RT: Runtime> {
+     Preloading,
+     Ready {
+         module_loader: Arc<dyn ModuleCache<RT>>,
++        module_metadata: BTreeMap<CanonicalizedModulePath, Arc<ParsedDocument<ModuleMetadata>>>,
++        source_package: Option<Arc<ParsedDocument<SourcePackage>>>,
+         modules: BTreeMap<
+             CanonicalizedModulePath,
+             (Arc<ParsedDocument<ModuleMetadata>>, Arc<V8ModuleSource>),
+@@ -129,9 +143,35 @@ enum ActionPreloaded<RT: Runtime> {
+         rng: Option<ChaCha12Rng>,
+         import_time_unix_timestamp: Option<UnixTimestamp>,
+         performance_api: Option<PerformanceApi>,
++        context_read_set: Option<ContextReadSet>,
+     },
+ }
+ 
++enum MaybeSnooped<RT: Runtime> {
++    Tx(Transaction<RT>),
++    SnoopedTx(SnoopedTransaction<RT>),
++}
++
++impl<RT: Runtime> Deref for MaybeSnooped<RT> {
++    type Target = Transaction<RT>;
++
++    fn deref(&self) -> &Self::Target {
++        match self {
++            MaybeSnooped::Tx(tx) => tx,
++            MaybeSnooped::SnoopedTx(tx) => tx,
++        }
++    }
++}
++
++impl<RT: Runtime> DerefMut for MaybeSnooped<RT> {
++    fn deref_mut(&mut self) -> &mut Self::Target {
++        match self {
++            MaybeSnooped::Tx(tx) => tx,
++            MaybeSnooped::SnoopedTx(tx) => tx,
++        }
++    }
++}
++
+ impl<RT: Runtime> ActionPhase<RT> {
+     pub fn new(
+         rt: RT,
+@@ -147,7 +187,7 @@ impl<RT: Runtime> ActionPhase<RT> {
+             phase: Phase::Importing,
+             rt,
+             preloaded: ActionPreloaded::Created {
+-                tx,
++                tx: MaybeSnooped::Tx(tx),
+                 module_loader,
+                 default_system_env_vars,
+                 resources,
+@@ -184,29 +224,17 @@ impl<RT: Runtime> ActionPhase<RT> {
+                     .map(|c| ChaCha12Rng::from_seed(c.import_phase_rng_seed));
+                 let import_time_unix_timestamp =
+                     udf_config.as_ref().map(|c| c.import_phase_unix_timestamp);
+-
+                 let module_metadata = ModuleModel::new(&mut tx)
+                     .get_all_metadata(component_id)
+                     .await?;
+                 let source_package = SourcePackageModel::new(&mut tx, component_id.into())
+                     .get_latest()
+                     .await?;
+-                let mut modules = BTreeMap::new();
+-                for metadata in module_metadata {
+-                    if metadata.path.is_system() {
+-                        continue;
+-                    }
+-                    let path = metadata.path.clone();
+-                    let module = module_loader
+-                        .get_module_with_metadata(
+-                            &metadata,
+-                            source_package
+-                                .as_ref()
+-                                .context("source package not found")?,
+-                        )
+-                        .await?;
+-                    modules.insert(path, (metadata, module));
+-                }
++                let module_metadata = module_metadata
++                    .into_iter()
++                    .filter(|metadata| !metadata.path.is_system())
++                    .map(|metadata| (metadata.path.clone(), metadata))
++                    .collect();
+ 
+                 {
+                     let loaded_resources = ComponentsModel::new(&mut tx)
+@@ -278,15 +306,26 @@ impl<RT: Runtime> ActionPhase<RT> {
+                     )
+                 };
+ 
++                let context_read_set = match tx {
++                    MaybeSnooped::Tx(_) => None,
++                    MaybeSnooped::SnoopedTx(snooped_tx) => {
++                        let (mut tx, read_set) = snooped_tx.finish_snoop();
++                        ContextCache::capture_context_read_set(read_set, &mut tx).await?
++                    },
++                };
++
+                 Ok(ActionPreloaded::Ready {
+                     module_loader,
+-                    modules,
++                    module_metadata,
++                    source_package,
++                    modules: BTreeMap::new(),
+                     env_vars,
+                     component_arguments,
+                     component_env,
+                     rng,
+                     import_time_unix_timestamp,
+                     performance_api: import_time_unix_timestamp.map(PerformanceApi::new),
++                    context_read_set,
+                 })
+             })
+             .await?;
+@@ -298,34 +337,119 @@ impl<RT: Runtime> ActionPhase<RT> {
+         self.component
+     }
+ 
+-    pub fn get_module(
++    pub fn snoop_reads(&mut self) -> anyhow::Result<()> {
++        anyhow::ensure!(self.phase == Phase::Importing);
++        let preloaded = mem::replace(&mut self.preloaded, ActionPreloaded::Preloading);
++        let (tx, module_loader, default_system_env_vars, resources, convex_origin_override) =
++            match preloaded {
++                ActionPreloaded::Created {
++                    tx,
++                    module_loader,
++                    default_system_env_vars,
++                    resources,
++                    convex_origin_override,
++                } => (
++                    tx,
++                    module_loader,
++                    default_system_env_vars,
++                    resources,
++                    convex_origin_override,
++                ),
++                preloaded => {
++                    self.preloaded = preloaded;
++                    anyhow::bail!("Phase not initialized");
++                },
++            };
++        let tx = match tx {
++            MaybeSnooped::Tx(tx) => MaybeSnooped::SnoopedTx(tx.snoop_reads()),
++            MaybeSnooped::SnoopedTx(tx) => {
++                self.preloaded = ActionPreloaded::Created {
++                    tx: MaybeSnooped::SnoopedTx(tx),
++                    module_loader,
++                    default_system_env_vars,
++                    resources,
++                    convex_origin_override,
++                };
++                anyhow::bail!("Called snoop_reads while already snooping")
++            },
++        };
++        self.preloaded = ActionPreloaded::Created {
++            tx,
++            module_loader,
++            default_system_env_vars,
++            resources,
++            convex_origin_override,
++        };
++        Ok(())
++    }
++
++    pub async fn validate_context_read_set(
++        &mut self,
++        read_set: &ContextReadSet,
++    ) -> anyhow::Result<bool> {
++        let ActionPreloaded::Created { tx, .. } = &mut self.preloaded else {
++            anyhow::bail!("Phase not initialized");
++        };
++        ContextCache::validate_and_apply_context_read_set(tx, read_set).await
++    }
++
++    pub fn take_context_read_set(&mut self) -> anyhow::Result<Option<ContextReadSet>> {
++        let ActionPreloaded::Ready {
++            context_read_set, ..
++        } = &mut self.preloaded
++        else {
++            anyhow::bail!("Phase not initialized");
++        };
++        Ok(context_read_set.take())
++    }
++
++    pub async fn get_module(
+         &mut self,
+         module_path: &ModulePath,
+-        _timeout: &mut Timeout<RT>,
++        timeout: &mut Timeout<RT>,
+     ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>> {
++        let canonical_path = module_path.clone().canonicalize();
+         let ActionPreloaded::Ready {
+             ref module_loader,
+-            ref modules,
++            ref module_metadata,
++            ref source_package,
++            ref mut modules,
+             ..
+         } = self.preloaded
+         else {
+             anyhow::bail!("Phase not initialized");
+         };
+-        let module = modules.get(&module_path.clone().canonicalize());
+ 
+-        let Some((module, source)) = module else {
++        if let Some((module, source)) = modules.get(&canonical_path) {
++            let code_cache_result = module_loader.clone().code_cache_result(module);
++            return Ok(Some((source.clone(), code_cache_result)));
++        }
++
++        let Some(module_metadata) = module_metadata.get(&canonical_path) else {
+             return Ok(None);
+         };
+ 
+         anyhow::ensure!(
+-            module.environment == ModuleEnvironment::Isolate,
++            module_metadata.environment == ModuleEnvironment::Isolate,
+             "Trying to execute {:?} in isolate, but it is bundled for {:?}.",
+             module_path,
+-            module.environment
++            module_metadata.environment
+         );
+ 
+-        let code_cache_result = module_loader.clone().code_cache_result(module);
+-        Ok(Some((source.clone(), code_cache_result)))
++        let source = timeout
++            .with_release_permit(
++                PauseReason::LoadModule,
++                module_loader.get_module_with_metadata(
++                    module_metadata,
++                    source_package
++                        .as_ref()
++                        .context("source package not found")?,
++                ),
++            )
++            .await?;
++        let code_cache_result = module_loader.clone().code_cache_result(module_metadata);
++        modules.insert(canonical_path, (module_metadata.clone(), source.clone()));
++        Ok(Some((source, code_cache_result)))
+     }
+ 
+     pub fn begin_execution(&mut self) -> anyhow::Result<()> {
+diff --git a/crates/isolate/src/environment/udf/mod.rs b/crates/isolate/src/environment/udf/mod.rs
+index 079cd5dc5b2fb9f5f6f180884a63995eb641710a..15f6515522a15c708c5f53fe2dbc102116199971 100644
+--- a/crates/isolate/src/environment/udf/mod.rs
++++ b/crates/isolate/src/environment/udf/mod.rs
+@@ -1,4 +1,3 @@
+-use ::metrics::IntoLabel;
+ use astral_future::AstralBody;
+ use common::{
+     self,
+@@ -19,7 +18,6 @@ use common::{
+     execution_context::ExecutionContext,
+     knobs::ISOLATE_MAX_USER_HEAP_SIZE,
+ };
+-use fastrace::local::LocalSpan;
+ use futures::{
+     future::{
+         self,
+@@ -119,7 +117,6 @@ use database::{
+     BiggestDocumentWrites,
+     FunctionExecutionSize,
+     Transaction,
+-    TransactionReadSet,
+     OVER_LIMIT_HELP,
+ };
+ use deno_core::{
+@@ -693,7 +690,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+                     let mut scope = RequestScope::<RT, Self>::enter(v8_scope);
+                     let read_set = scope.state_mut()?.environment.phase.finish_snoop()?;
+                     if let Ok(Ok(_)) = initialize_result {
+-                        context_read_set = Self::capture_context_read_set(
++                        context_read_set = ContextCache::capture_context_read_set(
+                             read_set,
+                             scope.state_mut()?.environment.phase.tx_mut()?,
+                         )
+@@ -1364,71 +1361,10 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+         else {
+             return Ok(None);
+         };
+-        let mut reusable = scopeguard::guard(false, |reusable| {
+-            LocalSpan::add_property(|| ("reuse_success", reusable.as_label()));
+-        });
+         let tx = self.phase.tx_mut()?;
+-        for (namespace, tablet_index_name, table_name, intervals, hash) in &read_set.range_hashes {
+-            let tablet = *tablet_index_name.table();
+-            if !tx.table_mapping().tablet_id_exists(tablet) {
+-                return Ok(None);
+-            }
+-            let (new_namespace, _, new_table_name) =
+-                tx.table_mapping().get_table_metadata(tablet)?;
+-            anyhow::ensure!(namespace == new_namespace, "{tablet} changed namespace?");
+-            anyhow::ensure!(table_name == new_table_name, "{tablet} changed name?");
+-            let Some(new_hash) = tx
+-                .hash_index_interval_no_deps(tablet_index_name, table_name, intervals)
+-                .await?
+-            else {
+-                return Ok(None);
+-            };
+-            if new_hash != *hash {
+-                return Ok(None);
+-            }
++        if !ContextCache::validate_and_apply_context_read_set(tx, &read_set).await? {
++            return Ok(None);
+         }
+-        *reusable = true;
+-        // All hashes match, so make sure to merge the saved read set into `tx`
+-        tx.apply_reads(read_set.read_set.clone());
+         Ok(Some((context, module_map, read_set)))
+     }
+-
+-    #[fastrace::trace]
+-    async fn capture_context_read_set(
+-        read_set: TransactionReadSet,
+-        tx: &mut Transaction<RT>,
+-    ) -> anyhow::Result<Option<ContextReadSet>> {
+-        anyhow::ensure!(
+-            read_set.read_set().iter_search().count() == 0,
+-            "searches can't be done during init"
+-        );
+-        let mut range_hashes = vec![];
+-        for (tablet_index_name, reads) in read_set.read_set().iter_indexed() {
+-            let &(namespace, _table_number, ref table_name) = tx
+-                .table_mapping()
+-                .get_table_metadata(*tablet_index_name.table())?;
+-            anyhow::ensure!(
+-                table_name.is_system(),
+-                "context init read non-system table {table_name}?"
+-            );
+-            let table_name = table_name.clone();
+-            let Some(hash) = tx
+-                .hash_index_interval_no_deps(tablet_index_name, &table_name, &reads.intervals)
+-                .await?
+-            else {
+-                return Ok(None);
+-            };
+-            range_hashes.push((
+-                namespace,
+-                tablet_index_name.clone(),
+-                table_name,
+-                reads.intervals.clone(),
+-                hash,
+-            ));
+-        }
+-        Ok(Some(ContextReadSet {
+-            read_set,
+-            range_hashes,
+-        }))
+-    }
+ }
+diff --git a/crates/isolate/src/request_scope.rs b/crates/isolate/src/request_scope.rs
+index 260440587e3cf02c3f23144da6abed285ba49ef2..6f0c83d03110b71ecdb81f6c8cd83d25cb1f99a4 100644
+--- a/crates/isolate/src/request_scope.rs
++++ b/crates/isolate/src/request_scope.rs
+@@ -100,6 +100,7 @@ pub struct RequestState<RT: Runtime, E: IsolateEnvironment<RT>> {
+     pub stream_listeners: WithHeapSize<BTreeMap<uuid::Uuid, StreamListener>>,
+     /// Tracks bytes read in HTTP action requests
+     pub request_stream_state: Option<RequestStreamState>,
++    http_action_abort_stream_id: Option<uuid::Uuid>,
+     pub console_timers: WithHeapSize<BTreeMap<String, UnixTimestamp>>,
+ }
+ 
+@@ -112,6 +113,7 @@ impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
+             streams: WithHeapSize::default(),
+             stream_listeners: WithHeapSize::default(),
+             request_stream_state: None,
++            http_action_abort_stream_id: None,
+             console_timers: WithHeapSize::default(),
+         }
+     }
+@@ -180,6 +182,36 @@ impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
+         Ok(uuid)
+     }
+ 
++    pub fn create_http_action_abort_stream(&mut self) -> anyhow::Result<uuid::Uuid> {
++        anyhow::ensure!(
++            self.http_action_abort_stream_id.is_none(),
++            "HTTP action abort stream created twice"
++        );
++        let uuid = self.create_stream()?;
++        self.http_action_abort_stream_id = Some(uuid);
++        Ok(uuid)
++    }
++
++    pub fn has_pending_stream_work_for_context_reuse(&self) -> bool {
++        let abort_stream_id = self.http_action_abort_stream_id;
++        // The abort listener is expected to wait for client disconnect. Its Rust
++        // resolver root is dropped with RequestState and must not disable reuse.
++        let has_pending_stream = self.streams.iter().any(|(stream_id, stream)| {
++            if Some(*stream_id) == abort_stream_id {
++                return false;
++            }
++            match stream {
++                Ok(stream) => !stream.done || !stream.parts.is_empty(),
++                Err(_) => true,
++            }
++        });
++        let has_pending_listener = self
++            .stream_listeners
++            .keys()
++            .any(|stream_id| Some(*stream_id) != abort_stream_id);
++        has_pending_stream || has_pending_listener
++    }
++
+     /// As the name implies, the time returned by this function would be a
+     /// source of non-determinism, so should not be externalized to
+     /// functions. An example of a safe use of this function is `console.time`
+diff --git a/crates/isolate/src/termination.rs b/crates/isolate/src/termination.rs
+index 9a61e6146d706450ac126102170d30d581bbb84c..d6a4618fced27cb721625cafd6f291c76a764d38 100644
+--- a/crates/isolate/src/termination.rs
++++ b/crates/isolate/src/termination.rs
+@@ -249,6 +249,9 @@ impl IsolateHandle {
+         inner.next_context_id += 1;
+         if !nested {
+             inner.context_stack.clear();
++            // This is per-root-request diagnostic state. Nested calls must keep
++            // the parent HTTP request size available for OOM reporting.
++            inner.request_stream_bytes = None;
+         }
+         let handle = ContextId { context_id };
+         inner.context_stack.push(context_id);
+diff --git a/patches/reuse_http_action_contexts/README.md b/patches/reuse_http_action_contexts/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..971f420b180ea1c95d8340d947990d3f500a9c2b
+--- /dev/null
++++ b/patches/reuse_http_action_contexts/README.md
+@@ -0,0 +1,310 @@
++# Reuse HTTP Action Contexts
++
++This patch adds an opt-in mode for reusing V8 contexts for HTTP actions. It is
++intended for self-hosted deployments that have a small number of hot HTTP action
++entry points, where the HTTP actions mostly route requests, call Convex queries,
++mutations, or actions, and build HTTP responses. For that shape of application,
++repeatedly creating and initializing a fresh JavaScript realm for each HTTP
++request can be a large fixed cost. Reusing the already-initialized context can
++materially improve throughput and tail latency.
++
++The patch is deliberately behind `REUSE_HTTP_ACTION_CONTEXTS`. It changes the
++semantics of HTTP actions in a way that is acceptable for some deployments and
++not acceptable as a silent global default. It preserves fresh per-request Rust
++state, request state, response state, cancellation state, and callback state,
++but it can preserve JavaScript module and global state across HTTP action
++requests that land on the same cached context.
++
++This note uses "reuse" for the behavior and "cache" for the backend data
++structure that stores a reusable context between requests. A cached context is
++not a user-facing cache API. It is an implementation detail of the isolate
++worker.
++
++## What is being reused
++
++Convex uses several "context" objects at different layers. This patch is about a
++V8 context, not the user-facing JavaScript `ctx` argument and not just a Rust
++dependency-injection object.
++
++A reused HTTP action context contains:
++
++- a `v8::Context`, which is a JavaScript global realm;
++- the JavaScript global object for that realm;
++- already-installed Convex native syscall and op functions on the realm;
++- already-evaluated JavaScript modules and their module-level state;
++- a `ModuleMap`, which maps module specifiers to V8 module handles;
++- a captured `ContextReadSet` for the system-table reads used while initializing
++  the module graph.
++
++The per-request state is not supposed to be reused. Each request still gets a
++fresh `ActionEnvironment`, `RequestState`, `RequestScope`, HTTP request stream
++state, response streamer, identity, callback map, task response receiver,
++cancellation path, and syscall trace. Those objects are installed into V8
++context slots before the request runs and removed when the request scope is
++dropped.
++
++The cache save path also refuses to store an HTTP action context after a request
++that ends with a Convex/JavaScript execution error, records a V8 termination, or
++leaves unresolved action task promises, dynamic imports, unhandled promise
++rejections, or non-abort streams. A non-abort stream must be closed, have no
++unread buffered chunks, and have no listener before the context can be saved.
++This prevents an ignored or partially read request body, fetch body, storage
++body, or response body from carrying request-owned work into a later invocation.
++The request abort stream is the one exception: its listener is expected to
++remain pending until the client disconnects and is detached when the request
++state is dropped.
++
++`TextDecoder` resources follow their JavaScript objects through V8 weak handles
++and are not request-scoped stream work. A decoder deliberately retained in
++module or global state therefore remains usable with the rest of that state;
++one that becomes unreachable is reclaimed with its JavaScript object.
++
++The context is inserted into the cache only after all fallible request
++finalization, including warning emission and result extraction, has completed.
++A request that returns a system error therefore cannot leave its candidate
++context in the cache even if JavaScript execution itself completed cleanly.
++
++Termination is checked after the final microtask checkpoint because that
++checkpoint can still run user code. Error HTTP status codes deliberately written
++by application code are different: if the action successfully streams that
++response, the context can still be saved. A handler or response-body stream
++error, including exceeding the response-body limit, that occurs after the
++response head has started is still an execution error and prevents reuse, even
++though the HTTP result is already represented as streamed. The guard is about
++failed or unfinished execution paths where request-owned JavaScript promises or
++streams may still be attached while the Rust task, callback, cancellation, and
++response state is being dropped.
++
++The action task executor is already closed when that final checkpoint runs. If a
++late microtask tries to start another action task, task registration removes the
++new promise resolver and returns an error instead of panicking on the closed
++task channel. The syscall boundary records termination, so that context is not
++saved.
++
++There is a separate request-local diagnostic guard in
++`IsolateHandle::push_context` in `crates/isolate/src/termination.rs`. For a new
++root request, it clears the saved HTTP request stream byte count used when
++formatting OOM errors. Nested calls preserve the parent value, because the
++parent HTTP request body is still the relevant diagnostic context. This reset
++keeps an OOM in a later reused context from reporting the body size of an
++earlier HTTP request. The request abort signal uses a separate ordinary stream,
++so creating it does not replace the body stream's byte counter.
++
++The important semantic change is that JavaScript module and global state can
++persist. A module-level variable set by one request can be visible to a later
++request if that later request runs on the same cached V8 context. Applications
++should not depend on this for correctness, because contexts can be cleared under
++memory pressure, invalidated by deploy or configuration changes, or simply not
++be the one selected by the scheduler. But with this patch enabled, the behavior
++is possible and expected.
++
++## Cache shape in this patch
++
++The context cache introduced by this patch is local to an isolate worker. It is
++not a single process-global HTTP action context.
++
++Each isolate worker owns a `ContextCache`. HTTP action contexts are cached by
++`CanonicalizedComponentModulePath`, which means component plus module path.
++While a request is running, the context is taken out of that worker's cache. If
++the request succeeds and the context is still reusable, it is saved back into
++that same worker's cache.
++
++For a deployment with one HTTP router module and eight isolate workers, the
++normal warm steady state is therefore up to eight cached HTTP action contexts
++for that router module, not one context per URL route and not one global context
++for all workers. If the application uses multiple HTTP modules or components,
++each worker may cache more than one module-path context over time.
++
++## Why the key is the module path
++
++A single shared HTTP action context could be made to work for some applications,
++but it would be a wider semantic change. It would allow module-level state from
++one HTTP entry module to exist in the same JavaScript realm as another entry
++module that did not import it. That may be harmless for simple applications, but
++it is not the smallest correctness boundary.
++
++The module-path key is a conservative compromise:
++
++- it matches the existing Convex database-UDF context reuse boundary;
++- it avoids sharing module-level globals between unrelated HTTP entry modules;
++- it lets the scheduler prefer an isolate worker that already has the requested
++  module warmed;
++- it keeps invalidation tied to the system-table reads used to initialize that
++  module graph.
++
++For many self-hosted applications, all HTTP routes live in one router module. In
++that common case this patch effectively gives one reusable HTTP action context
++per isolate worker for the whole HTTP router, not one context per URL route.
++
++## Why this can be fast
++
++Without this patch, an HTTP action request may reuse a V8 isolate, but it still
++builds a fresh V8 context and module map for the request. For a hot, simple HTTP
++path, that setup work can dominate the actual application work. The request may
++spend more time creating the JavaScript realm, wiring native Convex functions,
++loading module metadata, evaluating the HTTP router module, and resolving
++imports than doing the useful request-specific operation.
++
++This is especially visible when the HTTP action is mostly a thin adapter around
++Convex function calls. The expensive part is not necessarily the query or
++mutation. The expensive part can be paying the JavaScript initialization cost on
++every request before reaching the cheap or cached operation behind it.
++
++Reusing the V8 context keeps the evaluated router and imported module graph
++warm. The next request can install fresh per-request state into the same realm
++and enter the already-evaluated code. This removes a large fixed cost from the
++hot path.
++
++In one self-hosted stress test with one hot HTTP action endpoint,
++`HTTP_SERVER_MAX_CONCURRENT_REQUESTS=192`, and a `30s` warm run at `200 rps`,
++disabling HTTP action context reuse produced `587/6000` successful responses,
++`5413` HTTP `503` responses, and a p95 latency of `6651 ms`. Enabling reuse on
++the same backend candidate produced `6000/6000` successful responses with p50
++`46 ms`, p95 `110 ms`, and p99 `296 ms`. These numbers are not a universal
++benchmark, but they show the kind of fixed per-request cost this patch is meant
++to remove.
++
++## What the read-set validation means
++
++The `ContextReadSet` uses Convex's normal transaction read tracking machinery.
++During HTTP action context initialization, Convex reads system tables for data
++such as module metadata, source package metadata, environment variables,
++component resources, canonical URLs, and UDF configuration. The patch can snoop
++those initialization reads and store enough information to validate them later.
++
++Before a cached HTTP action context is reused, the backend checks that the
++relevant system-table ranges still hash the same way. If those reads no longer
++validate, the cached context is discarded and the request initializes a fresh
++context.
++
++This is not a separate deployment-version token. It is a use of Convex's
++existing transactional read-set concept for system metadata. That matters
++because deploys, environment variable changes, resource changes, component
++changes, and canonical URL changes are represented as writes to Convex system
++tables. If those writes affect the ranges read during context initialization,
++validation fails and reuse stops for that old context.
++
++The current implementation was reviewed specifically for freshness paths around
++deploys, source package changes, environment variables, component resources,
++canonical URLs, and component metadata. The important property is that the
++cached context is not reused until the saved initialization reads validate
++against the current transaction. The core validation helper is
++`ContextCache::validate_and_apply_context_read_set` in
++`crates/isolate/src/context_cache.rs`, and the HTTP action reuse call site is
++`ActionEnvironment::run_http_action` in
++`crates/isolate/src/environment/action/mod.rs`. This does not prove that no
++subtle invalidation bug can exist, which is one reason the behavior remains
++explicit and opt-in, but the main known stale-router failure mode is addressed
++by validating the system metadata reads before reuse.
++
++## Why this is not an obvious upstream default
++
++We do not know why this optimization is not already upstream. The most plausible
++reason is that it is not only an implementation optimization; it is a contract
++change.
++
++Fresh HTTP action contexts imply a simple model: module/global JavaScript state
++does not live across HTTP requests. Reusing contexts changes that model. A
++hosted product cannot assume every application treats module globals as
++stateless implementation detail. It also has to consider worker stickiness,
++memory retained by arbitrary module graphs, and support cases where behavior
++depends on whether a request hit a warm worker or a fresh one.
++
++For self-hosted deployments, the operator usually owns both the code and the
++runtime policy. That makes the trade easier to evaluate directly. If the code
++does not store request-specific state in module globals, and if rollback is
++available by disabling `REUSE_HTTP_ACTION_CONTEXTS`, the optimization is a
++reasonable self-hosted default candidate.
++
++## When this patch is a good fit
++
++This note is written for self-hosted operators. In that setting, the patch is a
++good fit for the common Convex HTTP action style: routes validate an HTTP
++request, call Convex queries, mutations, or actions, and prepare an HTTP
++response. That code shape usually should not keep request-specific mutable state
++in module globals anyway, so the semantic change is mostly "the router and its
++imports stay warm" rather than "the application now depends on in-memory cross
++request state."
++
++The main self-assessment is simple: inspect HTTP action modules for top-level
++mutable state that is intended to be per request. If there is none, the patch is
++usually a reasonable self-hosted optimization to test. If there is request-owned
++state in module globals, move it into the handler scope before enabling this
++knob. In particular, do not retain a request, response, action context, stream,
++or promise from one handler in a module global. If the application intentionally
++uses module globals as an in-process cache, treat that cache as best-effort
++only; isolate recreation, memory pressure, deploys, and scheduler choices can
++all clear or bypass it.
++
++For the standard self-hosted Docker Compose file, set
++`REUSE_HTTP_ACTION_CONTEXTS=true` in the Compose environment or the `.env` file.
++The Compose file passes the variable through without supplying a default, so an
++unset value preserves the backend's default of `false`.
++
++## Memory behavior
++
++V8 does not expose a simple, precise "bytes owned by this context" value through
++this code path. The backend can observe isolate-level heap statistics such as
++used heap, total heap, available heap, external memory, native context count,
++and detached context count. Per-context attribution is much harder because
++contexts share one isolate heap.
++
++The practical memory guard is therefore isolate-level rather than exact
++per-context accounting. The backend already checks isolate heap availability
++between requests. If the isolate does not have enough available heap and cached
++contexts exist, the context cache is marked under memory pressure and contexts
++are cleared before constructing a fresh context. If memory is still
++insufficient, the isolate is treated as not clean and is recreated.
++
++A matching cached context can still be taken directly while the cache is marked
++under memory pressure; this is the existing behavior shared with reusable
++database-UDF contexts and avoids allocating another V8 context. Therefore,
++memory pressure does not guarantee immediate eviction of a hot HTTP context.
++The isolate heap limit, idle timeout, and maximum lifetime remain the backstops
++for a repeatedly reused context. Operators should not interpret the cache's
++memory-pressure handling as a per-context memory cap.
++
++Operators adopting this patch should treat context reuse as a memory-throughput
++tradeoff. The maximum idle warm state is one saved reusable context per isolate
++worker, shared with database-UDF reuse. Increasing isolate worker count can
++therefore increase the number of retained contexts. Multiple hot modules change
++which contexts occupy those worker slots rather than multiplying the per-worker
++slot count. Module graph size and top-level caches should still be measured.
++
++The companion
++[`context_reuse_observability/README.md`](../context_reuse_observability/README.md) patch exposes
++HTTP cache save, take, clear, occupancy, and scheduler-affinity
++signals with bounded `context_kind="http_action"` labels. It deliberately does
++not add route or module labels.
++
++For a rough estimate, assume one hot HTTP router module, eight isolate workers,
++and a single-digit MiB retained context size after warmup. That is usually tens
++of MiB of retained heap, not GiBs. Even if the warm context is closer to `10
++MiB`, an eight-worker deployment is around `80 MiB` for the main HTTP router
++context. On a `4 vCPU / 16 GiB` self-hosted server, that is unlikely to be the
++dominant memory term. The risk becomes more meaningful with many separate HTTP
++modules, large import graphs, or top-level in-memory caches.
++
++The practical operating check is concrete: after enabling the knob, run a warm
++load test for the hot HTTP path and compare p50/p95/p99 latency, HTTP `503`
++count, isolate used heap, isolate available heap, native context count, detached
++context count, and isolate recreation reasons. Also verify that a deploy or
++relevant environment/resource change is visible after the next request, which
++exercises the read-set invalidation path.
++
++Application code should still be correct when contexts are not reused. Context
++reuse is a performance optimization with observable state-retention semantics,
++not a durable in-memory cache API.
++## Interaction with isolate queue delay control
++
++HTTP action context reuse can reduce action initialization time and therefore
++change isolate service time, queue sojourn, and retained heap per worker. It
++does not change whether an HTTP action is an independent action or whether a
++nested call is a dependency. The opt-in queue policy is documented in
++[`isolate_queue_control/README.md`](../isolate_queue_control/README.md).
++
++Keep the two controls independently reversible. A queue-policy comparison
++should hold context reuse constant, and a context-reuse comparison should hold
++worker, admission, and queue policy constant. Mixed-load validation should
++cover warm and cold HTTP actions, nested queries and mutations, isolate heap
++pressure, context invalidation, queue rejections, and dispatch sojourn.
+diff --git a/self-hosted/docker/docker-compose.yml b/self-hosted/docker/docker-compose.yml
+index b4abf72d339801453b6c744b09d7b9a77a8378dc..1f7cd9325cfd3ecc2ade8bdd23f45325e5b64363 100644
+--- a/self-hosted/docker/docker-compose.yml
++++ b/self-hosted/docker/docker-compose.yml
+@@ -37,6 +37,7 @@ services:
+       - MYSQL_URL
+       - POSTGRES_URL
+       - REDACT_LOGS_TO_CLIENT
++      - REUSE_HTTP_ACTION_CONTEXTS
+       - RUST_BACKTRACE
+       - RUST_LOG=${RUST_LOG:-info}
+       - S3_ENDPOINT_URL

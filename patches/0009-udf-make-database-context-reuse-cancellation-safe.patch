@@ -1,0 +1,1073 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 15 Jul 2026 01:38:06 +0800
+Subject: [PATCH 09/24] udf: make database context reuse cancellation-safe
+
+Preserve upstream module-wide experimental_reuseContext behavior for queries
+and mutations while keeping actions and HTTP actions fresh at the database-UDF
+boundary. Recheck the typed decision at validation, scheduler-affinity,
+context-take, and context-save boundaries.
+
+Carry an explicit caller-drop signal through queued and same-isolate recursive
+UDF execution. Give separately scheduled nested UDF callbacks their own signal
+and publish cancellation before their response receiver closes when the parent
+stops waiting. Recheck cancellation and termination after the final microtask
+checkpoint immediately before publishing a reusable context, while keeping the
+documented post-check timeout race explicit.
+
+Cover conversion and cancellation primitives and document the generic
+adoption, source-purity, and rollback contract without an application module
+allowlist.
+---
+ crates/isolate/src/client.rs                  | 115 ++++++++++++++-
+ crates/isolate/src/context_cache.rs           |  18 ++-
+ crates/isolate/src/environment/action/mod.rs  |  11 +-
+ crates/isolate/src/environment/udf/mod.rs     |  64 +++++----
+ crates/isolate/src/isolate_worker.rs          |   5 +-
+ crates/model/src/modules/module_versions.rs   |   9 +-
+ crates/pb/protos/common.proto                 |   2 +
+ crates/udf/src/validation.rs                  | 109 ++++++++++++---
+ .../README.md                                 | 112 +++++++++++++++
+ .../cancellation_design_reference.md          | 131 ++++++++++++++++++
+ patches/reuse_http_action_contexts/README.md  |   5 +
+ self-hosted/advanced/knobs.md                 |   8 +-
+ 12 files changed, 517 insertions(+), 72 deletions(-)
+ create mode 100644 patches/cancellation_safe_database_context_reuse/README.md
+ create mode 100644 patches/cancellation_safe_database_context_reuse/cancellation_design_reference.md
+
+diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
+index f424c344b8ee03ba573cc444e222aa75cbd961ce..b6c91ac26f715d432f30a599ebaa45fcc922a7a6 100644
+--- a/crates/isolate/src/client.rs
++++ b/crates/isolate/src/client.rs
+@@ -9,6 +9,7 @@ use std::{
+     pin::pin,
+     sync::{
+         atomic::{
++            AtomicBool,
+             AtomicUsize,
+             Ordering,
+         },
+@@ -127,6 +128,7 @@ use futures::{
+         PollNext,
+         StreamExt,
+     },
++    task::AtomicWaker,
+     TryStreamExt as _,
+ };
+ use itertools::Either;
+@@ -174,6 +176,7 @@ use value::identifier::Identifier;
+ use crate::{
+     concurrency_limiter::ConcurrencyLimiter,
+     context_cache::{
++        context_cache_key,
+         CachedContexts,
+         ContextCache,
+     },
+@@ -221,6 +224,74 @@ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
+ pub const PAUSE_REQUEST: &str = "pause_request";
+ pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
+ 
++/// Caller-drop signal for one database-UDF execution tree.
++///
++/// Nested UDF syscalls are unbatched, so same-isolate recursion has one active
++/// descendant chain. Waking the most recently registered frame repolls the
++/// `RecursiveExecutor` tree.
++#[derive(Clone)]
++pub struct CancellationSignal {
++    inner: Arc<CancellationState>,
++}
++
++struct CancellationState {
++    cancelled: AtomicBool,
++    waker: AtomicWaker,
++}
++
++impl CancellationSignal {
++    fn new() -> Self {
++        Self {
++            inner: Arc::new(CancellationState {
++                cancelled: AtomicBool::new(false),
++                waker: AtomicWaker::new(),
++            }),
++        }
++    }
++
++    fn cancel(&self) {
++        self.inner.cancelled.store(true, Ordering::Release);
++        self.inner.waker.wake();
++    }
++
++    pub(crate) fn is_cancelled(&self) -> bool {
++        self.inner.cancelled.load(Ordering::Acquire)
++    }
++
++    pub(crate) async fn cancelled(&self) {
++        std::future::poll_fn(|cx| {
++            if self.is_cancelled() {
++                return std::task::Poll::Ready(());
++            }
++            self.inner.waker.register(cx.waker());
++            // Recheck after registration so cancellation between the first load and
++            // waker installation cannot be lost.
++            if self.is_cancelled() {
++                std::task::Poll::Ready(())
++            } else {
++                std::task::Poll::Pending
++            }
++        })
++        .await
++    }
++}
++
++struct CancelUdfOnDrop(Option<CancellationSignal>);
++
++impl CancelUdfOnDrop {
++    fn disarm(mut self) {
++        self.0 = None;
++    }
++}
++
++impl Drop for CancelUdfOnDrop {
++    fn drop(&mut self) {
++        if let Some(signal) = &self.0 {
++            signal.cancel();
++        }
++    }
++}
++
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ struct RequestSchedulingProperties {
+     unblocks_ancestor: bool,
+@@ -783,10 +854,7 @@ impl<RT: Runtime> Request<RT> {
+             #[cfg(test)]
+             RequestType::Test { .. } => return None,
+         };
+-        Some(CanonicalizedComponentModulePath {
+-            component: function_path.component,
+-            module_path: function_path.udf_path.module().clone(),
+-        })
++        Some(context_cache_key(function_path))
+     }
+ 
+     fn scheduling_properties(
+@@ -821,6 +889,7 @@ pub enum RequestType<RT: Runtime> {
+     Udf {
+         request: UdfRequest<RT>,
+         environment_data: EnvironmentData<RT>,
++        cancellation: CancellationSignal,
+         response: oneshot::Sender<anyhow::Result<(Transaction<RT>, FunctionOutcome)>>,
+         queue_timer: Timer<VMHistogram>,
+         rng_seed: [u8; 32],
+@@ -1311,6 +1380,8 @@ impl<RT: Runtime> IsolateClient<RT> {
+         scheduler_dependency: SchedulerDependencyClass,
+     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
+         let (tx, rx) = oneshot::channel();
++        let cancellation = CancellationSignal::new();
++        let caller_cancellation = cancellation.clone();
+         let request = RequestType::Udf {
+             request: UdfRequest {
+                 path_and_args,
+@@ -1321,6 +1392,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+                 context,
+             },
+             environment_data,
++            cancellation,
+             response: tx,
+             queue_timer: queue_timer(),
+             rng_seed,
+@@ -1338,7 +1410,13 @@ impl<RT: Runtime> IsolateClient<RT> {
+             EncodedSpan::from_parent(),
+             scheduler_dependency,
+         ))?;
+-        let (tx, outcome) = Self::receive_response(rx).await??;
++        let response = pin!(Self::receive_response(rx));
++        // Declare this guard after the pinned response future so cancellation is
++        // published before dropping the receiver when this task is dropped.
++        let cancel_on_drop = CancelUdfOnDrop(Some(caller_cancellation));
++        let response = response.await;
++        cancel_on_drop.disarm();
++        let (tx, outcome) = response??;
+ 
+         Ok((tx, outcome))
+     }
+@@ -1796,9 +1874,12 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+     ) -> anyhow::Result<(Transaction<RT>, NestedUdfOutcome)> {
+         let subquery_path = udf_request.path_and_args.path().clone();
+         let (tx, rx) = oneshot::channel();
++        let cancellation = CancellationSignal::new();
++        let caller_cancellation = cancellation.clone();
+         let request = RequestType::Udf {
+             request: udf_request,
+             environment_data,
++            cancellation,
+             response: tx,
+             queue_timer: queue_timer(),
+             rng_seed,
+@@ -1820,7 +1901,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+             .ok()
+             .context("scheduler shut down")?;
+         metrics::log_scheduler_request_enqueued(self.pool_name, scheduling_properties.as_label());
+-        let (tx, outcome) = IsolateClient::<RT>::receive_response(rx).await??;
++        let response = pin!(IsolateClient::<RT>::receive_response(rx));
++        // Match `execute_udf`: publish child cancellation before receiver
++        // closure if its parent stops waiting for this separately scheduled UDF.
++        let cancel_on_drop = CancelUdfOnDrop(Some(caller_cancellation));
++        let response = response.await;
++        cancel_on_drop.disarm();
++        let (tx, outcome) = response??;
+         let outcome = match outcome {
+             FunctionOutcome::Query(outcome) | FunctionOutcome::Mutation(outcome) => {
+                 NestedUdfOutcome {
+@@ -2662,6 +2749,8 @@ mod tests {
+         wait_for_external_permit,
+         worker_rejection_reason,
+         ActiveRequestCounts,
++        CancelUdfOnDrop,
++        CancellationSignal,
+         ExternalPermitWaitOutcome,
+         IdleWorkerInfo,
+         IsolateConfig,
+@@ -3255,6 +3344,20 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn caller_drop_signal_is_shared_and_guard_can_be_disarmed() {
++        let signal = CancellationSignal::new();
++        let nested_signal = signal.clone();
++
++        CancelUdfOnDrop(Some(signal.clone())).disarm();
++        assert!(!signal.is_cancelled());
++        assert!(!nested_signal.is_cancelled());
++
++        drop(CancelUdfOnDrop(Some(signal.clone())));
++        assert!(signal.is_cancelled());
++        assert!(nested_signal.is_cancelled());
++    }
++
+     #[test]
+     fn dependency_and_descendant_capability_are_independent() {
+         assert_eq!(properties(false, false, false).as_label(), "independent");
+diff --git a/crates/isolate/src/context_cache.rs b/crates/isolate/src/context_cache.rs
+index 707277fdd437f2f67ed2d84b95712544cf7c99ac..688861cf234d127245c63402dbd702e1ed407e6e 100644
+--- a/crates/isolate/src/context_cache.rs
++++ b/crates/isolate/src/context_cache.rs
+@@ -2,7 +2,10 @@ use std::sync::Arc;
+ 
+ use ::metrics::IntoLabel;
+ use common::{
+-    components::CanonicalizedComponentModulePath,
++    components::{
++        CanonicalizedComponentModulePath,
++        ResolvedComponentFunctionPath,
++    },
+     interval::IntervalSet,
+     knobs::REUSE_HTTP_ACTION_CONTEXTS,
+     runtime::Runtime,
+@@ -84,6 +87,15 @@ pub(crate) struct ContextReadSet {
+     )>,
+ }
+ 
++pub(crate) fn context_cache_key(
++    function_path: &ResolvedComponentFunctionPath,
++) -> CanonicalizedComponentModulePath {
++    CanonicalizedComponentModulePath {
++        component: function_path.component,
++        module_path: function_path.udf_path.module().clone(),
++    }
++}
++
+ impl ContextCache {
+     pub fn new() -> Self {
+         Self {
+@@ -303,7 +315,9 @@ impl CachedContexts {
+     pub fn can_serve_request<RT: Runtime>(&self, request: &Request<RT>) -> bool {
+         let this = self.inner.lock();
+         match &request.inner {
+-            RequestType::Udf { request: inner, .. } if inner.path_and_args.reuse_context() => {
++            RequestType::Udf { request: inner, .. }
++                if inner.path_and_args.reuse_context(inner.udf_type) =>
++            {
+                 request.module().is_some_and(|module| {
+                     matches!(
+                         &this.saved_context,
+diff --git a/crates/isolate/src/environment/action/mod.rs b/crates/isolate/src/environment/action/mod.rs
+index c4f634f393b7e7bcb1fea7adcacfcbdf632d611e..1c5abe1d833c46111edea6e6f1c615e444993929 100644
+--- a/crates/isolate/src/environment/action/mod.rs
++++ b/crates/isolate/src/environment/action/mod.rs
+@@ -18,7 +18,6 @@ use std::{
+ use anyhow::anyhow;
+ use common::{
+     components::{
+-        CanonicalizedComponentModulePath,
+         ComponentId,
+         ComponentPath,
+     },
+@@ -148,7 +147,10 @@ use crate::{
+         EnvironmentData,
+         SharedIsolateHeapStats,
+     },
+-    context_cache::ContextCache,
++    context_cache::{
++        context_cache_key,
++        ContextCache,
++    },
+     environment::{
+         helpers::{
+             module_loader::module_specifier_from_path,
+@@ -352,10 +354,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+             _ = tx.send(());
+         }
+         scope!(let handle_scope, isolate.isolate());
+-        let reusable_module_path = CanonicalizedComponentModulePath {
+-            component: component_function_path.component,
+-            module_path: udf_path.module().clone(),
+-        };
++        let reusable_module_path = context_cache_key(component_function_path);
+         let mut context_scope;
+         let mut reused_http_action_context = false;
+         let reused_context = if *REUSE_HTTP_ACTION_CONTEXTS
+diff --git a/crates/isolate/src/environment/udf/mod.rs b/crates/isolate/src/environment/udf/mod.rs
+index 15f6515522a15c708c5f53fe2dbc102116199971..14b1daa2bca646ba0ca8a5a7b21409d55f8c8ff0 100644
+--- a/crates/isolate/src/environment/udf/mod.rs
++++ b/crates/isolate/src/environment/udf/mod.rs
+@@ -7,7 +7,6 @@ use common::{
+     },
+     components::{
+         CanonicalizedComponentFunctionPath,
+-        CanonicalizedComponentModulePath,
+         ResolvedComponentFunctionPath,
+     },
+     document::{
+@@ -18,13 +17,6 @@ use common::{
+     execution_context::ExecutionContext,
+     knobs::ISOLATE_MAX_USER_HEAP_SIZE,
+ };
+-use futures::{
+-    future::{
+-        self,
+-        BoxFuture,
+-    },
+-    FutureExt,
+-};
+ use itertools::Either;
+ use model::{
+     environment_variables::types::{
+@@ -51,6 +43,7 @@ use udf::{
+ 
+ use crate::{
+     context_cache::{
++        context_cache_key,
+         ContextCache,
+         ContextReadSet,
+     },
+@@ -164,6 +157,7 @@ use self::{
+ use super::ModuleCodeCacheResult;
+ use crate::{
+     client::{
++        CancellationSignal,
+         EnvironmentData,
+         SharedIsolateHeapStats,
+         UdfCallback,
+@@ -365,6 +359,7 @@ type UdfRecursiveExecutor<RT> = RecursiveExecutor<
+         anyhow::Result<Result<PendingValue, JsError>>,
+     )>,
+ >;
++
+ struct RunUdf<'a, 'b, RT: Runtime> {
+     rt: &'a RT,
+     v8_scope: &'a mut v8::Isolate,
+@@ -373,6 +368,7 @@ struct RunUdf<'a, 'b, RT: Runtime> {
+     isolate_handle: &'a IsolateHandle,
+     executor: &'a UdfRecursiveExecutor<RT>,
+     heap_stats: &'a SharedIsolateHeapStats,
++    cancellation: CancellationSignal,
+ }
+ 
+ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -393,9 +389,10 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+             client_id,
+             rng_seed,
+         );
+-        // it is not necessary to propagate cancellation as the parent will already
+-        // cancel the entire tree of futures.
+-        let cancellation = future::pending().boxed();
++        // Same-isolate nested JavaScript can complete synchronously before the parent
++        // select repolls cancellation, so its context-save boundary needs the shared
++        // caller-drop signal too.
++        let cancellation = self.cancellation;
+         // N.B.: `run_nested` calls the corresponding `pop_context`.
+         // This may not happen in case of a system error, but in that case we
+         // are going to throw away the entire context stack anyway.
+@@ -470,7 +467,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+         client_id: String,
+         rng_seed: [u8; 32],
+     ) -> (Self, DatabaseUdfArgs) {
+-        let reuse_context = path_and_args.reuse_context();
++        let reuse_context = path_and_args.reuse_context(udf_type);
+         let (path, arguments, udf_server_version) = path_and_args.consume();
+         let component = path.component;
+         let identity = transaction.inert_identity();
+@@ -525,7 +522,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+         context_cache: &mut ContextCache,
+         permit: ConcurrencyPermit,
+         isolate_clean: &mut bool,
+-        cancellation: BoxFuture<'_, ()>,
++        cancellation: CancellationSignal,
+         args: DatabaseUdfArgs,
+         function_started: Option<oneshot::Sender<()>>,
+         udf_callback: Option<IsolateClient<RT>>,
+@@ -632,7 +629,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+         mut request_state: RequestState<RT, Self>,
+         timeout: &mut Timeout<RT>,
+         isolate_clean: &mut bool,
+-        cancellation: BoxFuture<'_, ()>,
++        cancellation: CancellationSignal,
+         udf_callback: Option<IsolateClient<RT>>,
+     ) -> anyhow::Result<(Self, anyhow::Result<Result<PendingValue, JsError>>)> {
+         scope!(let handle_scope, isolate);
+@@ -707,7 +704,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+                         &mut *v8_scope,
+                         context_cache,
+                         timeout,
+-                        cancellation,
++                        &cancellation,
+                         args,
+                         module,
+                         udf_callback,
+@@ -723,6 +720,12 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+         // to ensure the microtask queue is empty. Otherwise, JS from this request may
+         // leak to a subsequent one on isolate reuse.
+         isolate_context.checkpoint();
++        // The final checkpoint can run user code and trigger termination after
++        // `run_inner` performed its last check. Preserve that failure through the
++        // context-save gate; the top-level request will extract the specific error.
++        if let Err(e) = isolate_handle.check_terminated() {
++            result = Err(e);
++        }
+         *isolate_clean = true;
+ 
+         let request_state = isolate_context.take_state().context("Lost RequestState?")?;
+@@ -733,8 +736,19 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+             Err(e) => result = Ok(Err(e)),
+         }
+ 
+-        // Only reuse contexts if the execution was successful, in case
+-        // there are any promises hanging around
++        // Database UDFs do not poll cancellation while synchronous JavaScript runs.
++        // Check again at the save boundary so a dropped caller cannot retain the
++        // context of an execution whose result it will never receive.
++        if args.reuse_context
++            && context_read_set.is_some()
++            && matches!(result, Ok(Ok(_)))
++            && cancellation.is_cancelled()
++        {
++            log_isolate_request_cancelled();
++            result = Err(anyhow!("Cancelled"));
++        }
++
++        // Only reuse contexts after successful isolate execution.
+         if args.reuse_context
+             && let Ok(Ok(_)) = result
+             && let Some(read_set) = context_read_set
+@@ -745,10 +759,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+             let v8_scope = isolate_context.scope();
+             let context = v8_scope.get_current_context();
+             context_cache.save_context(
+-                CanonicalizedComponentModulePath {
+-                    component: this.path.component,
+-                    module_path: this.path.udf_path.module().clone(),
+-                },
++                context_cache_key(&this.path),
+                 v8::Global::new(v8_scope, context),
+                 module_map,
+                 read_set,
+@@ -819,7 +830,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+         v8_scope: &mut v8::PinScope<'_, '_>,
+         context_cache: &mut ContextCache,
+         timeout: &mut Timeout<RT>,
+-        cancellation: BoxFuture<'_, ()>,
++        cancellation: &CancellationSignal,
+         args: &DatabaseUdfArgs,
+         module: v8::Local<'_, v8::Module>,
+         udf_callback: Option<IsolateClient<RT>>,
+@@ -947,7 +958,6 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+             Ok(None) => anyhow::bail!("Successful invocation returned None"),
+             Err(e) => return Ok(Err(e)),
+         };
+-        let mut cancellation = cancellation;
+         loop {
+             // Advance the user's promise as far as it can go by draining the microtask
+             // queue.
+@@ -1036,6 +1046,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+                                 isolate_handle: handle,
+                                 executor,
+                                 heap_stats: &heap_stats,
++                                cancellation: (*cancellation).clone(),
+                             };
+                             let udf_callback = if let Some(callback) = &udf_callback {
+                                 Either::Left(callback)
+@@ -1044,7 +1055,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+                             };
+                             select! {
+                                 biased;
+-                                _ = &mut cancellation => {
++                                _ = cancellation.cancelled() => {
+                                     log_isolate_request_cancelled();
+                                     anyhow::bail!("Cancelled");
+                                 },
+@@ -1353,10 +1364,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+         &mut self,
+         context_cache: &mut ContextCache,
+     ) -> anyhow::Result<Option<(v8::Global<v8::Context>, ModuleMap, ContextReadSet)>> {
+-        let module_path = CanonicalizedComponentModulePath {
+-            component: self.path.component,
+-            module_path: self.path.udf_path.module().clone(),
+-        };
++        let module_path = context_cache_key(&self.path);
+         let Some((context, module_map, read_set)) = context_cache.take_reused_context(&module_path)
+         else {
+             return Ok(None);
+diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
+index acce24f4d063f4a106cc43e42f785316e2233b66..6e6967bfd7eb46e6a4baf95717e4df624eb3caf5 100644
+--- a/crates/isolate/src/isolate_worker.rs
++++ b/crates/isolate/src/isolate_worker.rs
+@@ -72,7 +72,8 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
+             RequestType::Udf {
+                 request,
+                 environment_data,
+-                mut response,
++                cancellation,
++                response,
+                 queue_timer,
+                 rng_seed,
+                 reactor_depth,
+@@ -99,7 +100,7 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
+                         context_cache,
+                         permit,
+                         &mut isolate_clean,
+-                        response.closed().boxed(),
++                        cancellation,
+                         args,
+                         function_started_sender,
+                         udf_callback,
+diff --git a/crates/model/src/modules/module_versions.rs b/crates/model/src/modules/module_versions.rs
+index 1e71f8e5e0848d2b46048dc8c7f9b974427370e0..cf9b0061d608747fd53dd618c1b9de344d44be3b 100644
+--- a/crates/model/src/modules/module_versions.rs
++++ b/crates/model/src/modules/module_versions.rs
+@@ -96,9 +96,12 @@ pub struct AnalyzedModule {
+     pub cron_specs: Option<WithHeapSize<BTreeMap<CronIdentifier, CronSpec>>>,
+     /// Index of the module's original source in the source map.
+     pub source_index: Option<u32>,
+-    /// Whether to keep around the JS context after running a function from this
+-    /// module. If true, state will non-deterministically leak from UDF to UDF
+-    /// (e.g. on the global object or module attributes).
++    /// Whether this module requests experimental JS context reuse. Effective
++    /// reuse also depends on the function type and runtime-specific policy;
++    /// database queries and mutations may be eligible, while actions and HTTP
++    /// actions are ineligible at the database-UDF boundary. When reuse occurs,
++    /// state can non-deterministically leak between executions (e.g. on the
++    /// global object or module attributes).
+     ///
+     /// This is experimental for now and the reuse isn't guaranteed to happen.
+     pub reuse_context: bool,
+diff --git a/crates/pb/protos/common.proto b/crates/pb/protos/common.proto
+index 6e47db9a428a58826b188daa89d674297b32bac0..20606073355d3e507268d8c915e2bef5023dd2bf 100644
+--- a/crates/pb/protos/common.proto
++++ b/crates/pb/protos/common.proto
+@@ -10,6 +10,7 @@ message ValidatedPathAndArgs {
+   optional string npm_version = 3;
+   optional ComponentPath component_path = 4;
+   optional string component_id = 5;
++  // Consumers must combine this value with the request's UdfType.
+   optional bool reuse_context = 6;
+ }
+ 
+@@ -18,6 +19,7 @@ message ValidatedHttpPath {
+   optional ComponentPath component_path = 22;
+   optional string component_id = 3;
+   optional string npm_version = 4;
++  // Legacy database-module marker. HTTP action reuse does not use this field.
+   optional bool reuse_context = 5;
+ }
+ 
+diff --git a/crates/udf/src/validation.rs b/crates/udf/src/validation.rs
+index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..8f48b25fae9bad4f1ff4de89e27dea1fa192de4e 100644
+--- a/crates/udf/src/validation.rs
++++ b/crates/udf/src/validation.rs
+@@ -447,8 +447,9 @@ impl VisibilityInfo {
+ /// - Checking the args size.
+ /// - Checking that the args pass validation.
+ ///
+-/// This should only be constructed via `ValidatedPathAndArgs::new` to use the
+-/// type system to enforce that validation is never skipped.
++/// This should only be constructed by the validation methods below or
++/// deserialized from a trusted function-runner protocol value. Protocol
++/// consumers must still combine its reuse bit with the accompanying `UdfType`.
+ #[derive(Clone, Eq, PartialEq)]
+ pub struct ValidatedPathAndArgs {
+     path: ResolvedComponentFunctionPath,
+@@ -458,6 +459,13 @@ pub struct ValidatedPathAndArgs {
+     reuse_context: bool,
+ }
+ 
++fn database_udf_context_reuse_enabled(reuse_context: bool, udf_type: UdfType) -> bool {
++    match udf_type {
++        UdfType::Query | UdfType::Mutation => reuse_context,
++        UdfType::Action | UdfType::HttpAction => false,
++    }
++}
++
+ impl ValidatedPathAndArgs {
+     /// Check if the function being called matches the allowed visibility and
+     /// return a ValidatedPathAndArgs or an appropriate JsError.
+@@ -723,7 +731,10 @@ impl ValidatedPathAndArgs {
+                 path,
+                 args,
+                 npm_version: Some(version),
+-                reuse_context,
++                reuse_context: database_udf_context_reuse_enabled(
++                    reuse_context,
++                    expected_udf_type,
++                ),
+             },
+             visibility_info,
+         )))
+@@ -780,8 +791,73 @@ impl ValidatedPathAndArgs {
+         })
+     }
+ 
+-    pub fn reuse_context(&self) -> bool {
+-        self.reuse_context
++    pub fn reuse_context(&self, udf_type: UdfType) -> bool {
++        // Check the type again because `from_proto` reconstructs this value without
++        // passing through `new_inner`.
++        database_udf_context_reuse_enabled(self.reuse_context, udf_type)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use common::{
++        components::{
++            ComponentId,
++            ComponentPath,
++            ResolvedComponentFunctionPath,
++        },
++        types::UdfType,
++    };
++    use sync_types::types::SerializedArgs;
++
++    use super::{
++        ValidatedHttpPath,
++        ValidatedPathAndArgs,
++    };
++
++    fn marked_path_and_args() -> ValidatedPathAndArgs {
++        ValidatedPathAndArgs {
++            path: ResolvedComponentFunctionPath {
++                component: ComponentId::Root,
++                udf_path: "mixed.js:function".parse().expect("invalid test UDF path"),
++                component_path: ComponentPath::root(),
++            },
++            args: SerializedArgs::from_args(vec![]).expect("invalid test arguments"),
++            npm_version: None,
++            reuse_context: true,
++        }
++    }
++
++    #[test]
++    fn protocol_reuse_bit_is_enabled_only_for_database_requests() {
++        let proto: pb::common::ValidatedPathAndArgs = marked_path_and_args()
++            .try_into()
++            .expect("failed to serialize test path and arguments");
++        assert_eq!(proto.reuse_context, Some(true));
++
++        let path_and_args = ValidatedPathAndArgs::from_proto(proto)
++            .expect("failed to deserialize test path and arguments");
++        assert!(path_and_args.reuse_context(UdfType::Query));
++        assert!(path_and_args.reuse_context(UdfType::Mutation));
++        assert!(!path_and_args.reuse_context(UdfType::Action));
++        assert!(!path_and_args.reuse_context(UdfType::HttpAction));
++    }
++
++    #[test]
++    fn http_protocol_reuse_bit_is_cleared() {
++        let proto = pb::common::ValidatedHttpPath {
++            path: Some("http.js:default".to_string()),
++            component_path: Some(ComponentPath::root().into()),
++            component_id: ComponentId::Root.serialize_to_string(),
++            npm_version: None,
++            reuse_context: Some(true),
++        };
++        let validated_path =
++            ValidatedHttpPath::from_proto(proto).expect("failed to deserialize test HTTP path");
++        let proto: pb::common::ValidatedHttpPath = validated_path
++            .try_into()
++            .expect("failed to serialize test HTTP path");
++        assert_eq!(proto.reuse_context, Some(false));
+     }
+ }
+ 
+@@ -811,13 +887,12 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
+ 
+ /// A UDF path that has been validated to be an HTTP route.
+ ///
+-/// This should only be constructed via `ValidatedHttpRoute::try_from` to use
+-/// the type system to enforce that validation is never skipped.
++/// This should only be constructed by `ValidatedHttpPath::new` or deserialized
++/// from a trusted function-runner protocol value.
+ #[derive(Clone, Eq, PartialEq, Debug)]
+ pub struct ValidatedHttpPath {
+     path: ResolvedComponentFunctionPath,
+     npm_version: Option<Version>,
+-    reuse_context: bool,
+ }
+ 
+ impl ValidatedHttpPath {
+@@ -851,14 +926,9 @@ impl ValidatedHttpPath {
+             Ok(udf_version) => udf_version,
+             Err(e) => return Ok(Err(e)),
+         };
+-        let module = ModuleModel::new(tx)
+-            .get_metadata_for_function_by_id(&path)
+-            .await?;
+         Ok(Ok(ValidatedHttpPath {
+             path,
+             npm_version: Some(udf_version),
+-            reuse_context: module
+-                .is_some_and(|m| m.analyze_result.as_ref().is_some_and(|a| a.reuse_context)),
+         }))
+     }
+ 
+@@ -876,7 +946,7 @@ impl ValidatedHttpPath {
+             component_path,
+             component_id,
+             npm_version,
+-            reuse_context,
++            reuse_context: _,
+         }: pb::common::ValidatedHttpPath,
+     ) -> anyhow::Result<Self> {
+         let component = ComponentId::deserialize_from_string(component_id.as_deref())?;
+@@ -891,7 +961,6 @@ impl ValidatedHttpPath {
+                 component_path,
+             },
+             npm_version: npm_version.map(|v| Version::parse(&v)).transpose()?,
+-            reuse_context: reuse_context.unwrap_or(false),
+         })
+     }
+ }
+@@ -900,11 +969,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+     type Error = anyhow::Error;
+ 
+     fn try_from(
+-        ValidatedHttpPath {
+-            path,
+-            npm_version,
+-            reuse_context,
+-        }: ValidatedHttpPath,
++        ValidatedHttpPath { path, npm_version }: ValidatedHttpPath,
+     ) -> anyhow::Result<Self> {
+         let component_path = Some(path.component_path.into());
+         Ok(Self {
+@@ -912,7 +977,9 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+             npm_version: npm_version.map(|v| v.to_string()),
+             component_path,
+             component_id: path.component.serialize_to_string(),
+-            reuse_context: Some(reuse_context),
++            // This legacy field is not an HTTP-action reuse permission. HTTP
++            // action reuse is controlled locally by REUSE_HTTP_ACTION_CONTEXTS.
++            reuse_context: Some(false),
+         })
+     }
+ }
+diff --git a/patches/cancellation_safe_database_context_reuse/README.md b/patches/cancellation_safe_database_context_reuse/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..136da7a0094afadde0e83dcc5e5a1bb3cc66a423
+--- /dev/null
++++ b/patches/cancellation_safe_database_context_reuse/README.md
+@@ -0,0 +1,112 @@
++# Cancellation-Safe Database UDF Context Reuse
++
++This patch hardens upstream database-UDF context reuse against caller cancellation while preserving
++the upstream module-wide policy: a module whose analyzed namespace contains
++`experimental_reuseContext = true` may reuse contexts for both queries and mutations. Actions and
++HTTP actions remain ineligible at the database-UDF validation boundary.
++
++The patch is generic. The backend contains no application module names or deployment allowlist.
++Applications decide which module graphs are safe and emit the ordinary upstream export.
++
++## Why maintain this patch
++
++Upstream passes the caller receiver's close future into isolate execution. That observes caller drop
++while a database UDF waits in its async-syscall loop, but it does not give same-isolate nested UDFs a
++shared signal they can check at their own context-save boundary. Synchronous JavaScript also does
++not poll the receiver-close future.
++
++Without the hardening, an execution whose caller has gone away can finish and publish its JavaScript
++context for later reuse. This patch creates one cancellation signal per request, propagates it
++through same-isolate descendants, and checks it immediately before synchronous cache insertion.
++The full ownership, memory-ordering, nested-call, and timing design is preserved in
++[`cancellation_design_reference.md`](cancellation_design_reference.md).
++
++## Effective eligibility
++
++The analyzed module bit is carried through function validation and the trusted function-runner
++protocol. Consumers combine it with the actual UDF type:
++
++- query: may reuse when the analyzed module bit is true;
++- mutation: may reuse when the analyzed module bit is true;
++- action: fresh;
++- HTTP action: fresh at this database-UDF boundary.
++
++The UDF type is checked again after protocol reconstruction. A stale or mixed-version producer
++therefore cannot make an action or HTTP action eligible merely by sending a true bit.
++
++Current upstream always supports the analyzed marker and no longer has a backend-wide enable knob.
++Eligibility is therefore controlled by application module policy and the UDF-type boundary above.
++
++## Mutation correctness boundary
++
++A mutation context can be published before the enclosing transaction commits. That fact alone does
++not make reuse incorrect. A source-safe module that retains no request-derived or transaction-
++derived mutable state behaves correctly after success, failure, or OCC retry.
++
++The real hazard is conditional: JavaScript state written during a failed attempt may survive into a
++retry or later mutation even though the database transaction did not commit. Applications must not
++mark graphs that retain `ctx`, arguments, documents, identities, errors, promises, callbacks, or
++derived mutable values across executions. They must also review third-party package globals and
++import-time work. Queries require the same source discipline because they can also leave failed or
++canceled execution state in a reusable context.
++
++Commit-aware publication would be required only for an application that deliberately retains state
++whose validity depends on successful transaction commit. It is not needed for source-pure module
++graphs and is outside this patch.
++
++## Save boundary
++
++A database context is saved only when:
++
++- the module and UDF type are effectively eligible;
++- initialization produced or retained a valid context read set;
++- isolate execution completed successfully;
++- the final microtask checkpoint did not expose V8 or isolate termination; and
++- caller cancellation was not visible at the final non-awaiting check.
++
++There is no await between the final cancellation check and cache insertion. Caller drop before that
++check prevents publication. Caller drop after it does not retract a context that already reached the
++save boundary. A failed or canceled taken context is discarded because it is absent from the cache
++while executing.
++
++The signal does not interrupt synchronous JavaScript from another thread. Such work continues until
++an existing timeout, syscall cancellation point, termination check, or final save check. The
++scheduler discards a request when selection observes a closed response and cancels a selected
++request's pending active-permit acquisition if closure occurs there. External canceled entries can
++remain retained while ineligible until selection or their bounded queue deadline; direct internal
++entries are pruned when their buffer is polled. Caller drop can still race the final pre-dispatch
++check or happen after execution begins, but the canceled execution cannot republish its context.
++
++## Composition
++
++This patch composes with:
++
++- `bounded_multi_context_reuse`, which changes cache admission and eviction but preserves the same
++  eligibility and save checks;
++- `context_reuse_observability`, which records allowed query and mutation decisions, fresh/reused
++  initialization, validation, cache lifecycle, affinity, occupancy, and memory;
++- `reuse_http_action_contexts`, whose HTTP execution cache is a separate runtime policy and must not
++  leak its marker through database-UDF protocol reconstruction.
++
++## Verification
++
++Focused protocol coverage proves that the reuse bit survives serialization for queries and
++mutations and is rejected for actions and HTTP actions. Focused cancellation coverage verifies
++shared clone visibility, drop-guard publication, and disarming. The nested-call plumbing and final
++save-boundary ordering remain source-traced because the public checkout has no executable reusable-
++context lifecycle harness. An upstream or private harness should additionally exercise queued and
++executing caller drop, synchronous handlers, same-isolate recursion, snapshot queries, separately
++scheduled children, termination during the final checkpoint, mutation OCC retries, and isolate-
++system failure.
++
++## Adoption and rollback
++
++Before activation, inventory marked modules and review complete runtime import graphs. Establish
++fresh/reused, evaluation, OCC, error, latency, cache occupancy, isolate memory, and recreation
++baselines. Roll out application policy separately from the backend image when practical so evidence
++can identify which semantic change caused a regression.
++
++Normal per-module rollback removes the emitted upstream marker and redeploys that module. There is
++no backend-wide disable knob in current upstream. Emergency rollback must remove the marker from
++every opted-in module, deploy those application changes, and restart backend workers to clear
++process-local saved contexts before traffic resumes.
+diff --git a/patches/cancellation_safe_database_context_reuse/cancellation_design_reference.md b/patches/cancellation_safe_database_context_reuse/cancellation_design_reference.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..87d472109ebbc5e5c086371aee0daf41a9e605db
+--- /dev/null
++++ b/patches/cancellation_safe_database_context_reuse/cancellation_design_reference.md
+@@ -0,0 +1,131 @@
++# Database UDF Context Reuse Cancellation Hardening
++
++> Detailed design reference. This is not a separate adoption unit. Module-wide eligibility and
++> cancellation-safe context publication are maintained together in
++> [`README.md`](README.md). This reference
++> preserves the original signal-ownership, memory-ordering, save-boundary, and timing analysis.
++
++This maintained patch hardens the caller-drop boundary for reusable database
++UDF contexts. It is generally applicable to upstream database context reuse;
++it is not specific to a UDF-type gate. The maintained patch in
++[`README.md`](README.md)
++depends on this patch so that its documented cancellation behavior is true.
++
++## Upstream gap
++
++The isolate client waits for a database UDF result through a one-shot channel.
++Upstream passed `response.closed()` into the isolate as its cancellation
++future. That detects caller drop while the database UDF is waiting in its
++async-syscall loop, but it does not provide a signal that a same-isolate nested
++UDF can check at its own context-save boundary. Synchronous JavaScript also
++does not poll the channel-closure future.
++
++As a result, a reusable database UDF could finish after its caller was dropped and
++publish module state from an abandoned execution. This is independent of the
++query or mutation type and applies to any reusable database context.
++
++## Signal ownership and propagation
++
++Each `IsolateClient::execute_udf` request creates one `CancellationSignal` and
++keeps a caller-side `CancelUdfOnDrop` guard while waiting for the response.
++The guard is declared after the pinned response future. Rust drops locals in
++reverse declaration order, so cancellation is published before the response
++receiver is dropped when the waiting future is canceled. The guard is disarmed
++after any completed response, including an execution error or sender error,
++because no execution remains for that caller to cancel.
++
++The signal is part of `RequestType::Udf`, so it follows a request while queued
++and while executing. A top-level database UDF and every same-isolate nested
++query, snapshot query, or mutation clone that signal. A separately scheduled
++child creates its own signal in the direct `IsolateClient` callback path.
++Dropping the parent child-request future sets the child's signal before dropping
++the child's response receiver.
++
++The shared state contains an `AtomicBool` and one `AtomicWaker`. Cancellation
++stores with release ordering and checks load with acquire ordering. The wait
++future checks the flag, registers its waker, and checks the flag again, so a
++cancellation between the first check and registration cannot be lost.
++
++One waker is sufficient under the current database syscall contract. `runUdf`
++is an unbatched syscall, so same-isolate recursion has one active descendant
++chain. Several ancestor cancellation waits can remain pending, but the deepest
++registered frame is enough: waking it makes that frame fail and wakes each
++ancestor as the recursive result unwinds. Batching or concurrently executing
++same-isolate `runUdf` calls would invalidate this assumption and would require
++a multi-waiter notification primitive.
++
++The signal has no ownership edge back to the caller guard or request. Stored
++wakers are dropped with the signal after the request completes, so the design
++does not create a persistent ownership cycle.
++
++## Save boundary
++
++Database UDFs continue to poll cancellation while waiting for an async syscall.
++Reusable executions additionally perform a non-awaiting cancellation check
++after the final microtask checkpoint, request-state extraction, and termination
++handling, immediately before the context-save gate.
++
++The final microtask checkpoint can run user code. The database path therefore
++rechecks V8 termination after the checkpoint, matching the existing HTTP reuse
++requirement, so termination exposed by that checkpoint cannot pass through the
++save gate merely because the worker will recreate the isolate afterward. An
++asynchronous isolate termination that is not visible at this check is a
++post-check race. A later worker or next-request cleanliness check that observes
++the termination discards the isolate and its context cache, but those checks
++are optimistic rather than synchronized with the background timeout task. This
++patch excludes termination visible at the final check; it does not claim that
++cache insertion or worker advertisement is linearized against a termination
++that becomes visible afterward.
++
++A context is published only when all of the following are true:
++
++- the module is effectively eligible for database context reuse;
++- initialization produced or retained a valid context read set;
++- isolate execution completed with `Ok(Ok(_))`;
++- the final checkpoint did not expose V8 or isolate termination; and
++- caller cancellation was not visible at the final check.
++
++The final caller check is the cancellation linearization point. There is no
++await between it and the synchronous cache insertion. A caller drop that wins
++before the check prevents the save. A caller drop after the check does not
++retract a context that has reached the save point, just as retention,
++transaction merge, return validation, query-result finalization, and mutation
++commit occur too late to retract it.
++
++Thrown or rejected handlers, observed cancellation, and termination or
++isolate-system errors visible at the save gate do not publish a reusable
++context. A taken context is absent from the cache while it executes, so any
++such failure also discards that context.
++
++## Cancellation timing and non-goals
++
++The signal does not terminate V8 from another thread. Synchronous JavaScript,
++module initialization, and context-read-set validation may continue until they
++reach an existing timeout, syscall cancellation point, termination check, or
++the final save check. This preserves upstream execution and timeout behavior
++while closing the reusable-context publication hole.
++
++Non-reusable UDFs retain upstream cancellation semantics: cancellation is
++observed while waiting for async syscalls, but synchronous JavaScript is not
++interrupted by this patch. Their contexts are never candidates for the cache.
++
++The scheduler discards requests whose closed response is visible at selection
++and cancels a selected request's active-permit acquisition when closure becomes
++visible during that wait. An ineligible external entry can remain retained until
++selection or its finite queue deadline; the internal callback buffer prunes
++closed entries whenever it is polled. Caller drop can still race after the final
++pre-dispatch check or occur after execution begins. Such an execution can spend
++work and consume a taken warm context before the final save check discards it,
++but it cannot publish the canceled execution. Returning an untouched taken
++context remains a separate cache-lifecycle change.
++
++## Verification boundary
++
++The public checkout has no database-UDF lifecycle harness that can run normal
++deployed JavaScript through the application, function-runner, isolate,
++recursive-call, and cache-save layers. The source trace establishes the
++ownership and save ordering above. Behavior-level regression coverage still
++belongs in an upstream or private lifecycle harness and should cover queued and
++executing caller drop, synchronous handlers, same-isolate recursion, snapshot
++queries, separately scheduled children, termination during the final
++checkpoint, and isolate-system failure.
+diff --git a/patches/reuse_http_action_contexts/README.md b/patches/reuse_http_action_contexts/README.md
+index b6e19fa69bd3a1b4c04d1f0a3c6fb4e4317b4dac..bf3249c94fdd87d238e5d4cc08b14bff952caa91 100644
+--- a/patches/reuse_http_action_contexts/README.md
++++ b/patches/reuse_http_action_contexts/README.md
+@@ -15,6 +15,11 @@ state, request state, response state, cancellation state, and callback state,
+ but it can preserve JavaScript module and global state across HTTP action
+ requests that land on the same cached context.
+ 
++This knob is independent of the database-module
++`experimental_reuseContext` export. The HTTP runtime does not consult the
++legacy reuse bit on `ValidatedHttpPath`, so it cannot opt an HTTP action into
++reuse. The maintained database-UDF patch also serializes that bit as false for HTTP paths.
++
+ This note uses "reuse" for the behavior and "cache" for the backend data
+ structure that stores a reusable context between requests. A cached context is
+ not a user-facing cache API. It is an implementation detail of the isolate
+diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
+index 1b1d4c2d392ff82210b98a79d52722643d63ee34..b54fdfc6846332e1c91bcf6110cc9a1412fcfa9f 100644
+--- a/self-hosted/advanced/knobs.md
++++ b/self-hosted/advanced/knobs.md
+@@ -3,10 +3,10 @@
+ There is a large number of detailed configuration options in
+ [knobs.rs](/crates/common/src/knobs.rs). These options are configurable via
+ environment variables. In order to tune your Convex instance at scale for your
+-workload, you may need to adjust these knobs. You will have to set these
+-environment variables by adding them to your `docker-compose.yml` file. Commonly
+-overriden knobs are listed in the `env` section of the
+-[`docker-compose.yml`](../docker/docker-compose.yml)
++workload, you may need to adjust these knobs. The stock Compose file passes
++commonly overridden knobs from the host environment or Compose `.env` file.
++Add other variables to the backend service's `environment` section in
++[`docker-compose.yml`](../docker/docker-compose.yml).
+ 
+ ## `HTTP_SERVER_MAX_CONCURRENT_REQUESTS`
+ 
