@@ -36,7 +36,7 @@ use common::{
         LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES,
         LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES,
         LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT,
-        LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES,
+        LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES,
         MAX_ISOLATE_WORKERS,
         SOURCE_MAP_CACHE_MAX_SIZE_BYTES,
         UDF_CACHE_MAX_SIZE,
@@ -1453,8 +1453,8 @@ fn configured_startup_budget_with_isolate_memory_commit_percent(
             // This sampled Linux direct-child retirement trigger is a planning allowance, not a
             // hard RSS maximum. Sampling delay, active-request drain, and descendants can exceed
             // it.
-            name: "local_node_rss_threshold",
-            bytes: u64::try_from(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES)?,
+            name: "local_node_rss_budget",
+            bytes: u64::try_from(*LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES)?,
         },
         MemoryBudgetComponent {
             name: "native_kernel_reserve",
@@ -2416,6 +2416,7 @@ mod tests {
 
     use common::{
         http::ExternalRequestShedding,
+        knobs::LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES,
         memory_pressure::MemoryPressureSignal,
     };
     use tempfile::TempDir;
@@ -2859,11 +2860,38 @@ VmSwap:\t50 kB
     }
 
     #[test]
+    fn startup_budget_reserves_total_local_node_budget() {
+        let (budget, _) = configured_startup_budget().unwrap();
+        let node = budget
+            .components
+            .iter()
+            .find(|component| component.name == "local_node_rss_budget")
+            .unwrap();
+        assert_eq!(
+            node.bytes,
+            u64::try_from(*LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES).unwrap()
+        );
+    }
+
+    #[test]
     fn isolate_capacity_accounting_rounds_up_and_rejects_invalid_percentages() {
         assert_eq!(account_isolate_memory_capacity(1, 75).unwrap(), 1);
         assert_eq!(account_isolate_memory_capacity(101, 75).unwrap(), 76);
         assert!(account_isolate_memory_capacity(100, 0).is_err());
         assert!(account_isolate_memory_capacity(100, 101).is_err());
+    }
+
+    #[test]
+    fn finite_cgroup_limit_covers_total_local_node_budget() {
+        let (budget, _) = configured_startup_budget().unwrap();
+        let root = TempDir::new().unwrap();
+        fs::write(root.path().join("memory.current"), "0\n").unwrap();
+        fs::write(
+            root.path().join("memory.max"),
+            format!("{}\n", budget.total_bytes - 1),
+        )
+        .unwrap();
+        assert!(startup_budget_headroom(root.path(), &budget).is_err());
     }
 
     #[test]
