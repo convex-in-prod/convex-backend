@@ -1,5 +1,5 @@
 import { Command, Option } from "@commander-js/extra-typings";
-import { invoke } from "./executor";
+import { ExecutorRole, invoke, SystemOperationState } from "./executor";
 import { v4 as uuidv4 } from "uuid";
 import { log, setDebugLogging } from "./log";
 import os from "node:os";
@@ -20,6 +20,7 @@ async function startServer(
   diagnosticControlPath: string | undefined,
   diagnosticProfilePath: string | undefined,
   diagnosticProfileDurationMs: number,
+  role: ExecutorRole,
 ) {
   setDebugLogging(debug);
   if (
@@ -45,6 +46,7 @@ async function startServer(
     });
   }
   const app = express();
+  const systemOperationState = new SystemOperationState();
   app.use(express.json({ limit: "6MB" })); // 5 MiB for args (https://docs.convex.dev/production/state/limits#functions) + extra space
 
   // Override os.tmpdir to use the provided tempdir
@@ -61,9 +63,16 @@ async function startServer(
   });
 
   app.post("/prepare", async (req: Request, res: Response) => {
+    if (role !== "application") {
+      res.status(400).json({
+        type: "error",
+        message: "System Node executor does not prepare application packages",
+      });
+      return;
+    }
     try {
-      await prepareSourcePackage(req.body);
-      res.json({ type: "success" });
+      const result = await prepareSourcePackage(req.body);
+      res.json({ type: "success", ...result });
     } catch (_error: unknown) {
       // Package failure is a typed protocol outcome. Keep HTTP errors for
       // failures that prevent the endpoint from producing that response.
@@ -75,6 +84,15 @@ async function startServer(
   });
 
   app.post("/invoke", async (req: Request, res: Response) => {
+    const releaseSystemOperation =
+      role === "system" ? systemOperationState.tryAcquire() : undefined;
+    if (releaseSystemOperation === null) {
+      res.status(409).json({
+        type: "error",
+        message: "System Node executor operation is already active",
+      });
+      return;
+    }
     try {
       const request = req.body;
       request.requestId = uuidv4();
@@ -83,7 +101,7 @@ async function startServer(
       res.setHeader("Content-Type", "application/x-ndjson");
       res.setHeader("Transfer-Encoding", "chunked");
 
-      await invoke(request, res);
+      await invoke(request, res, role);
     } catch (err: unknown) {
       const message = extractErrorMessage(err) || "Internal server error";
       // If we haven't written anything yet, send an error response
@@ -102,6 +120,7 @@ async function startServer(
         );
       }
     } finally {
+      releaseSystemOperation?.();
       res.end();
     }
   });
@@ -152,6 +171,11 @@ program
     "bounded main-thread CPU profile duration in milliseconds",
     "4000",
   )
+  .addOption(
+    new Option("--role <role>", "executor role")
+      .choices(["application", "system"])
+      .default("application"),
+  )
   .action(async (options) => {
     const listenTarget =
       options.ipcPath !== undefined
@@ -164,6 +188,7 @@ program
       options.diagnosticControlPath,
       options.diagnosticProfilePath,
       Number(options.diagnosticProfileDurationMs),
+      options.role as ExecutorRole,
     );
   });
 
