@@ -248,6 +248,7 @@ async function deployToNewPreviewDeployment(
     skipWorkosCheck?: boolean | undefined;
     skipLargeIndexesCheck: boolean;
     message: string | null;
+    forceNodeCutover?: boolean | undefined;
   },
 ) {
   const previewName = options.previewName ?? null;
@@ -353,6 +354,7 @@ async function deployToNewPreviewDeployment(
         : "ask for confirmation",
     warnOnSlowSchemaValidation: true,
     message: options.message,
+    forceNodeCutover: !!options.forceNodeCutover,
   };
   showSpinner(`Deploying to ${previewUrl}...`);
   await runPush(ctx, pushOptions);
@@ -399,6 +401,7 @@ async function deployToExistingDeployment(
     skipLargeIndexesCheck: boolean;
     allowDeletingLargeIndexes: boolean;
     message: string | null;
+    forceNodeCutover?: boolean | undefined;
   },
 ) {
   const deploymentToActOn = await loadSelectedDeploymentCredentials(
