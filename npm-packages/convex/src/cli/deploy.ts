@@ -238,6 +238,7 @@ async function deployToNewPreviewDeployment(
     debugBundlePath?: string | undefined;
     skipWorkosCheck?: boolean | undefined;
     message: string | null;
+    forceNodeCutover?: boolean | undefined;
   },
 ) {
   const previewName = options.previewName ?? null;
@@ -334,6 +335,7 @@ async function deployToNewPreviewDeployment(
     pushAllModules: !!options.pushAllModules,
     largeIndexDeletionCheck: "no verification", // fine for preview deployments
     message: options.message,
+    forceNodeCutover: !!options.forceNodeCutover,
   };
   showSpinner(`Deploying to ${previewUrl}...`);
   await runPush(ctx, pushOptions);
@@ -379,6 +381,7 @@ async function deployToExistingDeployment(
     skipWorkosCheck?: boolean | undefined;
     allowDeletingLargeIndexes: boolean;
     message: string | null;
+    forceNodeCutover?: boolean | undefined;
   },
 ) {
   const deploymentToActOn = await loadSelectedDeploymentCredentials(
