@@ -76,6 +76,7 @@ export type PushOptions = {
   logManager?: LogManager | undefined;
   largeIndexDeletionCheck: LargeIndexDeletionCheck;
   message: string | null;
+  forceNodeCutover: boolean;
 };
 
 export async function runCodegen(
@@ -150,6 +151,7 @@ export function hash(bundle: Bundle) {
 function isModuleTheSame(newBundle: Bundle, oldBundleHash: BundleHash) {
   return (
     newBundle.environment === oldBundleHash.environment &&
+    newBundle.nodePool === oldBundleHash.nodePool &&
     hash(newBundle) === oldBundleHash.hash
   );
 }
@@ -170,6 +172,7 @@ export function partitionModulesByChanges(
     .map((func) => ({
       path: func.path,
       environment: func.environment,
+      ...(func.nodePool === undefined ? {} : { nodePool: func.nodePool }),
       sha256: hash(func),
     }));
   const changedModules = functions.filter((newBundle) => {
@@ -230,6 +233,7 @@ async function startComponentsPushAndCodegen(
     debugNodeApis: boolean;
     largeIndexDeletionCheck: LargeIndexDeletionCheck;
     codegenOnlyThisComponent?: string | undefined;
+    forceNodeCutover?: boolean | undefined;
   },
 ): Promise<StartPushResponse | null> {
   const convexDir = await getFunctionsDirectoryPath(ctx);
@@ -463,6 +467,22 @@ async function startComponentsPushAndCodegen(
     startPush(ctx, span, startPushRequest, options),
   );
 
+  if (options.forceNodeCutover && !options.dryRun) {
+    if (startPushResponse.nodeExecutorCutoverProtocolVersion !== 1) {
+      await ctx.crash({
+        exitCode: 1,
+        errorType: "fatal",
+        printedMessage:
+          "The target backend does not support --force-node-cutover. Remove the option or use a backend that advertises forced Node cutover protocol version 1.",
+      });
+    }
+    logMessage(
+      chalkStderr.yellow(
+        "Warning: forced Node cutover can interrupt actions whose external effects may already have completed. Read authoritative state before retrying an interrupted action.",
+      ),
+    );
+  }
+
   if (options.verbose) {
     logMessage("startPush: " + JSON.stringify(startPushResponse, null, 2));
   }
@@ -558,7 +578,10 @@ function logStartPushSizes(span: Span, startPushRequest: StartPushRequest) {
       if (module.environment === "isolate") {
         v8Size += module.source.length + (module.sourceMap ?? "").length;
         v8Count += 1;
-      } else if (module.environment === "node") {
+      } else if (
+        module.environment === "node" ||
+        module.environment.startsWith("node:pool:")
+      ) {
         nodeSize += module.source.length + (module.sourceMap ?? "").length;
         nodeCount += 1;
       }

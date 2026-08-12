@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use common::log_lines::LogLine;
+use errors::ErrorMetadata;
+use model::source_packages::types::NodeExecutorPoolTopology;
 use tokio::sync::mpsc;
 
 use crate::executor::{
@@ -19,6 +21,24 @@ impl NoopNodeExecutor {
 impl NodeExecutor for NoopNodeExecutor {
     fn enable(&self) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn validate_pool_topology(&self, topology: &NodeExecutorPoolTopology) -> anyhow::Result<()> {
+        if !topology.is_empty() {
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "NodeExecutorPoolsNotSupported",
+                "This runtime does not support dedicated Node executor pools",
+            ));
+        }
+        Ok(())
+    }
+
+    fn reconcile_pool_topology(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        _version: common::types::Timestamp,
+    ) -> anyhow::Result<()> {
+        self.validate_pool_topology(topology)
     }
 
     async fn invoke(

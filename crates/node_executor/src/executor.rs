@@ -1,12 +1,18 @@
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     future::Future,
     path::Path,
     sync::{
         Arc,
         LazyLock,
     },
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use anyhow::Context;
@@ -80,6 +86,7 @@ use model::{
         },
     },
     source_packages::types::{
+        NodeExecutorPoolTopology,
         PackageSize,
         SourcePackageId,
     },
@@ -148,12 +155,112 @@ const MAX_STREAMED_RESPONSE_PARTS: usize = 1024;
 #[async_trait]
 pub trait NodeExecutor: Sync + Send {
     fn enable(&self) -> anyhow::Result<()>;
+    fn validate_pool_topology(&self, topology: &NodeExecutorPoolTopology) -> anyhow::Result<()>;
+    fn reconcile_pool_topology(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+    ) -> anyhow::Result<()>;
+    fn begin_pool_cutover(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+        _reservation: &mut Option<NodeExecutorCutoverReservation>,
+    ) -> anyhow::Result<()> {
+        self.reconcile_pool_topology(topology, version)
+    }
+    async fn reserve_pool_cutover(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        force: bool,
+    ) -> anyhow::Result<Option<NodeExecutorCutoverReservation>> {
+        self.validate_pool_topology(topology)?;
+        anyhow::ensure!(
+            !force,
+            ErrorMetadata::bad_request(
+                "NodeExecutorCutoverProtocolUnsupported",
+                "This Node executor does not support forced cutover",
+            )
+        );
+        Ok(None)
+    }
+    async fn complete_pool_cutover(
+        &self,
+        _target: NodeExecutorCutoverTarget,
+        _version: common::types::Timestamp,
+        _reservation: Option<NodeExecutorCutoverReservation>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn invoke(
         &self,
         request: ExecutorRequest,
         log_line_sender: mpsc::UnboundedSender<LogLine>,
     ) -> anyhow::Result<InvokeResponse>;
     fn shutdown(&self);
+}
+
+pub struct NodeExecutorCutoverReservation {
+    pub(crate) permit: Option<crate::local::SurgePermit>,
+    claim: Option<Box<dyn NodeExecutorCutoverClaim>>,
+}
+
+pub(crate) trait NodeExecutorCutoverClaim: Send {
+    fn commit(
+        &mut self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+    ) -> anyhow::Result<()>;
+}
+
+impl NodeExecutorCutoverReservation {
+    #[cfg(test)]
+    pub(crate) fn new(permit: crate::local::SurgePermit) -> Self {
+        Self {
+            permit: Some(permit),
+            claim: None,
+        }
+    }
+
+    pub(crate) fn with_claim(
+        permit: crate::local::SurgePermit,
+        claim: impl NodeExecutorCutoverClaim + 'static,
+    ) -> Self {
+        Self {
+            permit: Some(permit),
+            claim: Some(Box::new(claim)),
+        }
+    }
+
+    pub(crate) fn commit_claim(
+        &mut self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+    ) -> anyhow::Result<()> {
+        match self.claim.as_mut() {
+            Some(claim) => claim.commit(topology, version),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for NodeExecutorCutoverReservation {
+    fn drop(&mut self) {
+        // Restore router recovery ownership before capacity can be admitted to
+        // another deployment on a different runtime thread.
+        drop(self.claim.take());
+        if let Some(permit) = self.permit.take() {
+            permit.release();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct NodeExecutorCutoverTarget {
+    pub topology: NodeExecutorPoolTopology,
+    pub source_package: SourcePackage,
+    pub source_package_id: SourcePackageId,
+    pub environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
 }
 
 pub struct InvokeResponse {
@@ -232,6 +339,63 @@ impl<RT: Runtime> NodeActions<RT> {
 
     pub fn enable(&self) -> anyhow::Result<()> {
         self.executor.enable()
+    }
+
+    pub fn validate_pool_topology(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+    ) -> anyhow::Result<()> {
+        self.executor.validate_pool_topology(topology)
+    }
+
+    pub fn reconcile_pool_topology(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+    ) -> anyhow::Result<()> {
+        self.executor.reconcile_pool_topology(topology, version)
+    }
+
+    pub fn cutover_package_url_validity(&self, topology: &NodeExecutorPoolTopology) -> Duration {
+        let resident_pool_count = 1 + topology.values().collect::<BTreeSet<_>>().len();
+        let sequential_timeout_stages = u32::try_from(2 * resident_pool_count + 2)
+            .expect("Node executor cutover stage count does not fit u32");
+        self.user_timeout
+            .checked_mul(sequential_timeout_stages)
+            .expect("Node executor cutover package URL validity overflow")
+    }
+
+    pub async fn reserve_pool_cutover(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        force: bool,
+    ) -> anyhow::Result<Option<NodeExecutorCutoverReservation>> {
+        self.executor.reserve_pool_cutover(topology, force).await
+    }
+
+    pub fn begin_pool_cutover(
+        &self,
+        topology: &NodeExecutorPoolTopology,
+        version: common::types::Timestamp,
+        reservation: &mut Option<NodeExecutorCutoverReservation>,
+    ) -> anyhow::Result<()> {
+        self.executor
+            .begin_pool_cutover(topology, version, reservation)
+    }
+
+    pub async fn complete_pool_cutover(
+        &self,
+        target: NodeExecutorCutoverTarget,
+        version: common::types::Timestamp,
+        reservation: Option<NodeExecutorCutoverReservation>,
+    ) -> anyhow::Result<()> {
+        self.executor
+            .complete_pool_cutover(target, version, reservation)
+            .await
+    }
+
+    pub fn record_pool_cutover_post_commit_failure(&self) {
+        crate::metrics::log_local_node_deployment_cutover_event("post_commit_failed");
     }
 
     pub fn shutdown(&self) {
@@ -582,6 +746,15 @@ impl ExecutorRequest {
             Self::BuildDeps(_) => "build_deps",
         }
     }
+
+    pub(crate) fn preparation_source_package(&self) -> Option<SourcePackage> {
+        match self {
+            Self::Execute { request, .. } => Some(request.source_package.clone()),
+            // Analysis packages have not committed and must not become the
+            // readiness target of a later resident-generation rotation.
+            Self::Analyze(_) | Self::BuildDeps(_) => None,
+        }
+    }
 }
 
 impl TryFrom<ExecutorRequest> for JsonValue {
@@ -673,6 +846,10 @@ pub struct SourcePackage {
 
     // Info of external package if external dependencies were specified.
     pub external_deps: Option<Package>,
+
+    // The fetch URIs are short-lived even though the keys and checksums are
+    // stable. Deferred local replacement must not reuse them after this time.
+    pub download_url_expiration: Instant,
 }
 
 impl From<SourcePackage> for JsonValue {
@@ -722,6 +899,9 @@ pub struct ExecuteRequest {
 
     pub source_package: SourcePackage,
     pub source_package_id: SourcePackageId,
+    pub node_executor_pool_topology: NodeExecutorPoolTopology,
+    pub topology_version: common::types::Timestamp,
+    pub node_pool: Option<model::config::types::NodeExecutorPoolName>,
     pub user_identity: Option<UserIdentityAttributes>,
     pub auth_header: Option<String>,
     pub environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
