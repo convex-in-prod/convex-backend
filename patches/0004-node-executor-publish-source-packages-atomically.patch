@@ -5,11 +5,13 @@ Subject: [PATCH 04/24] node-executor: publish source packages atomically
 
 Lease source packages across execute and analyze, retain only zero-owner entries, and enforce count and byte limits for source and external packages. Reference-count external ownership, keep same-key materialization single-flight, and stage, validate, and atomically publish complete package trees.
 
+Expose a preparation request that acquires and releases a package lease without importing application modules. This provides a strict boundary for materializing and verifying a package before an executor accepts calls that can evaluate application code.
+
 Run dependency installation in a private directory through a bounded asynchronous process-group supervisor. Ordinary completion and install timeout wait for the supervisor to close. Abrupt executor-generation death triggers best-effort process-group termination, but Rust receives no descendant-exit acknowledgement.
 
 Enforce extracted and compressed dependency size limits before archive publication or upload. Bound archive inspection and upload, reject non-success responses, sanitize failures, and remove retained package state during Lambda reset.
 
-Reference-count stack roots, resolve frames directly from registered module paths, restore the process stack hook before every invocation, and expose bounded package and stack-format metrics. Cover concurrent ownership, failed publication, build timeout, upload, cleanup, and stack-hook regressions.
+Reference-count stack roots, resolve frames directly from registered module paths, restore the process stack hook before every invocation, and expose bounded package and stack-format metrics. Cover concurrent ownership, failed publication, build timeout, upload, cleanup, preparation, and stack-hook regressions.
 
 Correct the package verification guidance to use each package's defined lint script, targeted Prettier checks, and the existing Turbo build command.
 ---
@@ -22,13 +24,15 @@ Correct the package verification guidance to use each package's defined lint scr
  npm-packages/node-executor/src/errors.test.ts |  210 +++
  npm-packages/node-executor/src/errors.ts      |  227 ++-
  npm-packages/node-executor/src/executor.ts    |  209 ++-
- npm-packages/node-executor/src/local.ts       |   23 +-
- .../node-executor/src/source_package.test.ts  | 1580 +++++++++++++++++
+ npm-packages/node-executor/src/local.ts       |   38 +-
+ npm-packages/node-executor/src/prepare.ts     |   26 +
+ .../node-executor/src/source_package.test.ts  | 1657 +++++++++++++++++
  .../node-executor/src/source_package.ts       | 1560 +++++++++++++---
- .../README.md                                 |  450 +++++
- 13 files changed, 4693 insertions(+), 535 deletions(-)
+ .../README.md                                 |  461 +++++
+ 14 files changed, 4822 insertions(+), 535 deletions(-)
  create mode 100644 npm-packages/node-executor/src/build_deps.test.ts
  create mode 100644 npm-packages/node-executor/src/errors.test.ts
+ create mode 100644 npm-packages/node-executor/src/prepare.ts
  create mode 100644 npm-packages/node-executor/src/source_package.test.ts
  create mode 100644 patches/atomic_node_executor_source_packages/README.md
 
@@ -2030,19 +2034,20 @@ index 404c19f85876557b6817c5ad92cff6221bea7ebc..f1ea3a34944d8838fa5027ba791801e1
  export const globalDevConsole = new AsyncLocalStorage<Console>();
  
 diff --git a/npm-packages/node-executor/src/local.ts b/npm-packages/node-executor/src/local.ts
-index 9ad0a26fe68f506fb0b6ec2e810ecb0389568e81..d50f5daf2a04084fb98bd2fae9900d7f02ba11ac 100644
+index 9ad0a26fe68f506fb0b6ec2e810ecb0389568e81..ebb55e05e68baaa4e8a4a3b3434856300a2bf7c7 100644
 --- a/npm-packages/node-executor/src/local.ts
 +++ b/npm-packages/node-executor/src/local.ts
-@@ -5,6 +5,8 @@ import { log, setDebugLogging } from "./log";
+@@ -5,6 +5,9 @@ import { log, setDebugLogging } from "./log";
  import os from "node:os";
  import http from "node:http";
  import express, { Request, Response } from "express";
 +import { extractErrorMessage, getPrepareStackTraceStats } from "./errors";
 +import { getPackageCacheStats } from "./source_package";
++import { prepareSourcePackage } from "./prepare";
  
  const DEFAULT_PORT = 3002;
  
-@@ -19,14 +21,21 @@ async function startServer(
+@@ -19,14 +22,35 @@ async function startServer(
  
    // Override os.tmpdir to use the provided tempdir
    os.tmpdir = () => tempdir;
@@ -2059,6 +2064,20 @@ index 9ad0a26fe68f506fb0b6ec2e810ecb0389568e81..d50f5daf2a04084fb98bd2fae9900d7f
 +      packageCache: getPackageCacheStats(),
 +      stackTrace: getPrepareStackTraceStats(),
 +    });
++  });
++
++  app.post("/prepare", async (req: Request, res: Response) => {
++    try {
++      await prepareSourcePackage(req.body);
++      res.json({ type: "success" });
++    } catch (_error: unknown) {
++      // Package failure is a typed protocol outcome. Keep HTTP errors for
++      // failures that prevent the endpoint from producing that response.
++      res.json({
++        type: "error",
++        message: "Package preparation failed",
++      });
++    }
    });
  
    app.post("/invoke", async (req: Request, res: Response) => {
@@ -2066,7 +2085,7 @@ index 9ad0a26fe68f506fb0b6ec2e810ecb0389568e81..d50f5daf2a04084fb98bd2fae9900d7f
      try {
        const request = req.body;
        request.requestId = uuidv4();
-@@ -36,23 +45,25 @@ async function startServer(
+@@ -36,23 +60,25 @@ async function startServer(
        res.setHeader("Transfer-Encoding", "chunked");
  
        await invoke(request, res);
@@ -2095,7 +2114,7 @@ index 9ad0a26fe68f506fb0b6ec2e810ecb0389568e81..d50f5daf2a04084fb98bd2fae9900d7f
        res.end();
      }
    });
-@@ -64,7 +75,7 @@ async function startServer(
+@@ -64,7 +90,7 @@ async function startServer(
        typeof addr === "object" && addr
          ? `port ${addr.port}`
          : typeof listenTarget === "object" && "path" in listenTarget
@@ -2104,12 +2123,44 @@ index 9ad0a26fe68f506fb0b6ec2e810ecb0389568e81..d50f5daf2a04084fb98bd2fae9900d7f
            : String(listenTarget);
      log(`Node executor server listening on ${addrStr}`);
    });
+diff --git a/npm-packages/node-executor/src/prepare.ts b/npm-packages/node-executor/src/prepare.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1851802e9be5a272ff72350ff5ffc99433fe8755
+--- /dev/null
++++ b/npm-packages/node-executor/src/prepare.ts
+@@ -0,0 +1,26 @@
++import { z } from "zod";
++import { acquireSourcePackage } from "./source_package";
++
++const packageSchema = z.object({
++  uri: z.string(),
++  key: z.string(),
++  sha256: z.string(),
++}).strict();
++
++const sourcePackageSchema = z.object({
++  uri: z.string(),
++  key: z.string(),
++  sha256: z.string(),
++  bundled_source: packageSchema,
++  external_deps: packageSchema.nullish(),
++}).strict();
++
++const preparationRequestSchema = z.object({
++  sourcePackage: sourcePackageSchema,
++}).strict();
++
++export async function prepareSourcePackage(request: unknown): Promise<void> {
++  const { sourcePackage } = preparationRequestSchema.parse(request);
++  const lease = await acquireSourcePackage(sourcePackage);
++  await lease.release();
++}
 diff --git a/npm-packages/node-executor/src/source_package.test.ts b/npm-packages/node-executor/src/source_package.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..6bfe3d257055d8978f87377a42796aa4966331cc
+index 0000000000000000000000000000000000000000..a42dd8c78bfb72e75511f938e1d6b0cfa0251e1e
 --- /dev/null
 +++ b/npm-packages/node-executor/src/source_package.test.ts
-@@ -0,0 +1,1580 @@
+@@ -0,0 +1,1657 @@
 +import { createHash } from "node:crypto";
 +import * as fs from "node:fs";
 +import http from "node:http";
@@ -2120,6 +2171,7 @@ index 0000000000000000000000000000000000000000..6bfe3d257055d8978f87377a42796aa4
 +import AdmZip from "adm-zip";
 +import { afterEach, beforeEach, expect, test, vi } from "vitest";
 +
++import { prepareSourcePackage } from "./prepare";
 +import {
 +  acquireSourcePackage,
 +  availableExternalPackages,
@@ -2146,6 +2198,83 @@ index 0000000000000000000000000000000000000000..6bfe3d257055d8978f87377a42796aa4
 +  if (tmpdir !== undefined) {
 +    await fs.promises.rm(tmpdir, { recursive: true, force: true });
 +    tmpdir = undefined;
++  }
++});
++
++test("preparation publishes source and external packages without evaluating modules", async () => {
++  const sourceZip = makeSourcePackageZip(
++    "external-package-key",
++    1,
++    "node",
++    undefined,
++    'throw new Error("application module was evaluated during preparation");\n',
++  );
++  const externalZip = makeExternalDepsZip();
++  const server = await startPackageServer({
++    "/source.zip": sourceZip,
++    "/external.zip": externalZip,
++  });
++
++  try {
++    const sourcePackage = makeSourcePackage(
++      `${server.baseUrl}/source.zip`,
++      sha256(sourceZip),
++      `${server.baseUrl}/external.zip`,
++      sha256(externalZip),
++    );
++
++    await prepareSourcePackage({ sourcePackage });
++
++    expect(availableSourcePackages.has("source-package-key")).toBe(true);
++    expect(availableExternalPackages.has("external-package-key")).toBe(true);
++    expect(server.requestCounts.get("/source.zip")).toBe(1);
++    expect(server.requestCounts.get("/external.zip")).toBe(1);
++    expect(getPackageCacheStats()).toMatchObject({
++      importedSourcePackages: 0,
++      activeSourceOwners: 0,
++    });
++  } finally {
++    await server.close();
++  }
++});
++
++test("preparation rejects extra request and package fields before downloading", async () => {
++  const sourceZip = makeSourcePackageZip();
++  const externalZip = makeExternalDepsZip();
++  const server = await startPackageServer({
++    "/source.zip": sourceZip,
++    "/external.zip": externalZip,
++  });
++
++  try {
++    const sourcePackage = makeSourcePackage(
++      `${server.baseUrl}/source.zip`,
++      sha256(sourceZip),
++      `${server.baseUrl}/external.zip`,
++      sha256(externalZip),
++    );
++
++    await expect(
++      prepareSourcePackage({
++        sourcePackage,
++        udfPath: "actions/example.js",
++      }),
++    ).rejects.toThrow();
++    await expect(
++      prepareSourcePackage({
++        sourcePackage: {
++          ...sourcePackage,
++          bundled_source: {
++            ...sourcePackage.bundled_source,
++            arguments: [],
++          },
++        },
++      }),
++    ).rejects.toThrow();
++
++    expect(server.requestCounts.size).toBe(0);
++  } finally {
++    await server.close();
 +  }
 +});
 +
@@ -3500,7 +3629,14 @@ index 0000000000000000000000000000000000000000..6bfe3d257055d8978f87377a42796aa4
 +function makeSourcePackageZip(
 +  externalDepsStorageKey: string | null = "external-package-key",
 +  moduleValue = 1,
++  actionEnvironment = "node",
++  moduleEnvironments: [string, string][] | undefined = undefined,
++  applicationModule = `import "../_deps/chunk.js";\nexport const value = ${moduleValue};\n`,
 +): Buffer {
++  moduleEnvironments ??= [
++    ["_deps/chunk.js", "node"],
++    ["actions/example.js", actionEnvironment],
++  ];
 +  const zip = new AdmZip();
 +  zip.addFile("modules/", Buffer.alloc(0));
 +  zip.addFile("modules/actions/", Buffer.alloc(0));
@@ -3514,20 +3650,12 @@ index 0000000000000000000000000000000000000000..6bfe3d257055d8978f87377a42796aa4
 +          "actions/example.js",
 +          "actions/example.js.map",
 +        ],
-+        moduleEnvironments: [
-+          ["_deps/chunk.js", "node"],
-+          ["actions/example.js", "node"],
-+        ],
++        moduleEnvironments,
 +        externalDepsStorageKey: externalDepsStorageKey ?? undefined,
 +      }),
 +    ),
 +  );
-+  zip.addFile(
-+    "modules/actions/example.js",
-+    Buffer.from(
-+      `import "../_deps/chunk.js";\nexport const value = ${moduleValue};\n`,
-+    ),
-+  );
++  zip.addFile("modules/actions/example.js", Buffer.from(applicationModule));
 +  zip.addFile(
 +    "modules/_deps/chunk.js",
 +    Buffer.from("export const chunk = 1;\n"),
@@ -5465,10 +5593,10 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..cb0dff0c96930296bd728cd1c19243c9
  }
 diff --git a/patches/atomic_node_executor_source_packages/README.md b/patches/atomic_node_executor_source_packages/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..27026cd649c987607bc3022f153c2a3f93554b5d
+index 0000000000000000000000000000000000000000..41f2072588464260840db6b2952b6a82ceadaf99
 --- /dev/null
 +++ b/patches/atomic_node_executor_source_packages/README.md
-@@ -0,0 +1,450 @@
+@@ -0,0 +1,461 @@
 +# Atomic Node Executor Source Packages
 +
 +This patch fixes a local Node executor source-package cache race that can break
@@ -5492,9 +5620,11 @@ index 0000000000000000000000000000000000000000..27026cd649c987607bc3022f153c2a3f
 +`--tempdir`, and sends requests to the Node process through `/invoke`.
 +
 +The Node process overrides `os.tmpdir()` to that Rust-owned temp directory. It
-+serves many `/invoke` requests during its lifetime. `execute` and `analyze` both
-+acquire a package lease before importing user modules. Source packages are
-+materialized lazily under:
++serves many `/invoke` requests during its lifetime. `execute` and `analyze`
++acquire a package lease before importing user modules. The local resilience
++patch also uses the same acquisition boundary through `/prepare` to materialize
++a candidate's packages without importing an application module. Source
++packages are materialized lazily under:
 +
 +```text
 +<tempdir>/source/<source-package-cache-id>/
@@ -5638,6 +5768,11 @@ index 0000000000000000000000000000000000000000..27026cd649c987607bc3022f153c2a3f
 +  syscall disposal settle. Lookup and ownership acquisition verify the same map
 +  entry without an intervening asynchronous operation, so a zero-owner cache hit
 +  cannot retire while a new request is acquiring it.
++- Candidate preparation validates the complete request shape, acquires and
++  releases the same source-package lease, and carries no function path or
++  arguments. It therefore exercises source and external package publication
++  without importing or invoking application code. A preparation failure is a
++  typed endpoint result and cannot make a candidate ready.
 +- The local cache targets at most eight dynamic source packages and 512 MiB of
 +  source-package data, plus at most eight dynamic external packages and 2 GiB of
 +  external-package data. Byte accounting uses successfully extracted
@@ -5737,13 +5872,14 @@ index 0000000000000000000000000000000000000000..27026cd649c987607bc3022f153c2a3f
 +
 +## Package lifetime
 +
-+The local lease covers the supported invocation or analysis boundary. User
-+syscalls are disposed when that boundary returns success, an error, or a
-+timeout. The Node timeout race cannot cancel the underlying JavaScript promise,
-+and timed-out work and un-awaited callbacks are not supported after the
-+boundary. A future lazy import is safe while its invocation owns the lease. Work
-+that resumes after the boundary cannot rely on historical package files
-+remaining present.
++The local lease covers the supported invocation, analysis, or preparation
++boundary. Preparation releases its lease after publication because it does not
++evaluate application code. User syscalls are disposed when an invocation or
++analysis boundary returns success, an error, or a timeout. The Node timeout
++race cannot cancel the underlying JavaScript promise, and timed-out work and
++un-awaited callbacks are not supported after the boundary. A future lazy import
++is safe while its invocation owns the lease. Work that resumes after the
++boundary cannot rely on historical package files remaining present.
 +
 +The count and byte limits are process-local constants rather than deployment
 +labels or package-key configuration. When every package needed to reduce the
@@ -5803,6 +5939,9 @@ index 0000000000000000000000000000000000000000..27026cd649c987607bc3022f153c2a3f
 +`source_package.test.ts`, `errors.test.ts`, and `build_deps.test.ts` add focused
 +Vitest coverage for the package, stack, and dependency-build contracts:
 +
++- Candidate preparation publishes the source and external packages without
++  evaluating an application module, leaves no active package owner, and rejects
++  extra request or package fields before downloading.
 +- Sixteen concurrent requests for the same source package share one source
 +  download and one external dependency download, publish one final directory,
 +  and reuse it in a second concurrent wave.

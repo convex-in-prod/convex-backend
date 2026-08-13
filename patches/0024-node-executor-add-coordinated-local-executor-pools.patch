@@ -46,22 +46,19 @@ Add focused coverage for declaration and metadata validation, package readiness,
  .../convex/src/cli/lib/deployApi/startPush.ts |     1 +
  npm-packages/convex/src/cli/lib/dev.ts        |     1 +
  npm-packages/convex/src/cli/lib/run.ts        |     1 +
- npm-packages/node-executor/src/local.ts       |    15 +
- npm-packages/node-executor/src/prepare.ts     |    26 +
- .../node-executor/src/source_package.test.ts  |   176 +-
+ .../node-executor/src/source_package.test.ts  |    79 +-
  .../node-executor/src/source_package.ts       |    59 +-
  patches/README.md                             |    59 +-
- .../README.md                                 |    38 +-
+ .../README.md                                 |     7 +
  patches/backend_memory_resilience/README.md   |   122 +-
  .../local_node_executor_resilience/README.md  |   413 +-
  .../README.md                                 |   569 +
  self-hosted/advanced/knobs.md                 |    96 +-
  self-hosted/docker/docker-compose.yml         |     1 +
- 46 files changed, 16153 insertions(+), 4349 deletions(-)
+ 44 files changed, 16004 insertions(+), 4329 deletions(-)
  create mode 100644 crates/node_executor/src/routed.rs
  create mode 100644 npm-packages/convex/src/bundler/index.test.ts
  create mode 100644 npm-packages/convex/src/cli/lib/deployApi/modules.test.ts
- create mode 100644 npm-packages/node-executor/src/prepare.ts
  create mode 100644 patches/pinned_local_node_executor_pools/README.md
 
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
@@ -21421,168 +21418,11 @@ index 80910b35995cfcc80774910b2af0ef53dc6df83f..1499832e22a5d6d0c04589d23aacdf6b
        typecheck: args.typecheck,
        typecheckComponents: args.typecheckComponents,
        debug: false,
-diff --git a/npm-packages/node-executor/src/local.ts b/npm-packages/node-executor/src/local.ts
-index 7b87d639bed5cdefeda1bb0621db9978bbf1bef9..6bcfdbed921bd980dba39a4818a3bb466fc20d81 100644
---- a/npm-packages/node-executor/src/local.ts
-+++ b/npm-packages/node-executor/src/local.ts
-@@ -9,6 +9,7 @@ import { lockDiagnosticReportConfiguration } from "./diagnostic_report";
- import { extractErrorMessage, getPrepareStackTraceStats } from "./errors";
- import { startMainThreadProfiler } from "./main_thread_profiler";
- import { getPackageCacheStats } from "./source_package";
-+import { prepareSourcePackage } from "./prepare";
- 
- const DEFAULT_PORT = 3002;
- 
-@@ -59,6 +60,20 @@ async function startServer(
-     });
-   });
- 
-+  app.post("/prepare", async (req: Request, res: Response) => {
-+    try {
-+      await prepareSourcePackage(req.body);
-+      res.json({ type: "success" });
-+    } catch (_error: unknown) {
-+      // Package failure is a typed protocol outcome. Keep HTTP errors for
-+      // failures that prevent the endpoint from producing that response.
-+      res.json({
-+        type: "error",
-+        message: "Package preparation failed",
-+      });
-+    }
-+  });
-+
-   app.post("/invoke", async (req: Request, res: Response) => {
-     try {
-       const request = req.body;
-diff --git a/npm-packages/node-executor/src/prepare.ts b/npm-packages/node-executor/src/prepare.ts
-new file mode 100644
-index 0000000000000000000000000000000000000000..1851802e9be5a272ff72350ff5ffc99433fe8755
---- /dev/null
-+++ b/npm-packages/node-executor/src/prepare.ts
-@@ -0,0 +1,26 @@
-+import { z } from "zod";
-+import { acquireSourcePackage } from "./source_package";
-+
-+const packageSchema = z.object({
-+  uri: z.string(),
-+  key: z.string(),
-+  sha256: z.string(),
-+}).strict();
-+
-+const sourcePackageSchema = z.object({
-+  uri: z.string(),
-+  key: z.string(),
-+  sha256: z.string(),
-+  bundled_source: packageSchema,
-+  external_deps: packageSchema.nullish(),
-+}).strict();
-+
-+const preparationRequestSchema = z.object({
-+  sourcePackage: sourcePackageSchema,
-+}).strict();
-+
-+export async function prepareSourcePackage(request: unknown): Promise<void> {
-+  const { sourcePackage } = preparationRequestSchema.parse(request);
-+  const lease = await acquireSourcePackage(sourcePackage);
-+  await lease.release();
-+}
 diff --git a/npm-packages/node-executor/src/source_package.test.ts b/npm-packages/node-executor/src/source_package.test.ts
-index 8375a8a20c2fc64ad366fdf8c5f72a7dea4f36b2..3d0ea6e12b8a711ae9b4dd2a054c26d495727dff 100644
+index 845fadeddeddd6d947e3edc231ee6bca86645a85..3d0ea6e12b8a711ae9b4dd2a054c26d495727dff 100644
 --- a/npm-packages/node-executor/src/source_package.test.ts
 +++ b/npm-packages/node-executor/src/source_package.test.ts
-@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
- import AdmZip from "adm-zip";
- import { afterEach, beforeEach, expect, test, vi } from "vitest";
- 
-+import { prepareSourcePackage } from "./prepare";
- import {
-   acquireSourcePackage,
-   availableExternalPackages,
-@@ -38,6 +39,83 @@ afterEach(async () => {
-   }
- });
- 
-+test("preparation publishes source and external packages without evaluating modules", async () => {
-+  const sourceZip = makeSourcePackageZip(
-+    "external-package-key",
-+    1,
-+    "node",
-+    undefined,
-+    'throw new Error("application module was evaluated during preparation");\n',
-+  );
-+  const externalZip = makeExternalDepsZip();
-+  const server = await startPackageServer({
-+    "/source.zip": sourceZip,
-+    "/external.zip": externalZip,
-+  });
-+
-+  try {
-+    const sourcePackage = makeSourcePackage(
-+      `${server.baseUrl}/source.zip`,
-+      sha256(sourceZip),
-+      `${server.baseUrl}/external.zip`,
-+      sha256(externalZip),
-+    );
-+
-+    await prepareSourcePackage({ sourcePackage });
-+
-+    expect(availableSourcePackages.has("source-package-key")).toBe(true);
-+    expect(availableExternalPackages.has("external-package-key")).toBe(true);
-+    expect(server.requestCounts.get("/source.zip")).toBe(1);
-+    expect(server.requestCounts.get("/external.zip")).toBe(1);
-+    expect(getPackageCacheStats()).toMatchObject({
-+      importedSourcePackages: 0,
-+      activeSourceOwners: 0,
-+    });
-+  } finally {
-+    await server.close();
-+  }
-+});
-+
-+test("preparation rejects extra request and package fields before downloading", async () => {
-+  const sourceZip = makeSourcePackageZip();
-+  const externalZip = makeExternalDepsZip();
-+  const server = await startPackageServer({
-+    "/source.zip": sourceZip,
-+    "/external.zip": externalZip,
-+  });
-+
-+  try {
-+    const sourcePackage = makeSourcePackage(
-+      `${server.baseUrl}/source.zip`,
-+      sha256(sourceZip),
-+      `${server.baseUrl}/external.zip`,
-+      sha256(externalZip),
-+    );
-+
-+    await expect(
-+      prepareSourcePackage({
-+        sourcePackage,
-+        udfPath: "actions/example.js",
-+      }),
-+    ).rejects.toThrow();
-+    await expect(
-+      prepareSourcePackage({
-+        sourcePackage: {
-+          ...sourcePackage,
-+          bundled_source: {
-+            ...sourcePackage.bundled_source,
-+            arguments: [],
-+          },
-+        },
-+      }),
-+    ).rejects.toThrow();
-+
-+    expect(server.requestCounts.size).toBe(0);
-+  } finally {
-+    await server.close();
-+  }
-+});
-+
- test("concurrent package requests share one atomic source and external download", async () => {
-   const sourceZip = makeSourcePackageZip();
-   const externalZip = makeExternalDepsZip();
-@@ -87,6 +165,83 @@ test("concurrent package requests share one atomic source and external download"
+@@ -165,6 +165,83 @@ test("concurrent package requests share one atomic source and external download"
    }
  });
  
@@ -21666,7 +21506,7 @@ index 8375a8a20c2fc64ad366fdf8c5f72a7dea4f36b2..3d0ea6e12b8a711ae9b4dd2a054c26d4
  test("prebuild initialization clears package roots from a prior runtime", async () => {
    const sourceRoot = path.join(tmpdir!, "source");
    const externalRoot = path.join(tmpdir!, "external_deps");
-@@ -492,7 +647,7 @@ test("failed source cleanup still enforces external cache bounds", async () => {
+@@ -570,7 +647,7 @@ test("failed source cleanup still enforces external cache bounds", async () => {
    });
    const server = await startPackageServer(routes);
    const realRm = fs.promises.rm;
@@ -21675,44 +21515,6 @@ index 8375a8a20c2fc64ad366fdf8c5f72a7dea4f36b2..3d0ea6e12b8a711ae9b4dd2a054c26d4
    vi.spyOn(fs.promises, "rm").mockImplementation(
      async (...args: Parameters<typeof fs.promises.rm>) => {
        const [target] = args;
-@@ -1434,7 +1589,14 @@ function makeSourceOnlyPackage(
- function makeSourcePackageZip(
-   externalDepsStorageKey: string | null = "external-package-key",
-   moduleValue = 1,
-+  actionEnvironment = "node",
-+  moduleEnvironments: [string, string][] | undefined = undefined,
-+  applicationModule = `import "../_deps/chunk.js";\nexport const value = ${moduleValue};\n`,
- ): Buffer {
-+  moduleEnvironments ??= [
-+    ["_deps/chunk.js", "node"],
-+    ["actions/example.js", actionEnvironment],
-+  ];
-   const zip = new AdmZip();
-   zip.addFile("modules/", Buffer.alloc(0));
-   zip.addFile("modules/actions/", Buffer.alloc(0));
-@@ -1448,20 +1610,12 @@ function makeSourcePackageZip(
-           "actions/example.js",
-           "actions/example.js.map",
-         ],
--        moduleEnvironments: [
--          ["_deps/chunk.js", "node"],
--          ["actions/example.js", "node"],
--        ],
-+        moduleEnvironments,
-         externalDepsStorageKey: externalDepsStorageKey ?? undefined,
-       }),
-     ),
-   );
--  zip.addFile(
--    "modules/actions/example.js",
--    Buffer.from(
--      `import "../_deps/chunk.js";\nexport const value = ${moduleValue};\n`,
--    ),
--  );
-+  zip.addFile("modules/actions/example.js", Buffer.from(applicationModule));
-   zip.addFile(
-     "modules/_deps/chunk.js",
-     Buffer.from("export const chunk = 1;\n"),
 diff --git a/npm-packages/node-executor/src/source_package.ts b/npm-packages/node-executor/src/source_package.ts
 index c1a2848c7f009e18022400a7446a46b89283b9a2..d54854d035c71de034ac44cb685e3f31ecdd5b58 100644
 --- a/npm-packages/node-executor/src/source_package.ts
@@ -21897,59 +21699,10 @@ index 70c56d1d7ec69b3a3a74903037ef5e743ca9ad16..808f79a025614a5c6e6524f16694e495
  
  ### [Dependency capacity](dependency_capacity/README.md)
 diff --git a/patches/atomic_node_executor_source_packages/README.md b/patches/atomic_node_executor_source_packages/README.md
-index 27026cd649c987607bc3022f153c2a3f93554b5d..1aa880f9dd8538662c7d196710e309beb5189dbf 100644
+index 41f2072588464260840db6b2952b6a82ceadaf99..1aa880f9dd8538662c7d196710e309beb5189dbf 100644
 --- a/patches/atomic_node_executor_source_packages/README.md
 +++ b/patches/atomic_node_executor_source_packages/README.md
-@@ -21,9 +21,11 @@ creates a fresh temp directory, writes `local.cjs`, starts Node with
- `--tempdir`, and sends requests to the Node process through `/invoke`.
- 
- The Node process overrides `os.tmpdir()` to that Rust-owned temp directory. It
--serves many `/invoke` requests during its lifetime. `execute` and `analyze` both
--acquire a package lease before importing user modules. Source packages are
--materialized lazily under:
-+serves many `/invoke` requests during its lifetime. `execute` and `analyze`
-+acquire a package lease before importing user modules. The local resilience
-+patch also uses the same acquisition boundary through `/prepare` to materialize
-+a candidate's packages without importing an application module. Source
-+packages are materialized lazily under:
- 
- ```text
- <tempdir>/source/<source-package-cache-id>/
-@@ -167,6 +169,11 @@ complete units.
-   syscall disposal settle. Lookup and ownership acquisition verify the same map
-   entry without an intervening asynchronous operation, so a zero-owner cache hit
-   cannot retire while a new request is acquiring it.
-+- Candidate preparation validates the complete request shape, acquires and
-+  releases the same source-package lease, and carries no function path or
-+  arguments. It therefore exercises source and external package publication
-+  without importing or invoking application code. A preparation failure is a
-+  typed endpoint result and cannot make a candidate ready.
- - The local cache targets at most eight dynamic source packages and 512 MiB of
-   source-package data, plus at most eight dynamic external packages and 2 GiB of
-   external-package data. Byte accounting uses successfully extracted
-@@ -266,13 +273,14 @@ unsupported and requires restarting the executor to obtain a fresh tempdir.
- 
- ## Package lifetime
- 
--The local lease covers the supported invocation or analysis boundary. User
--syscalls are disposed when that boundary returns success, an error, or a
--timeout. The Node timeout race cannot cancel the underlying JavaScript promise,
--and timed-out work and un-awaited callbacks are not supported after the
--boundary. A future lazy import is safe while its invocation owns the lease. Work
--that resumes after the boundary cannot rely on historical package files
--remaining present.
-+The local lease covers the supported invocation, analysis, or preparation
-+boundary. Preparation releases its lease after publication because it does not
-+evaluate application code. User syscalls are disposed when an invocation or
-+analysis boundary returns success, an error, or a timeout. The Node timeout
-+race cannot cancel the underlying JavaScript promise, and timed-out work and
-+un-awaited callbacks are not supported after the boundary. A future lazy import
-+is safe while its invocation owns the lease. Work that resumes after the
-+boundary cannot rely on historical package files remaining present.
- 
- The count and byte limits are process-local constants rather than deployment
- labels or package-key configuration. When every package needed to reduce the
-@@ -327,11 +335,21 @@ requested package. The local resilience patch exports those values as backend
+@@ -335,6 +335,13 @@ requested package. The local resilience patch exports those values as backend
  metrics. Package keys, paths, module names, and function names are not metric
  labels or lifecycle log fields.
  
@@ -21963,14 +21716,6 @@ index 27026cd649c987607bc3022f153c2a3f93554b5d..1aa880f9dd8538662c7d196710e309be
  ## Tests
  
  `source_package.test.ts`, `errors.test.ts`, and `build_deps.test.ts` add focused
- Vitest coverage for the package, stack, and dependency-build contracts:
- 
-+- Candidate preparation publishes the source and external packages without
-+  evaluating an application module, leaves no active package owner, and rejects
-+  extra request or package fields before downloading.
- - Sixteen concurrent requests for the same source package share one source
-   download and one external dependency download, publish one final directory,
-   and reuse it in a second concurrent wave.
 diff --git a/patches/backend_memory_resilience/README.md b/patches/backend_memory_resilience/README.md
 index 4612b7b69d31f3aca8b0c90244f090849197b366..b4febaaf3ba6c1bd29160d468b314fe190e35e64 100644
 --- a/patches/backend_memory_resilience/README.md
