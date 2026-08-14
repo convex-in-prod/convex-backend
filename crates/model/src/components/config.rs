@@ -235,7 +235,7 @@ impl<'a, RT: Runtime> ComponentDefinitionConfigModel<'a, RT> {
 #[derive(Debug)]
 pub struct ComponentDefinitionDiff {}
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SerializedComponentDefinitionDiff {}
 
