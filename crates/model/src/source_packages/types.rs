@@ -224,7 +224,7 @@ impl std::fmt::Display for PackageSize {
     }
 }
 
-const MAX_UNZIPPED_PACKAGES_SIZE: usize = 230_000_000; // 230 MB - Lambda gives us 250 MB
+pub const MAX_UNZIPPED_PACKAGES_SIZE: usize = 230_000_000; // 230 MB - Lambda gives us 250 MB
 
 impl PackageSize {
     pub fn verify_size(&self) -> anyhow::Result<()> {

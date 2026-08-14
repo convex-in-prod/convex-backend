@@ -213,6 +213,7 @@ pub mod deploy_config;
 pub mod deploy_config2;
 pub mod deployment_audit_log;
 pub mod deployment_info;
+pub mod deployment_operations;
 pub mod deployment_state;
 pub mod environment_variables;
 pub mod http_actions;
@@ -237,6 +238,7 @@ pub mod usage_limits;
 
 #[derive(Clone)]
 pub struct LocalAppState {
+    pub(crate) deployment_operations: deployment_operations::DeploymentOperations,
     // Origin for the server (e.g. http://127.0.0.1:3210, https://demo.convex.cloud)
     pub origin: ConvexOrigin,
     // Origin for the corresponding convex.site (where we serve HTTP) (e.g. http://127.0.0.1:8001, https://crazy-giraffe-123.convex.site)
@@ -432,6 +434,7 @@ pub async fn make_app(
     }
 
     let app_state = LocalAppState {
+        deployment_operations: deployment_operations::DeploymentOperations::default(),
         origin,
         site_origin: config.convex_site_url()?,
         instance_name,

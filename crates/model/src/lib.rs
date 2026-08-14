@@ -240,6 +240,7 @@ pub mod cron_jobs;
 pub mod data_sync_progress;
 pub mod database_globals;
 pub mod deployment_audit_log;
+pub mod deployment_receipts;
 pub mod environment_variables;
 pub mod exports;
 pub mod external_packages;
@@ -588,6 +589,7 @@ pub fn app_system_tables() -> Vec<&'static dyn ErasedSystemTable> {
     let mut system_tables: Vec<&'static dyn ErasedSystemTable> = vec![
         &DatabaseGlobalsTable,
         &DeploymentAuditLogsTable,
+        &deployment_receipts::DeploymentReceiptsTable,
         &EnvironmentVariablesTable,
         &AuthTable,
         &ExternalPackagesTable,

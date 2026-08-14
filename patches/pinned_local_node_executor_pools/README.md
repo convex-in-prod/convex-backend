@@ -148,15 +148,16 @@ Rust download boundary with ambiguous environment metadata.
 Module content equality includes the pool assignment, and source-package
 metadata equality includes the complete topology.
 
-`finish_push` downloads every package after the client round trip and replaces
-its round-tripped topology with the complete topology reconstructed from the
-archive. The root topology used after commit is derived only after that
-normalization, then validated again against the runtime pool limit and host
-process budget before the commit transaction starts. A client that omits newly
-added optional topology fields therefore cannot preserve an incomplete older
-record or bypass the runtime capability check. Downloaded component archives
-are also rechecked as isolate-only before commit, so the round trip cannot add a
-Node component.
+`finish_push` downloads packages after the client round trip, or reuses retained
+server-owned sources when the deployment operation verifies the exact preparation
+response. It replaces the round-tripped topology with the complete topology
+reconstructed from those verified sources. The root topology used after commit
+is derived only after that normalization, then validated again against the
+runtime pool limit and host process budget before the commit transaction starts.
+A client that omits newly added optional topology fields cannot preserve an
+incomplete older record or bypass the runtime capability check. Component sources
+are also rechecked as isolate-only before commit, so the round trip cannot add
+a Node component.
 
 The complete proposed root topology is reconstructed before analysis and
 schema work. The active `NodeExecutor` validates it before the deployment can
@@ -164,7 +165,7 @@ commit. A deployment can contain at most eight distinct named pools. A runtime
 that does not implement dedicated pools rejects every topology with a named
 assignment while continuing to support ordinary default-routed Node modules.
 
-After package download, archive normalization, analysis, and resource
+After source resolution, topology normalization, analysis, and resource
 validation, every routed deployment reserves the global surge slot and
 installs an exact router-visible claim before its durable deployment
 transaction. Cold acquisition is immediate, but still reserves capacity so a
@@ -196,7 +197,9 @@ is absent, so an older or unsupported backend cannot silently ignore the
 operator's request.
 
 Dry runs, failed analysis, abandoned pushes, failed admission, and failed
-commits do not change the running router. An uncommitted claim may temporarily
+commits do not publish the proposed topology. Forced admission can still
+terminate a routine candidate or an old draining generation before a later
+validation or commit fails. An uncommitted claim may temporarily
 displace failed-cutover recovery, but cancellation restores that exact recovery
 owner before releasing capacity. Commit converts only the matching claim to a
 committed claim. The reservation retains it until runtime ownership is
@@ -221,8 +224,11 @@ deployment. Publications are version ordered, so a delayed older deployment
 cannot replace a newer topology.
 
 Node execution also reconciles from the same repeatable database snapshot that
-supplied its module and source-package metadata. A request that observes a
-committed topology newer than the router waits for publication and the matching
+supplied its module and source-package metadata. It selects the latest activation
+record, matching post-commit cutover. Unchanged module rows may still reference
+an older package; those references cannot select the Node generation for a newer
+snapshot. A request that observes a committed topology newer than the router
+waits for publication and the matching
 pool cutover instead of running in an incompatible generation. An older request
 is rejected when its source-package topology no longer agrees with the
 published topology. An older request with the same complete topology is
@@ -277,6 +283,10 @@ backend on panic before task cleanup can run.
 The original caller owns only its result receiver. If that receiver disappears,
 the runtime task continues the local request timer and active admission through
 the same terminal boundary, then records that terminal delivery was abandoned.
+Opt-in deployment operations additionally supply an explicit cancellation
+signal. Cancellation or workflow exit drops that invocation and uses the same
+exact-generation retirement and reaping owner as task loss. Both system and
+whole-job admission remain held through cleanup; application pools are unaffected.
 Health remains outside this gate. Analysis installs its requested environment
 and restores the child baseline; dependency builds start from that baseline.
 The system generation recycles cold and never uses or overlaps the application
