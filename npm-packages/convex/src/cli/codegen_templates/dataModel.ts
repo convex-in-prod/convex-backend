@@ -8,7 +8,7 @@ import {
   AnalyzedSchema,
   TableDefinition,
 } from "../lib/deployApi/componentDefinition.js";
-import { StartPushResponse } from "../lib/deployApi/startPush.js";
+import { CodegenAnalysis } from "../lib/deployApi/startPush.js";
 import { ConvexValidator } from "../lib/deployApi/validator.js";
 import { compareStrings, header } from "./common.js";
 import { validatorToType } from "./validator_helpers.js";
@@ -126,7 +126,7 @@ export function dynamicDataModelTS() {
 
 async function staticDataModelImpl(
   ctx: Context,
-  startPush: StartPushResponse,
+  codegenAnalysis: CodegenAnalysis,
   rootComponent: ComponentDirectory,
   componentDirectory: ComponentDirectory,
   useTypeScript: boolean,
@@ -136,12 +136,12 @@ async function staticDataModelImpl(
     componentDirectory,
   );
 
-  const analysis = startPush.analysis[definitionPath];
+  const analysis = codegenAnalysis.analysis[definitionPath];
   if (!analysis) {
     return await ctx.crash({
       exitCode: 1,
       errorType: "fatal",
-      printedMessage: `No analysis found for component ${definitionPath} orig: ${definitionPath}\nin\n${Object.keys(startPush.analysis).toString()}`,
+      printedMessage: `No analysis found for component ${definitionPath} orig: ${definitionPath}\nin\n${Object.keys(codegenAnalysis.analysis).toString()}`,
     });
   }
   if (!analysis.schema) {
@@ -190,13 +190,13 @@ async function staticDataModelImpl(
 
 export async function staticDataModelDTS(
   ctx: Context,
-  startPush: StartPushResponse,
+  codegenAnalysis: CodegenAnalysis,
   rootComponent: ComponentDirectory,
   componentDirectory: ComponentDirectory,
 ) {
   return staticDataModelImpl(
     ctx,
-    startPush,
+    codegenAnalysis,
     rootComponent,
     componentDirectory,
     false,
@@ -206,13 +206,13 @@ export async function staticDataModelDTS(
 // Used for components and root
 export async function staticDataModelTS(
   ctx: Context,
-  startPush: StartPushResponse,
+  codegenAnalysis: CodegenAnalysis,
   rootComponent: ComponentDirectory,
   componentDirectory: ComponentDirectory,
 ) {
   return staticDataModelImpl(
     ctx,
-    startPush,
+    codegenAnalysis,
     rootComponent,
     componentDirectory,
     true,

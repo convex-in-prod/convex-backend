@@ -6,10 +6,11 @@ This self-hosted patch makes both local Convex HTTP gates use the strict
 `HTTP_SERVER_MAX_CONCURRENT_REQUESTS` setting and adds bounded dependency-only overflow to the main
 backend gate through `HTTP_SERVER_DEPENDENCY_RESERVE`.
 
-All requests consume shared base admission while it is available. Only authenticated Node callback
-routes carrying the callback-token header may raise main-service occupancy above that base. The
-patch does not prioritize application routes, bound an external reverse proxy, or replace
-application and isolate limits.
+All requests consume shared base admission while it is available. The baseline
+allows Node callback routes carrying the callback-token header above that base.
+The maintained deployment extension also admits authenticated configuration
+routes through three bounded allowances described below. Application and
+isolate limits and any external reverse proxy remain separate.
 
 The isolate and application dependency-capacity companion is documented in
 [`dependency_capacity/README.md`](../dependency_capacity/README.md). The patches are independently selectable, but a
@@ -32,16 +33,23 @@ callback cannot enter and the ancestor cannot release its downstream resources.
 Let:
 
 - `H = HTTP_SERVER_MAX_CONCURRENT_REQUESTS`, the total permits in each local HTTP service;
-- `D = HTTP_SERVER_DEPENDENCY_RESERVE`, callback-only overflow in the main service;
-- `H - D`, the main-service shared base.
+- `D = HTTP_SERVER_DEPENDENCY_RESERVE`, callback overflow in the main service;
+- `C = 3`, the deployment allowances when the deployment extension is carried;
+- `H - D - C`, the main-service ordinary admission ceiling (`C = 0` in the baseline).
 
 The main API and port `3211` proxy have separate gates with the same `H`. A request sent to port
 `3211` retains a proxy permit while its forwarded `/http` request holds a main-service permit. A
 reverse proxy may instead route directly to `/http` on port `3210`, which uses only the main gate.
 
-Every main-service request consumes shared base while it has room. Only `/api/actions/*` requests
-carrying the callback-token header may raise occupancy above `H - D`, up to `H`. The port `3211`
-proxy has no dependency overflow because Node callbacks target the main API origin.
+Every main-service request consumes the shared total. `/api/actions/*` requests
+carrying the callback-token header can reach `H`. Exact deployment POST routes
+with an authorization header first claim one of three single-request slots:
+analysis/submission, schema-wait/finish, or status/cancel/capabilities. They can
+also reach `H`, but must authenticate before decompression and handling.
+Dependencies can consume the complete total, including unused deployment
+allowances; these are not three exclusive physical permits. The port `3211`
+proxy has neither deployment allowances nor dependency overflow because it
+forwards HTTP actions and callbacks target the main API origin.
 
 This classification occurs before route middleware authenticates the token. The token still
 protects callback operations, but the reserve is not a denial-of-service security boundary: a
@@ -60,8 +68,13 @@ The concurrency middleware releases a permit when the service future returns the
 head. A streaming HTTP action body and its producing isolate work can outlive both main and proxy
 permits. These settings do not bound concurrently streaming response bodies.
 
-Requests above a gate wait for a permit. The current request instrumentation and
-`HTTP_SERVER_TIMEOUT_SECONDS` layer start after permit acquisition, so neither measures nor bounds
+Ordinary and callback requests above a gate wait for a permit. Deployment lane
+occupancy rejects immediately with 429, total-permit waits time out after two
+seconds with 429, and the subsequent header-authentication check has its own
+two-second limit, returning 503 on timeout. Missing authorization headers retain
+ordinary admission. Handlers also authorize their body credential. The current
+request instrumentation and `HTTP_SERVER_TIMEOUT_SECONDS` layer start after
+permit acquisition, so neither measures nor bounds
 that pre-permit wait. Use Caddy or another upstream load balancer for finite external queueing,
 route-specific bulkheads, and caller-visible overload timeouts.
 
@@ -81,7 +94,8 @@ local fixed limits, so operators should normally select an explicit value from m
 and downstream capacity.
 
 `H` must be a positive integer no larger than Tokio's supported semaphore bound. `D` defaults to
-`1`, may be `0` to disable callback overflow, and must be smaller than `H`. Empty, malformed,
+`1`, may be `0` to disable callback overflow, and must leave ordinary space after
+the three deployment allowances: `D + 3 < H` in the maintained local backend. Empty, malformed,
 non-Unicode, signed, overflowing, zero total, and inconsistent values fail before runtime and
 database initialization rather than falling back.
 

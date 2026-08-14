@@ -171,6 +171,29 @@ pub async fn upload_package(
     ))
 }
 
+/// Validate the exact archive size without creating a storage object. Using
+/// the canonical writer preserves the compressed-size contract at preflight.
+pub async fn measure_package(
+    package: BTreeMap<CanonicalizedModulePath, &ModuleConfig>,
+) -> anyhow::Result<PackageSize> {
+    let (sender, mut receiver) = mpsc::channel::<Bytes>(1);
+    let packager = write_package(package, ChannelWriter::new(sender, 64 * 1024), None);
+    let counter = async {
+        let mut bytes = 0usize;
+        while let Some(chunk) = receiver.recv().await {
+            bytes = bytes
+                .checked_add(chunk.len())
+                .context("package size overflow")?;
+        }
+        anyhow::Ok(bytes)
+    };
+    let ((unzipped_size_bytes, _), zipped_size_bytes) = futures::try_join!(packager, counter)?;
+    Ok(PackageSize {
+        zipped_size_bytes,
+        unzipped_size_bytes,
+    })
+}
+
 #[fastrace::trace]
 pub async fn download_package(
     storage: Arc<dyn Storage>,
@@ -360,5 +383,23 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&metadata).unwrap();
         assert!(serde_json::from_slice::<LegacyMetadataJson>(&encoded).is_err());
+    }
+
+    #[tokio::test]
+    async fn measure_package_matches_archive_size() {
+        let module = ModuleConfig {
+            path: "functions/example.js".parse().unwrap(),
+            source: ModuleSource::new("export const example = 1;"),
+            source_map: Some("example-source-map".into()),
+            environment: ModuleEnvironment::Isolate,
+            node_pool: None,
+        };
+        let package = || BTreeMap::from([(module.path.clone().canonicalize(), &module)]);
+        let mut first_archive = std::io::Cursor::new(Vec::new());
+        write_package(package(), &mut first_archive, None)
+            .await
+            .unwrap();
+        let measured = super::measure_package(package()).await.unwrap();
+        assert_eq!(measured.zipped_size_bytes, first_archive.get_ref().len());
     }
 }

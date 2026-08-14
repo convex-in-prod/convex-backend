@@ -98,6 +98,13 @@ External shedding is independently gated by
 When both controllers are enabled, the reclamation entry and exit boundaries must each preserve
 more headroom than the corresponding shedding boundary. Invalid relationships fail startup.
 
+With external shedding enabled, authenticated deployment intake has a separate
+hard stop at `LOCAL_BACKEND_DEPLOYMENT_MIN_HEADROOM_BYTES` (default 2 GiB).
+It is checked even when ordinary soft shedding is inactive and must be below
+the finite cgroup limit. Internal reclamation alone does not enable this HTTP
+stop. Above the stop, deployment routes retain their bounded HTTP allowances
+during ordinary shedding; dependency callbacks retain the existing exemption.
+
 The controller samples cgroup headroom every second. On an eligible reclamation sample it starts at
 most one allocator trim on a detached native worker while control sampling continues, then consumes
 its completion and resamples the cgroup. It publishes the shared pressure signal only if headroom

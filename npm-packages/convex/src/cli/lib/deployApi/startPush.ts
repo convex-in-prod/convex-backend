@@ -24,6 +24,8 @@ export const startPushRequest = looseObject({
 
   nodeVersion: z.optional(z.string()),
   nodeDefaultMemoryMb: z.optional(z.number()),
+  forCodegen: z.optional(z.boolean()),
+  includeAnalysis: z.optional(z.boolean()),
 });
 export type StartPushRequest = z.infer<typeof startPushRequest>;
 
@@ -34,6 +36,13 @@ export const schemaChange = looseObject({
 });
 export type SchemaChange = z.infer<typeof schemaChange>;
 
+export const componentAnalysis = z.record(
+  componentDefinitionPath,
+  evaluatedComponentDefinition,
+);
+export type ComponentAnalysis = z.infer<typeof componentAnalysis>;
+export type CodegenAnalysis = { analysis: ComponentAnalysis };
+
 export const startPushResponse = looseObject({
   environmentVariables: z.record(z.string(), z.string()),
 
@@ -41,7 +50,7 @@ export const startPushResponse = looseObject({
   componentDefinitionPackages: z.record(componentDefinitionPath, sourcePackage),
 
   appAuth: z.array(authInfo),
-  analysis: z.record(componentDefinitionPath, evaluatedComponentDefinition),
+  analysis: componentAnalysis,
 
   app: checkedComponent,
 
@@ -115,6 +124,7 @@ export function startPushResponseForLogging(
 }
 
 export const evaluatePushResponse = looseObject({
+  analysis: z.optional(componentAnalysis),
   schemaChange,
 });
 export type EvaluatePushResponse = z.infer<typeof evaluatePushResponse>;
