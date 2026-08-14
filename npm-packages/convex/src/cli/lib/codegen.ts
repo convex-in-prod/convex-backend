@@ -35,7 +35,7 @@ import {
   ComponentDirectory,
   toComponentDefinitionPath,
 } from "./components/definition/directoryStructure.js";
-import { StartPushResponse } from "./deployApi/startPush.js";
+import { CodegenAnalysis } from "./deployApi/startPush.js";
 import {
   componentApiDTS,
   componentApiJs,
@@ -327,7 +327,7 @@ export async function doFinalComponentCodegen(
   tmpDir: TempDir,
   rootComponent: ComponentDirectory,
   componentDirectory: ComponentDirectory,
-  startPushResponse: StartPushResponse,
+  codegenAnalysis: CodegenAnalysis,
   componentsMap: Map<string, ComponentDirectory>,
   opts?: {
     dryRun?: boolean;
@@ -364,13 +364,13 @@ export async function doFinalComponentCodegen(
       dataModelContents = useTypeScript
         ? await staticDataModelTS(
             ctx,
-            startPushResponse,
+            codegenAnalysis,
             rootComponent,
             componentDirectory,
           )
         : await staticDataModelDTS(
             ctx,
-            startPushResponse,
+            codegenAnalysis,
             rootComponent,
             componentDirectory,
           );
@@ -402,7 +402,7 @@ export async function doFinalComponentCodegen(
     const componentTSPath = path.join(codegenDir, "component.ts");
     const componentTSContents = await componentTS(
       ctx,
-      startPushResponse,
+      codegenAnalysis,
       rootComponent,
       componentDirectory,
     );
@@ -421,7 +421,7 @@ export async function doFinalComponentCodegen(
     rootComponent,
     componentDirectory,
   );
-  const analysis = startPushResponse.analysis[definitionPath];
+  const analysis = codegenAnalysis.analysis[definitionPath];
   const envVars: EnvVarMeta[] =
     analysis?.definition.envVars && analysis.definition.envVars.length > 0
       ? analysis.definition.envVars
@@ -441,7 +441,7 @@ export async function doFinalComponentCodegen(
     const apiDTSPath = path.join(codegenDir, "api.d.ts");
     const apiContents = await componentApiDTS(
       ctx,
-      startPushResponse,
+      codegenAnalysis,
       rootComponent,
       componentDirectory,
       componentsMap,
@@ -474,7 +474,7 @@ export async function doFinalComponentCodegen(
     const apiTSPath = path.join(codegenDir, "api.ts");
     const apiContents = await componentApiTSWithTypes(
       ctx,
-      startPushResponse,
+      codegenAnalysis,
       rootComponent,
       componentDirectory,
       componentsMap,
