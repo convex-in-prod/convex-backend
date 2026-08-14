@@ -1,0 +1,757 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Fri, 14 Aug 2026 11:52:23 +0800
+Subject: [PATCH 25/25] deployment: return non-committing analysis for codegen
+
+Extend evaluate_push with an opt-in evaluated component map while retaining the schema-only response for ordinary deployment preflight. Compute schema and index differences through the canonical preparation path in a dropped transaction so validation and backfill workers cannot observe pending metadata.
+
+Share file-based export construction with start_push and keep normal development and deployment lifecycle behavior unchanged. Restrict the standalone component environment-binding exception to the sole synthetic-root child, preserve symbolic bindings into strict descendants, and reject malformed synthetic roots.
+
+Document the matching CLI protocol, backend-first rollout, residual analysis side effects, compatibility boundaries, and rejected alternatives as a standalone operator adoption patch.
+---
+ crates/application/src/deploy_config.rs       |  69 ++++--
+ crates/local_backend/src/deploy_config2.rs    |  19 +-
+ crates/model/src/components/type_checking.rs  | 229 +++++++++++++++++-
+ crates/model/src/components/types.rs          |  13 +-
+ npm-packages/convex/src/cli/codegen.ts        |   3 +-
+ patches/README.md                             |  30 ++-
+ .../non_committing_codegen_analysis/README.md | 148 +++++++++++
+ 7 files changed, 459 insertions(+), 52 deletions(-)
+ create mode 100644 patches/non_committing_codegen_analysis/README.md
+
+diff --git a/crates/application/src/deploy_config.rs b/crates/application/src/deploy_config.rs
+index e4c5637a78e8134a5cdd8a83c810e6faf8c2d90f..90249ea4bbebbbca9624c6589b5fd7d517fd6451 100644
+--- a/crates/application/src/deploy_config.rs
++++ b/crates/application/src/deploy_config.rs
+@@ -289,17 +289,7 @@ impl<RT: Runtime> Application<RT> {
+             .load_indexes_into_memory(btreeset! { SCHEMAS_TABLE.clone() })
+             .await?;
+ 
+-        // TODO(ENG-7533): Clean up exports from the start push response when we've
+-        // updated clients to use `functions` directly.
+-        for (path, definition) in evaluated_components.iter_mut() {
+-            // We don't need to include exports for the root since we don't use codegen
+-            // for the app's `api` object.
+-            if path.is_root() {
+-                continue;
+-            }
+-            anyhow::ensure!(definition.definition.exports.is_empty());
+-            definition.definition.exports = file_based_exports(&definition.functions)?;
+-        }
++        add_file_based_exports_to_analysis(&mut evaluated_components)?;
+ 
+         let resp = StartPushResponse {
+             environment_variables: user_environment_variables,
+@@ -398,7 +388,7 @@ impl<RT: Runtime> Application<RT> {
+                 .collect(),
+         )?;
+         let ctx = if config.for_codegen {
+-            TypecheckContext::new_for_codegen(&evaluated_components, &initializer_evaluator)
++            TypecheckContext::new_for_codegen(&evaluated_components, &initializer_evaluator)?
+         } else {
+             TypecheckContext::new(&evaluated_components, &initializer_evaluator)
+         };
+@@ -453,6 +443,9 @@ impl<RT: Runtime> Application<RT> {
+         evaluated_components: &BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
+     ) -> anyhow::Result<SchemaChange> {
+         let mut tx = self.begin(Identity::system()).await?;
++        // Reuse the canonical preparation logic, but keep every schema, index,
++        // and component-namespace write inside this uncommitted transaction.
++        // Schema and backfill workers can only observe the committed metadata.
+         let schema_change = ComponentConfigModel::new(&mut tx)
+             .start_component_schema_changes(app, evaluated_components, false)
+             .await?;
+@@ -632,15 +625,24 @@ impl<RT: Runtime> Application<RT> {
+     ) -> anyhow::Result<EvaluatePushResponse> {
+         let EvaluatedPushContents {
+             app,
+-            evaluated_components,
++            mut evaluated_components,
+             ..
+         } = self.evaluate_push_contents(config).await?;
+ 
+         let schema_change = self
+             .handle_schema_change_read_only(&app, &evaluated_components)
+             .await?;
++        let analysis = if config.include_analysis {
++            add_file_based_exports_to_analysis(&mut evaluated_components)?;
++            Some(evaluated_components)
++        } else {
++            None
++        };
+ 
+-        Ok(EvaluatePushResponse { schema_change })
++        Ok(EvaluatePushResponse {
++            analysis,
++            schema_change,
++        })
+     }
+ 
+     #[fastrace::trace]
+@@ -1154,12 +1156,10 @@ fn validate_env_var_declarations(
+ 
+ /// Convex code push is a multiphase process.
+ ///
+-/// Clients that want to push code send this message to the backend. They use
+-/// a resulting [StartPushResponse] to complete codegen and optionally
+-/// complete the code push.
+-///
+-/// They also might decide to not do a complete push (e.g. just getting the
+-/// analyze results to use for codegen).
++/// Deploying clients send this message to `start_push`, then use the resulting
++/// [StartPushResponse] for code generation and to complete the push. Clients
++/// that only need schema diffs or code generation analysis send the same
++/// message to `evaluate_push`, which does not start the multiphase push.
+ #[derive(Deserialize, Debug)]
+ #[serde(rename_all = "camelCase")]
+ pub struct StartPushRequest {
+@@ -1177,10 +1177,17 @@ pub struct StartPushRequest {
+     #[serde(default)]
+     pub dry_run: bool,
+ 
+-    /// Indicates that this request is only for codegen and isn't initiating a
+-    /// full mutiphase push.
++    /// Indicates standalone component codegen, where the CLI uses a synthetic
++    /// root that cannot provide the component's required environment bindings.
++    /// Older clients send this request to `start_push`, so that path also
++    /// avoids committing index changes when this is set.
+     #[serde(default)]
+     pub for_codegen: bool,
++
++    /// Requests evaluated module and component analysis from `evaluate_push`.
++    /// `start_push` already returns this analysis regardless of this field.
++    #[serde(default)]
++    pub include_analysis: bool,
+ }
+ 
+ impl StartPushRequest {
+@@ -1216,6 +1223,7 @@ impl StartPushRequest {
+             node_version,
+             dry_run: self.dry_run,
+             for_codegen: self.for_codegen,
++            include_analysis: self.include_analysis,
+         })
+     }
+ }
+@@ -1246,9 +1254,26 @@ pub struct StartPushResult {
+ 
+ #[derive(Debug)]
+ pub struct EvaluatePushResponse {
++    pub analysis: Option<BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>>,
+     pub schema_change: SchemaChange,
+ }
+ 
++fn add_file_based_exports_to_analysis(
++    analysis: &mut BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
++) -> anyhow::Result<()> {
++    // TODO(ENG-7533): Stop adding exports to analysis after clients use
++    // `functions` directly for code generation.
++    for (path, definition) in analysis {
++        // The app's `api` object does not use these generated exports.
++        if path.is_root() {
++            continue;
++        }
++        anyhow::ensure!(definition.definition.exports.is_empty());
++        definition.definition.exports = file_based_exports(&definition.functions)?;
++    }
++    Ok(())
++}
++
+ impl From<NodeDependencyJson> for NodeDependency {
+     fn from(value: NodeDependencyJson) -> Self {
+         Self {
+diff --git a/crates/local_backend/src/deploy_config2.rs b/crates/local_backend/src/deploy_config2.rs
+index b97411041309adb320b4efc278c63d1c63008223..ce62abe99081e4113839f24055e93be5a656a863 100644
+--- a/crates/local_backend/src/deploy_config2.rs
++++ b/crates/local_backend/src/deploy_config2.rs
+@@ -182,6 +182,15 @@ impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
+ 
+     fn try_from(value: EvaluatePushResponse) -> Result<Self, Self::Error> {
+         Ok(Self {
++            analysis: value
++                .analysis
++                .map(|analysis| {
++                    analysis
++                        .into_iter()
++                        .map(|(k, v)| Ok((String::from(k), v.try_into()?)))
++                        .collect::<anyhow::Result<_>>()
++                })
++                .transpose()?,
+             schema_change: value.schema_change.try_into()?,
+         })
+     }
+@@ -190,6 +199,8 @@ impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
+ #[derive(Deserialize, Serialize)]
+ #[serde(rename_all = "camelCase")]
+ pub struct SerializedEvaluatePushResponse {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    analysis: Option<BTreeMap<String, SerializedEvaluatedComponentDefinition>>,
+     schema_change: SerializedSchemaChange,
+ }
+ 
+@@ -225,10 +236,10 @@ pub async fn start_push(
+     )?))
+ }
+ 
+-// This endpoint is similar to `start_push`, but it doesn’t save the schema (so
+-// it won’t start schema validation/index backfill). It can be used to determine
+-// what will be the effects of a large push without starting work that can take
+-// a long time on large instances.
++// This endpoint is similar to `start_push`, but it does not commit schema or
++// index preparation, so it cannot start schema validation or index backfills.
++// It always returns the schema diff and includes code generation analysis only
++// when requested.
+ pub async fn evaluate_push(
+     MtState(st): MtState<LocalAppState>,
+     Json(req): Json<StartPushRequest>,
+diff --git a/crates/model/src/components/type_checking.rs b/crates/model/src/components/type_checking.rs
+index e35fce35f4e827a572e0dabd330bf389ab745231..c6641426be4f94332178fa622a95c7fcf733c575 100644
+--- a/crates/model/src/components/type_checking.rs
++++ b/crates/model/src/components/type_checking.rs
+@@ -82,7 +82,7 @@ pub trait InitializerEvaluator: Send + Sync {
+ pub struct TypecheckContext<'a> {
+     evaluated_definitions: &'a BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
+     initializer_evaluator: &'a dyn InitializerEvaluator,
+-    validate_env_vars: bool,
++    unbound_env_component_path: Option<ComponentPath>,
+ }
+ 
+ impl<'a> TypecheckContext<'a> {
+@@ -93,21 +93,33 @@ impl<'a> TypecheckContext<'a> {
+         Self {
+             evaluated_definitions: definitions,
+             initializer_evaluator,
+-            validate_env_vars: true,
++            unbound_env_component_path: None,
+         }
+     }
+ 
+     pub fn new_for_codegen(
+         definitions: &'a BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
+         initializer_evaluator: &'a dyn InitializerEvaluator,
+-    ) -> Self {
+-        Self {
++    ) -> anyhow::Result<Self> {
++        let root = definitions
++            .get(&ComponentDefinitionPath::root())
++            .ok_or_else(|| {
++                ErrorMetadata::bad_request("TypecheckError", "Root component definition not found")
++            })?;
++        let [target] = root.definition.child_components.as_slice() else {
++            anyhow::bail!(ErrorMetadata::bad_request(
++                "TypecheckError",
++                "Standalone component codegen requires a synthetic root with exactly one child \
++                 component",
++            ));
++        };
++        Ok(Self {
+             evaluated_definitions: definitions,
+             initializer_evaluator,
+-            // When doing isolate codegen for a component, a shell root component is used which
+-            // doesn't have env vars defined.
+-            validate_env_vars: false,
+-        }
++            // Standalone component codegen mounts the target below a synthetic root
++            // that cannot supply its environment bindings.
++            unbound_env_component_path: Some(ComponentPath::root().push(target.name.clone())),
++        })
+     }
+ 
+     #[fastrace::trace]
+@@ -150,13 +162,18 @@ impl<'a> TypecheckContext<'a> {
+                 )
+             })?;
+ 
++        // Only the component mounted directly under the synthetic root lacks
++        // bindings. Components instantiated by that target must remain strict.
++        let allow_unbound_env_vars =
++            self.unbound_env_component_path.as_ref() == Some(&component_path);
++
+         let mut builder = CheckedComponentBuilder::check_args(
+             &definition_path,
+             &component_path,
+             evaluated,
+             args,
+             env,
+-            self.validate_env_vars,
++            allow_unbound_env_vars,
+         )?;
+ 
+         // Pre-compute the HTTP mount path for each child component by name.
+@@ -239,6 +256,9 @@ impl<'a> TypecheckContext<'a> {
+                             .env
+                             .get(&parent_id)
+                             .cloned()
++                            // Preserve a structurally valid binding through the
++                            // target when only its synthetic-root binding is unknown.
++                            .or_else(|| allow_unbound_env_vars.then(|| binding.clone()))
+                             .map(|resolved| (child_key, resolved))
+                     },
+                 })
+@@ -429,7 +449,7 @@ impl<'a> CheckedComponentBuilder<'a> {
+         evaluated: &'a EvaluatedComponentDefinition,
+         args: BTreeMap<Identifier, Resource>,
+         env: BTreeMap<Identifier, EnvBinding>,
+-        validate_env_vars: bool,
++        allow_unbound_env_vars: bool,
+     ) -> anyhow::Result<Self> {
+         match &evaluated.definition.definition_type {
+             ComponentDefinitionType::App => {
+@@ -457,7 +477,7 @@ impl<'a> CheckedComponentBuilder<'a> {
+                 ));
+             }
+         }
+-        if !component_path.is_root() && validate_env_vars {
++        if !component_path.is_root() && !allow_unbound_env_vars {
+             for (env_name, validator) in env_validators {
+                 if !validator.optional && !env.contains_key(env_name) {
+                     anyhow::bail!(ErrorMetadata::bad_request(
+@@ -730,7 +750,6 @@ impl CheckedHttpRoutes {
+             .unwrap_or(true)
+             && self.mounts.is_empty()
+     }
+-
+ }
+ 
+ mod json {
+@@ -928,3 +947,189 @@ pub use self::json::{
+     SerializedCheckedComponent,
+     SerializedResourceTree,
+ };
++
++#[cfg(test)]
++mod tests {
++    use common::{
++        bootstrap_model::components::definition::{
++            ComponentDefinitionMetadata,
++            ComponentDefinitionType,
++            ComponentInstantiation,
++            EnvVarValidator,
++        },
++        runtime::UnixTimestamp,
++        schemas::validator::Validator,
++    };
++    use semver::Version;
++
++    use super::*;
++    use crate::udf_config::types::UdfConfig;
++
++    struct UnusedInitializerEvaluator;
++
++    #[async_trait]
++    impl InitializerEvaluator for UnusedInitializerEvaluator {
++        async fn evaluate(
++            &self,
++            _path: ComponentDefinitionPath,
++            _args: BTreeMap<Identifier, Resource>,
++            _name: ComponentName,
++        ) -> anyhow::Result<BTreeMap<Identifier, Resource>> {
++            unreachable!("test component instantiations provide their arguments")
++        }
++    }
++
++    fn instantiation(
++        name: &str,
++        path: &str,
++        env: BTreeMap<Identifier, EnvBinding>,
++    ) -> ComponentInstantiation {
++        ComponentInstantiation {
++            name: name.parse().unwrap(),
++            path: path.parse().unwrap(),
++            args: Some(BTreeMap::new()),
++            env,
++        }
++    }
++
++    fn evaluated_component(
++        path: ComponentDefinitionPath,
++        definition_type: ComponentDefinitionType,
++        child_components: Vec<ComponentInstantiation>,
++        required_env_vars: &[&str],
++    ) -> EvaluatedComponentDefinition {
++        EvaluatedComponentDefinition {
++            definition: ComponentDefinitionMetadata {
++                path,
++                definition_type,
++                child_components,
++                http_mounts: BTreeMap::new(),
++                http_prefix: None,
++                exports: BTreeMap::new(),
++                env_vars: required_env_vars
++                    .iter()
++                    .map(|name| {
++                        (
++                            name.parse().unwrap(),
++                            EnvVarValidator {
++                                validator: Validator::String,
++                                optional: false,
++                            },
++                        )
++                    })
++                    .collect(),
++            },
++            schema: None,
++            functions: BTreeMap::new(),
++            udf_config: UdfConfig {
++                server_version: Version::new(1, 0, 0),
++                import_phase_rng_seed: [0; 32],
++                import_phase_unix_timestamp: UnixTimestamp::from_nanos(0),
++            },
++        }
++    }
++
++    fn codegen_definitions(
++        nested_env: Option<BTreeMap<Identifier, EnvBinding>>,
++    ) -> BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition> {
++        let root_path = ComponentDefinitionPath::root();
++        let target_path: ComponentDefinitionPath = "target".parse().unwrap();
++        let nested_path: ComponentDefinitionPath = "nested".parse().unwrap();
++
++        let root = evaluated_component(
++            root_path.clone(),
++            ComponentDefinitionType::App,
++            vec![instantiation("target", "target", BTreeMap::new())],
++            &[],
++        );
++        let include_nested = nested_env.is_some();
++        let target_children = nested_env
++            .map(|env| vec![instantiation("nested", "nested", env)])
++            .unwrap_or_default();
++        let target = evaluated_component(
++            target_path.clone(),
++            ComponentDefinitionType::ChildComponent {
++                name: "targetDefinition".parse().unwrap(),
++                args: BTreeMap::new(),
++            },
++            target_children,
++            &["TARGET_ENV"],
++        );
++
++        let mut definitions = BTreeMap::from([(root_path, root), (target_path, target)]);
++        if include_nested {
++            let nested = evaluated_component(
++                nested_path.clone(),
++                ComponentDefinitionType::ChildComponent {
++                    name: "nestedDefinition".parse().unwrap(),
++                    args: BTreeMap::new(),
++                },
++                vec![],
++                &["NESTED_ENV"],
++            );
++            definitions.insert(nested_path, nested);
++        }
++        definitions
++    }
++
++    #[tokio::test]
++    async fn codegen_allows_unbound_env_on_synthetic_root_child() {
++        let definitions = codegen_definitions(None);
++        let context =
++            TypecheckContext::new_for_codegen(&definitions, &UnusedInitializerEvaluator).unwrap();
++
++        context.instantiate_root().await.unwrap();
++    }
++
++    #[test]
++    fn codegen_rejects_non_synthetic_root_shape() {
++        let mut definitions = codegen_definitions(None);
++        let root = definitions
++            .get_mut(&ComponentDefinitionPath::root())
++            .unwrap();
++        root.definition.child_components.push(instantiation(
++            "anotherTarget",
++            "target",
++            BTreeMap::new(),
++        ));
++
++        let error = TypecheckContext::new_for_codegen(&definitions, &UnusedInitializerEvaluator)
++            .err()
++            .unwrap()
++            .to_string();
++        assert!(error.contains("synthetic root with exactly one child"));
++    }
++
++    #[tokio::test]
++    async fn ordinary_validation_rejects_unbound_env_on_root_child() {
++        let definitions = codegen_definitions(None);
++        let context = TypecheckContext::new(&definitions, &UnusedInitializerEvaluator);
++
++        let error = context.instantiate_root().await.unwrap_err().to_string();
++        assert!(error.contains("missing required env var"));
++        assert!(error.contains("TARGET_ENV"));
++    }
++
++    #[tokio::test]
++    async fn codegen_rejects_unbound_required_env_on_nested_component() {
++        let definitions = codegen_definitions(Some(BTreeMap::new()));
++        let context =
++            TypecheckContext::new_for_codegen(&definitions, &UnusedInitializerEvaluator).unwrap();
++
++        let error = context.instantiate_root().await.unwrap_err().to_string();
++        assert!(error.contains("missing required env var"));
++        assert!(error.contains("NESTED_ENV"));
++    }
++
++    #[tokio::test]
++    async fn codegen_preserves_symbolic_env_binding_through_unbound_target() {
++        let definitions = codegen_definitions(Some(BTreeMap::from([(
++            "NESTED_ENV".parse().unwrap(),
++            EnvBinding::EnvVar("TARGET_ENV".parse().unwrap()),
++        )])));
++        let context =
++            TypecheckContext::new_for_codegen(&definitions, &UnusedInitializerEvaluator).unwrap();
++
++        context.instantiate_root().await.unwrap();
++    }
++}
+diff --git a/crates/model/src/components/types.rs b/crates/model/src/components/types.rs
+index 80631b6f548a99dddbd7b35283fe87b118770495..eed64341431c1532faba1289664562a9d95d5eb0 100644
+--- a/crates/model/src/components/types.rs
++++ b/crates/model/src/components/types.rs
+@@ -53,12 +53,15 @@ pub struct ProjectConfig {
+ 
+     pub dry_run: bool,
+ 
+-    /// When true, relax typechecks that don't affect the codegen output. The
+-    /// CLI sets this for standalone component codegen (`convex codegen
+-    /// --component-dir ...`), where it wraps the target component in a
+-    /// synthetic root app that can't provide bindings for the child's required
+-    /// env vars.
++    /// When true, allow the component directly mounted by the synthetic root
++    /// app to leave its required environment variables unbound. The CLI sets
++    /// this only for standalone component codegen (`convex codegen
++    /// --component-dir ...`).
+     pub for_codegen: bool,
++
++    /// Include evaluated module and component analysis in an `evaluate_push`
++    /// response. Deployment preflight only needs the schema diff.
++    pub include_analysis: bool,
+ }
+ 
+ #[derive(Debug)]
+diff --git a/npm-packages/convex/src/cli/codegen.ts b/npm-packages/convex/src/cli/codegen.ts
+index 2538b957ff95de9100fb24b3fe84f613d8d90a68..0cd7f01fb668c2a0d02bd89ceae30ee80caa3c8a 100644
+--- a/npm-packages/convex/src/cli/codegen.ts
++++ b/npm-packages/convex/src/cli/codegen.ts
+@@ -67,7 +67,8 @@ export const codegen = new Command("codegen")
+       liveComponentSources: !!options.liveComponentSources,
+       debugNodeApis: false,
+       systemUdfs: !!options.systemUdfs,
+-      largeIndexDeletionCheck: "no verification" as const, // `codegen` is a read-only operation
++      // Codegen does not perform an additional large-index-deletion preflight.
++      largeIndexDeletionCheck: "no verification" as const,
+       codegenOnlyThisComponent: options.componentDir,
+     };
+ 
+diff --git a/patches/README.md b/patches/README.md
+index 808f79a025614a5c6e6524f16694e4956265732e..0f893e39c89f061c74a8d98d2dad9f67d0ff76b1 100644
+--- a/patches/README.md
++++ b/patches/README.md
+@@ -11,7 +11,8 @@ an explicitly ordered corrective integration commit may complete several earlier
+ the owning essays identify those compositions. Lane-aware queueing and its optional deployment
+ extension are one queue-control patch. The matching degradable-query client half is maintained in
+ `convex-js`; it shares the protocol and adoption essay but is not another commit in this backend
+-chain.
++chain. Non-committing codegen analysis likewise has a matching CLI commit, with the combined
++adoption contract documented in the backend essay.
+ 
+ ## Database connection reliability
+ 
+@@ -49,6 +50,18 @@ chain.
+ - Activation: only through the privileged repair endpoint; dry-run is the default.
+ - Rollback: do not execute a stale plan. There is no generic undo after destructive finalization.
+ 
++## Deployment and code generation
++
++### [Non-committing codegen analysis](non_committing_codegen_analysis/README.md)
++
++- Purpose: let standalone codegen obtain authoritative evaluated component analysis without
++  committing pending schema or index metadata or starting validation and backfill workers.
++- Prerequisites: the matching `convex-js` CLI patch. Upgrade the backend before distributing that
++  CLI; other backend patches are not required.
++- Activation: automatic when the matching CLI sends `includeAnalysis` to `evaluate_push`.
++- Rollback: roll back the CLI before the backend if codegen must remain available; no data or
++  configuration rollback is required.
++
+ ## Schema reliability
+ 
+ ### [Isolate schema-validation progress OCC](schema_validation_progress_occ/README.md)
+@@ -305,16 +318,17 @@ These files preserve the full earlier analysis without creating additional opera
+ ## Recommended rollout order
+ 
+ 1. Apply standalone import, build, and Node-package reliability fixes as needed.
+-2. Deploy dependency capacity before lane-aware queueing or the deployment lane.
+-3. Deploy scheduled-action pre-claim admission after those scheduler patches; it protects both the
++2. Deploy non-committing codegen analysis in the backend before distributing the matching CLI.
++3. Deploy dependency capacity before lane-aware queueing or the deployment lane.
++4. Deploy scheduled-action pre-claim admission after those scheduler patches; it protects both the
+    legacy CoDel and lane-aware queue paths.
+-4. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
++5. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
+    own wait and occupancy signals.
+-5. Establish observability before enabling application context-reuse markers or HTTP reuse.
+-6. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
++6. Establish observability before enabling application context-reuse markers or HTTP reuse.
++7. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
+    after cold-miss evidence.
+-7. Deliver matching backend and client protocol before enabling degradable frontend behavior.
+-8. Change one independent capacity or semantic opt-in at a time unless the documented policy
++8. Deliver matching backend and client protocol before enabling degradable frontend behavior.
++9. Change one independent capacity or semantic opt-in at a time unless the documented policy
+    explicitly requires a coupled rollout and rollback order.
+ 
+ Do not use module, function, route, client, deployment, or tenant names in generic backend logic or
+diff --git a/patches/non_committing_codegen_analysis/README.md b/patches/non_committing_codegen_analysis/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3c56069388757de839a976564549d30e7b544b1
+--- /dev/null
++++ b/patches/non_committing_codegen_analysis/README.md
+@@ -0,0 +1,148 @@
++# Non-Committing Analysis for Code Generation
++
++This patch lets `convex codegen` obtain authoritative server analysis without
++starting a deployment or publishing pending schema and index metadata.
++
++It adds an optional analysis result to the existing `evaluate_push` deployment
++preflight endpoint. The matching `convex-js` patch uses that endpoint for
++standalone code generation. Normal development and deployment flows continue
++to use `start_push`, wait for schema and index preparation, and finish the push.
++
++## Background
++
++Generated API, data-model, component, and environment-variable types depend on
++the backend's evaluated module and component definitions. The deployment
++protocol already returned that analysis from `start_push`, so standalone
++codegen historically began the same multiphase push used by `dev` and
++`deploy`, even though codegen never called `finish_push`.
++
++For an ordinary application, `start_push` commits pending schema and index
++metadata before returning. Schema validation and index backfill workers can
++then observe that metadata and begin work. A later real deployment can report
++that codegen-created metadata as removed or replaced. The generated files do
++not require any of those durable changes.
++
++`evaluate_push` already computes deployment schema and index differences
++without committing its transaction. Before this patch, however, its response
++contained only those differences, not the evaluated component analysis needed
++by codegen.
++
++## Protocol
++
++`StartPushRequest` has an additive `includeAnalysis` field. When it is true on
++an `evaluate_push` request, the response includes the evaluated component map
++under `analysis`. When it is absent or false, `evaluate_push` retains its small
++schema-difference response. `start_push` continues to return analysis
++regardless of this field.
++
++The backend derives both responses from the same evaluated component map. It
++also applies the same file-based component exports before returning either
++analysis result. Generated code therefore receives the same module, schema,
++function, export, and environment-variable information from `evaluate_push`
++that it previously received from `start_push`.
++
++Deployment and large-index preflight requests omit `includeAnalysis`. They do
++not pay the serialization and response-size cost of analysis they do not use.
++
++## Non-committing schema and index preparation
++
++`evaluate_push` calls the canonical component schema and index preparation
++logic in a database transaction. That logic can stage schema, index, table, and
++component-namespace writes while calculating the exact deployment difference.
++The endpoint drops the transaction without committing it.
++
++Schema validation and index backfill workers can observe only committed
++metadata. An `evaluate_push` request therefore does not:
++
++- publish a pending schema or index;
++- start schema validation or an index backfill;
++- load a proposed index into the worker-visible in-memory index set; or
++- replace the currently deployed functions.
++
++The endpoint is not globally free of side effects. Existing analysis paths can
++upload source packages, populate external-dependency and runtime caches, and
++enable Node action infrastructure. Those operations support analysis and do
++not publish deployment schema or index state.
++
++## CLI behavior and compatibility
++
++The matching CLI sends standalone `convex codegen` to `evaluate_push` with
++`includeAnalysis: true`. It never falls back to `start_push`. If an older
++backend returns the legacy response without `analysis`, the CLI reports an
++explicit backend-version error and stops.
++
++The response decoder continues to accept a legacy `evaluate_push` response so
++the CLI can produce that specific error. The request and response additions
++are otherwise optional:
++
++- an older CLI can use the patched backend, but its standalone codegen retains
++  the older `start_push` behavior;
++- an older backend continues to serve deployment requests from the patched
++  CLI because those requests omit `includeAnalysis`; and
++- `dev` and `deploy` retain the existing
++  `start_push -> wait_for_schema -> finish_push` lifecycle.
++
++Upgrade the backend before distributing the matching CLI. Roll back the CLI
++before the backend if standalone codegen must remain available throughout the
++rollback.
++
++## Standalone component environment bindings
++
++`convex codegen --component-dir` evaluates a target component beneath a
++synthetic root. That root cannot provide concrete values for the target's
++required environment variables. The backend allows missing bindings only for
++the single component directly mounted beneath that synthetic root.
++
++Components instantiated by the target remain subject to normal required
++environment-variable validation. A symbolic binding from a nested component
++to the target's environment remains structurally valid even though the
++synthetic root cannot provide the final value. A malformed synthetic root with
++zero or multiple target children is rejected instead of widening the binding
++exception ambiguously.
++
++Ordinary codegen and every deployment path retain full environment-binding
++validation.
++
++## Considered alternatives
++
++### Continue using `start_push`
++
++Codegen would keep publishing deployment metadata and starting background
++work. Avoiding `finish_push` does not undo the committed preparation phase.
++
++### Fall back to `start_push` for an older backend
++
++An automatic fallback would silently restore the mutation this patch is meant
++to prevent. A version error is safer and makes the required rollout order
++explicit.
++
++### Return analysis from every preflight request
++
++Large-index preflight only needs the schema difference. Always returning the
++component map would add unnecessary serialization, transfer, and client memory
++cost.
++
++### Reimplement schema and index comparison for codegen
++
++A second comparison path could drift from deployment semantics. Running the
++canonical preparation logic in a dropped transaction preserves one source of
++truth without making its staged writes durable.
++
++### Disable environment validation recursively for component codegen
++
++Only the synthetic root-to-target binding is unavailable. Disabling validation
++below that boundary would accept genuinely missing bindings in nested
++components and could generate types for a component graph that cannot be
++deployed.
++
++## Operator rollout
++
++This patch has no database migration or configuration setting.
++
++1. Deploy the patched backend.
++2. Distribute a CLI containing the matching non-committing codegen patch.
++3. Run codegen and confirm that it uses `evaluate_push` and returns generated
++   files without publishing pending schema or index state.
++
++The patch can be adopted independently of scheduler, schema-validation OCC,
++Node executor, and memory-management patches.
