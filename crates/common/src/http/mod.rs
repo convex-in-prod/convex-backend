@@ -206,6 +206,10 @@ mod metrics {
         &["service_name", "is_dependency"]
     );
     register_convex_counter!(
+        pub(super) HTTP_DEPLOYMENT_HARD_STOP_TOTAL,
+        "Deployment HTTP intake rejected by the hard memory-headroom stop"
+    );
+    register_convex_counter!(
         HTTP_MEMORY_PRESSURE_SHED_TOTAL,
         "External HTTP requests rejected before handling because backend cgroup memory headroom \
          was low",
@@ -625,12 +629,14 @@ pub struct ConvexHttpService {
 #[derive(Clone)]
 pub struct ExternalRequestShedding {
     active: Arc<AtomicBool>,
+    deployment_hard_stop: Arc<AtomicBool>,
 }
 
 impl ExternalRequestShedding {
     pub fn new(active: bool) -> Self {
         Self {
             active: Arc::new(AtomicBool::new(active)),
+            deployment_hard_stop: Arc::new(AtomicBool::new(active)),
         }
     }
 
@@ -642,6 +648,31 @@ impl ExternalRequestShedding {
     pub fn set_active(&self, active: bool) -> bool {
         self.active.swap(active, Ordering::AcqRel)
     }
+
+    pub fn set_deployment_hard_stop(&self, active: bool) {
+        self.deployment_hard_stop.store(active, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+pub struct DeploymentHttpAdmission {
+    pub analysis_paths: &'static [&'static str],
+    pub completion_paths: &'static [&'static str],
+    pub status_paths: &'static [&'static str],
+    pub authenticate: Arc<
+        dyn Fn(HeaderMap) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync,
+    >,
+}
+
+impl DeploymentHttpAdmission {
+    pub const RESERVED_SLOTS: usize = 3;
+}
+
+#[derive(Clone, Copy)]
+enum DeploymentHttpLane {
+    Analysis = 0,
+    Completion = 1,
+    Status = 2,
 }
 
 #[derive(Clone)]
@@ -650,6 +681,8 @@ struct HttpConcurrencyLimiter {
     dependency_path_prefixes: &'static [&'static str],
     external_request_shedding: Option<ExternalRequestShedding>,
     service_name: &'static str,
+    deployment: Option<DeploymentHttpAdmission>,
+    deployment_slots: [Arc<tokio::sync::Semaphore>; DeploymentHttpAdmission::RESERVED_SLOTS],
 }
 
 fn memory_pressure_response(service_name: &'static str) -> Response {
@@ -682,34 +715,103 @@ async fn dependency_aware_concurrency_middleware(
         && request
             .headers()
             .contains_key(CONVEX_ACTIONS_CALLBACK_TOKEN);
-    if !is_dependency
-        && limiter
+    let deployment = limiter.deployment.as_ref().and_then(|deployment| {
+        if request.method() != Method::POST
+            || !request.headers().contains_key(http::header::AUTHORIZATION)
+        {
+            return None;
+        }
+        let path = request.uri().path();
+        let lane = if deployment.analysis_paths.contains(&path) {
+            DeploymentHttpLane::Analysis
+        } else if deployment.completion_paths.contains(&path) {
+            DeploymentHttpLane::Completion
+        } else if deployment.status_paths.contains(&path) {
+            DeploymentHttpLane::Status
+        } else {
+            return None;
+        };
+        Some((deployment, lane))
+    });
+    let deployment_slot = if let Some((_, lane)) = deployment {
+        match limiter.deployment_slots[lane as usize]
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(slot) => Some(slot),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                return StatusCode::TOO_MANY_REQUESTS.into_response()
+            },
+            Err(tokio::sync::TryAcquireError::Closed) => panic!("deployment HTTP admission closed"),
+        }
+    } else {
+        None
+    };
+    let shed = || {
+        limiter
             .external_request_shedding
             .as_ref()
-            .is_some_and(ExternalRequestShedding::is_active)
-    {
+            .is_some_and(|shedding| {
+                if deployment.is_some() {
+                    shedding.deployment_hard_stop.load(Ordering::Acquire)
+                } else {
+                    shedding.is_active()
+                }
+            })
+    };
+    if !is_dependency && shed() {
+        if deployment.is_some() {
+            metrics::HTTP_DEPLOYMENT_HARD_STOP_TOTAL.inc();
+        }
         return memory_pressure_response(limiter.service_name);
     }
-    let permit = limiter
+    let acquire = limiter
         .gate
-        .acquire_with_waiter(is_dependency, || {
+        .acquire_with_waiter(is_dependency || deployment.is_some(), || {
             metrics::HttpAdmissionWaitGuard::new(limiter.service_name, is_dependency)
-        })
+        });
+    let permit = if deployment.is_some() {
+        match tokio::time::timeout(Duration::from_secs(2), acquire).await {
+            Ok(permit) => permit,
+            Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+        }
+    } else {
+        acquire.await
+    };
+    if let Some((deployment, _)) = deployment {
+        // Only this bounded credential check precedes authentication. Body
+        // decompression and handlers run after it, inside the total HTTP cap.
+        let authenticated = tokio::time::timeout(
+            Duration::from_secs(2),
+            (deployment.authenticate)(request.headers().clone()),
+        )
         .await;
+        match authenticated {
+            Ok(Ok(())) => (),
+            Ok(Err(error)) => return HttpResponseError::from(error).into_response(),
+            Err(_) => {
+                return HttpError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "DeploymentAuthenticationTimeout",
+                    "Timed out authenticating deployment intake. Retry the request.",
+                )
+                .into_response()
+            },
+        }
+    }
     // A request can wait for a normal concurrency permit while memory pressure
     // begins. Recheck before running the handler so queued external work does
     // not bypass an active shedding interval.
-    if !is_dependency
-        && limiter
-            .external_request_shedding
-            .as_ref()
-            .is_some_and(ExternalRequestShedding::is_active)
-    {
+    if !is_dependency && shed() {
+        if deployment.is_some() {
+            metrics::HTTP_DEPLOYMENT_HARD_STOP_TOTAL.inc();
+        }
         drop(permit);
         return memory_pressure_response(limiter.service_name);
     }
     let response = next.run(request).await;
     drop(permit);
+    drop(deployment_slot);
     response
 }
 
@@ -730,6 +832,7 @@ impl ConvexHttpService {
             0,
             &[],
             None,
+            None,
             request_timeout,
             route_metric_mapper,
         )
@@ -743,6 +846,7 @@ impl ConvexHttpService {
         dependency_reserve: usize,
         dependency_path_prefixes: &'static [&'static str],
         external_request_shedding: Option<ExternalRequestShedding>,
+        deployment: Option<DeploymentHttpAdmission>,
         request_timeout: Duration,
         route_metric_mapper: RM,
     ) -> Self {
@@ -759,22 +863,32 @@ impl ConvexHttpService {
             .layer(sentry_tower::SentryHttpLayer::new());
         metrics::initialize_http_admission_metrics(service_name);
         log_http_service_max_concurrent_requests(service_name, max_concurrency);
-        let base_capacity = max_concurrency - dependency_reserve;
+        let deployment_reserve = if deployment.is_some() {
+            DeploymentHttpAdmission::RESERVED_SLOTS
+        } else {
+            0
+        };
+        assert!(
+            dependency_reserve + deployment_reserve < max_concurrency,
+            "HTTP reserves must leave ordinary capacity"
+        );
+        let base_capacity = max_concurrency - dependency_reserve - deployment_reserve;
         let concurrency_gate =
             crate::dependency_overflow::DependencyOverflowGate::new(base_capacity, max_concurrency);
         let concurrency_gate_for_base_gauge = concurrency_gate.clone();
-        let base_concurrency_gauge = (dependency_reserve > 0).then(|| {
-            PullingGauge::new(
-                service_metric_name(
-                    service_name,
-                    &SERVICE_NAME,
-                    "http_service_base_concurrent_requests",
-                ),
-                "The amount of shared base HTTP admission capacity in use",
-                Box::new(move || concurrency_gate_for_base_gauge.base_in_use() as f64),
-            )
-            .expect("Invalid base concurrency gauge initialization")
-        });
+        let base_concurrency_gauge =
+            (dependency_reserve > 0 || deployment_reserve > 0).then(|| {
+                PullingGauge::new(
+                    service_metric_name(
+                        service_name,
+                        &SERVICE_NAME,
+                        "http_service_base_concurrent_requests",
+                    ),
+                    "The amount of shared base HTTP admission capacity in use",
+                    Box::new(move || concurrency_gate_for_base_gauge.base_in_use() as f64),
+                )
+                .expect("Invalid base concurrency gauge initialization")
+            });
         if let Some(gauge) = &base_concurrency_gauge
             && let Err(e) = CONVEX_METRICS_REGISTRY.register(Box::new(gauge.clone()))
         {
@@ -784,6 +898,8 @@ impl ConvexHttpService {
         }
         let concurrency_gate_for_total_gauge = concurrency_gate.clone();
         let concurrency_limiter = HttpConcurrencyLimiter {
+            deployment,
+            deployment_slots: std::array::from_fn(|_| Arc::new(tokio::sync::Semaphore::new(1))),
             gate: concurrency_gate,
             dependency_path_prefixes,
             external_request_shedding,
@@ -1857,9 +1973,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_deployment_uses_bounded_reserve_until_hard_pressure() {
+        let shedding = ExternalRequestShedding::new(true);
+        shedding.set_deployment_hard_stop(false);
+        let gate = DependencyOverflowGate::new(1, 3);
+        let _ordinary = gate.acquire(false).await;
+        let limiter = HttpConcurrencyLimiter {
+            gate: gate.clone(),
+            dependency_path_prefixes: &["/api/actions/"],
+            external_request_shedding: Some(shedding.clone()),
+            service_name: "deployment_admission_test",
+            deployment: Some(super::DeploymentHttpAdmission {
+                analysis_paths: &[],
+                completion_paths: &[],
+                status_paths: &["/api/deploy2/operations/status"],
+                authenticate: Arc::new(|headers| {
+                    Box::pin(async move {
+                        anyhow::ensure!(
+                            headers
+                                .get(http::header::AUTHORIZATION)
+                                .is_some_and(|value| value == "Convex valid"),
+                            errors::ErrorMetadata::unauthenticated(
+                                "InvalidAdminKey",
+                                "Invalid test credential"
+                            )
+                        );
+                        Ok(())
+                    })
+                }),
+            }),
+            deployment_slots: std::array::from_fn(|_| Arc::new(Semaphore::new(1))),
+        };
+        let app = Router::new()
+            .route(
+                "/api/deploy2/operations/status",
+                axum::routing::post(ok_handler),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                limiter,
+                dependency_aware_concurrency_middleware,
+            ));
+        for (key, expected) in [
+            ("Convex invalid", StatusCode::UNAUTHORIZED),
+            ("Convex valid", StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/deploy2/operations/status")
+                        .header(http::header::AUTHORIZATION, key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(gate.active(), 1);
+        }
+        shedding.set_active(false);
+        shedding.set_deployment_hard_stop(true);
+        let response = app
+            .oneshot(
+                Request::post("/api/deploy2/operations/status")
+                    .header(http::header::AUTHORIZATION, "Convex valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(gate.active(), 1);
+    }
+
+    #[tokio::test]
+    async fn deployment_status_and_finish_progress_while_analysis_and_ordinary_intake_are_busy() {
+        let gate = DependencyOverflowGate::new(1, 5);
+        let _ordinary = gate.acquire(false).await;
+        let slots = std::array::from_fn(|_| Arc::new(Semaphore::new(1)));
+        let limiter = HttpConcurrencyLimiter {
+            gate: gate.clone(),
+            dependency_path_prefixes: &["/api/actions/"],
+            external_request_shedding: None,
+            service_name: "deployment_completion_test",
+            deployment: Some(super::DeploymentHttpAdmission {
+                analysis_paths: &["/start"],
+                completion_paths: &["/finish"],
+                status_paths: &["/status"],
+                authenticate: Arc::new(|_| Box::pin(async { Ok(()) })),
+            }),
+            deployment_slots: slots,
+        };
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let app = Router::new()
+            .route("/start", axum::routing::post(ordinary_handler))
+            .route("/finish", axum::routing::post(ordinary_handler))
+            .route("/status", axum::routing::post(ok_handler))
+            .with_state(BlockingHandlerState {
+                started,
+                release: release.clone(),
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                limiter,
+                dependency_aware_concurrency_middleware,
+            ));
+        let request = |path: &str| {
+            Request::post(path)
+                .header(http::header::AUTHORIZATION, "Convex valid")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let analysis = tokio::spawn(app.clone().oneshot(request("/start")));
+        tokio::time::timeout(Duration::from_secs(1), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let finish = tokio::spawn(app.clone().oneshot(request("/finish")));
+        tokio::time::timeout(Duration::from_secs(1), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let dependency = gate.acquire(true).await;
+        assert_eq!(gate.active(), 4);
+        let status = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.clone().oneshot(request("/status")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(gate.active(), 4);
+        let excess = app.oneshot(request("/start")).await.unwrap();
+        assert_eq!(excess.status(), StatusCode::TOO_MANY_REQUESTS);
+        release.add_permits(2);
+        assert_eq!(analysis.await.unwrap().unwrap().status(), StatusCode::OK);
+        assert_eq!(finish.await.unwrap().unwrap().status(), StatusCode::OK);
+        drop(dependency);
+        assert_eq!(gate.active(), 1);
+    }
+
+    #[tokio::test]
     async fn memory_pressure_sheds_external_requests_but_preserves_dependencies() {
         let shedding = ExternalRequestShedding::new(true);
         let limiter = HttpConcurrencyLimiter {
+            deployment: None,
+            deployment_slots: std::array::from_fn(|_| Arc::new(tokio::sync::Semaphore::new(1))),
             gate: DependencyOverflowGate::new(1, 2),
             dependency_path_prefixes: &["/api/actions/"],
             external_request_shedding: Some(shedding.clone()),
@@ -1904,6 +2163,8 @@ mod tests {
     async fn queued_external_request_rechecks_memory_pressure_before_handling() {
         let shedding = ExternalRequestShedding::new(false);
         let limiter = HttpConcurrencyLimiter {
+            deployment: None,
+            deployment_slots: std::array::from_fn(|_| Arc::new(tokio::sync::Semaphore::new(1))),
             gate: DependencyOverflowGate::new(1, 1),
             dependency_path_prefixes: &[],
             external_request_shedding: Some(shedding.clone()),
@@ -1954,6 +2215,8 @@ mod tests {
     #[tokio::test]
     async fn dependencies_share_base_before_using_http_overflow() {
         let limiter = HttpConcurrencyLimiter {
+            deployment: None,
+            deployment_slots: std::array::from_fn(|_| Arc::new(tokio::sync::Semaphore::new(1))),
             gate: DependencyOverflowGate::new(2, 3),
             dependency_path_prefixes: &["/api/actions/"],
             external_request_shedding: None,
@@ -2042,6 +2305,8 @@ mod tests {
     #[tokio::test]
     async fn dependency_http_requests_still_obey_total_capacity() {
         let limiter = HttpConcurrencyLimiter {
+            deployment: None,
+            deployment_slots: std::array::from_fn(|_| Arc::new(tokio::sync::Semaphore::new(1))),
             gate: DependencyOverflowGate::new(1, 1),
             dependency_path_prefixes: &["/api/actions/"],
             external_request_shedding: None,

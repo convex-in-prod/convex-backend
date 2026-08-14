@@ -324,6 +324,22 @@ pub fn router(st: LocalAppState) -> Router {
         .route("/prepare_schema", post(prepare_schema))
         .route("/deploy2/start_push", post(deploy_config2::start_push))
         .route(
+            "/deploy2/operations/capabilities",
+            post(crate::deployment_operations::capabilities),
+        )
+        .route(
+            "/deploy2/operations/submit",
+            post(crate::deployment_operations::submit),
+        )
+        .route(
+            "/deploy2/operations/status",
+            post(crate::deployment_operations::status),
+        )
+        .route(
+            "/deploy2/operations/cancel",
+            post(crate::deployment_operations::cancel),
+        )
+        .route(
             "/deploy2/evaluate_push",
             post(deploy_config2::evaluate_push),
         )

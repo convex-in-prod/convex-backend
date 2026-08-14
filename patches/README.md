@@ -11,7 +11,8 @@ an explicitly ordered corrective integration commit may complete several earlier
 the owning essays identify those compositions. Lane-aware queueing and its optional deployment
 extension are one queue-control patch. The matching degradable-query client half is maintained in
 `convex-js`; it shares the protocol and adoption essay but is not another commit in this backend
-chain.
+chain. Non-committing codegen analysis likewise has a matching CLI commit, with the combined
+adoption contract documented in the backend essay.
 
 ## Database connection reliability
 
@@ -51,16 +52,35 @@ chain.
 
 ## Deployment and code generation
 
+### [Non-committing codegen analysis](non_committing_codegen_analysis/README.md)
+
+- Purpose: let standalone codegen obtain authoritative evaluated component analysis without
+  committing pending schema or index metadata or starting validation and backfill workers.
+- Prerequisites: the matching `convex-js` CLI patch. Upgrade the backend before distributing that
+  CLI; other backend patches are not required.
+- Activation: automatic when the matching CLI sends `includeAnalysis` to `evaluate_push`.
+- Rollback: roll back the CLI before the backend if codegen must remain available; no data or
+  configuration rollback is required.
+
 ### [Paced isolate module analysis](deployment_analysis_pacing/README.md)
 
 - Purpose: make each isolate module analysis attempt fairly borrow from the configured degradable
   query capacity instead of adding deployment fan-out above that elastic root-work ceiling.
 - Prerequisites: degradable reactive-query admission supplies the shared application-scoped gate.
   The control-plane lane is recommended for typed queue treatment but is not required for pacing.
-- Activation: automatic when `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is configured;
-  no analysis or query behavior changes while it is unset.
+- Activation: root pacing is automatic when `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS`
+  is configured. Whole-job admission and enabled deployment-lane allowances have their own
+  activation contracts and remain effective when that root gate is unset.
 - Rollback: restore the previous backend image. Unsetting the cap also disables pacing, but it
   simultaneously disables degradable-query backpressure.
+
+The maintained [deployment admission and operation extension](non_committing_codegen_analysis/deployment_operations.md)
+composes whole-job ownership with shared HTTP admission, dependency capacity,
+the optional deployment lane, and active-JavaScript class admission. This
+composition requires those backend interfaces; the original non-committing
+codegen protocol above remains a smaller adoption unit. Whole-job and HTTP
+admission apply to legacy callers too. Retained operation identity/status/cancel
+requires explicit client negotiation, and its preparation is process-local.
 
 ## Log privacy
 
@@ -284,10 +304,18 @@ These files preserve the full earlier analysis without creating additional opera
 
 - [Combined dependency and HTTP capacity design](dependency_capacity/design_reference.md)
   retains the benchmark tables, full stage model, metrics interpretation, and application coverage
-  matrix that preceded the two concise adoption essays.
+  matrix that preceded the two concise adoption essays. Its phase-only active-permit discussion
+  describes compatibility mode with both service floors zero and the control-plane lane disabled;
+  the class-aware policy is specified in the degradable active-JavaScript admission note below.
+- [Isolate delay queue design](isolate_queue_control/isolate_delay_queue_design_reference.md)
+  defines the queue-lane, scheduler-property, active-class, and active-permit-phase distinctions;
+  the oldest-eligible selection and lifecycle mechanics; and interactions with the surrounding
+  admission and execution patches.
 - [Deployment control-plane lane design](isolate_queue_control/deployment_lane_design_reference.md) retains
   the complete classifier, FIFO and reserve proof, deferred worker-reservation design, rejected
-  alternatives, and test matrix.
+  alternatives, and test matrix of the original lane. Its deferred-reservation
+  sections are historical; the maintained extension implements bounded queue/worker
+  allowances and fair configuration service within protected JavaScript capacity.
 - [Degradable active-JavaScript admission](degradable_reactive_queries/active_javascript_admission.md)
   records the service-class propagation, work-conserving floor policy, scheduler exposure
   invariant, configuration rules, and deliberately excluded generalizations.
@@ -297,18 +325,19 @@ These files preserve the full earlier analysis without creating additional opera
 ## Recommended rollout order
 
 1. Apply standalone import, build, and Node-package reliability fixes as needed.
-2. Deploy dependency capacity before lane-aware queueing or the deployment lane.
-3. Deploy scheduled-action pre-claim admission after those scheduler patches; it protects both the
+2. Deploy non-committing codegen analysis in the backend before distributing the matching CLI.
+3. Deploy dependency capacity before lane-aware queueing or the deployment lane.
+4. Deploy scheduled-action pre-claim admission after those scheduler patches; it protects both the
    legacy CoDel and lane-aware queue paths.
-4. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
+5. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
    own wait and occupancy signals.
-5. Deploy the unified context-reuse patch before enabling reviewed module policy properties.
-6. Enable reviewed context-reuse properties in application-owned stages; consider prewarming only
+6. Deploy the unified context-reuse patch before enabling reviewed module policy properties.
+7. Enable reviewed context-reuse properties in application-owned stages; consider prewarming only
    after cold-miss evidence.
-7. Deliver matching backend and client protocol before enabling degradable frontend behavior.
-8. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a
+8. Deliver matching backend and client protocol before enabling degradable frontend behavior.
+9. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a
    controlled multi-module push before changing analysis concurrency or queue deadlines.
-9. Change one independent capacity or semantic opt-in at a time unless the documented policy
+10. Change one independent capacity or semantic opt-in at a time unless the documented policy
    explicitly requires a coupled rollout and rollback order.
 
 Keep deployment-specific names out of generic backend logic and infrastructure metric labels.
