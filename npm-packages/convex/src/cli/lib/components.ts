@@ -16,8 +16,9 @@ import {
 } from "./config.js";
 import {
   finishPush,
+  type PushRequestMode,
   reportPushCompleted,
-  startPush,
+  startOrEvaluatePush,
   waitForSchema,
 } from "./deploy2.js";
 import { version } from "../version.js";
@@ -43,7 +44,11 @@ import { typeCheckFunctionsInMode, TypeCheckMode } from "./typecheck.js";
 import { withTmpDir } from "../../bundler/fs.js";
 import { handleDebugBundlePath } from "./debugBundlePath.js";
 import { chalkStderr } from "chalk";
-import { StartPushRequest, StartPushResponse } from "./deployApi/startPush.js";
+import {
+  CodegenAnalysis,
+  StartPushRequest,
+  StartPushResponse,
+} from "./deployApi/startPush.js";
 import { DetailedDeploymentCredentials } from "./api.js";
 import { FinishPushDiff } from "./deployApi/finishPush.js";
 import { Reporter, Span } from "./tracing.js";
@@ -146,6 +151,7 @@ export async function runCodegen(
         stagedValidatorDeletionCheck: "no verification",
         warnOnSlowSchemaValidation: false,
       },
+      "codegen",
     );
   } else {
     if (options.typecheck !== "disable") {
@@ -262,6 +268,7 @@ async function startComponentsPushAndCodegen(
     codegenOnlyThisComponent?: string | undefined;
     forceNodeCutover?: boolean | undefined;
   },
+  pushMode: PushRequestMode,
 ): Promise<StartPushResponse | null> {
   const convexDir = await getFunctionsDirectoryPath(ctx);
 
@@ -546,13 +553,23 @@ async function startComponentsPushAndCodegen(
     );
   }
 
-  changeSpinner("Uploading functions to Convex...");
-  const startPushResponse = await parentSpan.enterAsync("startPush", (span) =>
-    startPush(ctx, span, startPushRequest, options),
+  changeSpinner(
+    pushMode === "codegen"
+      ? "Analyzing functions for code generation..."
+      : "Uploading functions to Convex...",
+  );
+  const pushResult = await parentSpan.enterAsync(
+    pushMode === "codegen" ? "evaluatePush" : "startPush",
+    (span) =>
+      startOrEvaluatePush(ctx, span, startPushRequest, options, pushMode),
   );
 
-  if (options.forceNodeCutover && !options.dryRun) {
-    if (startPushResponse.nodeExecutorCutoverProtocolVersion !== 1) {
+  if (
+    pushResult.kind === "startPush" &&
+    options.forceNodeCutover &&
+    !options.dryRun
+  ) {
+    if (pushResult.response.nodeExecutorCutoverProtocolVersion !== 1) {
       await ctx.crash({
         exitCode: 1,
         errorType: "fatal",
@@ -568,9 +585,16 @@ async function startComponentsPushAndCodegen(
   }
 
   if (options.verbose) {
-    logMessage("startPush: " + JSON.stringify(startPushResponse, null, 2));
+    if (pushResult.kind === "startPush") {
+      logMessage("startPush: " + JSON.stringify(pushResult.response, null, 2));
+    } else {
+      logMessage(
+        `evaluatePush: received analysis for ${Object.keys(pushResult.response.analysis).length} component definitions`,
+      );
+    }
   }
 
+  const codegenAnalysis: CodegenAnalysis = pushResult.response;
   if (options.codegen) {
     changeSpinner("Generating TypeScript bindings...");
     await parentSpan.enterAsync("doFinalComponentCodegen", () =>
@@ -584,7 +608,7 @@ async function startComponentsPushAndCodegen(
             tmpDir,
             rootComponent,
             rootComponent,
-            startPushResponse,
+            codegenAnalysis,
             components,
             options,
           );
@@ -605,7 +629,7 @@ async function startComponentsPushAndCodegen(
             tmpDir,
             rootComponent,
             directory,
-            startPushResponse,
+            codegenAnalysis,
             components,
             options,
           );
@@ -648,7 +672,7 @@ async function startComponentsPushAndCodegen(
     }
   });
 
-  return startPushResponse;
+  return pushResult.kind === "startPush" ? pushResult.response : null;
 }
 
 function logStartPushSizes(span: Span, startPushRequest: StartPushRequest) {
@@ -699,6 +723,7 @@ export async function runComponentsPush(
         projectConfig,
         configPath,
         options,
+        "startPush",
       ),
   );
   if (!startPushResponse) {

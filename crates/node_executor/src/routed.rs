@@ -124,6 +124,9 @@ struct SystemOperationOwner {
     id: u64,
     kind: NodeSystemOperationKind,
     state: StdMutex<SystemOperationOwnerState>,
+    // A disconnected analysis subscriber cannot release whole-job admission
+    // while its dedicated Node process still owns execution or cleanup.
+    _deployment_job: Option<common::query_analysis_admission::DeploymentAnalysisPermit>,
 }
 
 struct SystemOperationOwnerState {
@@ -491,6 +494,9 @@ impl SystemOperationOwner {
     ) -> Arc<Self> {
         Arc::new(Self {
             admission: Arc::downgrade(admission),
+            _deployment_job: common::query_analysis_admission::DEPLOYMENT_ANALYSIS_JOB
+                .try_with(Clone::clone)
+                .ok(),
             system,
             id,
             kind,
@@ -3092,17 +3098,43 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
         // unbound permit, and task-loss cleanup must not later finish a slot
         // that the permit has already released.
         let mut task_guard = SystemOperationTaskGuard::new(owner.clone());
+        // Task locals do not propagate through spawn. Capture the explicit
+        // operation signal before transferring execution to its Node owner.
+        let cancellation = common::query_analysis_admission::DEPLOYMENT_OPERATION_CANCELLATION
+            .try_with(Clone::clone)
+            .ok();
         let operation = tokio::spawn(async move {
             crate::metrics::log_local_node_route_request(system.pool_name(), request_kind);
-            let result = system
-                .invoke_with_fingerprint(
+            let cancelled = async move {
+                match cancellation {
+                    Some(mut cancellation) => {
+                        // Closing the signal means the owning workflow exited,
+                        // including expiry or failure in its other analysis branch.
+                        let _ = cancellation.wait_for(|cancelled| *cancelled).await;
+                    },
+                    None => std::future::pending().await,
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                () = cancelled => {
+                    // Keep the task guard armed. Dropping the HTTP future does
+                    // not stop Node: its existing owner must retire and reap the
+                    // exact system generation before releasing either admission.
+                    result_delivery.record(result_tx.send(Err(ErrorMetadata::bad_request(
+                        "DeploymentOperationCancelled",
+                        "Deployment system operation was cancelled",
+                    ).into())).is_ok());
+                    return;
+                },
+                result = system.invoke_with_fingerprint(
                     request,
                     log_line_sender,
                     None,
                     ResidentGenerationAccess::AllowColdStart,
                     None,
-                )
-                .await;
+                ) => result,
+            };
             let result = match system.finish_system_operation_terminal_observation().await {
                 Ok(()) => {
                     task_guard.finish();
@@ -3606,6 +3638,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn routed_system_work_keeps_capacity_after_original_caller_disappears() {
+        use common::query_analysis_admission::{
+            DeploymentAnalysisAdmission,
+            DeploymentAnalysisKind,
+            DEPLOYMENT_ANALYSIS_JOB,
+        };
+        let jobs = DeploymentAnalysisAdmission::default();
+        let job = jobs
+            .acquire(DeploymentAnalysisKind::Deploy, 1024)
+            .await
+            .unwrap();
         let socket_dir = TempDir::new().unwrap();
         let socket_path = socket_dir.path().join("executor.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -3636,7 +3678,7 @@ mod tests {
             .await
             .unwrap();
         let invoke_executor = executor.clone();
-        let invocation = tokio::spawn(async move {
+        let invocation = tokio::spawn(DEPLOYMENT_ANALYSIS_JOB.scope(job, async move {
             let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
             invoke_executor
                 .invoke_system(
@@ -3648,11 +3690,13 @@ mod tests {
                     log_line_sender,
                 )
                 .await
-        });
+        }));
 
         request_received_receiver.await.unwrap();
         invocation.abort();
         assert!(invocation.await.unwrap_err().is_cancelled());
+        let mut next_job = Box::pin(jobs.acquire(DeploymentAnalysisKind::Deploy, 1024));
+        assert!(futures::poll!(&mut next_job).is_pending());
 
         let later_executor = executor.clone();
         let later = tokio::spawn(async move {
@@ -3674,62 +3718,98 @@ mod tests {
         assert_eq!(later.kind, NodeSystemOperationKind::Analyze);
         drop(later);
         wait_for_no_active_system_operation(&executor.system_admission).await;
+        drop(next_job.await.unwrap());
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn lost_system_operation_task_reaps_its_generation_before_releasing_admission() {
-        let (executor, _socket_dir, request_received, server) = blocked_system_executor().await;
-        let reservation = executor
-            .acquire_system_operation(NodeSystemOperationKind::BuildDeps)
-            .await
-            .unwrap();
-        let child_lock = executor.system.lock_test_generation_child().await;
-        let invoke_executor = executor.clone();
-        let invocation = tokio::spawn(async move {
-            let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
-            invoke_executor
-                .invoke_system(
-                    ExecutorRequest::BuildDeps(crate::executor::BuildDepsRequest {
-                        deps: vec![],
-                        upload_url: String::new(),
-                    }),
-                    reservation,
-                    log_line_sender,
-                )
+        use common::query_analysis_admission::{
+            DeploymentAnalysisAdmission,
+            DeploymentAnalysisKind,
+            DEPLOYMENT_ANALYSIS_JOB,
+            DEPLOYMENT_OPERATION_CANCELLATION,
+        };
+        enum Stop {
+            TaskLoss,
+            Cancel,
+            OwnerExited,
+        }
+        for stop in [Stop::TaskLoss, Stop::Cancel, Stop::OwnerExited] {
+            let (cancel, cancellation) = watch::channel(false);
+            let jobs = DeploymentAnalysisAdmission::default();
+            let job = jobs
+                .acquire(DeploymentAnalysisKind::Deploy, 1024)
                 .await
-        });
-        request_received.await.unwrap();
-
-        let owner = wait_for_active_system_owner(
-            &executor.system_admission,
-            SystemOperationOwnerPhase::Running,
-        )
-        .await;
-        owner.abort();
-        wait_for_active_system_owner(
-            &executor.system_admission,
-            SystemOperationOwnerPhase::Cleaning,
-        )
-        .await;
-        assert!(invocation.await.unwrap().is_err());
-
-        let waiting_admission = executor.system_admission.clone();
-        let later = tokio::spawn(async move {
-            waiting_admission
-                .acquire(NodeSystemOperationKind::Analyze, Duration::from_secs(1))
+                .unwrap();
+            let (executor, _socket_dir, request_received, server) = blocked_system_executor().await;
+            let reservation = executor
+                .acquire_system_operation(NodeSystemOperationKind::BuildDeps)
                 .await
-        });
-        wait_for_system_waiter_count(&executor.system_admission, 1).await;
-        assert!(!later.is_finished());
-        assert!(executor.system.test_has_generation_owner().await);
+                .unwrap();
+            let child_lock = executor.system.lock_test_generation_child().await;
+            let invoke_executor = executor.clone();
+            let invocation = tokio::spawn(DEPLOYMENT_OPERATION_CANCELLATION.scope(
+                cancellation,
+                DEPLOYMENT_ANALYSIS_JOB.scope(job, async move {
+                    let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
+                    invoke_executor
+                        .invoke_system(
+                            ExecutorRequest::BuildDeps(crate::executor::BuildDepsRequest {
+                                deps: vec![],
+                                upload_url: String::new(),
+                            }),
+                            reservation,
+                            log_line_sender,
+                        )
+                        .await
+                }),
+            ));
+            request_received.await.unwrap();
 
-        drop(child_lock);
-        let later = later.await.unwrap().unwrap();
-        assert!(!executor.system.test_has_generation_owner().await);
-        drop(later);
-        server.abort();
-        assert!(server.await.unwrap_err().is_cancelled());
+            let owner = wait_for_active_system_owner(
+                &executor.system_admission,
+                SystemOperationOwnerPhase::Running,
+            )
+            .await;
+            match stop {
+                Stop::TaskLoss => owner.abort(),
+                Stop::Cancel => {
+                    cancel.send_replace(true);
+                },
+                Stop::OwnerExited => drop(cancel),
+            }
+            wait_for_active_system_owner(
+                &executor.system_admission,
+                SystemOperationOwnerPhase::Cleaning,
+            )
+            .await;
+            let error = invocation.await.unwrap().unwrap_err();
+            if !matches!(stop, Stop::TaskLoss) {
+                assert_eq!(error.short_msg(), "DeploymentOperationCancelled");
+            }
+            drop(owner);
+            let mut next_job = Box::pin(jobs.acquire(DeploymentAnalysisKind::Deploy, 1024));
+            assert!(futures::poll!(&mut next_job).is_pending());
+
+            let waiting_admission = executor.system_admission.clone();
+            let later = tokio::spawn(async move {
+                waiting_admission
+                    .acquire(NodeSystemOperationKind::Analyze, Duration::from_secs(1))
+                    .await
+            });
+            wait_for_system_waiter_count(&executor.system_admission, 1).await;
+            assert!(!later.is_finished());
+            assert!(executor.system.test_has_generation_owner().await);
+
+            drop(child_lock);
+            let later = later.await.unwrap().unwrap();
+            assert!(!executor.system.test_has_generation_owner().await);
+            drop(later);
+            drop(next_job.await.unwrap());
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
     }
 
     #[cfg(unix)]
