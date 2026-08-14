@@ -10,16 +10,16 @@ Coordinate multiple subscription managers through a monotone enforced minimum so
 Use fair worker selection to prevent subscription churn from starving write-log advancement. Propagate internal subscription and advancement errors to local-backend fatal preemption, and route unwind-profile worker panics through the same boundary; production release panics continue to abort directly.
 ---
  crates/database/src/database.rs     |   8 +-
- crates/database/src/metrics.rs      | 180 ++++++++++++++++++++++
+ crates/database/src/metrics.rs      | 182 +++++++++++++++++++++-
  crates/database/src/subscription.rs | 229 +++++++++++++++++++++++-----
  crates/database/src/write_log.rs    | 101 +++++++++++-
- 4 files changed, 468 insertions(+), 50 deletions(-)
+ 4 files changed, 469 insertions(+), 51 deletions(-)
 
 diff --git a/crates/database/src/database.rs b/crates/database/src/database.rs
-index 6d2e49084e9043150976fca0e93b1113921e075c..70bf043716f6b4bfc70cc9e5336e4d802851d8cc 100644
+index 88e0bb708d3a8c2ff3f7c1f5138f62053f4b7881..120069aac25a0c074c9d6044828b02ecafc82816 100644
 --- a/crates/database/src/database.rs
 +++ b/crates/database/src/database.rs
-@@ -1069,8 +1069,12 @@ impl<RT: Runtime> Database<RT> {
+@@ -1070,8 +1070,12 @@ impl<RT: Runtime> Database<RT> {
              Arc::new(log_reader.clone()),
          );
          let invalidation_callback = InvalidationMetricCallback::new();
@@ -35,19 +35,20 @@ index 6d2e49084e9043150976fca0e93b1113921e075c..70bf043716f6b4bfc70cc9e5336e4d80
              log_writer,
              snapshot_writer,
 diff --git a/crates/database/src/metrics.rs b/crates/database/src/metrics.rs
-index 8b38efbd389c7614a617979e99ce2fc4aaf58c6f..7d303132a3288213d1dcc424d9184f151796f114 100644
+index 86e64f92aa10d2d44a3ff51767a3b8a73f70f3cd..64d95bf6f795a15cfc79ab1c98dfca093777e160 100644
 --- a/crates/database/src/metrics.rs
 +++ b/crates/database/src/metrics.rs
-@@ -1,3 +1,8 @@
+@@ -1,4 +1,8 @@
+-use std::time::Duration;
 +use std::{
 +    collections::BTreeMap,
 +    sync::LazyLock,
++    time::Duration,
 +};
-+
+ 
  use ::search::metrics::{
      SearchType,
-     SEARCH_TYPE_LABEL,
-@@ -14,6 +19,7 @@ use metrics::{
+@@ -16,6 +20,7 @@ use metrics::{
      log_counter_with_labels,
      log_distribution,
      log_distribution_with_labels,
@@ -55,7 +56,7 @@ index 8b38efbd389c7614a617979e99ce2fc4aaf58c6f..7d303132a3288213d1dcc424d9184f15
      register_convex_counter,
      register_convex_gauge,
      register_convex_histogram,
-@@ -25,6 +31,7 @@ use metrics::{
+@@ -27,6 +32,7 @@ use metrics::{
      Timer,
      STATUS_LABEL,
  };
@@ -63,19 +64,20 @@ index 8b38efbd389c7614a617979e99ce2fc4aaf58c6f..7d303132a3288213d1dcc424d9184f15
  use prometheus::{
      VMHistogram,
      VMHistogramVec,
-@@ -386,6 +393,179 @@ pub fn write_log_commit_bytes(bytes: usize) {
+@@ -450,6 +456,180 @@ pub fn write_log_commit_bytes(bytes: usize) {
      log_distribution(&DATABASE_WRITE_LOG_COMMIT_BYTES, bytes as f64);
  }
  
 +register_convex_gauge!(
 +    DATABASE_WRITE_LOG_RETAINED_BYTES_INFO,
-+    "HeapSize-weighted dynamic bytes in retained update elements; excludes write-log collection \
-+     overhead and inline fields"
++    "HeapSize-weighted dynamic bytes in update elements referenced by live write-log owners; \
++     excludes collection overhead, inline fields, and point-in-time snapshots held by off-thread \
++     commit pre-validation"
 +);
 +register_convex_gauge!(
 +    DATABASE_WRITE_LOG_RETAINED_ENTRIES_INFO,
-+    "Database- and text-index (index, timestamp) update vectors currently retained in the \
-+     in-memory write log"
++    "Database- and text-index (index, timestamp) update vectors referenced by live write-log \
++     owners; excludes point-in-time snapshots held by off-thread commit pre-validation"
 +);
 +register_convex_gauge!(
 +    DATABASE_WRITE_LOG_RETENTION_SPAN_SECONDS_INFO,
@@ -556,7 +558,7 @@ index 7178cd7188929de717a10272005cab5a1059d3a2..d416706c84823d89c5b7232e1b3a80a7
 +    }
 +}
 diff --git a/crates/database/src/write_log.rs b/crates/database/src/write_log.rs
-index 9c5e8edfa9196a9ec94df3485b7dd55388156f60..74109f2b16374086f0614a2554b62de4f24b0a9a 100644
+index 6be1cb0fd0b4fd847f587ced1e941ab7b608266f..07ffcc2a26d808d336c55375217955337ce45c21 100644
 --- a/crates/database/src/write_log.rs
 +++ b/crates/database/src/write_log.rs
 @@ -280,22 +280,27 @@ impl HeapSize for WriteSource {

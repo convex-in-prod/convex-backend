@@ -16,10 +16,10 @@ Export bounded normal and cgroup-pressure cache operations, clear reasons, owner
  .../src/in_process_function_runner.rs         |   43 +-
  crates/function_runner/src/server.rs          |   27 +-
  crates/isolate/src/client.rs                  |  268 ++-
- crates/isolate/src/context_cache.rs           | 1482 +++++++++++++++--
+ crates/isolate/src/context_cache.rs           | 1474 +++++++++++++++--
  crates/isolate/src/environment/action/mod.rs  |   49 +-
  .../isolate/src/environment/action/phase.rs   |   11 +-
- crates/isolate/src/environment/udf/mod.rs     |  192 ++-
+ crates/isolate/src/environment/udf/mod.rs     |  190 ++-
  crates/isolate/src/isolate.rs                 |   41 +-
  crates/isolate/src/isolate_worker.rs          |    4 +
  crates/isolate/src/metrics.rs                 |  159 +-
@@ -33,11 +33,11 @@ Export bounded normal and cgroup-pressure cache operations, clear reasons, owner
  patches/reuse_http_action_contexts/README.md  |   87 +-
  self-hosted/advanced/knobs.md                 |   41 +-
  self-hosted/docker/docker-compose.yml         |    2 +
- 22 files changed, 2830 insertions(+), 439 deletions(-)
+ 22 files changed, 2815 insertions(+), 444 deletions(-)
  create mode 100644 patches/bounded_multi_context_reuse/README.md
 
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index b1a1e2e796e7b938057f3263620b4066927ff75a..a22f3407d3d037ee0322ffd54547e6040935ddcb 100644
+index 4355585266547ad033c9854efde3b7c39ec4d6e4..68e264d6d9e4412c5d2a7d154492b231bd825b31 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -68,7 +68,7 @@ fn validate_usize_strict_nonzero(name: &str, value: usize) -> anyhow::Result<usi
@@ -62,7 +62,7 @@ index b1a1e2e796e7b938057f3263620b4066927ff75a..a22f3407d3d037ee0322ffd54547e604
          tracing::info!("Overriding {name} to {value:?} from environment");
      }
      value
-@@ -1255,11 +1249,35 @@ pub static REUSE_ISOLATES: LazyLock<bool> = LazyLock::new(|| env_config("REUSE_I
+@@ -1260,11 +1254,35 @@ pub static REUSE_ISOLATES: LazyLock<bool> = LazyLock::new(|| env_config("REUSE_I
  
  /// If true, HTTP actions may reuse a V8 context with an already-evaluated HTTP
  /// router module. This is off by default because it preserves module-level JS
@@ -100,7 +100,7 @@ index b1a1e2e796e7b938057f3263620b4066927ff75a..a22f3407d3d037ee0322ffd54547e604
  /// Duration in seconds before an idle isolate is recreated
  pub static ISOLATE_IDLE_TIMEOUT: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_IDLE_TIMEOUT_SECONDS", 600)));
-@@ -1331,9 +1349,8 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
+@@ -1336,9 +1354,8 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
  /// active-JavaScript gates.
  pub static APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: LazyLock<Option<usize>> =
      LazyLock::new(|| {
@@ -885,7 +885,7 @@ index be4f52e12678fd17220724a6645032e3d7c250d3..3f67fa799e960c0610d0dbc8a2492c25
                      2,
                      2,
 diff --git a/crates/isolate/src/context_cache.rs b/crates/isolate/src/context_cache.rs
-index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1449c22be 100644
+index ffbac52d18e5a4bc641ea7e97afd75f08cd828fe..7be3c47224df99feb8e1f5de421368b56c0f7805 100644
 --- a/crates/isolate/src/context_cache.rs
 +++ b/crates/isolate/src/context_cache.rs
 @@ -1,4 +1,15 @@
@@ -1007,7 +1007,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
  }
  
  /// A mirror of the cache keys present in a `ContextCache`.
-@@ -85,24 +108,442 @@ pub struct CachedContexts {
+@@ -85,24 +108,439 @@ pub struct CachedContexts {
  }
  
  struct CachedContextsInner {
@@ -1090,7 +1090,10 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +    }
 +
 +    fn with_protected_capacity(main_capacity: usize) -> Self {
-+        assert!(main_capacity > 0, "protected cache capacity must be positive");
++        assert!(
++            main_capacity > 0,
++            "protected cache capacity must be positive"
++        );
 +        let frequency_aging_interval = main_capacity
 +            .checked_add(1)
 +            .and_then(|capacity| capacity.checked_mul(16))
@@ -1172,13 +1175,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +    }
 +
 +    fn insert_new(&mut self, key: K, value: V) -> CacheInsertionResult<K, V> {
-+        self.insert(
-+            key,
-+            value,
-+            CacheSegment::Window,
-+            false,
-+            self.main_capacity,
-+        )
++        self.insert(key, value, CacheSegment::Window, false, self.main_capacity)
 +    }
 +
 +    fn insert_new_without_growth(&mut self, key: K, value: V) -> CacheInsertionResult<K, V> {
@@ -1397,8 +1394,8 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +                    was_cached: candidate_was_cached,
 +                }),
 +            )
-+        }
-+    }
+         }
+     }
 +
 +    fn weakest_main_position(&self) -> usize {
 +        self.main
@@ -1437,7 +1434,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +                self.evict_for_memory_pressure()
 +                    .expect("cgroup-pressure cache shrink lost its victim"),
 +            );
-         }
++        }
 +        evicted
 +    }
 +
@@ -1452,7 +1449,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +        self.observations_since_aging = 0;
 +        self.access_clock = 0;
 +        evicted
-     }
++    }
  }
  
 -#[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1460,7 +1457,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
  pub(crate) enum ReusableContextKind {
      DatabaseUdf,
      HttpAction,
-@@ -110,8 +551,11 @@ pub(crate) enum ReusableContextKind {
+@@ -110,8 +548,11 @@ pub(crate) enum ReusableContextKind {
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  pub(crate) enum ContextCacheClearReason {
@@ -1474,7 +1471,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
      AppDefinitionEvaluation,
      CacheDrop,
  }
-@@ -136,73 +580,136 @@ pub(crate) fn context_cache_key(
+@@ -136,73 +577,134 @@ pub(crate) fn context_cache_key(
      }
  }
  
@@ -1536,9 +1533,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +    #[cfg(test)]
 +    pub(crate) fn new() -> Self {
 +        Self::with_budget(
-+            Arc::new(ContextCacheBudget::new(
-+                *MAX_REUSABLE_CONTEXTS_PER_ISOLATE,
-+            )),
++            Arc::new(ContextCacheBudget::new(*MAX_REUSABLE_CONTEXTS_PER_ISOLATE)),
 +            MemoryPressureSignal::default(),
 +        )
 +    }
@@ -1653,7 +1648,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
              v8::Local::new(scope, context)
          } else {
              make_context(scope)
-@@ -215,15 +722,19 @@ impl ContextCache {
+@@ -215,15 +717,19 @@ impl ContextCache {
          context: v8::Global<v8::Context>,
          module_map: ModuleMap,
          read_set: ContextReadSet,
@@ -1676,7 +1671,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
          );
      }
  
-@@ -233,112 +744,362 @@ impl ContextCache {
+@@ -233,112 +739,362 @@ impl ContextCache {
          context: v8::Global<v8::Context>,
          module_map: ModuleMap,
          read_set: ContextReadSet,
@@ -1702,14 +1697,9 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
      fn save_reusable_context(
          &mut self,
 +        key: ReusableContextKey,
-         saved_context: SavedContext,
--        cached_context: CachedContext,
++        saved_context: SavedContext,
 +        token: Option<ReusableContextToken>,
-     ) {
--        let context_kind = saved_context
--            .reusable_key()
--            .map(|(context_kind, _)| context_kind)
--            .expect("saved reusable context must have a reusable kind");
++    ) {
 +        // The worker cannot poll its watch receiver while it is serving a
 +        // request. Keep controller transitions ordered before this guard or
 +        // after the complete synchronous publication, including rejected-root
@@ -1728,10 +1718,15 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +    fn save_reusable_context_under_pressure_guard(
 +        &mut self,
 +        key: ReusableContextKey,
-+        saved_context: SavedContext,
+         saved_context: SavedContext,
+-        cached_context: CachedContext,
 +        token: Option<ReusableContextToken>,
 +        pressure_active: bool,
-+    ) {
+     ) {
+-        let context_kind = saved_context
+-            .reusable_key()
+-            .map(|(context_kind, _)| context_kind)
+-            .expect("saved reusable context must have a reusable kind");
 +        if self.cgroup_memory_pressure_active != pressure_active {
 +            let removed_root = self.set_cgroup_memory_pressure(pressure_active);
 +            // V8 collection requires the isolate and remains a worker-loop action.
@@ -2040,11 +2035,11 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +        let mut removed_root = std::mem::take(&mut self.low_memory_notification_pending);
 +        if self.cgroup_memory_pressure_active == active {
 +            return removed_root;
-+        }
+         }
 +        self.cgroup_memory_pressure_active = active;
 +        if !active {
 +            return removed_root;
-         }
++        }
 +
 +        removed_root |= self.fresh_context.take().is_some();
 +        assert_eq!(
@@ -2074,8 +2069,8 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +            "resident context permits drifted after cgroup-pressure eviction"
 +        );
 +        removed_root
-+    }
-+
+     }
+ 
 +    fn assert_mirror(&self, cached_contexts: &CachedContextsInner) {
 +        assert!(
 +            self.reusable_contexts
@@ -2083,8 +2078,8 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +                .eq(cached_contexts.saved_contexts.iter()),
 +            "context cache mirror keys drifted"
 +        );
-     }
- 
++    }
++
 +    fn replace_mirror(&self, cached_contexts: &mut CachedContextsInner) {
 +        // The scheduler may read this Arc after the isolate is recreated. Update
 +        // every key while holding its one lock, after local insertion and before
@@ -2115,7 +2110,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
      #[fastrace::trace]
      pub(crate) async fn validate_and_apply_context_read_set<RT: Runtime>(
          tx: &mut Transaction<RT>,
-@@ -373,6 +1134,8 @@ impl ContextCache {
+@@ -373,6 +1129,8 @@ impl ContextCache {
          Ok(true)
      }
  
@@ -2124,7 +2119,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
      #[fastrace::trace]
      pub(crate) async fn capture_context_read_set<RT: Runtime>(
          read_set: TransactionReadSet,
-@@ -420,26 +1183,27 @@ impl ContextCache {
+@@ -420,26 +1178,27 @@ impl ContextCache {
  impl CachedContexts {
      pub fn can_serve_request<RT: Runtime>(&self, request: &Request<RT>) -> bool {
          let this = self.inner.lock();
@@ -2170,7 +2165,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
      }
  }
  
-@@ -456,3 +1220,353 @@ fn make_context<'s>(scope: &v8::PinScope<'s, '_, ()>) -> v8::Local<'s, v8::Conte
+@@ -456,3 +1215,350 @@ fn make_context<'s>(scope: &v8::PinScope<'s, '_, ()>) -> v8::Local<'s, v8::Conte
      let _create_context_timer = create_context_timer();
      v8::Context::new(scope, v8::ContextOptions::default())
  }
@@ -2275,9 +2270,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +
 +        for round in 0..4u16 {
 +            for offset in 0..cache.frequency_aging_interval as u16 {
-+                cache.observe(&(
-+                    2000 + round * cache.frequency_aging_interval as u16 + offset
-+                ));
++                cache.observe(&(2000 + round * cache.frequency_aging_interval as u16 + offset));
 +            }
 +        }
 +        assert_eq!(cache.frequency(&1), 0);
@@ -2407,8 +2400,7 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +        );
 +        assert_eq!(
 +            evicted.len(),
-+            *MAX_REUSABLE_CONTEXTS_PER_ISOLATE
-+                - CGROUP_PRESSURE_REUSABLE_CONTEXTS_PER_ISOLATE
++            *MAX_REUSABLE_CONTEXTS_PER_ISOLATE - CGROUP_PRESSURE_REUSABLE_CONTEXTS_PER_ISOLATE
 +        );
 +        assert!(evicted[1..].iter().all(|key| *key >= 3));
 +        assert!(cache.contains_key(&1));
@@ -2525,10 +2517,10 @@ index 765683641da4843b5c6e556fa6c6cbdd1f31a7ef..fa06de9951c9de813e8f80453b8959e1
 +    }
 +}
 diff --git a/crates/isolate/src/environment/action/mod.rs b/crates/isolate/src/environment/action/mod.rs
-index 978255cc61038fb04462b20dcb8c9302ef861953..07d70866f6808b701be4e67718ce668d6f3269e2 100644
+index 3574be14f0cd21d570d4b0c6001d51b278b96c7b..e5f2afd12f9dcf6b81ec886ddb393938cbe650f7 100644
 --- a/crates/isolate/src/environment/action/mod.rs
 +++ b/crates/isolate/src/environment/action/mod.rs
-@@ -360,12 +360,15 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -362,12 +362,15 @@ impl<RT: Runtime> ActionEnvironment<RT> {
          if let Some(tx) = function_started {
              _ = tx.send(());
          }
@@ -2545,7 +2537,7 @@ index 978255cc61038fb04462b20dcb8c9302ef861953..07d70866f6808b701be4e67718ce668d
                  context_cache.take_http_action_context(&reusable_module_path)
          {
              // Cached HTTP action contexts keep evaluated JS modules. Validate the
-@@ -374,10 +377,10 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -376,10 +379,10 @@ impl<RT: Runtime> ActionEnvironment<RT> {
              if state
                  .environment
                  .phase
@@ -2558,7 +2550,7 @@ index 978255cc61038fb04462b20dcb8c9302ef861953..07d70866f6808b701be4e67718ce668d
              } else {
                  None
              }
-@@ -385,7 +388,9 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -387,7 +390,9 @@ impl<RT: Runtime> ActionEnvironment<RT> {
              None
          };
          let mut context_read_set = None;
@@ -2569,7 +2561,7 @@ index 978255cc61038fb04462b20dcb8c9302ef861953..07d70866f6808b701be4e67718ce668d
              reused_http_action_context = true;
              context_read_set = Some(read_set);
              let v8_context = v8::Local::new(handle_scope, context);
-@@ -460,6 +465,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -462,6 +467,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
              .as_ref()
              .ok_or_else(|| anyhow::anyhow!("No HTTP response streamer for HTTP action"))?;
          let total_bytes_sent = http_response_streamer.total_bytes_sent();
@@ -2577,7 +2569,7 @@ index 978255cc61038fb04462b20dcb8c9302ef861953..07d70866f6808b701be4e67718ce668d
          match termination_error {
              Ok(Ok(..)) => (),
              Ok(Err(e)) => {
-@@ -487,6 +493,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -489,6 +495,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
              && !has_pending_request_work
              && !self.has_pending_task_promises()
              && !self.http_action_had_execution_error
@@ -2585,7 +2577,7 @@ index 978255cc61038fb04462b20dcb8c9302ef861953..07d70866f6808b701be4e67718ce668d
              && matches!(&result, Ok((_, HttpActionResult::Streamed)));
          let candidate_context_read_set = if can_save_http_action_context {
              match context_read_set.take() {
-@@ -496,15 +503,14 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -498,15 +505,14 @@ impl<RT: Runtime> ActionEnvironment<RT> {
          } else {
              None
          };
@@ -2609,7 +2601,7 @@ index 978255cc61038fb04462b20dcb8c9302ef861953..07d70866f6808b701be4e67718ce668d
          };
          let user_execution_time = execution_time.elapsed;
          self.add_warnings_to_log_lines_http_action(execution_time, total_bytes_sent)?;
-@@ -522,15 +528,30 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -524,15 +530,30 @@ impl<RT: Runtime> ActionEnvironment<RT> {
          // Do not publish the context until every fallible request-finalization step
          // has succeeded. A caller that receives an error must never leave a warmed
          // context behind from that request.
@@ -2668,7 +2660,7 @@ index 9406faef18d72440f057f5ee2b2fc85b7112f918..373d61ed0fde358b08d37135e3ac8de9
  
      pub fn take_context_read_set(&mut self) -> anyhow::Result<Option<ContextReadSet>> {
 diff --git a/crates/isolate/src/environment/udf/mod.rs b/crates/isolate/src/environment/udf/mod.rs
-index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc862cd9559d 100644
+index 8f0c1d1d11390fa78b5b56a5a65467ed2c103eb9..9a30eb8fac5bc2e2813ce36ebb1c7c4eafa4a2e9 100644
 --- a/crates/isolate/src/environment/udf/mod.rs
 +++ b/crates/isolate/src/environment/udf/mod.rs
 @@ -7,6 +7,7 @@ use common::{
@@ -2688,7 +2680,7 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
      },
      environment::udf::{
          astral_future::RecursiveExecutor,
-@@ -271,14 +274,18 @@ impl<RT: Runtime> IsolateEnvironment<RT> for DatabaseUdfEnvironment<RT> {
+@@ -277,14 +280,18 @@ impl<RT: Runtime> SyscallProvider<RT> for DatabaseUdfSyscallProvider<RT> {
              // start of execution and doesn't observe elapsed time.
              UdfType::Query => self.phase.performance_now_fixed(),
              UdfType::Mutation => self.phase.performance_now_incrementing(),
@@ -2709,7 +2701,7 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
          }
      }
  
-@@ -351,9 +358,47 @@ type UdfRecursiveExecutor<RT> = RecursiveExecutor<
+@@ -488,9 +495,47 @@ type UdfRecursiveExecutor<RT> = RecursiveExecutor<
      anyhow::Result<(
          DatabaseUdfEnvironment<RT>,
          anyhow::Result<Result<PendingValue, JsError>>,
@@ -2757,7 +2749,7 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
  struct RunUdf<'a, 'b, RT: Runtime> {
      rt: &'a RT,
      v8_scope: &'a mut v8::Isolate,
-@@ -384,7 +429,7 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -521,7 +566,7 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
          // Same-isolate nested JavaScript can complete synchronously before the parent
          // select repolls cancellation, so its context-save boundary needs the shared
          // caller-drop signal too.
@@ -2766,7 +2758,7 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
          // N.B.: `run_nested` calls the corresponding `pop_context`.
          // This may not happen in case of a system error, but in that case we
          // are going to throw away the entire context stack anyway.
-@@ -395,24 +440,26 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -532,24 +577,26 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
          // User code is going to run again; regain the concurrency permit.
          let mut unpause_guard = self.paused_timeout.regain().await?;
          // Actually run the UDF.
@@ -2809,14 +2801,17 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
 +            self.executor.spawn(unsafe { body.project() }).await??
 +        };
          let outcome = NestedUdfOutcome {
-             observed_identity: nested_provider.phase.observed_identity(),
-             observed_rng: nested_provider.phase.observed_rng(),
-@@ -423,7 +470,15 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+             observed_identity: nested_provider.syscall_provider.phase.observed_identity(),
+             observed_rng: nested_provider.syscall_provider.phase.observed_rng(),
+@@ -560,10 +607,15 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
              result: result?,
-             syscall_trace: nested_provider.syscall_trace,
+             syscall_trace: nested_provider.syscall_provider.syscall_trace,
          };
--        Ok((nested_provider.phase.into_transaction()?, outcome))
-+        let transaction = nested_provider.phase.into_transaction()?;
+-        Ok((
+-            nested_provider.syscall_provider.phase.into_transaction()?,
+-            outcome,
+-        ))
++        let transaction = nested_provider.syscall_provider.phase.into_transaction()?;
 +        if let Some(reusable_context) = reusable_context {
 +            reusable_context.publish(
 +                self.context_cache,
@@ -2828,7 +2823,7 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
      }
  }
  
-@@ -527,7 +582,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -718,7 +770,7 @@ where
              // reject the function for capacity reasons.
              _ = tx.send(());
          }
@@ -2837,7 +2832,7 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
              .run_until(Self::run_nested(
                  &executor,
                  &args,
-@@ -537,7 +592,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -728,7 +780,7 @@ where
                  state,
                  &mut timeout,
                  isolate_clean,
@@ -2846,7 +2841,7 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
                  udf_callback,
              ))
              .await?;
-@@ -553,6 +608,11 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -744,10 +796,20 @@ where
              Err(e) => result = Err(e),
          }
          let result = result?;
@@ -2856,27 +2851,20 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
 +            None
 +        };
  
-         let execution_time = timeout.into_function_execution_time(this.udf_type);
-         let user_execution_time = execution_time.elapsed;
-@@ -603,9 +663,15 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
-         let outcome = match this.udf_type {
-             UdfType::Query => FunctionOutcome::Query(outcome),
-             UdfType::Mutation => FunctionOutcome::Mutation(outcome),
--            _ => anyhow::bail!("UdfEnvironment should only run queries and mutations"),
-+            UdfType::Action | UdfType::HttpAction => {
-+                anyhow::bail!("UdfEnvironment should only run queries and mutations")
-+            },
-         };
--        Ok((this.phase.into_transaction()?, outcome))
-+        let transaction = this.phase.into_transaction()?;
+         let execution_time = timeout.into_function_execution_time(this.syscall_provider.udf_type());
+-        this.syscall_provider
+-            .into_outcome(args, result, execution_time)
++        let outcome = this
++            .syscall_provider
++            .into_outcome(args, result, execution_time)?;
 +        if let Some(reusable_context) = reusable_context {
 +            reusable_context.publish(context_cache, &cancellation, &handle)?;
 +        }
-+        Ok((transaction, outcome))
++        Ok(outcome)
      }
  
      /// Runs a query or mutation, possibly nested via `runQuery`/`runMutation`.
-@@ -620,15 +686,24 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -762,15 +824,24 @@ where
          isolate_clean: &mut bool,
          cancellation: CancellationSignal,
          udf_callback: Option<IsolateClient<RT>>,
@@ -2904,30 +2892,30 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
              let v8_context = v8::Local::new(handle_scope, context);
              context_scope = v8::ContextScope::new(handle_scope, v8_context);
              (
-@@ -676,11 +751,17 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -816,11 +887,17 @@ where
+                 .await;
+                 if snoop {
                      let mut scope = RequestScope::<RT, Self>::enter(v8_scope);
-                     let read_set = scope.state_mut()?.environment.phase.finish_snoop()?;
-                     if let Ok(Ok(_)) = initialize_result {
--                        context_read_set = ContextCache::capture_context_read_set(
--                            read_set,
--                            scope.state_mut()?.environment.phase.tx_mut()?,
--                        )
--                        .await?;
-+                        // Read-set hashing is the final system-owned part of
-+                        // initialization, even though module evaluation has completed.
-+                        context_read_set = timeout
-+                            .with_release_permit(
-+                                PauseReason::UdfInitialize,
-+                                ContextCache::capture_context_read_set(
-+                                    read_set,
-+                                    scope.state_mut()?.environment.phase.tx_mut()?,
-+                                ),
-+                            )
-+                            .await?;
-                     }
+-                    context_read_set = scope
+-                        .state_mut()?
+-                        .environment
+-                        .syscall_provider
+-                        .finish_snoop(matches!(initialize_result, Ok(Ok(_))))
++                    // Read-set hashing is the final system-owned part of
++                    // initialization, even though module evaluation has completed.
++                    context_read_set = timeout
++                        .with_release_permit(
++                            PauseReason::UdfInitialize,
++                            scope
++                                .state_mut()?
++                                .environment
++                                .syscall_provider
++                                .finish_snoop(matches!(initialize_result, Ok(Ok(_)))),
++                        )
+                         .await?;
                  }
                  initialize_result
-@@ -737,8 +818,9 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -877,8 +954,9 @@ where
              result = Err(anyhow!("Cancelled"));
          }
  
@@ -2939,15 +2927,15 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
              && let Ok(Ok(_)) = result
              && let Some(read_set) = context_read_set
          {
-@@ -747,15 +829,18 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -887,15 +965,18 @@ where
                  .context("Lost ModuleMap?")?;
              let v8_scope = isolate_context.scope();
              let context = v8_scope.get_current_context();
 -            context_cache.save_context(
--                context_cache_key(&this.path),
+-                context_cache_key(this.syscall_provider.path()),
 -                v8::Global::new(v8_scope, context),
 +            Some(PendingReusableContext {
-+                module_path: context_cache_key(&this.path),
++                module_path: context_cache_key(this.syscall_provider.path()),
 +                context: v8::Global::new(v8_scope, context),
                  module_map,
                  read_set,
@@ -2964,44 +2952,39 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
      }
  
      #[fastrace::trace(properties = {"reusable_context": "{reusable_context}", "is_reused": "{is_reused}"})]
-@@ -1350,10 +1435,10 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -1260,10 +1341,10 @@ where
      async fn take_and_validate_reused_context(
          &mut self,
          context_cache: &mut ContextCache,
 -    ) -> anyhow::Result<Option<(v8::Global<v8::Context>, ModuleMap, ContextReadSet)>> {
 +        timeout: &mut Timeout<RT>,
 +    ) -> anyhow::Result<Option<TakenContext>> {
-         let module_path = context_cache_key(&self.path);
+         let module_path = context_cache_key(self.syscall_provider.path());
 -        let Some((context, module_map, read_set)) = context_cache.take_reused_context(&module_path)
 -        else {
 +        let Some(taken_context) = context_cache.take_reused_context(&module_path) else {
              metrics::log_database_udf_context_reuse_lookup(
-                 self.udf_type,
+                 self.syscall_provider.udf_type(),
                  DatabaseUdfContextReuseLookupOutcome::NotFound,
-@@ -1362,8 +1447,21 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -1272,9 +1353,14 @@ where
          };
-         // A found context has one terminal lookup outcome even if broken request
-         // transaction state prevents read-set validation from starting.
-+        // Validation hashing is initialization work. If the future blocks,
-+        // `with_release_permit` releases the active-JavaScript permit and excludes
-+        // only that blocked interval from the user timeout.
-         let validation_result = match self.phase.tx_mut() {
--            Ok(tx) => ContextCache::validate_and_apply_context_read_set(tx, &read_set).await,
-+            Ok(tx) => {
-+                timeout
-+                    .with_release_permit(
-+                        PauseReason::UdfInitialize,
-+                        ContextCache::validate_and_apply_context_read_set(
-+                            tx,
-+                            taken_context.read_set(),
-+                        ),
-+                    )
-+                    .await
-+            },
-             Err(error) => Err(error),
-         };
+         // A found context has one terminal lookup outcome even if the request
+         // transaction cannot validate its saved read set.
+-        let validation_result = self
+-            .syscall_provider
+-            .validate_reused_context(&read_set)
++        // Validation hashing is initialization work. If it blocks, release the
++        // active-JavaScript permit and exclude only that interval from user time.
++        let validation_result = timeout
++            .with_release_permit(
++                PauseReason::UdfInitialize,
++                self.syscall_provider
++                    .validate_reused_context(taken_context.read_set()),
++            )
+             .await;
          match validation_result {
-@@ -1388,6 +1486,6 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+             Ok(true) => {
+@@ -1298,7 +1384,7 @@ where
                  return Err(error);
              },
          }
@@ -3009,8 +2992,9 @@ index 0d392858bc08127986290d7bb80891d141adaedb..f0c9ca679fc7d542d110e6362af1dc86
 +        Ok(Some(taken_context))
      }
  }
+ 
 diff --git a/crates/isolate/src/isolate.rs b/crates/isolate/src/isolate.rs
-index b37b10699916be70f1afdb857f72380b291da894..b38101c90946e8cbf00c61ab7dabf5b3474050b8 100644
+index da6f8a9fcd4364d285f088bb0fae8446fd611198..ac1c16b2e7fc83573f68ca4a19d9152ae087b669 100644
 --- a/crates/isolate/src/isolate.rs
 +++ b/crates/isolate/src/isolate.rs
 @@ -268,6 +268,16 @@ impl<RT: Runtime> Isolate<RT> {
@@ -3092,10 +3076,10 @@ index 1a292efbd75c563e484922397734f4175a015b27..a5900dde6d94b6ad50200970f365748e
              RequestType::Udf {
                  request,
 diff --git a/crates/isolate/src/metrics.rs b/crates/isolate/src/metrics.rs
-index e6fb688b00e3b47e04245068263bbc20fafccf08..bdc583c121c1443693199f016cde0a68626357d6 100644
+index 469b3782968ee178d66707b16759d637ff123a24..9de604393bbc85ac0a5da9cbf43a423ac883eb9e 100644
 --- a/crates/isolate/src/metrics.rs
 +++ b/crates/isolate/src/metrics.rs
-@@ -58,19 +58,28 @@ fn reusable_context_kind_label(context_kind: ReusableContextKind) -> &'static st
+@@ -59,19 +59,28 @@ fn reusable_context_kind_label(context_kind: ReusableContextKind) -> &'static st
  pub(crate) enum ContextCacheOperation {
      Save,
      Take,
@@ -3126,7 +3110,7 @@ index e6fb688b00e3b47e04245068263bbc20fafccf08..bdc583c121c1443693199f016cde0a68
          ContextCacheClearReason::AppDefinitionEvaluation => "app_definition_evaluation",
          ContextCacheClearReason::CacheDrop => "cache_drop",
      }
-@@ -135,6 +144,23 @@ pub fn log_pool_allocated_count(name: &'static str, count: usize) {
+@@ -136,6 +145,23 @@ pub fn log_pool_allocated_count(name: &'static str, count: usize) {
      );
  }
  
@@ -3150,7 +3134,7 @@ index e6fb688b00e3b47e04245068263bbc20fafccf08..bdc583c121c1443693199f016cde0a68
  fn scheduler_class_labels(
      name: &'static str,
      scheduler_class: &'static str,
-@@ -182,7 +208,7 @@ register_convex_counter!(
+@@ -183,7 +209,7 @@ register_convex_counter!(
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  pub(crate) enum SchedulerContextAffinityOutcome {
      Hit,
@@ -3159,7 +3143,7 @@ index e6fb688b00e3b47e04245068263bbc20fafccf08..bdc583c121c1443693199f016cde0a68
      NewWorker,
      StolenWorker,
  }
-@@ -191,7 +217,7 @@ impl SchedulerContextAffinityOutcome {
+@@ -192,7 +218,7 @@ impl SchedulerContextAffinityOutcome {
      fn metric_label(self) -> &'static str {
          match self {
              Self::Hit => "hit",
@@ -3168,7 +3152,7 @@ index e6fb688b00e3b47e04245068263bbc20fafccf08..bdc583c121c1443693199f016cde0a68
              Self::NewWorker => "new_worker",
              Self::StolenWorker => "stolen_worker",
          }
-@@ -708,6 +734,70 @@ pub fn finish_service_request_timer(timer: StatusTimer, status: RequestStatus) {
+@@ -709,6 +735,70 @@ pub fn finish_service_request_timer(timer: StatusTimer, status: RequestStatus) {
      };
  }
  
@@ -3239,7 +3223,7 @@ index e6fb688b00e3b47e04245068263bbc20fafccf08..bdc583c121c1443693199f016cde0a68
  register_convex_histogram!(
      UDF_ISOLATE_BUILD_SECONDS,
      "Time to build isolate context",
-@@ -1376,6 +1466,67 @@ register_convex_gauge!(
+@@ -1414,6 +1504,67 @@ register_convex_gauge!(
      &["context_kind"],
  );
  
@@ -3467,10 +3451,10 @@ index 25322ce7e2c02e8f7eb1d722a83b34acd5b0e08b..054bebd077fa93803ef5575e342e4600
 +    }
 +}
 diff --git a/crates/local_backend/src/lib.rs b/crates/local_backend/src/lib.rs
-index 7facea286a059a31926ac2524a2702ccee1fefc9..adc1bd8850fc4bc5236e43fc0fc16ec3f3d863ca 100644
+index bfcd47b6e534ebb368ff2a17b539dd2820fc02e0..f0c4860de2ff1e918957bb200dd54d1f7c4ad403 100644
 --- a/crates/local_backend/src/lib.rs
 +++ b/crates/local_backend/src/lib.rs
-@@ -235,7 +235,7 @@ pub async fn make_app(
+@@ -237,7 +237,7 @@ pub async fn make_app(
          reqwest::redirect::Policy::default(),
      );
      let function_runner: Arc<dyn FunctionRunner<ProdRuntime>> =
@@ -3479,7 +3463,7 @@ index 7facea286a059a31926ac2524a2702ccee1fefc9..adc1bd8850fc4bc5236e43fc0fc16ec3
              deployment,
              key_broker.function_runner_keybroker(),
              config.convex_origin_url()?,
-@@ -247,6 +247,7 @@ pub async fn make_app(
+@@ -249,6 +249,7 @@ pub async fn make_app(
              },
              database.clone(),
              fetch_client.clone(),
@@ -4393,7 +4377,7 @@ index ab39188d56a5546c7aa4d049531a3bdb4c82e1b7..7aed631ff8a4e680c45946aa466e9bf7
  The practical operating check is concrete: after enabling the knob, run a warm
  load test for the hot HTTP path and compare p50/p95/p99 latency, HTTP `503`
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index aa1027a529f040fddffb1cea028a7feafc07593a..943adb2717b45bb88de38912193c3f99146e6960 100644
+index f8056fbec4062038ad0fac5af86cdef5d960a44b..7a196e2147de72f1dfe3f0540ecfd40f1b335a73 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
 @@ -81,8 +81,11 @@ the pressure signal only after headroom reaches
