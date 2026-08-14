@@ -11,7 +11,8 @@ an explicitly ordered corrective integration commit may complete several earlier
 the owning essays identify those compositions. Lane-aware queueing and its optional deployment
 extension are one queue-control patch. The matching degradable-query client half is maintained in
 `convex-js`; it shares the protocol and adoption essay but is not another commit in this backend
-chain.
+chain. Non-committing codegen analysis likewise has a matching CLI commit, with the combined
+adoption contract documented in the backend essay.
 
 ## Database connection reliability
 
@@ -48,6 +49,18 @@ chain.
   is complementary but not required once valid checkpoints exist.
 - Activation: only through the privileged repair endpoint; dry-run is the default.
 - Rollback: do not execute a stale plan. There is no generic undo after destructive finalization.
+
+## Deployment and code generation
+
+### [Non-committing codegen analysis](non_committing_codegen_analysis/README.md)
+
+- Purpose: let standalone codegen obtain authoritative evaluated component analysis without
+  committing pending schema or index metadata or starting validation and backfill workers.
+- Prerequisites: the matching `convex-js` CLI patch. Upgrade the backend before distributing that
+  CLI; other backend patches are not required.
+- Activation: automatic when the matching CLI sends `includeAnalysis` to `evaluate_push`.
+- Rollback: roll back the CLI before the backend if codegen must remain available; no data or
+  configuration rollback is required.
 
 ## Schema reliability
 
@@ -305,16 +318,17 @@ These files preserve the full earlier analysis without creating additional opera
 ## Recommended rollout order
 
 1. Apply standalone import, build, and Node-package reliability fixes as needed.
-2. Deploy dependency capacity before lane-aware queueing or the deployment lane.
-3. Deploy scheduled-action pre-claim admission after those scheduler patches; it protects both the
+2. Deploy non-committing codegen analysis in the backend before distributing the matching CLI.
+3. Deploy dependency capacity before lane-aware queueing or the deployment lane.
+4. Deploy scheduled-action pre-claim admission after those scheduler patches; it protects both the
    legacy CoDel and lane-aware queue paths.
-4. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
+5. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
    own wait and occupancy signals.
-5. Establish observability before enabling application context-reuse markers or HTTP reuse.
-6. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
+6. Establish observability before enabling application context-reuse markers or HTTP reuse.
+7. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
    after cold-miss evidence.
-7. Deliver matching backend and client protocol before enabling degradable frontend behavior.
-8. Change one independent capacity or semantic opt-in at a time unless the documented policy
+8. Deliver matching backend and client protocol before enabling degradable frontend behavior.
+9. Change one independent capacity or semantic opt-in at a time unless the documented policy
    explicitly requires a coupled rollout and rollback order.
 
 Do not use module, function, route, client, deployment, or tenant names in generic backend logic or
