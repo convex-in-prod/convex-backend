@@ -50,13 +50,8 @@ use fastrace::{
     },
 };
 use model::{
-    auth::types::AuthDiff,
     components::{
-        config::{
-            SerializedComponentDefinitionDiff,
-            SerializedComponentDiff,
-            SerializedSchemaChange,
-        },
+        config::SerializedSchemaChange,
         type_checking::SerializedCheckedComponent,
         types::SerializedEvaluatedComponentDefinition,
     },
@@ -194,6 +189,15 @@ impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
 
     fn try_from(value: EvaluatePushResponse) -> Result<Self, Self::Error> {
         Ok(Self {
+            analysis: value
+                .analysis
+                .map(|analysis| {
+                    analysis
+                        .into_iter()
+                        .map(|(k, v)| Ok((String::from(k), v.try_into()?)))
+                        .collect::<anyhow::Result<_>>()
+                })
+                .transpose()?,
             schema_change: value.schema_change.try_into()?,
         })
     }
@@ -202,6 +206,8 @@ impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SerializedEvaluatePushResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    analysis: Option<BTreeMap<String, SerializedEvaluatedComponentDefinition>>,
     schema_change: SerializedSchemaChange,
 }
 
@@ -330,10 +336,10 @@ pub async fn start_push(
     )?))
 }
 
-// This endpoint is similar to `start_push`, but it doesn’t save the schema (so
-// it won’t start schema validation/index backfill). It can be used to determine
-// what will be the effects of a large push without starting work that can take
-// a long time on large instances.
+// This endpoint is similar to `start_push`, but it does not commit schema or
+// index preparation, so it cannot start schema validation or index backfills.
+// It always returns the schema diff and includes code generation analysis only
+// when requested.
 pub async fn evaluate_push(
     MtState(st): MtState<LocalAppState>,
     Json(req): Json<StartPushRequest>,
@@ -412,10 +418,14 @@ pub async fn wait_for_schema(
     Ok(Json(SchemaStatusJson::from(resp)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FinishPushRequest {
+    #[serde(skip_serializing)]
     pub admin_key: String,
+    /// Omitted by legacy clients. Identifies a bounded durable finish replay.
+    #[serde(default, skip_serializing)]
+    pub operation_id: Option<String>,
     start_push: SerializedStartPushResponse,
     pub dry_run: bool,
     pub message: Option<String>,
@@ -437,6 +447,32 @@ pub async fn finish_push_internal(
     .await?;
     identity.require_operation(keybroker::DeploymentOp::Deploy)?;
 
+    // The exclusive prepared lease precedes receipt lookup and force-capable
+    // cutover admission. Keep it through the application call, even if cancel
+    // or expiry revokes preparation while this finish still owns its sources.
+    let (_prepared_lease, operation) = if let Some(operation_id) = &req.operation_id {
+        let expires = crate::deployment_operations::operation_expiry(
+            operation_id,
+            st.deployment_operations.now(),
+        )?;
+        let input_sha256 =
+            crate::deployment_operations::normalized_digest(&mut serde_json::to_value(&req)?)?;
+        let prepared = st
+            .deployment_operations
+            .prepared(operation_id, serde_json::to_value(&req.start_push)?)?;
+        let operation = application::deploy_config::FinishPushOperation {
+            operation_id: operation_id.clone(),
+            input_sha256: input_sha256.as_hex(),
+            expires_unix_seconds: i64::try_from(
+                expires.duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+            )?,
+            prepared: prepared.as_ref().map(|lease| lease.sources.clone()),
+        };
+        (prepared, Some(operation))
+    } else {
+        (None, None)
+    };
+
     if req.force_node_cutover && !req.dry_run {
         anyhow::ensure!(
             req.start_push.node_executor_cutover_protocol_version == Some(1),
@@ -449,9 +485,15 @@ pub async fn finish_push_internal(
     let start_push = StartPushResponse::try_from(req.start_push)?;
     let message = req.message.map(PushMessage::try_from).transpose()?;
 
-    // We can't actually run `finish_push` in a dry run, since we rolled back all of
-    // our changes during start push.
+    // A dry run retains schema validation from start_push, but never activates
+    // code. It still rejects conflicting receipts or missing preparation.
     if req.dry_run {
+        if let Some(operation) = &operation {
+            let mut tx = st.application.begin(identity).await?;
+            if let Some((diff, ts)) = operation.validate(&mut tx).await? {
+                return Ok((diff, Some(ts)));
+            }
+        }
         tracing::info!("Skipping finish_push in dry run");
         let empty_diff = FinishPushDiff::default();
         return Ok((SerializedFinishPushDiff::try_from(empty_diff)?, None));
@@ -465,6 +507,7 @@ pub async fn finish_push_internal(
             start_push,
             message,
             req.force_node_cutover,
+            operation,
         )
         .await
         .map_err(|e| {
@@ -474,7 +517,7 @@ pub async fn finish_push_internal(
                 e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}"))
             }
         })?;
-    Ok((SerializedFinishPushDiff::try_from(resp)?, Some(ts)))
+    Ok((resp, Some(ts)))
 }
 
 pub async fn finish_push(
@@ -522,33 +565,7 @@ pub async fn report_push_completed_handler(
     Ok(Json(()))
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SerializedFinishPushDiff {
-    auth_diff: AuthDiff,
-    definition_diffs: BTreeMap<String, SerializedComponentDefinitionDiff>,
-    component_diffs: BTreeMap<String, SerializedComponentDiff>,
-}
-
-impl TryFrom<FinishPushDiff> for SerializedFinishPushDiff {
-    type Error = anyhow::Error;
-
-    fn try_from(value: FinishPushDiff) -> Result<Self, Self::Error> {
-        Ok(Self {
-            auth_diff: value.auth_diff,
-            definition_diffs: value
-                .definition_diffs
-                .into_iter()
-                .map(|(k, v)| Ok((String::from(k), v.try_into()?)))
-                .collect::<anyhow::Result<_>>()?,
-            component_diffs: value
-                .component_diffs
-                .into_iter()
-                .map(|(k, v)| Ok((String::from(k), v.try_into()?)))
-                .collect::<anyhow::Result<_>>()?,
-        })
-    }
-}
+pub use application::deploy_config::SerializedFinishPushDiff;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

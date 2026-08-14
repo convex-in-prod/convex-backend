@@ -611,6 +611,7 @@ pub struct ApplicationStorage {
 
 #[derive(Clone)]
 pub struct Application<RT: Runtime> {
+    deployment_analysis: common::query_analysis_admission::DeploymentAnalysisAdmission,
     runtime: RT,
     database: Database<RT>,
     runner: Arc<ApplicationFunctionRunner<RT>>,
@@ -976,6 +977,8 @@ impl<RT: Runtime> Application<RT> {
         };
 
         Ok(Self {
+            deployment_analysis:
+                common::query_analysis_admission::DeploymentAnalysisAdmission::default(),
             runtime,
             database,
             runner,
@@ -2200,7 +2203,7 @@ impl<RT: Runtime> Application<RT> {
         &self,
         udf_config: UdfConfig,
         new_modules: Vec<ModuleConfig>,
-        source_package: SourcePackage,
+        source_package: impl Into<Option<SourcePackage>> + Send,
         user_environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
         system_env_var_overrides: BTreeMap<EnvVarName, EnvVarValue>,
     ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
@@ -2244,7 +2247,31 @@ impl<RT: Runtime> Application<RT> {
 
     #[fastrace::trace]
     pub async fn evaluate_schema(&self, schema: ModuleConfig) -> anyhow::Result<DatabaseSchema> {
-        self._evaluate_schema(schema).await.map_err(|e| {
+        use common::query_analysis_admission::{
+            DeploymentAnalysisKind,
+            DEPLOYMENT_ANALYSIS_JOB,
+        };
+        // Whole pushes already own this gate. Standalone schema preparation
+        // joins it without recursively acquiring the single active slot.
+        let result = if DEPLOYMENT_ANALYSIS_JOB.try_with(|_| ()).is_ok() {
+            self._evaluate_schema(schema).await
+        } else {
+            let bytes = schema
+                .source
+                .as_bytes()
+                .len()
+                .checked_add(schema.source_map.as_deref().map_or(0, str::len))
+                .and_then(|bytes| bytes.checked_mul(2))
+                .context("schema input size overflow")?;
+            let permit = self
+                .deployment_analysis
+                .acquire(DeploymentAnalysisKind::Preflight, bytes)
+                .await?;
+            DEPLOYMENT_ANALYSIS_JOB
+                .scope(permit, self._evaluate_schema(schema))
+                .await
+        };
+        result.map_err(|e| {
             e.wrap_error_message(|msg| format!("Hit an error while evaluating your schema:\n{msg}"))
         })
     }
@@ -2456,7 +2483,7 @@ impl<RT: Runtime> Application<RT> {
         &self,
         udf_config: UdfConfig,
         modules: Vec<ModuleConfig>,
-        source_package: SourcePackage,
+        source_package: impl Into<Option<SourcePackage>> + Send,
         user_environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
         system_env_var_overrides: BTreeMap<EnvVarName, EnvVarValue>,
     ) -> anyhow::Result<(
@@ -2490,14 +2517,33 @@ impl<RT: Runtime> Application<RT> {
         Ok((auth_module.cloned(), analyze_result))
     }
 
-    async fn upload_packages(
+    async fn prepare_packages(
         &self,
         config: &ProjectConfig,
+        upload: bool,
     ) -> anyhow::Result<(
         Option<ExternalDepsPackageId>,
-        BTreeMap<ComponentDefinitionPath, SourcePackage>,
+        BTreeMap<ComponentDefinitionPath, Option<SourcePackage>>,
         Vec<ModuleConfig>,
     )> {
+        let upload = upload
+            || !config.node_dependencies.is_empty()
+            || config
+                .app_definition
+                .changed_runtime_modules
+                .iter()
+                .any(|module| module.environment == ModuleEnvironment::Node)
+            || config
+                .app_definition
+                .unchanged_runtime_module_hashes
+                .iter()
+                .any(|module| module.environment == ModuleEnvironment::Node)
+            || config.component_definitions.iter().any(|component| {
+                component
+                    .functions
+                    .iter()
+                    .any(|module| module.environment == ModuleEnvironment::Node)
+            });
         let upload_limit = Arc::new(Semaphore::new(*APPLICATION_MAX_CONCURRENT_UPLOADS));
 
         let mut app_functions: Vec<ModuleConfig> =
@@ -2572,12 +2618,32 @@ impl<RT: Runtime> Application<RT> {
                             "Existing module hash does not match."
                         ));
                     }
+                    // A metadata match authorizes reuse only when the archive
+                    // bytes, including the source map, still match that record.
+                    anyhow::ensure!(
+                        model::modules::hash_module_source(
+                            &module.source,
+                            module.source_map.as_ref(),
+                        ) == metadata.sha256,
+                        ErrorMetadata::conflict(
+                            "ExistingSourcePackageHashConflict",
+                            "Existing source package module content does not match its metadata."
+                        )
+                    );
                     if metadata.environment != unchanged_module.environment {
                         anyhow::bail!(ErrorMetadata::conflict(
                             "ExistingModuleEnvConflict",
                             "Existing module environment does not match."
                         ));
                     }
+                    anyhow::ensure!(
+                        module.environment == metadata.environment,
+                        ErrorMetadata::conflict(
+                            "ExistingSourcePackageEnvConflict",
+                            "Existing source package module environment does not match its \
+                             metadata."
+                        )
+                    );
                     if metadata.node_pool != unchanged_module.node_pool {
                         anyhow::bail!(ErrorMetadata::conflict(
                             "ExistingModuleNodePoolConflict",
@@ -2598,15 +2664,21 @@ impl<RT: Runtime> Application<RT> {
                 .all_modules(&app_functions)
                 .cloned()
                 .collect();
-            let app_pkg = self
-                .upload_package(
-                    &app_modules,
-                    external_deps_id_and_pkg.clone(),
-                    config.node_version,
-                )
-                .await?;
+            let (app_pkg, size) = if upload {
+                let package = self
+                    .upload_package(
+                        &app_modules,
+                        external_deps_id_and_pkg.clone(),
+                        config.node_version,
+                    )
+                    .await?;
+                let size = package.package_size;
+                (Some(package), size)
+            } else {
+                (None, self.validate_preflight_package(&app_modules).await?)
+            };
             drop(permit);
-            Ok((external_deps_id_and_pkg, app_pkg))
+            Ok((external_deps_id_and_pkg, app_pkg, size))
         };
 
         let mut component_pkg_futures = JoinSet::new();
@@ -2617,11 +2689,29 @@ impl<RT: Runtime> Application<RT> {
             let upload_limit = upload_limit.clone();
             let component_pkg_future = async move {
                 let permit = upload_limit.acquire().await?;
-                let component_pkg = app.upload_package(&component_modules, None, None).await?;
+                let (component_pkg, size) = if upload {
+                    let package = app.upload_package(&component_modules, None, None).await?;
+                    let size = package.package_size;
+                    (Some(package), size)
+                } else {
+                    (
+                        None,
+                        app.validate_preflight_package(&component_modules).await?,
+                    )
+                };
                 drop(permit);
-                anyhow::Ok((definition_path, component_pkg))
+                anyhow::Ok((definition_path, component_pkg, size))
             };
-            component_pkg_futures.spawn("upload_package", component_pkg_future);
+            // Dropping JoinSet requests cancellation but does not wait for a
+            // running task to drop its sources. Retain the whole-job lease in
+            // each task, including before its first poll.
+            let deployment_job =
+                common::query_analysis_admission::DEPLOYMENT_ANALYSIS_JOB.with(Clone::clone);
+            component_pkg_futures.spawn(
+                "upload_package",
+                common::query_analysis_admission::DEPLOYMENT_ANALYSIS_JOB
+                    .scope(deployment_job, component_pkg_future),
+            );
         }
         // `JoinSet::join_all` was added in tokio 1.40.0.
         let component_pkg_future = async {
@@ -2632,22 +2722,22 @@ impl<RT: Runtime> Application<RT> {
             anyhow::Ok(result)
         };
 
-        let ((external_deps, app_pkg), component_pkgs) =
+        let ((external_deps, app_pkg, root_size), component_pkgs) =
             tokio::try_join!(root_future, component_pkg_future)?;
 
         let mut total_size = PackageSize::default();
         if let Some((_, ref pkg)) = external_deps {
             total_size += pkg.package_size;
         }
-        total_size += app_pkg.package_size;
-        for (_, pkg) in &component_pkgs {
-            total_size += pkg.package_size;
+        total_size += root_size;
+        for (_, _, size) in &component_pkgs {
+            total_size += *size;
         }
         total_size.verify_size()?;
 
         let mut component_definition_packages = BTreeMap::new();
         component_definition_packages.insert(ComponentDefinitionPath::root(), app_pkg);
-        for (definition_path, component_pkg) in component_pkgs {
+        for (definition_path, component_pkg, _) in component_pkgs {
             anyhow::ensure!(component_definition_packages
                 .insert(definition_path, component_pkg)
                 .is_none());
@@ -2667,7 +2757,7 @@ impl<RT: Runtime> Application<RT> {
         &self,
         udf_config: UdfConfig,
         modules: Vec<ModuleConfig>,
-        source_package: SourcePackage,
+        source_package: impl Into<Option<SourcePackage>> + Send,
         user_environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
         system_env_var_overrides: BTreeMap<EnvVarName, EnvVarValue>,
     ) -> anyhow::Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>> {
@@ -2800,15 +2890,46 @@ impl<RT: Runtime> Application<RT> {
     }
 
     #[fastrace::trace]
+    fn validate_source_package_modules<'a>(
+        &self,
+        modules: &'a [ModuleConfig],
+    ) -> anyhow::Result<(
+        BTreeMap<CanonicalizedModulePath, &'a ModuleConfig>,
+        model::source_packages::types::NodeExecutorPoolTopology,
+    )> {
+        let topology = node_executor_pool_topology(modules)?;
+        self.runner()
+            .validate_node_executor_pool_topology(&topology)?;
+        let package: BTreeMap<_, _> = modules
+            .iter()
+            .map(|module| (module.path.clone().canonicalize(), module))
+            .collect();
+        anyhow::ensure!(
+            modules.len() == package.len(),
+            ErrorMetadata::bad_request(
+                "CanonicalizationConflict",
+                "Multiple modules canonicalize to the same name."
+            )
+        );
+        Ok((package, topology))
+    }
+
+    async fn validate_preflight_package(
+        &self,
+        modules: &[ModuleConfig],
+    ) -> anyhow::Result<PackageSize> {
+        let (package, _) = self.validate_source_package_modules(modules)?;
+        model::source_packages::upload_download::measure_package(package).await
+    }
+
     pub async fn upload_package(
         &self,
         modules: &Vec<ModuleConfig>,
         external_deps_id_and_pkg: Option<(ExternalDepsPackageId, ExternalDepsPackage)>,
         node_version: Option<NodeVersion>,
     ) -> anyhow::Result<SourcePackage> {
-        let node_executor_pool_topology = node_executor_pool_topology(modules)?;
-        self.runner()
-            .validate_node_executor_pool_topology(&node_executor_pool_topology)?;
+        let (package, node_executor_pool_topology) =
+            self.validate_source_package_modules(modules)?;
         // If there are any node actions, turn on the lambdas.
         if modules
             .iter()
@@ -2816,24 +2937,6 @@ impl<RT: Runtime> Application<RT> {
         {
             self.runner().enable_actions()?;
         }
-
-        tracing::info!(
-            "Uploading package with {} modules to Storage",
-            modules.len()
-        );
-
-        // Canonicalize the modules
-        let package: BTreeMap<_, _> = modules
-            .iter()
-            .map(|m| (m.path.clone().canonicalize(), m))
-            .collect();
-        anyhow::ensure!(
-            modules.len() == package.len(),
-            ErrorMetadata::bad_request(
-                "CanonicalizationConflict",
-                "Multiple modules canonicalize to the same name.",
-            )
-        );
 
         let (external_deps_package_id, external_deps_pkg) = match external_deps_id_and_pkg {
             Some((id, pkg)) => (Some(id), Some(pkg)),

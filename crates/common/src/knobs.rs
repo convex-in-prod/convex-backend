@@ -643,6 +643,16 @@ pub static LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES: LazyLock<usize> =
         )
     });
 
+/// Stop authenticated deployment intake below this cgroup headroom even when
+/// its reserved HTTP slot is free. Source reservations are logical byte limits;
+/// operators must also allow for active runtime heaps and allocator overhead.
+pub static LOCAL_BACKEND_DEPLOYMENT_MIN_HEADROOM_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    env_config_usize_strict(
+        "LOCAL_BACKEND_DEPLOYMENT_MIN_HEADROOM_BYTES",
+        2 * 1024 * 1024 * 1024,
+    )
+});
+
 /// Cgroup memory headroom at or above which external HTTP admission resumes.
 pub static LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES: LazyLock<usize> =
     LazyLock::new(|| {

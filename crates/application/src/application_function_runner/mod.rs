@@ -1899,8 +1899,11 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 })
             },
             ModuleEnvironment::Node => {
+                // Unchanged module rows can retain an older package ID. Match
+                // the activation record used by post-commit cutover so a new
+                // action snapshot cannot rotate back to that older package.
                 let source_package = SourcePackageModel::new(&mut tx, path.component.into())
-                    .get_latest()
+                    .get_latest_record()
                     .await?
                     .context("no source package?")?;
                 // Deployment publication is an eager fast path. Reconcile from the
@@ -2206,7 +2209,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         &self,
         udf_config: UdfConfig,
         new_modules: Vec<ModuleConfig>,
-        source_package: SourcePackage,
+        source_package: impl Into<Option<SourcePackage>> + Send,
         user_environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
         system_env_var_overrides: BTreeMap<EnvVarName, EnvVarValue>,
     ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
@@ -2228,10 +2231,14 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             self.query_analysis_admission.clone(),
         );
 
+        let source_package = source_package.into();
         let node_future = async {
             if node_modules.is_empty() {
                 return Ok(Ok(BTreeMap::new()));
             }
+            let source_package = source_package
+                .as_ref()
+                .context("Node analysis requires an uploaded source package")?;
             for path_str in ["schema.js", "crons.js", "http.js"] {
                 let path = path_str
                     .parse()
@@ -2328,7 +2335,20 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             }
         };
 
-        let (isolate_result, node_result) = tokio::try_join!(isolate_future, node_future)?;
+        tokio::pin!(isolate_future, node_future);
+        // A developer error is terminal too. Dropping isolate analysis signals
+        // execution-fenced cancellation; the Node owner retains admission until
+        // its existing terminal cleanup completes, including after detachment.
+        let (isolate_result, node_result) = tokio::select! {
+            isolate = &mut isolate_future => match isolate? {
+                Err(error) => return Ok(Err(error)),
+                Ok(isolate) => (Ok(isolate), node_future.await?),
+            },
+            node = &mut node_future => match node? {
+                Err(error) => return Ok(Err(error)),
+                Ok(node) => (isolate_future.await?, Ok(node)),
+            },
+        };
         match isolate_result {
             Ok(modules) => result.extend(modules),
             Err(e) => return Ok(Err(e)),

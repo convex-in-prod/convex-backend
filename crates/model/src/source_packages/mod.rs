@@ -58,6 +58,12 @@ impl<'a, RT: Runtime> SourcePackageModel<'a, RT> {
 
     #[fastrace::trace]
     pub async fn put(&mut self, source_package: SourcePackage) -> anyhow::Result<SourcePackageId> {
+        // Latest-record reads are activation authority, including for empty
+        // packages. Serialize inserts and advance past the previous record:
+        // transaction start times can tie or differ from commit order.
+        if let Some(previous) = self.get_latest_record().await? {
+            self.tx.advance_creation_time(previous.creation_time())?;
+        }
         let document_id = SystemMetadataModel::new(self.tx, self.namespace)
             .insert(&SOURCE_PACKAGES_TABLE, source_package.try_into()?)
             .await?;

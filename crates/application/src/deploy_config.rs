@@ -10,6 +10,14 @@ use std::{
     },
 };
 
+metrics::register_convex_counter!(
+    DEPLOYMENT_FINISH_EVENTS_TOTAL,
+    "Non-dry-run finish commit outcomes observed after the transaction; replay is historical, and \
+     activation commit does not establish Node cutover completion",
+    &["outcome"],
+    Duration::MAX,
+);
+
 use anyhow::Context;
 use async_trait::async_trait;
 use common::{
@@ -77,6 +85,7 @@ use fastrace::{
 };
 use futures::FutureExt;
 use keybroker::Identity;
+use storage::ObjectKey;
 use maplit::btreeset;
 use model::{
     auth::{
@@ -90,6 +99,8 @@ use model::{
             ComponentDefinitionDiff,
             ComponentDiff,
             SchemaChange,
+            SerializedComponentDefinitionDiff,
+            SerializedComponentDiff,
         },
         file_based_routing::file_based_exports,
         type_checking::{
@@ -187,13 +198,57 @@ pub struct PushMetrics {
     pub occ_stats: OccRetryStats,
 }
 
+fn project_source_bytes(config: &ProjectConfig) -> anyhow::Result<usize> {
+    let mut source_bytes = 0usize;
+    for module in config
+        .app_definition
+        .all_modules(&config.app_definition.changed_runtime_modules)
+        .chain(
+            config
+                .component_definitions
+                .iter()
+                .flat_map(|component| component.modules()),
+        )
+    {
+        source_bytes = source_bytes
+            .checked_add(module.source.as_bytes().len())
+            .and_then(|size| size.checked_add(module.source_map.as_deref().map_or(0, str::len)))
+            .context("analysis source size overflow")?;
+    }
+    Ok(source_bytes)
+}
+
+// Charge source copies, V8 strings and the two snapshot acceleration caches.
+// Runtime heap and root parallelism remain independently bounded by isolate
+// admission. Unchanged sources are bounded by the existing archive size limit.
+fn analysis_retention_estimate(config: &ProjectConfig) -> anyhow::Result<usize> {
+    let mut source_bytes = project_source_bytes(config)?;
+    if !config
+        .app_definition
+        .unchanged_runtime_module_hashes
+        .is_empty()
+    {
+        source_bytes = source_bytes
+            .checked_add(model::source_packages::types::MAX_UNZIPPED_PACKAGES_SIZE)
+            .context("analysis source size overflow")?;
+    }
+    source_bytes
+        .checked_mul(2)
+        // Components are analyzed sequentially; only one snapshot's caches
+        // are retained at a time.
+        .and_then(|size| size.checked_add(*common::knobs::ANALYZE_CODE_CACHE_MAX_BYTES))
+        .and_then(|size| size.checked_add(*common::knobs::ANALYZE_SOURCE_MAP_CACHE_MAX_BYTES))
+        .context("analysis retention size overflow")
+}
+
 struct EvaluatedPushContents {
     app: CheckedComponent,
     auth_info: Vec<AuthInfo>,
-    component_definition_packages: BTreeMap<ComponentDefinitionPath, SourcePackage>,
+    component_definition_packages: BTreeMap<ComponentDefinitionPath, Option<SourcePackage>>,
     evaluated_components: BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
     external_deps_id: Option<ExternalDepsPackageId>,
     user_environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
+    system_env_var_overrides: BTreeMap<EnvVarName, EnvVarValue>,
     app_functions: Vec<ModuleConfig>,
 }
 
@@ -285,6 +340,55 @@ impl<RT: Runtime> Application<RT> {
 
     #[fastrace::trace]
     pub async fn start_push(&self, config: &ProjectConfig) -> anyhow::Result<StartPushResult> {
+        self.start_push_with_retention(config, false).await
+    }
+
+    pub async fn start_push_with_prepared_sources(
+        &self,
+        config: &ProjectConfig,
+    ) -> anyhow::Result<StartPushResult> {
+        self.start_push_with_retention(config, true).await
+    }
+
+    async fn start_push_with_retention(
+        &self,
+        config: &ProjectConfig,
+        retain_sources: bool,
+    ) -> anyhow::Result<StartPushResult> {
+        use common::query_analysis_admission::{
+            DeploymentAnalysisKind,
+            DEPLOYMENT_ANALYSIS_JOB,
+        };
+        let permit = self
+            .deployment_analysis
+            .acquire(
+                if config.for_codegen || config.dry_run {
+                    DeploymentAnalysisKind::Preflight
+                } else {
+                    DeploymentAnalysisKind::Deploy
+                },
+                analysis_retention_estimate(config)?,
+            )
+            .await?;
+        DEPLOYMENT_ANALYSIS_JOB
+            .scope(permit, self.start_push_admitted(config, retain_sources))
+            .await
+    }
+
+    async fn start_push_admitted(
+        &self,
+        config: &ProjectConfig,
+        retain_sources: bool,
+    ) -> anyhow::Result<StartPushResult> {
+        let expected_prior = if retain_sources {
+            let mut tx = self.begin(Identity::system()).await?;
+            SourcePackageModel::new(&mut tx, TableNamespace::Global)
+                .get_latest_record()
+                .await?
+                .map(|package| package.developer_id())
+        } else {
+            None
+        };
         let EvaluatedPushContents {
             app,
             auth_info,
@@ -292,8 +396,9 @@ impl<RT: Runtime> Application<RT> {
             mut evaluated_components,
             external_deps_id,
             user_environment_variables,
+            system_env_var_overrides,
             app_functions,
-        } = self.evaluate_push_contents(config).await?;
+        } = self.evaluate_push_contents(config, true).await?;
 
         let skip_index_diff = config.dry_run || config.for_codegen;
         let mut schema_change = self
@@ -311,30 +416,69 @@ impl<RT: Runtime> Application<RT> {
             .load_indexes_into_memory(btreeset! { SCHEMAS_TABLE.clone() })
             .await?;
 
-        // TODO(ENG-7533): Clean up exports from the start push response when we've
-        // updated clients to use `functions` directly.
-        for (path, definition) in evaluated_components.iter_mut() {
-            // We don't need to include exports for the root since we don't use codegen
-            // for the app's `api` object.
-            if path.is_root() {
-                continue;
-            }
-            anyhow::ensure!(definition.definition.exports.is_empty());
-            definition.definition.exports = file_based_exports(&definition.functions)?;
-        }
+        add_file_based_exports_to_analysis(&mut evaluated_components)?;
 
         let resp = StartPushResponse {
             environment_variables: user_environment_variables,
             external_deps_id,
-            component_definition_packages,
+            component_definition_packages: component_definition_packages
+                .into_iter()
+                .map(|(path, package)| {
+                    Ok((
+                        path,
+                        package.context("start_push requires an uploaded source package")?,
+                    ))
+                })
+                .collect::<anyhow::Result<_>>()?,
             app_auth: auth_info,
             analysis: evaluated_components,
             app,
             schema_change,
         };
+        let prepared = if retain_sources {
+            let mut packages = BTreeMap::new();
+            packages.insert(
+                ComponentDefinitionPath::root(),
+                config
+                    .app_definition
+                    .all_modules(&app_functions)
+                    .map(|module| (module.path.clone().canonicalize(), module.clone()))
+                    .collect(),
+            );
+            for component in &config.component_definitions {
+                packages.insert(
+                    component.definition_path.clone(),
+                    component
+                        .modules()
+                        .map(|module| (module.path.clone().canonicalize(), module.clone()))
+                        .collect(),
+                );
+            }
+            let external_deps_storage_key = if let Some(id) = &resp.external_deps_id {
+                let mut tx = self.begin(Identity::system()).await?;
+                Some(
+                    ExternalPackagesModel::new(&mut tx)
+                        .get(id.clone())
+                        .await?
+                        .storage_key
+                        .clone(),
+                )
+            } else {
+                None
+            };
+            Some(Arc::new(PreparedPush {
+                packages,
+                external_deps_storage_key,
+                expected_prior,
+                system_env_var_overrides,
+            }))
+        } else {
+            None
+        };
         Ok(StartPushResult {
             response: resp,
             app_functions,
+            prepared,
         })
     }
 
@@ -342,9 +486,10 @@ impl<RT: Runtime> Application<RT> {
     async fn evaluate_push_contents(
         &self,
         config: &ProjectConfig,
+        upload: bool,
     ) -> anyhow::Result<EvaluatedPushContents> {
         let (external_deps_id, component_definition_packages, app_functions) =
-            self.upload_packages(config).await?;
+            self.prepare_packages(config, upload).await?;
 
         let app_udf_config = self
             .generate_udf_config(
@@ -404,7 +549,7 @@ impl<RT: Runtime> Application<RT> {
                 app_analysis,
                 app_udf_config,
                 user_environment_variables.clone(),
-                system_env_var_overrides,
+                system_env_var_overrides.clone(),
             )
             .await?;
         validate_env_var_declarations(&evaluated_components)?;
@@ -420,7 +565,7 @@ impl<RT: Runtime> Application<RT> {
                 .collect(),
         )?;
         let ctx = if config.for_codegen {
-            TypecheckContext::new_for_codegen(&evaluated_components, &initializer_evaluator)
+            TypecheckContext::new_for_codegen(&evaluated_components, &initializer_evaluator)?
         } else {
             TypecheckContext::new(&evaluated_components, &initializer_evaluator)
         };
@@ -433,6 +578,7 @@ impl<RT: Runtime> Application<RT> {
             evaluated_components,
             external_deps_id,
             user_environment_variables,
+            system_env_var_overrides,
             app_functions,
         })
     }
@@ -475,6 +621,9 @@ impl<RT: Runtime> Application<RT> {
         evaluated_components: &BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
     ) -> anyhow::Result<SchemaChange> {
         let mut tx = self.begin(Identity::system()).await?;
+        // Reuse the canonical preparation logic, but keep every schema, index,
+        // and component-namespace write inside this uncommitted transaction.
+        // Schema and backfill workers can only observe the committed metadata.
         let schema_change = ComponentConfigModel::new(&mut tx)
             .start_component_schema_changes(app, evaluated_components, false)
             .await?;
@@ -486,7 +635,7 @@ impl<RT: Runtime> Application<RT> {
     async fn evaluate_components(
         &self,
         config: &ProjectConfig,
-        component_definition_packages: &BTreeMap<ComponentDefinitionPath, SourcePackage>,
+        component_definition_packages: &BTreeMap<ComponentDefinitionPath, Option<SourcePackage>>,
         app_analysis: BTreeMap<CanonicalizedModulePath, AnalyzedModule>,
         app_udf_config: UdfConfig,
         user_environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
@@ -652,17 +801,46 @@ impl<RT: Runtime> Application<RT> {
         &self,
         config: &ProjectConfig,
     ) -> anyhow::Result<EvaluatePushResponse> {
+        use common::query_analysis_admission::{
+            DeploymentAnalysisKind,
+            DEPLOYMENT_ANALYSIS_JOB,
+        };
+        let permit = self
+            .deployment_analysis
+            .acquire(
+                DeploymentAnalysisKind::Preflight,
+                analysis_retention_estimate(config)?,
+            )
+            .await?;
+        DEPLOYMENT_ANALYSIS_JOB
+            .scope(permit, self.evaluate_push_admitted(config))
+            .await
+    }
+
+    async fn evaluate_push_admitted(
+        &self,
+        config: &ProjectConfig,
+    ) -> anyhow::Result<EvaluatePushResponse> {
         let EvaluatedPushContents {
             app,
-            evaluated_components,
+            mut evaluated_components,
             ..
-        } = self.evaluate_push_contents(config).await?;
+        } = self.evaluate_push_contents(config, false).await?;
 
         let schema_change = self
             .handle_schema_change_read_only(&app, &evaluated_components)
             .await?;
+        let analysis = if config.include_analysis {
+            add_file_based_exports_to_analysis(&mut evaluated_components)?;
+            Some(evaluated_components)
+        } else {
+            None
+        };
 
-        Ok(EvaluatePushResponse { schema_change })
+        Ok(EvaluatePushResponse {
+            analysis,
+            schema_change,
+        })
     }
 
     /// Predict, without side effects, the schema validation and index
@@ -671,6 +849,29 @@ impl<RT: Runtime> Application<RT> {
     /// and the transaction is dropped uncommitted.
     #[fastrace::trace]
     pub async fn evaluate_schema_prediction(
+        &self,
+        config: &ProjectConfig,
+    ) -> anyhow::Result<EvaluateSchemaPredictionResponse> {
+        use common::query_analysis_admission::{
+            DeploymentAnalysisKind,
+            DEPLOYMENT_ANALYSIS_JOB,
+        };
+        // The endpoint accepts the complete push configuration and retains it
+        // while waiting, even though only schema bundles are evaluated.
+        let bytes = project_source_bytes(config)?;
+        let permit = self
+            .deployment_analysis
+            .acquire(
+                DeploymentAnalysisKind::Preflight,
+                bytes.checked_mul(2).context("schema input size overflow")?,
+            )
+            .await?;
+        DEPLOYMENT_ANALYSIS_JOB
+            .scope(permit, self.evaluate_schema_prediction_admitted(config))
+            .await
+    }
+
+    async fn evaluate_schema_prediction_admitted(
         &self,
         config: &ProjectConfig,
     ) -> anyhow::Result<EvaluateSchemaPredictionResponse> {
@@ -704,8 +905,11 @@ impl<RT: Runtime> Application<RT> {
         let table_shapes = self.table_shapes_at(ts).await?;
 
         // Shape and validator subset checks can pin the CPU on large shapes,
-        // so run the prediction on its own task.
-        try_join("evaluate_schema_prediction", async move {
+        // so run the prediction on its own task. Cancellation only requests
+        // task abortion; that task must retain admission until it actually stops.
+        let deployment_job =
+            common::query_analysis_admission::DEPLOYMENT_ANALYSIS_JOB.with(Clone::clone);
+        let prediction = async move {
             let definitions = BootstrapComponentsModel::new(&mut tx)
                 .load_all_definitions()
                 .await?;
@@ -777,7 +981,12 @@ impl<RT: Runtime> Application<RT> {
                 component_schema_evaluations,
                 new_component_definitions,
             })
-        })
+        };
+        try_join(
+            "evaluate_schema_prediction",
+            common::query_analysis_admission::DEPLOYMENT_ANALYSIS_JOB
+                .scope(deployment_job, prediction),
+        )
         .await
     }
 
@@ -916,12 +1125,39 @@ impl<RT: Runtime> Application<RT> {
         mut start_push: StartPushResponse,
         message: Option<PushMessage>,
         force_node_cutover: bool,
-    ) -> anyhow::Result<(FinishPushDiff, Timestamp)> {
-        // Download all source packages. We can remove this once we don't store source
-        // in the database.
+        operation: Option<FinishPushOperation>,
+    ) -> anyhow::Result<(SerializedFinishPushDiff, Timestamp)> {
+        if let Some(operation) = &operation {
+            let mut tx = self.begin(identity.clone()).await?;
+            if let Some(replay) = operation.validate(&mut tx).await? {
+                DEPLOYMENT_FINISH_EVENTS_TOTAL
+                    .with_label_values(&["historical_replay"])
+                    .inc();
+                return Ok(replay);
+            }
+        }
+        let prepared = operation
+            .as_ref()
+            .and_then(|operation| operation.prepared.as_ref());
+        // Resolve source bytes from this server's retained preparation or the
+        // uploaded archive. Both paths still validate activation inputs below.
         let mut downloaded_source_packages = BTreeMap::new();
         for (definition_path, source_package) in &mut start_push.component_definition_packages {
-            let package = download_package(self.modules_storage().clone(), source_package).await?;
+            let package = if let Some(prepared) = prepared {
+                prepared
+                    .packages
+                    .get(definition_path)
+                    .context("prepared component package missing")?
+            } else {
+                let package =
+                    download_package(self.modules_storage().clone(), source_package).await?;
+                anyhow::ensure!(downloaded_source_packages
+                    .insert(definition_path.clone(), package)
+                    .is_none());
+                downloaded_source_packages
+                    .get(definition_path)
+                    .context("downloaded component package missing")?
+            };
             if !definition_path.is_root() {
                 anyhow::ensure!(
                     package.values().all(|module| {
@@ -935,12 +1171,18 @@ impl<RT: Runtime> Application<RT> {
                 );
             }
             // `StartPushResponse` crosses a client round trip before this point.
-            // Rebuild complete topology metadata from the archive so a client
+            // Rebuild complete topology metadata from verified sources so a client
             // that omits a newly added optional field cannot weaken the commit.
             source_package.node_executor_pool_topology =
                 node_executor_pool_topology(package.values())?;
-            downloaded_source_packages.insert(definition_path.clone(), package);
         }
+        // In particular, source maps are owned strings. Borrow the retained
+        // packages while waiting for cutover instead of copying them once per
+        // finish outside the registry's retained-source reservation.
+        let downloaded_source_packages = match prepared {
+            Some(prepared) => &prepared.packages,
+            None => &downloaded_source_packages,
+        };
         let committed_pool_topology = start_push
             .component_definition_packages
             .get(&ComponentDefinitionPath::root())
@@ -974,10 +1216,17 @@ impl<RT: Runtime> Application<RT> {
                 finish_push_write_source,
                 *FINISH_PUSH_MAX_OCC_FAILURES,
                 |tx| {
+                    let operation = &operation;
                     let start_push = &start_push;
-                    let downloaded_source_packages = &downloaded_source_packages;
                     let message = &message;
                     async move {
+                        // Reading the bounded receipt table participates in OCC.
+                        // Concurrent retries cannot both activate this operation.
+                        if let Some(operation) = operation {
+                            if let Some((diff, ts)) = operation.validate(tx).await? {
+                                return Ok((FinishPushCommit::Replayed(diff, ts), vec![]));
+                            }
+                        }
                         // Validate that environment variables haven't changed since `start_push`.
                         let environment_variables =
                             EnvironmentVariablesModel::new(tx).get_all().await?;
@@ -1075,7 +1324,18 @@ impl<RT: Runtime> Application<RT> {
                             definition_diffs,
                             component_diffs,
                         };
-                        Ok((diff, audit_log_events))
+                        let diff = SerializedFinishPushDiff::try_from(diff)?;
+                        if let Some(operation) = operation {
+                            model::deployment_receipts::DeploymentReceiptModel::new(tx)
+                                .record(model::deployment_receipts::DeploymentReceipt {
+                                    operation_id: operation.operation_id.clone(),
+                                    input_sha256: operation.input_sha256.clone(),
+                                    expires_unix_seconds: operation.expires_unix_seconds,
+                                    result_json: serde_json::to_string(&diff)?,
+                                })
+                                .await?;
+                        }
+                        Ok((FinishPushCommit::Applied(diff), audit_log_events))
                     }
                     .in_span(Span::enter_with_local_parent("finish_push_tx"))
                     .into()
@@ -1097,6 +1357,23 @@ impl<RT: Runtime> Application<RT> {
                     e
                 }
             })?;
+
+        let diff = match diff {
+            FinishPushCommit::Applied(diff) => {
+                DEPLOYMENT_FINISH_EVENTS_TOTAL
+                    .with_label_values(&["activation_committed"])
+                    .inc();
+                diff
+            },
+            // A receipt proves commit only. Do not repeat activation or launch
+            // a second cutover when the original owner already committed it.
+            FinishPushCommit::Replayed(diff, ts) => {
+                DEPLOYMENT_FINISH_EVENTS_TOTAL
+                    .with_label_values(&["historical_replay"])
+                    .inc();
+                return Ok((diff, ts));
+            },
+        };
 
         self.complete_node_executor_pool_cutover_after_commit(
             &committed_pool_topology,
@@ -1121,105 +1398,136 @@ impl<RT: Runtime> Application<RT> {
         node_version: Option<NodeVersion>,
         force_node_cutover: bool,
     ) -> anyhow::Result<(PushAnalytics, PushMetrics)> {
-        let begin_build_external_deps = Instant::now();
-        // Upload external node dependencies separately
-        let external_deps_id_and_pkg = if let Some(deps) = node_dependencies
-            && !deps.is_empty()
-        {
-            let deps: Vec<_> = deps.into_iter().map(NodeDependency::from).collect();
-            Some(self.build_external_node_deps(deps).await?)
-        } else {
-            None
+        use common::query_analysis_admission::{
+            DeploymentAnalysisKind,
+            DEPLOYMENT_ANALYSIS_JOB,
         };
-        let end_build_external_deps = Instant::now();
-        let external_deps_pkg_size = external_deps_id_and_pkg
-            .as_ref()
-            .map(|(_, pkg)| pkg.package_size)
-            .unwrap_or_default();
+        let bytes = modules.iter().try_fold(0usize, |bytes, module| {
+            bytes
+                .checked_add(module.source.as_bytes().len())
+                .and_then(|bytes| {
+                    bytes.checked_add(module.source_map.as_deref().map_or(0, str::len))
+                })
+                .context("deployment input size overflow")
+        })?;
+        let bytes = bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(*common::knobs::ANALYZE_CODE_CACHE_MAX_BYTES))
+            .and_then(|bytes| bytes.checked_add(*common::knobs::ANALYZE_SOURCE_MAP_CACHE_MAX_BYTES))
+            .context("deployment input size overflow")?;
+        let permit = self
+            .deployment_analysis
+            .acquire(DeploymentAnalysisKind::Deploy, bytes)
+            .await?;
+        DEPLOYMENT_ANALYSIS_JOB
+            .scope(permit, async move {
+                let begin_build_external_deps = Instant::now();
+                // Upload external node dependencies separately
+                let external_deps_id_and_pkg = if let Some(deps) = node_dependencies
+                    && !deps.is_empty()
+                {
+                    let deps: Vec<_> = deps.into_iter().map(NodeDependency::from).collect();
+                    Some(self.build_external_node_deps(deps).await?)
+                } else {
+                    None
+                };
+                let end_build_external_deps = Instant::now();
+                let external_deps_pkg_size = external_deps_id_and_pkg
+                    .as_ref()
+                    .map(|(_, pkg)| pkg.package_size)
+                    .unwrap_or_default();
 
-        let source_package = self
-            .upload_package(&modules, external_deps_id_and_pkg, node_version)
-            .await?;
-        let committed_pool_topology = source_package.node_executor_pool_topology.clone();
-        let end_upload_source_package = Instant::now();
-        // Verify that we have not exceeded the max zipped or unzipped file size
-        let combined_pkg_size = source_package.package_size + external_deps_pkg_size;
-        combined_pkg_size.verify_size()?;
+                let source_package = self
+                    .upload_package(&modules, external_deps_id_and_pkg, node_version)
+                    .await?;
+                let committed_pool_topology = source_package.node_executor_pool_topology.clone();
+                let end_upload_source_package = Instant::now();
+                // Verify that we have not exceeded the max zipped or unzipped file size
+                let combined_pkg_size = source_package.package_size + external_deps_pkg_size;
+                combined_pkg_size.verify_size()?;
 
-        let udf_config = self
-            .generate_udf_config(
-                udf_server_version,
-                TableNamespace::root_component(),
-                &Identity::system(),
-            )
-            .await?;
-        let begin_analyze = Instant::now();
-        // Note: This is not transactional with the rest of the deploy to avoid keeping
-        // a transaction open for a long time.
-        let mut tx = self.begin(Identity::system()).await?;
-        let user_environment_variables = EnvironmentVariablesModel::new(&mut tx).get_all().await?;
-        let system_env_var_overrides = system_env_var_overrides(&mut tx).await?;
-        drop(tx);
-        // Run analyze to make sure the new modules are valid.
-        let (auth_module, analyze_results) = self
-            .analyze_modules_with_auth_config(
-                udf_config.clone(),
-                modules.clone(),
-                source_package.clone(),
-                user_environment_variables,
-                system_env_var_overrides,
-            )
-            .await?;
-        let end_analyze = Instant::now();
-        let cutover_reservation = self
-            .runner()
-            .reserve_node_executor_pool_cutover(&committed_pool_topology, force_node_cutover)
-            .await?;
-        let (
-            ConfigMetadataAndSchema {
-                config_metadata,
-                schema,
-            },
-            occ_stats,
-            commit_ts,
-        ) = self
-            .apply_config_with_retries(
-                identity.clone(),
-                request_metadata,
-                ApplyConfigArgs {
-                    auth_module,
-                    config_file,
-                    schema_id,
-                    modules: modules.clone(),
-                    udf_config: udf_config.clone(),
-                    source_package,
-                    analyze_results: analyze_results.clone(),
-                },
-            )
-            .await?;
+                let udf_config = self
+                    .generate_udf_config(
+                        udf_server_version,
+                        TableNamespace::root_component(),
+                        &Identity::system(),
+                    )
+                    .await?;
+                let begin_analyze = Instant::now();
+                // Note: This is not transactional with the rest of the deploy to avoid keeping
+                // a transaction open for a long time.
+                let mut tx = self.begin(Identity::system()).await?;
+                let user_environment_variables =
+                    EnvironmentVariablesModel::new(&mut tx).get_all().await?;
+                let system_env_var_overrides = system_env_var_overrides(&mut tx).await?;
+                drop(tx);
+                // Run analyze to make sure the new modules are valid.
+                let (auth_module, analyze_results) = self
+                    .analyze_modules_with_auth_config(
+                        udf_config.clone(),
+                        modules.clone(),
+                        source_package.clone(),
+                        user_environment_variables,
+                        system_env_var_overrides,
+                    )
+                    .await?;
+                let end_analyze = Instant::now();
+                let cutover_reservation = self
+                    .runner()
+                    .reserve_node_executor_pool_cutover(
+                        &committed_pool_topology,
+                        force_node_cutover,
+                    )
+                    .await?;
+                let (
+                    ConfigMetadataAndSchema {
+                        config_metadata,
+                        schema,
+                    },
+                    occ_stats,
+                    commit_ts,
+                ) = self
+                    .apply_config_with_retries(
+                        identity.clone(),
+                        request_metadata,
+                        ApplyConfigArgs {
+                            auth_module,
+                            config_file,
+                            schema_id,
+                            modules: modules.clone(),
+                            udf_config: udf_config.clone(),
+                            source_package,
+                            analyze_results: analyze_results.clone(),
+                        },
+                    )
+                    .await?;
 
-        self.complete_node_executor_pool_cutover_after_commit(
-            &committed_pool_topology,
-            commit_ts,
-            cutover_reservation,
-        )
-        .await?;
+                self.complete_node_executor_pool_cutover_after_commit(
+                    &committed_pool_topology,
+                    commit_ts,
+                    cutover_reservation,
+                )
+                .await?;
 
-        Ok((
-            PushAnalytics {
-                config: config_metadata,
-                modules,
-                udf_server_version: udf_config.server_version,
-                analyze_results,
-                schema,
-            },
-            PushMetrics {
-                build_external_deps_time: end_build_external_deps - begin_build_external_deps,
-                upload_source_package_time: end_upload_source_package - end_build_external_deps,
-                analyze_time: end_analyze - begin_analyze,
-                occ_stats,
-            },
-        ))
+                Ok((
+                    PushAnalytics {
+                        config: config_metadata,
+                        modules,
+                        udf_server_version: udf_config.server_version,
+                        analyze_results,
+                        schema,
+                    },
+                    PushMetrics {
+                        build_external_deps_time: end_build_external_deps
+                            - begin_build_external_deps,
+                        upload_source_package_time: end_upload_source_package
+                            - end_build_external_deps,
+                        analyze_time: end_analyze - begin_analyze,
+                        occ_stats,
+                    },
+                ))
+            })
+            .await
     }
 }
 
@@ -1305,12 +1613,10 @@ fn validate_env_var_declarations(
 
 /// Convex code push is a multiphase process.
 ///
-/// Clients that want to push code send this message to the backend. They use
-/// a resulting [StartPushResponse] to complete codegen and optionally
-/// complete the code push.
-///
-/// They also might decide to not do a complete push (e.g. just getting the
-/// analyze results to use for codegen).
+/// Deploying clients send this message to `start_push`, then use the resulting
+/// [StartPushResponse] for code generation and to complete the push. Clients
+/// that only need schema diffs or code generation analysis send the same
+/// message to `evaluate_push`, which does not start the multiphase push.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct StartPushRequest {
@@ -1328,10 +1634,17 @@ pub struct StartPushRequest {
     #[serde(default)]
     pub dry_run: bool,
 
-    /// Indicates that this request is only for codegen and isn't initiating a
-    /// full mutiphase push.
+    /// Indicates standalone component codegen, where the CLI uses a synthetic
+    /// root that cannot provide the component's required environment bindings.
+    /// Older clients send this request to `start_push`, so that path also
+    /// avoids committing index changes when this is set.
     #[serde(default)]
     pub for_codegen: bool,
+
+    /// Requests evaluated module and component analysis from `evaluate_push`.
+    /// `start_push` already returns this analysis regardless of this field.
+    #[serde(default)]
+    pub include_analysis: bool,
 }
 
 impl StartPushRequest {
@@ -1367,6 +1680,7 @@ impl StartPushRequest {
             node_version,
             dry_run: self.dry_run,
             for_codegen: self.for_codegen,
+            include_analysis: self.include_analysis,
         })
     }
 }
@@ -1393,10 +1707,79 @@ pub struct StartPushResult {
     pub response: StartPushResponse,
     /// All runtime function modules in the app component
     pub app_functions: Vec<ModuleConfig>,
+    pub prepared: Option<Arc<PreparedPush>>,
+}
+
+/// Sources validated and uploaded by this server. Fields are private so an
+/// HTTP echo cannot manufacture authority to skip archive verification.
+#[derive(Debug)]
+#[cfg_attr(any(test, feature = "testing"), derive(Default))]
+pub struct PreparedPush {
+    packages: BTreeMap<ComponentDefinitionPath, BTreeMap<CanonicalizedModulePath, ModuleConfig>>,
+    external_deps_storage_key: Option<ObjectKey>,
+    expected_prior: Option<DeveloperDocumentId>,
+    system_env_var_overrides: BTreeMap<EnvVarName, EnvVarValue>,
+}
+
+impl PreparedPush {
+    async fn validate_activation<RT: Runtime>(
+        &self,
+        tx: &mut Transaction<RT>,
+    ) -> anyhow::Result<()> {
+        // The newest record also covers deployments with zero modules. This
+        // index read conflicts with concurrent activation, including legacy.
+        let actual = SourcePackageModel::new(tx, TableNamespace::Global)
+            .get_latest_record()
+            .await?
+            .map(|package| package.developer_id());
+        anyhow::ensure!(
+            actual == self.expected_prior,
+            ErrorMetadata::conflict(
+                "DeploymentOperationSuperseded",
+                "Another deployment activated after this operation began. Start a new operation \
+                 with current inputs."
+            )
+        );
+        // Canonical URLs also affect import-time analysis and auth. Their read
+        // must join the activation transaction, including every OCC retry.
+        anyhow::ensure!(
+            system_env_var_overrides(tx).await? == self.system_env_var_overrides,
+            ErrorMetadata::bad_request(
+                "RaceDetected",
+                "System environment variables have changed during push"
+            )
+        );
+        Ok(())
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.packages
+            .iter()
+            .map(|(path, modules)| {
+                path.to_string().len()
+                    + 128
+                    + modules
+                        .values()
+                        .map(|module| {
+                            module.source.as_bytes().len()
+                                + module.source_map.as_deref().map_or(0, str::len)
+                                + module.path.as_str().len()
+                                + 256
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+            + self
+                .system_env_var_overrides
+                .iter()
+                .map(|(name, value)| name.as_ref().len() + value.as_ref().len() + 128)
+                .sum::<usize>()
+    }
 }
 
 #[derive(Debug)]
 pub struct EvaluatePushResponse {
+    pub analysis: Option<BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>>,
     pub schema_change: SchemaChange,
 }
 
@@ -1573,6 +1956,22 @@ async fn predict_component_schema<RT: Runtime>(
         tables,
         indexes,
     })
+}
+
+fn add_file_based_exports_to_analysis(
+    analysis: &mut BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
+) -> anyhow::Result<()> {
+    // TODO(ENG-7533): Stop adding exports to analysis after clients use
+    // `functions` directly for code generation.
+    for (path, definition) in analysis {
+        // The app's `api` object does not use these generated exports.
+        if path.is_root() {
+            continue;
+        }
+        anyhow::ensure!(definition.definition.exports.is_empty());
+        definition.definition.exports = file_based_exports(&definition.functions)?;
+    }
+    Ok(())
 }
 
 impl From<NodeDependencyJson> for NodeDependency {
@@ -1828,6 +2227,89 @@ pub struct NodeDependencyJson {
     version: String,
 }
 
+#[derive(Clone)]
+pub struct FinishPushOperation {
+    pub operation_id: String,
+    pub input_sha256: String,
+    pub expires_unix_seconds: i64,
+    pub prepared: Option<Arc<PreparedPush>>,
+}
+
+impl FinishPushOperation {
+    pub async fn validate<RT: Runtime>(
+        &self,
+        tx: &mut Transaction<RT>,
+    ) -> anyhow::Result<Option<(SerializedFinishPushDiff, Timestamp)>> {
+        if let Some((result, ts)) = model::deployment_receipts::DeploymentReceiptModel::new(tx)
+            .lookup(&self.operation_id, &self.input_sha256)
+            .await?
+        {
+            let mut diff: SerializedFinishPushDiff = serde_json::from_str(&result)?;
+            diff.activation_replay = Some(ActivationReplay {
+                commit_timestamp: ts.to_string(),
+                node_cutover_completion: "unverified".to_owned(),
+            });
+            return Ok(Some((diff, ts)));
+        }
+        let prepared = self.prepared.as_ref().context(ErrorMetadata::bad_request(
+            "DeploymentOperationUnknown",
+            "No prepared operation exists in this process and no activation receipt was found. \
+             Inspect deployment state before starting another operation.",
+        ))?;
+        // Reject known stale preparation before cutover admission can force
+        // an old generation to terminate. The same validator runs again in
+        // the activation transaction to fence changes after this early read.
+        prepared.validate_activation(tx).await?;
+        Ok(None)
+    }
+}
+
+enum FinishPushCommit {
+    Applied(SerializedFinishPushDiff),
+    Replayed(SerializedFinishPushDiff, Timestamp),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializedFinishPushDiff {
+    /// A replay proves historical activation, including after a process
+    /// restart. It does not establish completion of the original Node
+    /// cutover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activation_replay: Option<ActivationReplay>,
+    auth_diff: AuthDiff,
+    definition_diffs: BTreeMap<String, SerializedComponentDefinitionDiff>,
+    component_diffs: BTreeMap<String, SerializedComponentDiff>,
+}
+
+impl TryFrom<FinishPushDiff> for SerializedFinishPushDiff {
+    type Error = anyhow::Error;
+
+    fn try_from(value: FinishPushDiff) -> Result<Self, Self::Error> {
+        Ok(Self {
+            activation_replay: None,
+            auth_diff: value.auth_diff,
+            definition_diffs: value
+                .definition_diffs
+                .into_iter()
+                .map(|(k, v)| Ok((String::from(k), v.try_into()?)))
+                .collect::<anyhow::Result<_>>()?,
+            component_diffs: value
+                .component_diffs
+                .into_iter()
+                .map(|(k, v)| Ok((String::from(k), v.try_into()?)))
+                .collect::<anyhow::Result<_>>()?,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivationReplay {
+    commit_timestamp: String,
+    node_cutover_completion: String,
+}
+
 #[derive(Debug, Default)]
 pub struct FinishPushDiff {
     pub auth_diff: AuthDiff,
@@ -1958,6 +2440,358 @@ mod node_pool_tests {
             udf_server_version: "1.0.0".to_owned(),
         };
         assert!(ComponentDefinitionConfig::try_from(component).is_err());
+    }
+}
+
+#[cfg(test)]
+async fn deployment_test_database(
+    runtime: runtime::prod::ProdRuntime,
+    persistence: Arc<dyn common::persistence::Persistence>,
+) -> anyhow::Result<database::Database<runtime::prod::ProdRuntime>> {
+    use common::{
+        runtime::new_unlimited_rate_limiter,
+        shutdown::ShutdownSignal,
+    };
+    use database::Database;
+    use indexing::index_cache::IndexCache;
+    use model::virtual_system_mapping;
+    use search::searcher::SearcherStub;
+
+    let (deleted_tablet_sender, _deleted_tablet_receiver) = tokio::sync::mpsc::channel(16);
+    Database::load(
+        persistence,
+        runtime.clone(),
+        Arc::new(SearcherStub),
+        ShutdownSignal::panic(),
+        virtual_system_mapping().clone(),
+        IndexCache::new(1 << 20).new_handle(),
+        Arc::new(new_unlimited_rate_limiter(runtime)),
+        deleted_tablet_sender,
+        "deployment_tests".to_owned(),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod deployment_receipt_tests {
+    use model::deployment_receipts::{
+        DeploymentReceipt,
+        DeploymentReceiptModel,
+    };
+    use runtime::prod::ProdRuntime;
+
+    use super::*;
+
+    fn receipt(id: &str, expires: i64) -> DeploymentReceipt {
+        DeploymentReceipt {
+            operation_id: id.to_owned(),
+            input_sha256: "input".to_owned(),
+            expires_unix_seconds: expires,
+            result_json: "{}".to_owned(),
+        }
+    }
+
+    fn source() -> SourcePackage {
+        SourcePackage {
+            storage_key: "deployment-receipt-test".try_into().unwrap(),
+            sha256: Sha256Digest::from([1; 32]),
+            external_deps_package_id: None,
+            package_size: Default::default(),
+            node_version: None,
+            node_executor_pool_topology: Default::default(),
+        }
+    }
+
+    #[test]
+    fn empty_source_activations_serialize_and_advance_the_generation() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let db =
+                deployment_test_database(rt, Arc::new(sqlite::SqlitePersistence::new(":memory:")?))
+                    .await?;
+            model::initialize_application_system_tables(&db).await?;
+            let mut older = db.begin_system().await?;
+            let mut newer = db.begin_system().await?;
+            // Empty legacy activations may have no changed module or config
+            // rows. Source insertion itself must order their generations.
+            SourcePackageModel::new(&mut older, TableNamespace::Global)
+                .put(source())
+                .await?;
+            // Future or tied transaction creation times must not make a later
+            // activation sort before the record used as current authority.
+            newer.advance_creation_time(common::document::CreationTime::try_from(
+                f64::from(newer.next_creation_time()) + 1000.0,
+            )?)?;
+            let first_id = SourcePackageModel::new(&mut newer, TableNamespace::Global)
+                .put(source())
+                .await?;
+            db.commit_with_write_source(newer, "test_newer_source")
+                .await?;
+            assert!(db
+                .commit_with_write_source(older, "test_older_source")
+                .await
+                .unwrap_err()
+                .is_occ());
+
+            let prepared = PreparedPush {
+                packages: BTreeMap::new(),
+                external_deps_storage_key: None,
+                expected_prior: Some(first_id.into()),
+                system_env_var_overrides: BTreeMap::new(),
+            };
+            let mut retry = db.begin_system().await?;
+            prepared.validate_activation(&mut retry).await?;
+            let second_id = SourcePackageModel::new(&mut retry, TableNamespace::Global)
+                .put(source())
+                .await?;
+            assert_ne!(first_id, second_id);
+            db.commit_with_write_source(retry, "test_source_retry")
+                .await?;
+            let mut tx = db.begin_system().await?;
+            let latest = SourcePackageModel::new(&mut tx, TableNamespace::Global)
+                .get_latest_record()
+                .await?
+                .context("missing source activation")?;
+            assert_eq!(latest.developer_id(), DeveloperDocumentId::from(second_id));
+            let operation = FinishPushOperation {
+                operation_id: "superseded-operation".to_owned(),
+                input_sha256: "input".to_owned(),
+                expires_unix_seconds: i64::try_from(tx.runtime().unix_timestamp().as_secs())? + 600,
+                prepared: Some(Arc::new(prepared)),
+            };
+            // The early finish check must reject before source resolution and
+            // force-capable cutover admission, not only inside the commit.
+            assert_eq!(
+                operation.validate(&mut tx).await.err().unwrap().short_msg(),
+                "DeploymentOperationSuperseded"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn finish_validation_requires_preparation_or_an_exact_receipt() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let db = deployment_test_database(
+                rt.clone(),
+                Arc::new(sqlite::SqlitePersistence::new(":memory:")?),
+            )
+            .await?;
+            model::initialize_application_system_tables(&db).await?;
+            let mut operation = FinishPushOperation {
+                operation_id: "operation".to_owned(),
+                input_sha256: "input".to_owned(),
+                expires_unix_seconds: i64::try_from(rt.unix_timestamp().as_secs())? + 600,
+                prepared: None,
+            };
+            let mut tx = db.begin_system().await?;
+            assert_eq!(
+                operation.validate(&mut tx).await.err().unwrap().short_msg(),
+                "DeploymentOperationUnknown"
+            );
+            operation.prepared = Some(Arc::new(PreparedPush {
+                packages: BTreeMap::new(),
+                external_deps_storage_key: None,
+                expected_prior: None,
+                system_env_var_overrides: BTreeMap::new(),
+            }));
+            assert!(operation.validate(&mut tx).await?.is_none());
+            let mut committed_receipt = receipt("operation", operation.expires_unix_seconds);
+            committed_receipt.result_json = serde_json::to_string(
+                &SerializedFinishPushDiff::try_from(FinishPushDiff::default())?,
+            )?;
+            DeploymentReceiptModel::new(&mut tx)
+                .record(committed_receipt)
+                .await?;
+            let committed = db
+                .commit_with_write_source(tx, "test_finish_receipt")
+                .await?;
+            let mut newer = db.begin_system().await?;
+            SourcePackageModel::new(&mut newer, TableNamespace::Global)
+                .put(source())
+                .await?;
+            db.commit_with_write_source(newer, "test_activation_after_receipt")
+                .await?;
+            let mut tx = db.begin_system().await?;
+            // Historical replay wins over the now-stale preparation. It must
+            // also remain available when restart removes that preparation.
+            let (diff, ts) = operation.validate(&mut tx).await?.unwrap();
+            assert_eq!(ts, committed);
+            assert_eq!(
+                diff.activation_replay.unwrap().node_cutover_completion,
+                "unverified"
+            );
+            operation.prepared = None;
+            assert_eq!(operation.validate(&mut tx).await?.unwrap().1, committed);
+            operation.input_sha256 = "changed-finish-intent".to_owned();
+            assert_eq!(
+                operation.validate(&mut tx).await.err().unwrap().short_msg(),
+                "DeploymentOperationInputMismatch"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn prepared_activation_rechecks_system_environment_transactionally() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let db =
+                deployment_test_database(rt, Arc::new(sqlite::SqlitePersistence::new(":memory:")?))
+                    .await?;
+            model::initialize_application_system_tables(&db).await?;
+            let prepared = PreparedPush {
+                packages: BTreeMap::new(),
+                external_deps_storage_key: None,
+                expected_prior: None,
+                system_env_var_overrides: BTreeMap::new(),
+            };
+            let mut activation = db.begin_system().await?;
+            prepared.validate_activation(&mut activation).await?;
+            SourcePackageModel::new(&mut activation, TableNamespace::Global)
+                .put(source())
+                .await?;
+            let mut update = db.begin_system().await?;
+            model::canonical_urls::CanonicalUrlsModel::new(&mut update)
+                .set_canonical_url(
+                    common::http::RequestDestination::ConvexCloud,
+                    "https://changed.example.invalid".to_owned(),
+                )
+                .await?;
+            db.commit_with_write_source(update, "test_canonical_url_change")
+                .await?;
+            assert!(db
+                .commit_with_write_source(activation, "test_stale_environment_activation")
+                .await
+                .unwrap_err()
+                .is_occ());
+            let mut retry = db.begin_system().await?;
+            assert_eq!(
+                prepared
+                    .validate_activation(&mut retry)
+                    .await
+                    .unwrap_err()
+                    .short_msg(),
+                "RaceDetected"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn activation_and_receipt_are_atomic_conflict_and_survive_restart() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("deployment.sqlite");
+            let path = path.to_str().context("test database path must be UTF-8")?;
+            let persistence: Arc<dyn common::persistence::Persistence> =
+                Arc::new(sqlite::SqlitePersistence::new(path)?);
+            let db = deployment_test_database(rt.clone(), persistence.clone()).await?;
+            model::initialize_application_system_tables(&db).await?;
+            let expiry = i64::try_from(rt.unix_timestamp().as_secs())? + 600;
+            let prepared = PreparedPush {
+                packages: BTreeMap::new(),
+                external_deps_storage_key: None,
+                expected_prior: None,
+                system_env_var_overrides: BTreeMap::new(),
+            };
+            let mut first = db.begin_system().await?;
+            let mut competing = db.begin_system().await?;
+            for tx in [&mut first, &mut competing] {
+                assert!(DeploymentReceiptModel::new(tx)
+                    .lookup("operation", "input")
+                    .await?
+                    .is_none());
+                prepared.validate_activation(tx).await?;
+                SourcePackageModel::new(tx, TableNamespace::Global)
+                    .put(source())
+                    .await?;
+                DeploymentReceiptModel::new(tx)
+                    .record(receipt("operation", expiry))
+                    .await?;
+            }
+            let committed = db
+                .commit_with_write_source(first, "test_deployment_receipt")
+                .await?;
+            let conflict = db
+                .commit_with_write_source(competing, "test_competing_deployment")
+                .await
+                .unwrap_err();
+            assert!(conflict.is_occ());
+            let mut tx = db.begin_system().await?;
+            assert!(prepared.validate_activation(&mut tx).await.is_err());
+            assert!(DeploymentReceiptModel::new(&mut tx)
+                .lookup("operation", "different")
+                .await
+                .is_err());
+            // A failed transaction cannot leave a replay receipt or activation.
+            DeploymentReceiptModel::new(&mut tx)
+                .record(receipt("aborted", expiry))
+                .await?;
+            drop(tx);
+            db.shutdown().await?;
+            drop(db);
+            drop(persistence);
+            // Reopen persistence so startup sees an existing database. A reused
+            // handle retains its initial is_fresh flag and bootstraps again.
+            let persistence = Arc::new(sqlite::SqlitePersistence::new(path)?);
+            let db = deployment_test_database(rt, persistence).await?;
+            let mut tx = db.begin_system().await?;
+            assert_eq!(
+                DeploymentReceiptModel::new(&mut tx)
+                    .lookup("operation", "input")
+                    .await?,
+                Some(("{}".to_owned(), committed))
+            );
+            assert!(DeploymentReceiptModel::new(&mut tx)
+                .lookup("aborted", "input")
+                .await?
+                .is_none());
+            assert!(prepared.validate_activation(&mut tx).await.is_err());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn receipts_have_finite_capacity_and_reject_expired_activation() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let db = deployment_test_database(
+                rt.clone(),
+                Arc::new(sqlite::SqlitePersistence::new(":memory:")?),
+            )
+            .await?;
+            model::initialize_application_system_tables(&db).await?;
+            let now = i64::try_from(rt.unix_timestamp().as_secs())?;
+            let mut tx = db.begin_system().await?;
+            assert!(DeploymentReceiptModel::new(&mut tx)
+                .record(receipt("expired", now))
+                .await
+                .is_err());
+            drop(tx);
+            for index in 0..16 {
+                let mut tx = db.begin_system().await?;
+                DeploymentReceiptModel::new(&mut tx)
+                    .record(receipt(&format!("operation-{index}"), now + 600))
+                    .await?;
+                db.commit_with_write_source(tx, "test_receipt_capacity")
+                    .await?;
+            }
+            let mut tx = db.begin_system().await?;
+            let error = DeploymentReceiptModel::new(&mut tx)
+                .record(receipt("excess", now + 600))
+                .await
+                .unwrap_err();
+            assert_eq!(error.short_msg(), "DeploymentReceiptsFull");
+            Ok(())
+        })
     }
 }
 
