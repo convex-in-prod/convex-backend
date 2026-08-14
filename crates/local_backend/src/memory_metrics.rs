@@ -328,6 +328,7 @@ pub struct CgroupMemoryPressureController {
     external_request_shedding: Option<ExternalRequestShedding>,
     shedding_enter_headroom_bytes: u64,
     shedding_exit_headroom_bytes: u64,
+    deployment_min_headroom_bytes: u64,
     latest_headroom_bytes: u64,
     memory_reclamation: MemoryPressureSignal,
     reclamation_active: bool,
@@ -539,6 +540,8 @@ pub fn initialize_memory_pressure_controller(
         u64::try_from(*LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES)?;
     let shedding_exit_headroom_bytes =
         u64::try_from(*LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES)?;
+    let deployment_min_headroom_bytes =
+        u64::try_from(*common::knobs::LOCAL_BACKEND_DEPLOYMENT_MIN_HEADROOM_BYTES)?;
     let reclamation_enter_headroom_bytes =
         u64::try_from(*LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES)?;
     let reclamation_exit_headroom_bytes =
@@ -598,6 +601,10 @@ pub fn initialize_memory_pressure_controller(
             "Memory pressure shedding exit headroom must be smaller than the finite cgroup memory \
              limit"
         );
+        anyhow::ensure!(
+            deployment_min_headroom_bytes < max_bytes,
+            "Deployment minimum headroom must be smaller than the finite cgroup memory limit"
+        );
     }
     if reclamation_enabled {
         anyhow::ensure!(
@@ -638,10 +645,14 @@ pub fn initialize_memory_pressure_controller(
     );
 
     Ok(Some(CgroupMemoryPressureController {
-        external_request_shedding: shedding_enabled
-            .then(|| ExternalRequestShedding::new(shedding_initially_active)),
+        external_request_shedding: shedding_enabled.then(|| {
+            let shedding = ExternalRequestShedding::new(shedding_initially_active);
+            shedding.set_deployment_hard_stop(headroom_bytes <= deployment_min_headroom_bytes);
+            shedding
+        }),
         shedding_enter_headroom_bytes,
         shedding_exit_headroom_bytes,
+        deployment_min_headroom_bytes,
         latest_headroom_bytes: headroom_bytes,
         // Consumers enter only after the controller has attempted allocator
         // trim for the initial pressure state.
@@ -719,6 +730,14 @@ impl CgroupMemoryPressureController {
             }
         }
         if let Some(external_request_shedding) = &self.external_request_shedding {
+            anyhow::ensure!(
+                self.deployment_min_headroom_bytes < max_bytes,
+                "Deployment minimum headroom must be smaller than the finite cgroup memory limit"
+            );
+            // Include deployment input and heap headroom in the operator's
+            // finite-memory policy, even while ordinary intake is shed.
+            external_request_shedding
+                .set_deployment_hard_stop(headroom_bytes <= self.deployment_min_headroom_bytes);
             anyhow::ensure!(
                 self.shedding_exit_headroom_bytes < max_bytes,
                 "Memory pressure shedding exit headroom must be smaller than the finite cgroup \
@@ -2463,6 +2482,7 @@ mod tests {
             external_request_shedding: Some(shedding.clone()),
             shedding_enter_headroom_bytes: 3,
             shedding_exit_headroom_bytes: 5,
+            deployment_min_headroom_bytes: 2,
             latest_headroom_bytes: 100,
             memory_reclamation: signal.clone(),
             reclamation_active: false,
@@ -2510,6 +2530,15 @@ mod tests {
         assert!(signal.is_active());
         controller.publish_reclamation_state(true);
         assert!(!signal.is_active());
+
+        controller.deployment_min_headroom_bytes = 100;
+        let error = controller
+            .update(&CgroupMemory {
+                current_bytes: 92,
+                max_bytes: Some(100),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("Deployment minimum headroom"));
     }
 
     #[test]
@@ -2519,6 +2548,7 @@ mod tests {
             external_request_shedding: None,
             shedding_enter_headroom_bytes: 3,
             shedding_exit_headroom_bytes: 5,
+            deployment_min_headroom_bytes: 2,
             latest_headroom_bytes: 100,
             memory_reclamation: signal.clone(),
             reclamation_active: false,
@@ -2557,6 +2587,7 @@ mod tests {
             external_request_shedding: None,
             shedding_enter_headroom_bytes: 3,
             shedding_exit_headroom_bytes: 5,
+            deployment_min_headroom_bytes: 2,
             latest_headroom_bytes: 3,
             memory_reclamation: MemoryPressureSignal::default(),
             reclamation_active: true,

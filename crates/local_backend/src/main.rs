@@ -13,7 +13,10 @@ use common::knobs::{
 };
 use common::{
     errors::MainError,
-    http::ConvexHttpService,
+    http::{
+        ConvexHttpService,
+        DeploymentHttpAdmission,
+    },
     knobs::{
         HTTP_SERVER_DEPENDENCY_RESERVE,
         HTTP_SERVER_MAX_CONCURRENT_REQUESTS,
@@ -80,8 +83,15 @@ fn main() -> Result<(), MainError> {
     let max_concurrent_requests = *HTTP_SERVER_MAX_CONCURRENT_REQUESTS;
     let dependency_reserve = *HTTP_SERVER_DEPENDENCY_RESERVE;
     assert!(
-        dependency_reserve < max_concurrent_requests,
-        "HTTP_SERVER_DEPENDENCY_RESERVE must be smaller than HTTP_SERVER_MAX_CONCURRENT_REQUESTS"
+        max_concurrent_requests <= tokio::sync::Semaphore::MAX_PERMITS,
+        "HTTP_SERVER_MAX_CONCURRENT_REQUESTS exceeds Tokio's supported semaphore capacity"
+    );
+    assert!(
+        dependency_reserve
+            .checked_add(DeploymentHttpAdmission::RESERVED_SLOTS)
+            .is_some_and(|reserved| reserved < max_concurrent_requests),
+        "HTTP_SERVER_DEPENDENCY_RESERVE plus deployment HTTP slots must leave ordinary capacity \
+         in HTTP_SERVER_MAX_CONCURRENT_REQUESTS"
     );
     tracing::info!("Starting a Convex backend");
     if !config.disable_beacon {
@@ -255,6 +265,9 @@ async fn run_server_inner(
         dependency_reserve,
         &["/api/actions/"],
         external_request_shedding.clone(),
+        Some(local_backend::deployment_operations::http_admission(
+            st.clone(),
+        )),
         *HTTP_SERVER_TIMEOUT_DURATION,
         HttpActionRouteMapper,
     );

@@ -239,13 +239,20 @@ start before admission control.
 
 `LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED` defaults to `false`. When
 enabled on Linux, the backend requires a readable finite cgroup v2 memory limit
-and samples current usage once per second. It rejects new non-dependency HTTP
+and samples current usage once per second. It rejects new ordinary HTTP
 requests with `503 BackendMemoryPressure` when headroom reaches
 `LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES`, which defaults to 3 GiB.
 Admission resumes only after headroom reaches
 `LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES`, which defaults to 5 GiB.
 The exit threshold must exceed the enter threshold and remain below the cgroup
 limit.
+
+Authenticated deployment POST routes use their bounded allowances until
+headroom reaches `LOCAL_BACKEND_DEPLOYMENT_MIN_HEADROOM_BYTES`, default 2 GiB.
+This threshold must be below the finite cgroup limit. It is checked whenever
+external shedding is enabled, even while ordinary soft shedding is inactive.
+Enabling internal reclamation alone does not enable this deployment stop.
+The Compose template passes the threshold through without overriding its default.
 
 The check runs before request-body handling and is repeated after the ordinary
 HTTP concurrency wait. `/version` and `/metrics` remain available. Node action
@@ -310,8 +317,9 @@ response head. A streaming HTTP action body, and the isolate work producing it,
 can outlive the main and proxy permits. These knobs therefore do not bound the
 number of response bodies being streamed concurrently.
 
-Requests above the limit enter an unbounded in-process permit wait instead of
-being rejected immediately. `HTTP_SERVER_TIMEOUT_SECONDS` and request handling
+Ordinary and dependency requests above the limit enter an unbounded in-process
+permit wait. Authenticated deployment intake has the bounded waits described
+below. `HTTP_SERVER_TIMEOUT_SECONDS` and request handling
 metrics start after permit acquisition, so they do not bound this admission
 wait. `http_admission_waiters_info{service_name,is_dependency}` reports actual
 queued waiters, and
@@ -322,14 +330,26 @@ when overload must be rejected within a fixed time.
 
 ## `HTTP_SERVER_DEPENDENCY_RESERVE`
 
-This creates dependency-only overflow above shared base capacity on port
-`3210`, so Node action callbacks can enter while their parent requests retain
-base permits. All requests, including callbacks, consume the shared base while
-it has room. Only `/api/actions/*` requests carrying the action callback-token
-header may raise total occupancy above the base. The default is `1`; `0`
-disables the overflow. The value must be a nonnegative integer smaller than
-`HTTP_SERVER_MAX_CONCURRENT_REQUESTS`. The port `3211` proxy does not use this
-reserve because Node callbacks target the main API origin.
+This preserves callback headroom on port `3210` so Node action callbacks can
+enter while their parent requests retain HTTP permits. The default is `1`;
+`0` disables this callback reserve. The main service also carves three
+deployment allowances from ordinary capacity. For total `H` and dependency
+reserve `D`, ordinary occupancy is limited to `H - D - 3`, and startup requires
+`D + 3 < H`. Every request consumes the same total. `/api/actions/*` requests
+carrying the callback-token header can reach `H`, including unused deployment
+allowances. The port `3211` proxy has neither reserve because it forwards
+HTTP actions and Node callbacks target the main API origin.
+
+Exact deployment POST routes carrying an authorization header first claim one
+single-request slot for analysis/submission, schema-wait/finish, or
+status/cancel/capabilities. An occupied slot rejects with 429. Waiting for the
+shared total times out after two seconds with 429. Header authentication then
+has its own two-second limit, returning 503 on timeout, before decompression.
+Handlers also authorize the body credential. Missing headers use ordinary
+admission. Dependencies can consume the entire total; the deployment slots
+are not exclusive physical HTTP permits. See
+[`deployment_operations.md`](../../patches/non_committing_codegen_analysis/deployment_operations.md)
+for the exact route and ownership contract.
 
 All Node callback operations share this finite reserve. A callback retains its
 HTTP permit while it waits at later application or isolate stages, so callback

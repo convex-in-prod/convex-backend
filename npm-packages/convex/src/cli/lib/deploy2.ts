@@ -15,6 +15,7 @@ import {
   typedDeploymentClient,
 } from "./utils/utils.js";
 import {
+  CodegenAnalysis,
   EvaluatePushResponse,
   evaluatePushResponse,
   schemaStatus,
@@ -106,6 +107,46 @@ export async function evaluatePush(
     "/api/deploy2/evaluate_push",
   );
   return evaluatePushResponse.parse(response);
+}
+
+export type PushRequestMode = "startPush" | "codegen";
+export type PushRequestResult =
+  | { kind: "startPush"; response: StartPushResponse }
+  | { kind: "codegen"; response: CodegenAnalysis };
+
+export async function startOrEvaluatePush(
+  ctx: Context,
+  span: Span,
+  request: StartPushRequest,
+  options: {
+    url: string;
+    deploymentName: string | null;
+    deploymentType?: DeploymentType;
+  },
+  mode: PushRequestMode,
+): Promise<PushRequestResult> {
+  if (mode === "startPush") {
+    return {
+      kind: "startPush",
+      response: await startPush(ctx, span, request, options),
+    };
+  }
+
+  const response = await evaluatePush(
+    ctx,
+    span,
+    { ...request, includeAnalysis: true },
+    options,
+  );
+  if (response.analysis === undefined) {
+    return await ctx.crash({
+      exitCode: 1,
+      errorType: "fatal",
+      printedMessage:
+        "This backend version does not support non-committing code generation. Upgrade the backend before running `convex codegen`.",
+    });
+  }
+  return { kind: "codegen", response: { analysis: response.analysis } };
 }
 
 export async function evaluateSchema(
