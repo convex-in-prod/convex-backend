@@ -14,9 +14,9 @@ Expose closed bounded admission, ownership, lifecycle, retry, and pressure metri
  crates/application/src/api.rs                 |   11 +-
  .../src/application_function_runner/mod.rs    |   34 +
  crates/application/src/cache/metrics.rs       |  177 ++-
- crates/application/src/cache/mod.rs           |  802 ++++++++++-
+ crates/application/src/cache/mod.rs           |  808 ++++++++++-
  crates/application/src/lib.rs                 |   66 +-
- crates/common/src/knobs.rs                    |   93 ++
+ crates/common/src/knobs.rs                    |   78 ++
  crates/convex/src/base_client/mod.rs          |    4 +-
  crates/convex/src/sync/web_socket_manager.rs  |    2 +
  crates/convex/sync_types/src/lib.rs           |    4 +
@@ -32,7 +32,7 @@ Expose closed bounded admission, ownership, lifecycle, retry, and pressure metri
  patches/README.md                             |  171 +++
  patches/degradable_reactive_queries/README.md | 1194 +++++++++++++++++
  self-hosted/docker/docker-compose.yml         |    1 +
- 21 files changed, 4521 insertions(+), 118 deletions(-)
+ 21 files changed, 4512 insertions(+), 118 deletions(-)
  create mode 100644 patches/README.md
  create mode 100644 patches/degradable_reactive_queries/README.md
 
@@ -408,7 +408,7 @@ index ddf171e96f0201ce1f5e88959c45e8bb21065cb5..10783261d8e567a7188c062723c29e46
  }
  
 diff --git a/crates/application/src/cache/mod.rs b/crates/application/src/cache/mod.rs
-index 489e5159cd2eddf3297c25b258a6ad19f3dc741c..0afff378e14fa7045fb1da5d23e2ea2ca9e1733c 100644
+index 489e5159cd2eddf3297c25b258a6ad19f3dc741c..ae18b7d74d3409496a2a98b1a69e7e38c5921568 100644
 --- a/crates/application/src/cache/mod.rs
 +++ b/crates/application/src/cache/mod.rs
 @@ -6,6 +6,7 @@ use std::{
@@ -908,7 +908,7 @@ index 489e5159cd2eddf3297c25b258a6ad19f3dc741c..0afff378e14fa7045fb1da5d23e2ea2c
          sender: Sender<CacheResult>,
          path: &'a PublicFunctionPath,
          args: &'a SerializedArgs,
-@@ -1153,3 +1394,514 @@ enum CacheOp<'a> {
+@@ -1153,3 +1394,520 @@ enum CacheOp<'a> {
          context: ExecutionContext,
      },
  }
@@ -939,7 +939,10 @@ index 489e5159cd2eddf3297c25b258a6ad19f3dc741c..0afff378e14fa7045fb1da5d23e2ea2c
 +        types::FunctionCaller,
 +        RequestId,
 +    };
-+    use value::JsonPackedValue;
++    use value::{
++        JsonPackedValue,
++        PendingValue,
++    };
 +
 +    use super::*;
 +
@@ -1020,7 +1023,9 @@ index 489e5159cd2eddf3297c25b258a6ad19f3dc741c..0afff378e14fa7045fb1da5d23e2ea2c
 +            log_lines: vec![].into(),
 +            journal: QueryJournal::new(),
 +            audit_log_lines: vec![].into(),
-+            result: Ok(JsonPackedValue::pack(ConvexValue::Null)),
++            result: Ok(JsonPackedValue::pack(PendingValue::Concrete(
++                ConvexValue::Null,
++            ))),
 +            syscall_trace: udf::SyscallTrace::new(),
 +            udf_server_version: None,
 +            memory_in_mb: 0,
@@ -1030,6 +1035,7 @@ index 489e5159cd2eddf3297c25b258a6ad19f3dc741c..0afff378e14fa7045fb1da5d23e2ea2c
 +            outcome: Arc::new(outcome),
 +            original_ts,
 +            token: Token::empty(original_ts),
++            visibility_info: None,
 +        }
 +    }
 +
@@ -1522,37 +1528,22 @@ index a9c8979144a72c5133f85585740603cebd894dcb..190da7dc02ca815d952243efe8a40e30
                  .await?
          });
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index c9677efe2bdf62027c6fc6412ed239d86f099180..6a010fa17c29c53ab8deb8b61fa48d675996509c 100644
+index faf8ae90532feead307f72332dfad352a34e1e11..4324d576104de5e29365bb37464c99b3fc85db7b 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -68,6 +68,26 @@ fn validate_usize_strict_nonzero(name: &str, value: usize) -> anyhow::Result<usi
-     Ok(value)
+@@ -82,6 +82,11 @@ fn env_config_optional_usize_strict(name: &str) -> Option<usize> {
+     value
  }
  
 +fn env_config_optional_usize_strict_nonzero(name: &str) -> Option<usize> {
-+    let value = match std::env::var(name) {
-+        Ok(var_s) => Some(parse_usize_strict(name, &var_s).unwrap_or_else(|e| panic!("{e}"))),
-+        Err(std::env::VarError::NotPresent) => None,
-+        Err(std::env::VarError::NotUnicode(..)) => {
-+            panic!("Invalid non-Unicode value for {name}")
-+        },
-+    };
-+    if let Some(value) = value {
-+        assert!(value > 0, "{name} must be greater than zero");
-+        assert!(
-+            value <= tokio::sync::Semaphore::MAX_PERMITS,
-+            "{name} must not exceed {}",
-+            tokio::sync::Semaphore::MAX_PERMITS,
-+        );
-+        tracing::info!("Overriding {name} to {value:?} from environment");
-+    }
-+    value
++    env_config_optional_usize_strict(name)
++        .map(|value| validate_usize_strict_nonzero(name, value).unwrap_or_else(|e| panic!("{e}")))
 +}
 +
  fn env_config_duration_millis_strict(name: &str, default: usize) -> Duration {
      let millis = env_config_usize_strict(name, default)
          .try_into()
-@@ -1169,6 +1189,68 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
+@@ -1183,6 +1188,68 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
      )
  });
  
@@ -1621,7 +1612,7 @@ index c9677efe2bdf62027c6fc6412ed239d86f099180..6a010fa17c29c53ab8deb8b61fa48d67
  /// The maximum number of mutations that can be run concurrently by an
  /// application.
  ///
-@@ -2172,4 +2254,15 @@ mod strict_capacity_tests {
+@@ -2186,4 +2253,15 @@ mod strict_capacity_tests {
              validate_usize_strict_nonzero("CAP", tokio::sync::Semaphore::MAX_PERMITS + 1).is_err()
          );
      }

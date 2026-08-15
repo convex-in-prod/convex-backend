@@ -20,18 +20,18 @@ Document the one-slot cache shared by database and HTTP contexts, nested replace
  crates/isolate/src/isolate_worker.rs          |   7 +-
  crates/isolate/src/metrics.rs                 | 195 +++++++++-
  crates/udf/src/metrics.rs                     |  31 ++
- crates/udf/src/validation.rs                  |  11 +-
+ crates/udf/src/validation.rs                  |   8 +-
  patches/context_reuse_observability/README.md | 333 ++++++++++++++++++
  patches/reuse_http_action_contexts/README.md  |  51 +--
  self-hosted/advanced/knobs.md                 |  17 +
- 11 files changed, 968 insertions(+), 102 deletions(-)
+ 11 files changed, 968 insertions(+), 99 deletions(-)
  create mode 100644 patches/context_reuse_observability/README.md
 
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7452d86d3 100644
+index e16bea9f0ef0f0991db287f6cdf791c8629dbe02..0d5bc9df37b03dc78f160de29a16199d7a2907b0 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
-@@ -77,6 +77,7 @@ use common::{
+@@ -76,6 +76,7 @@ use common::{
          ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS,
          ISOLATE_QUEUE_SIZE,
          MAX_ISOLATE_ACTION_WORKERS,
@@ -47,7 +47,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
      },
      isolate::{
          Isolate,
-@@ -208,6 +210,7 @@ use crate::{
+@@ -207,6 +209,7 @@ use crate::{
          queue_timer,
          rejected_before_execution_error,
          RejectedBeforeExecutionReason,
@@ -55,7 +55,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
      },
      module_cache::{
          ModuleCache,
-@@ -858,6 +861,32 @@ impl<RT: Runtime> Request<RT> {
+@@ -857,6 +860,32 @@ impl<RT: Runtime> Request<RT> {
          Some(context_cache_key(function_path))
      }
  
@@ -88,7 +88,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
      fn scheduling_properties(
          &self,
          control_plane_lane_enabled: bool,
-@@ -961,6 +990,7 @@ pub enum RequestType<RT: Runtime> {
+@@ -957,6 +986,7 @@ pub enum RequestType<RT: Runtime> {
          can_block_on_descendant: bool,
          is_isolate_action: bool,
          is_control_plane: bool,
@@ -96,7 +96,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
          fail_worker: bool,
          started: mpsc::UnboundedSender<usize>,
          completion: oneshot::Receiver<()>,
-@@ -1998,6 +2028,11 @@ struct ActiveWorkerState {
+@@ -1951,6 +1981,11 @@ struct ActiveWorkerState {
      scheduling_properties: RequestSchedulingProperties,
  }
  
@@ -108,7 +108,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
  impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      pub fn new(
          rt: RT,
-@@ -2297,8 +2332,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2250,8 +2285,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      let dispatch_state = self.state_snapshot();
                      let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
                          && dispatch_state.dependency_dispatch_uses_reserve();
@@ -122,7 +122,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
                          Err(reason) => {
                              metrics::log_scheduler_request_rejected(
                                  self.worker.config().name,
-@@ -2338,6 +2376,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2291,6 +2329,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          );
                          return;
                      }
@@ -136,7 +136,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
                      if let Some((lane, sojourn)) = dispatch_sojourn {
                          metrics::log_isolate_queue_sojourn(
                              self.worker.config().name,
-@@ -2412,10 +2457,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2365,10 +2410,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          }
      }
  
@@ -149,7 +149,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
      /// `self.available_workers` state, so the caller is responsible for using
      /// the worker and returning it back to `self.available_workers` after it is
      /// done.
-@@ -2423,7 +2468,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2376,7 +2421,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          &mut self,
          request: &Request<RT>,
          state: &SchedulerStateSnapshot,
@@ -158,7 +158,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
          let client_id = request.client_id.as_str();
          let eligibility = state.request_eligibility(
              request.scheduling_properties(self.control_plane_lane_enabled),
-@@ -2436,6 +2481,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2389,6 +2434,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              );
              return Err(reason);
          }
@@ -166,7 +166,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
          // Try to find an existing worker for this client.
          if let Some((client_id, mut workers)) = self.available_workers.remove_entry(client_id) {
              // If there is a worker with an appropriate reusable context, pick that one
-@@ -2446,12 +2492,29 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2399,12 +2445,29 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  .extract_if(.., |worker| {
                      worker.info.cached_contexts.can_serve_request(request)
                  })
@@ -199,7 +199,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
              }
              // Otherwise all the workers have cached contexts for other modules
              // that we don't want to clobber; try to assign a new worker
-@@ -2478,7 +2541,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2431,7 +2494,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  self.worker.config().name,
                  self.worker_senders.len() - 1
              );
@@ -212,7 +212,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
          }
          // No existing worker for this client and we've already started the max number
          // of workers -- just grab the least recently used worker. This worker is least
-@@ -2502,13 +2569,18 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2455,13 +2522,18 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              .pop_back()
              .expect("Available worker map should never contain an empty list");
          log_worker_stolen(worker.last_used_ts.elapsed());
@@ -232,16 +232,16 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
      }
  
      fn aggregate_heap_stats(&self) -> IsolateHeapStats {
-@@ -2560,6 +2632,8 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
-             let mut isolate =
-                 Isolate::new(self.rt(), *max_user_timeout, *ISOLATE_MAX_USER_HEAP_SIZE);
+@@ -2516,6 +2588,8 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+                 *ISOLATE_MAX_USER_HEAP_SIZE,
+             );
              isolate.set_heap_stats_handle(heap_stats.clone());
 +            // Rust drops locals in reverse declaration order. Declare the cache
 +            // after the isolate so its mirror and V8 globals are cleared first.
              let mut context_cache = ContextCache::new();
              heap_stats.store(isolate.heap_stats());
              loop {
-@@ -2693,6 +2767,7 @@ mod tests {
+@@ -2675,6 +2749,7 @@ mod tests {
          collections::{
              BTreeMap,
              HashMap,
@@ -249,7 +249,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
          },
          future::Future,
          pin::Pin,
-@@ -2754,6 +2829,7 @@ mod tests {
+@@ -2736,6 +2811,7 @@ mod tests {
          CancellationSignal,
          ExternalPermitWaitOutcome,
          IdleWorkerInfo,
@@ -257,7 +257,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
          IsolateConfig,
          IsolateWorker,
          IsolateWorkerHandle,
-@@ -2768,14 +2844,20 @@ mod tests {
+@@ -2750,14 +2826,20 @@ mod tests {
          SharedIsolateScheduler,
      };
      use crate::{
@@ -280,7 +280,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
          ConcurrencyLimiter,
          ConcurrencyPermit,
      };
-@@ -2870,6 +2952,7 @@ mod tests {
+@@ -2852,6 +2934,7 @@ mod tests {
                          can_block_on_descendant: _,
                          is_isolate_action: _,
                          is_control_plane: _,
@@ -288,7 +288,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
                          fail_worker,
                          started,
                          completion,
-@@ -2980,6 +3063,7 @@ mod tests {
+@@ -2962,6 +3045,7 @@ mod tests {
              ),
              is_isolate_action: matches!(kind, TestRequestKind::Action),
              is_control_plane: matches!(kind, TestRequestKind::ControlPlane),
@@ -296,7 +296,7 @@ index 165c42e853b1a750ec09d7a9c50e1c3ba40b02b6..ea8ff379966a54779e3825f6e2bd3df7
              fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
              started,
              completion: completion_receiver,
-@@ -3631,6 +3715,64 @@ mod tests {
+@@ -3613,6 +3697,64 @@ mod tests {
          assert!(!state.can_start_request(properties(true, false, false), "deployment"));
      }
  
@@ -682,7 +682,7 @@ index f079c1f1cffb46df2fb07f7d92f5aa5ca12ab377..ffbac52d18e5a4bc641ea7e97afd75f0
  
  fn make_context<'s>(scope: &v8::PinScope<'s, '_, ()>) -> v8::Local<'s, v8::Context> {
 diff --git a/crates/isolate/src/environment/udf/mod.rs b/crates/isolate/src/environment/udf/mod.rs
-index 0a00820dc21badaa4065da3f210babd0eea75f3b..8f0c1d1d11390fa78b5b56a5a65467ed2c103eb9 100644
+index dedbb77761aab34b83594bfba6a066ac15054223..9678054dc2930980734e3ee9a3d631322b65df4b 100644
 --- a/crates/isolate/src/environment/udf/mod.rs
 +++ b/crates/isolate/src/environment/udf/mod.rs
 @@ -185,6 +185,7 @@ use crate::{
@@ -693,7 +693,7 @@ index 0a00820dc21badaa4065da3f210babd0eea75f3b..8f0c1d1d11390fa78b5b56a5a65467ed
      },
      request_scope::{
          RequestScope,
-@@ -1263,14 +1264,39 @@ where
+@@ -1262,14 +1263,39 @@ where
          let module_path = context_cache_key(self.syscall_provider.path());
          let Some((context, module_map, read_set)) = context_cache.take_reused_context(&module_path)
          else {
@@ -751,12 +751,12 @@ index 56938777f6145ddad9ee00aa0c310da8b097df6b..da6f8a9fcd4364d285f088bb0fae8446
              self.handle
                  .terminate(IsolateTerminationReason::OutOfMemory.into());
 diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
-index 6fb6cb2f671f484ce618d96eb7b95110fc656c9e..1a292efbd75c563e484922397734f4175a015b27 100644
+index cfa2693cd3383cb235018463bc06f037aebd14df..45e0466a4d3750148e625e3e75d0de5153b7340b 100644
 --- a/crates/isolate/src/isolate_worker.rs
 +++ b/crates/isolate/src/isolate_worker.rs
-@@ -19,7 +19,10 @@ use crate::{
+@@ -17,7 +17,10 @@ use crate::{
+         Request,
          RequestType,
-         PAUSE_REQUEST,
      },
 -    context_cache::ContextCache,
 +    context_cache::{
@@ -766,7 +766,7 @@ index 6fb6cb2f671f484ce618d96eb7b95110fc656c9e..1a292efbd75c563e484922397734f417
      environment::{
          action::ActionEnvironment,
          analyze::AnalyzeEnvironment,
-@@ -302,7 +305,7 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
+@@ -300,7 +303,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                  // AppDefinitionEvaluator doesn't use the prewarmed V8 context
                  // because it uses an arbitrary number of contexts. This call is
                  // rare and not particularly latency-sensitive though
@@ -1053,7 +1053,7 @@ index 8309e206817ade15d508f8df79fc0dc242c4431d..8405503396b42d31c01bce0b5a0cd7df
      match &outcome {
          FunctionOutcome::Query(UdfOutcome { result, .. }) => result.is_ok(),
 diff --git a/crates/udf/src/validation.rs b/crates/udf/src/validation.rs
-index 8f48b25fae9bad4f1ff4de89e27dea1fa192de4e..3d55fc636eb8a7094dbfb426ab1f6c4bf2eb0245 100644
+index 338c01b2ff1dac184b342cec537ec21f32b27514..3d55fc636eb8a7094dbfb426ab1f6c4bf2eb0245 100644
 --- a/crates/udf/src/validation.rs
 +++ b/crates/udf/src/validation.rs
 @@ -83,6 +83,7 @@ use crate::{
@@ -1064,7 +1064,7 @@ index 8f48b25fae9bad4f1ff4de89e27dea1fa192de4e..3d55fc636eb8a7094dbfb426ab1f6c4b
      ActionOutcome,
      SyscallTrace,
      UdfOutcome,
-@@ -726,15 +727,17 @@ impl ValidatedPathAndArgs {
+@@ -726,12 +727,17 @@ impl ValidatedPathAndArgs {
              ))));
          }
  
@@ -1078,10 +1078,7 @@ index 8f48b25fae9bad4f1ff4de89e27dea1fa192de4e..3d55fc636eb8a7094dbfb426ab1f6c4b
                  path,
                  args,
                  npm_version: Some(version),
--                reuse_context: database_udf_context_reuse_enabled(
--                    reuse_context,
--                    expected_udf_type,
--                ),
+-                reuse_context: database_udf_context_reuse_enabled(reuse_context, expected_udf_type),
 +                reuse_context: reuse_context_enabled,
              },
              visibility_info,

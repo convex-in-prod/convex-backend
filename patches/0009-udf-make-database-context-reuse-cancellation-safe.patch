@@ -26,17 +26,17 @@ allowlist.
  crates/isolate/src/isolate_worker.rs          |   5 +-
  crates/model/src/modules/module_versions.rs   |   9 +-
  crates/pb/protos/common.proto                 |   2 +
- crates/udf/src/validation.rs                  | 109 ++++++++++++---
+ crates/udf/src/validation.rs                  | 106 +++++++++++---
  .../README.md                                 | 112 +++++++++++++++
  .../cancellation_design_reference.md          | 131 ++++++++++++++++++
  patches/reuse_http_action_contexts/README.md  |   5 +
  self-hosted/advanced/knobs.md                 |   8 +-
- 12 files changed, 517 insertions(+), 72 deletions(-)
+ 12 files changed, 514 insertions(+), 72 deletions(-)
  create mode 100644 patches/cancellation_safe_database_context_reuse/README.md
  create mode 100644 patches/cancellation_safe_database_context_reuse/cancellation_design_reference.md
 
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index c2d1bafc4b1ff61bd87129c715323490b519e372..165c42e853b1a750ec09d7a9c50e1c3ba40b02b6 100644
+index cc98c01cfe3c5d7513ff23d423a5ca994c4fcb24..e16bea9f0ef0f0991db287f6cdf791c8629dbe02 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -9,6 +9,7 @@ use std::{
@@ -47,7 +47,7 @@ index c2d1bafc4b1ff61bd87129c715323490b519e372..165c42e853b1a750ec09d7a9c50e1c3b
              AtomicUsize,
              Ordering,
          },
-@@ -128,6 +129,7 @@ use futures::{
+@@ -127,6 +128,7 @@ use futures::{
          PollNext,
          StreamExt,
      },
@@ -63,7 +63,7 @@ index c2d1bafc4b1ff61bd87129c715323490b519e372..165c42e853b1a750ec09d7a9c50e1c3b
          CachedContexts,
          ContextCache,
      },
-@@ -222,6 +225,74 @@ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
+@@ -218,6 +221,74 @@ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
  pub const PAUSE_REQUEST: &str = "pause_request";
  pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
  
@@ -138,7 +138,7 @@ index c2d1bafc4b1ff61bd87129c715323490b519e372..165c42e853b1a750ec09d7a9c50e1c3b
  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
  struct RequestSchedulingProperties {
      unblocks_ancestor: bool,
-@@ -784,10 +855,7 @@ impl<RT: Runtime> Request<RT> {
+@@ -783,10 +854,7 @@ impl<RT: Runtime> Request<RT> {
              #[cfg(test)]
              RequestType::Test { .. } => return None,
          };
@@ -150,15 +150,15 @@ index c2d1bafc4b1ff61bd87129c715323490b519e372..165c42e853b1a750ec09d7a9c50e1c3b
      }
  
      fn scheduling_properties(
-@@ -822,6 +890,7 @@ pub enum RequestType<RT: Runtime> {
+@@ -820,6 +888,7 @@ impl<RT: Runtime> Request<RT> {
+ pub enum RequestType<RT: Runtime> {
      Udf {
          request: UdfRequest<RT>,
-         environment_data: EnvironmentData<RT>,
 +        cancellation: CancellationSignal,
          response: oneshot::Sender<anyhow::Result<(Transaction<RT>, FunctionOutcome)>>,
          queue_timer: Timer<VMHistogram>,
          rng_seed: [u8; 32],
-@@ -1313,6 +1382,8 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1273,6 +1342,8 @@ impl<RT: Runtime> IsolateClient<RT> {
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          let (tx, rx) = oneshot::channel();
@@ -167,15 +167,15 @@ index c2d1bafc4b1ff61bd87129c715323490b519e372..165c42e853b1a750ec09d7a9c50e1c3b
          let request = RequestType::Udf {
              request: UdfRequest {
                  path_and_args,
-@@ -1323,6 +1394,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1283,6 +1354,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                  context,
+                 environment_data,
              },
-             environment_data,
 +            cancellation,
              response: tx,
              queue_timer: queue_timer(),
              rng_seed,
-@@ -1340,7 +1412,13 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1300,7 +1372,13 @@ impl<RT: Runtime> IsolateClient<RT> {
              EncodedSpan::from_parent(),
              scheduler_dependency,
          ))?;
@@ -190,7 +190,7 @@ index c2d1bafc4b1ff61bd87129c715323490b519e372..165c42e853b1a750ec09d7a9c50e1c3b
  
          Ok((tx, outcome))
      }
-@@ -1798,9 +1876,12 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1752,8 +1830,11 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
      ) -> anyhow::Result<(Transaction<RT>, NestedUdfOutcome)> {
          let subquery_path = udf_request.path_and_args.path().clone();
          let (tx, rx) = oneshot::channel();
@@ -198,12 +198,11 @@ index c2d1bafc4b1ff61bd87129c715323490b519e372..165c42e853b1a750ec09d7a9c50e1c3b
 +        let caller_cancellation = cancellation.clone();
          let request = RequestType::Udf {
              request: udf_request,
-             environment_data,
 +            cancellation,
              response: tx,
              queue_timer: queue_timer(),
              rng_seed,
-@@ -1822,7 +1903,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1775,7 +1856,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
              .ok()
              .context("scheduler shut down")?;
          metrics::log_scheduler_request_enqueued(self.pool_name, scheduling_properties.as_label());
@@ -218,7 +217,7 @@ index c2d1bafc4b1ff61bd87129c715323490b519e372..165c42e853b1a750ec09d7a9c50e1c3b
          let outcome = match outcome {
              FunctionOutcome::Query(outcome) | FunctionOutcome::Mutation(outcome) => {
                  NestedUdfOutcome {
-@@ -2663,6 +2750,8 @@ mod tests {
+@@ -2645,6 +2732,8 @@ mod tests {
          wait_for_external_permit,
          worker_rejection_reason,
          ActiveRequestCounts,
@@ -227,7 +226,7 @@ index c2d1bafc4b1ff61bd87129c715323490b519e372..165c42e853b1a750ec09d7a9c50e1c3b
          ExternalPermitWaitOutcome,
          IdleWorkerInfo,
          IsolateConfig,
-@@ -3256,6 +3345,20 @@ mod tests {
+@@ -3238,6 +3327,20 @@ mod tests {
          }
      }
  
@@ -328,7 +327,7 @@ index 1514ac9e2ab9aca2f5ba64fcb007375dfc17ab6f..3574be14f0cd21d570d4b0c6001d51b2
          let mut reused_http_action_context = false;
          let reused_context = if *REUSE_HTTP_ACTION_CONTEXTS
 diff --git a/crates/isolate/src/environment/udf/mod.rs b/crates/isolate/src/environment/udf/mod.rs
-index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0eea75f3b 100644
+index 54b6302f748e97f129a0d286fd5a4a8f9f831af4..dedbb77761aab34b83594bfba6a066ac15054223 100644
 --- a/crates/isolate/src/environment/udf/mod.rs
 +++ b/crates/isolate/src/environment/udf/mod.rs
 @@ -7,7 +7,6 @@ use common::{
@@ -385,7 +384,7 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
  }
  
  impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
-@@ -521,9 +517,10 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -519,9 +515,10 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
              client_id,
              rng_seed,
          );
@@ -399,16 +398,16 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
          // N.B.: `run_nested` calls the corresponding `pop_context`.
          // This may not happen in case of a system error, but in that case we
          // are going to throw away the entire context stack anyway.
-@@ -642,7 +639,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
-         client_id: String,
-         rng_seed: [u8; 32],
-     ) -> (Self, DatabaseUdfArgs) {
+@@ -641,7 +638,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+             module_loader,
+             deployment,
+         } = environment_data;
 -        let reuse_context = path_and_args.reuse_context();
 +        let reuse_context = path_and_args.reuse_context(udf_type);
          let (path, arguments, udf_server_version) = path_and_args.consume();
          let component = path.component;
          let identity = transaction.inert_identity();
-@@ -705,7 +702,7 @@ where
+@@ -704,7 +701,7 @@ where
          context_cache: &mut ContextCache,
          permit: ConcurrencyPermit,
          isolate_clean: &mut bool,
@@ -417,7 +416,7 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
          args: DatabaseUdfArgs,
          function_started: Option<oneshot::Sender<()>>,
          udf_callback: Option<IsolateClient<RT>>,
-@@ -762,7 +759,7 @@ where
+@@ -761,7 +758,7 @@ where
          mut request_state: RequestState<RT, Self>,
          timeout: &mut Timeout<RT>,
          isolate_clean: &mut bool,
@@ -426,7 +425,7 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
          udf_callback: Option<IsolateClient<RT>>,
      ) -> anyhow::Result<(Self, anyhow::Result<Result<PendingValue, JsError>>)> {
          scope!(let handle_scope, isolate);
-@@ -835,7 +832,7 @@ where
+@@ -834,7 +831,7 @@ where
                          &mut *v8_scope,
                          context_cache,
                          timeout,
@@ -435,7 +434,7 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
                          args,
                          module,
                          udf_callback,
-@@ -851,6 +848,12 @@ where
+@@ -850,6 +847,12 @@ where
          // to ensure the microtask queue is empty. Otherwise, JS from this request may
          // leak to a subsequent one on isolate reuse.
          isolate_context.checkpoint();
@@ -448,7 +447,7 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
          *isolate_clean = true;
  
          let request_state = isolate_context.take_state().context("Lost RequestState?")?;
-@@ -861,8 +864,19 @@ where
+@@ -860,8 +863,19 @@ where
              Err(e) => result = Ok(Err(e)),
          }
  
@@ -470,7 +469,7 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
          if args.reuse_context
              && let Ok(Ok(_)) = result
              && let Some(read_set) = context_read_set
-@@ -873,10 +887,7 @@ where
+@@ -872,10 +886,7 @@ where
              let v8_scope = isolate_context.scope();
              let context = v8_scope.get_current_context();
              context_cache.save_context(
@@ -482,7 +481,7 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
                  v8::Global::new(v8_scope, context),
                  module_map,
                  read_set,
-@@ -951,7 +962,7 @@ where
+@@ -950,7 +961,7 @@ where
          v8_scope: &mut v8::PinScope<'_, '_>,
          context_cache: &mut ContextCache,
          timeout: &mut Timeout<RT>,
@@ -491,7 +490,7 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
          args: &DatabaseUdfArgs,
          module: v8::Local<'_, v8::Module>,
          udf_callback: Option<IsolateClient<RT>>,
-@@ -1078,7 +1089,6 @@ where
+@@ -1077,7 +1088,6 @@ where
              Ok(None) => anyhow::bail!("Successful invocation returned None"),
              Err(e) => return Ok(Err(e)),
          };
@@ -499,7 +498,7 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
          loop {
              // Advance the user's promise as far as it can go by draining the microtask
              // queue.
-@@ -1166,6 +1176,7 @@ where
+@@ -1165,6 +1175,7 @@ where
                                  context_cache,
                                  isolate_handle: handle,
                                  executor,
@@ -507,7 +506,7 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
                              };
                              let udf_callback = if let Some(callback) = &udf_callback {
                                  Either::Left(callback)
-@@ -1174,7 +1185,7 @@ where
+@@ -1173,7 +1184,7 @@ where
                              };
                              select! {
                                  biased;
@@ -516,7 +515,7 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
                                      log_isolate_request_cancelled();
                                      anyhow::bail!("Cancelled");
                                  },
-@@ -1249,10 +1260,7 @@ where
+@@ -1248,10 +1259,7 @@ where
          &mut self,
          context_cache: &mut ContextCache,
      ) -> anyhow::Result<Option<(v8::Global<v8::Context>, ModuleMap, ContextReadSet)>> {
@@ -529,20 +528,20 @@ index 84220b1bf283c06eba1bc18d79031cd633cf7d44..0a00820dc21badaa4065da3f210babd0
          else {
              return Ok(None);
 diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
-index bd87817d4e1faa32ba04df7cb7050db1cbbd6bdb..6fb6cb2f671f484ce618d96eb7b95110fc656c9e 100644
+index def74d47a808666c972a94cb3c7139a778b38c5b..cfa2693cd3383cb235018463bc06f037aebd14df 100644
 --- a/crates/isolate/src/isolate_worker.rs
 +++ b/crates/isolate/src/isolate_worker.rs
-@@ -70,7 +70,8 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
+@@ -71,7 +71,8 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+         let debug_str = match inner {
              RequestType::Udf {
                  request,
-                 environment_data,
 -                mut response,
 +                cancellation,
 +                response,
                  queue_timer,
                  rng_seed,
                  reactor_depth,
-@@ -96,7 +97,7 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
+@@ -96,7 +97,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                          context_cache,
                          permit,
                          &mut isolate_clean,
@@ -592,7 +591,7 @@ index 6e47db9a428a58826b188daa89d674297b32bac0..20606073355d3e507268d8c915e2bef5
  }
  
 diff --git a/crates/udf/src/validation.rs b/crates/udf/src/validation.rs
-index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..8f48b25fae9bad4f1ff4de89e27dea1fa192de4e 100644
+index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..338c01b2ff1dac184b342cec537ec21f32b27514 100644
 --- a/crates/udf/src/validation.rs
 +++ b/crates/udf/src/validation.rs
 @@ -447,8 +447,9 @@ impl VisibilityInfo {
@@ -621,19 +620,16 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..8f48b25fae9bad4f1ff4de89e27dea1f
  impl ValidatedPathAndArgs {
      /// Check if the function being called matches the allowed visibility and
      /// return a ValidatedPathAndArgs or an appropriate JsError.
-@@ -723,7 +731,10 @@ impl ValidatedPathAndArgs {
+@@ -723,7 +731,7 @@ impl ValidatedPathAndArgs {
                  path,
                  args,
                  npm_version: Some(version),
 -                reuse_context,
-+                reuse_context: database_udf_context_reuse_enabled(
-+                    reuse_context,
-+                    expected_udf_type,
-+                ),
++                reuse_context: database_udf_context_reuse_enabled(reuse_context, expected_udf_type),
              },
              visibility_info,
          )))
-@@ -780,8 +791,73 @@ impl ValidatedPathAndArgs {
+@@ -780,8 +788,73 @@ impl ValidatedPathAndArgs {
          })
      }
  
@@ -709,7 +705,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..8f48b25fae9bad4f1ff4de89e27dea1f
      }
  }
  
-@@ -811,13 +887,12 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
+@@ -811,13 +884,12 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
  
  /// A UDF path that has been validated to be an HTTP route.
  ///
@@ -725,7 +721,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..8f48b25fae9bad4f1ff4de89e27dea1f
  }
  
  impl ValidatedHttpPath {
-@@ -851,14 +926,9 @@ impl ValidatedHttpPath {
+@@ -851,14 +923,9 @@ impl ValidatedHttpPath {
              Ok(udf_version) => udf_version,
              Err(e) => return Ok(Err(e)),
          };
@@ -740,7 +736,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..8f48b25fae9bad4f1ff4de89e27dea1f
          }))
      }
  
-@@ -876,7 +946,7 @@ impl ValidatedHttpPath {
+@@ -876,7 +943,7 @@ impl ValidatedHttpPath {
              component_path,
              component_id,
              npm_version,
@@ -749,7 +745,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..8f48b25fae9bad4f1ff4de89e27dea1f
          }: pb::common::ValidatedHttpPath,
      ) -> anyhow::Result<Self> {
          let component = ComponentId::deserialize_from_string(component_id.as_deref())?;
-@@ -891,7 +961,6 @@ impl ValidatedHttpPath {
+@@ -891,7 +958,6 @@ impl ValidatedHttpPath {
                  component_path,
              },
              npm_version: npm_version.map(|v| Version::parse(&v)).transpose()?,
@@ -757,7 +753,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..8f48b25fae9bad4f1ff4de89e27dea1f
          })
      }
  }
-@@ -900,11 +969,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+@@ -900,11 +966,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
      type Error = anyhow::Error;
  
      fn try_from(
@@ -770,7 +766,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..8f48b25fae9bad4f1ff4de89e27dea1f
      ) -> anyhow::Result<Self> {
          let component_path = Some(path.component_path.into());
          Ok(Self {
-@@ -912,7 +977,9 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+@@ -912,7 +974,9 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
              npm_version: npm_version.map(|v| v.to_string()),
              component_path,
              component_id: path.component.serialize_to_string(),
