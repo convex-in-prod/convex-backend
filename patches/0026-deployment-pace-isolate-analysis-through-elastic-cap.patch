@@ -1,0 +1,1235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Sat, 15 Aug 2026 16:15:21 +0800
+Subject: [PATCH 26/26] deployment: pace isolate analysis through elastic
+ capacity
+
+Module analysis creates one isolate request per non-dependency module, evaluates its import graph in V8 without supported asynchronous ops, and can keep up to ANALYZE_CONCURRENCY attempts active. Rejected-before-execution and overload responses can also create bounded retries. This work bypasses application action limits while still consuming shared-base isolate workers, active-JavaScript permits, CPU, and queue entries.
+
+Make the degradable-query leader semaphore an application-scoped admission object shared with isolate analysis. Preserve immediate typed deferral for degradable cache-miss leaders, but make each isolate module attempt wait fairly for one permit before queue admission and release it before retry backoff. This keeps degradable leaders plus active analysis attempts within the configured elastic cap without reserving an idle worker. When the cap is unset, analysis retains its previous behavior.
+
+A queued analysis waiter receives released capacity before a later immediate degradable acquisition, providing bounded-class progress whenever existing permit holders complete. Normal queries, dependencies, mutations, actions, Node analysis, configuration evaluation, worker eligibility, and dependency reserve remain unchanged.
+
+Expose analysis reservation occupancy and gate-wait metrics. Add focused fairness and capacity-transfer tests, and document patch composition, source evidence, sizing limits, a worked capacity example, rollout, rollback, and a controlled deployment experiment.
+---
+ .../src/application_function_runner/mod.rs    |   8 +-
+ crates/application/src/cache/metrics.rs       |   2 +-
+ crates/application/src/cache/mod.rs           |  83 +++++---
+ crates/common/src/knobs.rs                    |   5 +-
+ crates/common/src/lib.rs                      |   1 +
+ crates/common/src/query_analysis_admission.rs | 112 +++++++++++
+ .../src/in_process_function_runner.rs         |   3 +
+ crates/function_runner/src/lib.rs             |   2 +
+ crates/function_runner/src/server.rs          |  10 +-
+ crates/isolate/src/client.rs                  |  72 +++++--
+ crates/isolate/src/metrics.rs                 |  32 ++++
+ patches/README.md                             |  13 ++
+ patches/degradable_reactive_queries/README.md |  82 +++++---
+ patches/deployment_analysis_pacing/README.md  | 178 ++++++++++++++++++
+ patches/isolate_queue_control/README.md       |  21 ++-
+ .../deployment_lane_design_reference.md       |  39 ++--
+ self-hosted/advanced/knobs.md                 |  26 +++
+ 17 files changed, 598 insertions(+), 91 deletions(-)
+ create mode 100644 crates/common/src/query_analysis_admission.rs
+ create mode 100644 patches/deployment_analysis_pacing/README.md
+
+diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
+index 1ad21e2561c48df4fd0df68dcf1a02ef26895809..4794d1f9ca33c1e58435ffdd3313332606a748f5 100644
+--- a/crates/application/src/application_function_runner/mod.rs
++++ b/crates/application/src/application_function_runner/mod.rs
+@@ -65,6 +65,7 @@ use common::{
+         LogLine,
+         LogLines,
+     },
++    query_analysis_admission::QueryAnalysisAdmission,
+     query_journal::QueryJournal,
+     runtime::{
+         Runtime,
+@@ -716,6 +717,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
+     audit_log_client: AuditLogClient,
+ 
+     cache_manager: CacheManager<RT>,
++    query_analysis_admission: Option<QueryAnalysisAdmission>,
+     default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
+     node_action_limiter: Limiter<RT>,
+     ai_gateway_jwt_minter: Option<Arc<dyn AiGatewayJwtMinter>>,
+@@ -746,6 +748,8 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+             default_system_env_vars.clone(),
+             function_log.clone(),
+         );
++        let query_analysis_admission =
++            APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS.map(QueryAnalysisAdmission::new);
+         let cache_manager = CacheManager::new(
+             runtime.clone(),
+             database.clone(),
+@@ -753,7 +757,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+             function_log.clone(),
+             audit_log_client.clone(),
+             cache,
+-            *APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS,
++            query_analysis_admission.clone(),
+         );
+ 
+         let node_action_limiter = Limiter::new(
+@@ -777,6 +781,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+             function_log,
+             audit_log_client,
+             cache_manager,
++            query_analysis_admission,
+             default_system_env_vars,
+             node_action_limiter,
+             ai_gateway_jwt_minter,
+@@ -2027,6 +2032,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+             udf_config,
+             isolate_modules,
+             environment_variables.clone(),
++            self.query_analysis_admission.clone(),
+         );
+ 
+         let node_future = async {
+diff --git a/crates/application/src/cache/metrics.rs b/crates/application/src/cache/metrics.rs
+index 10783261d8e567a7188c062723c29e467fbdcd8e..f28b3b338738b8c6c1b2b3874bf1dc55522c9bad 100644
+--- a/crates/application/src/cache/metrics.rs
++++ b/crates/application/src/cache/metrics.rs
+@@ -96,7 +96,7 @@ register_convex_gauge!(
+ );
+ register_convex_gauge!(
+     DEGRADABLE_QUERY_LEADER_CAPACITY_INFO,
+-    "Configured degradable query cache-miss leader capacity"
++    "Configured capacity shared by degradable query leaders and isolate module analysis"
+ );
+ register_convex_counter!(
+     DEGRADABLE_QUERY_CACHE_RECHECK_TOTAL,
+diff --git a/crates/application/src/cache/mod.rs b/crates/application/src/cache/mod.rs
+index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931a52df556 100644
+--- a/crates/application/src/cache/mod.rs
++++ b/crates/application/src/cache/mod.rs
+@@ -36,6 +36,10 @@ use common::{
+         DATABASE_UDF_SYSTEM_TIMEOUT,
+         DATABASE_UDF_USER_TIMEOUT,
+     },
++    query_analysis_admission::{
++        QueryAnalysisAdmission,
++        QueryAnalysisPermit,
++    },
+     query_journal::QueryJournal,
+     runtime::Runtime,
+     types::{
+@@ -103,11 +107,6 @@ use sync_types::{
+     types::SerializedArgs,
+     QueryWorkloadClass,
+ };
+-use tokio::sync::{
+-    OwnedSemaphorePermit,
+-    Semaphore,
+-    TryAcquireError,
+-};
+ use udf::{
+     validation::{
+         PendingArgsPolicy,
+@@ -203,36 +202,35 @@ struct DegradableQueryLeaderAdmission {
+ }
+ 
+ struct DegradableQueryLeaderAdmissionInner {
+-    semaphore: Arc<Semaphore>,
++    admission: QueryAnalysisAdmission,
+     permits_in_use: AtomicUsize,
+ }
+ 
+ struct DegradableQueryLeaderPermit {
+-    permit: Option<OwnedSemaphorePermit>,
++    permit: Option<QueryAnalysisPermit>,
+     admission: Arc<DegradableQueryLeaderAdmissionInner>,
+ }
+ 
+ impl DegradableQueryLeaderAdmission {
++    #[cfg(test)]
+     fn new(capacity: usize) -> Self {
+-        initialize_degradable_leader_metrics(capacity);
++        Self::from_shared(QueryAnalysisAdmission::new(capacity))
++    }
++
++    fn from_shared(admission: QueryAnalysisAdmission) -> Self {
++        initialize_degradable_leader_metrics(admission.capacity());
+         Self {
+             inner: Arc::new(DegradableQueryLeaderAdmissionInner {
+-                semaphore: Arc::new(Semaphore::new(capacity)),
++                admission,
+                 permits_in_use: AtomicUsize::new(0),
+             }),
+         }
+     }
+ 
+     fn try_acquire(&self) -> anyhow::Result<DegradableQueryLeaderPermit> {
+-        let permit = match self.inner.semaphore.clone().try_acquire_owned() {
+-            Ok(permit) => permit,
+-            Err(TryAcquireError::NoPermits) => {
+-                log_degradable_leader_admission(DegradableLeaderAdmissionOutcome::Deferred);
+-                return Err(ErrorMetadata::degradable_query_capacity().into());
+-            },
+-            Err(TryAcquireError::Closed) => {
+-                panic!("degradable query leader admission semaphore unexpectedly closed")
+-            },
++        let Some(permit) = self.inner.admission.try_acquire_degradable() else {
++            log_degradable_leader_admission(DegradableLeaderAdmissionOutcome::Deferred);
++            return Err(ErrorMetadata::degradable_query_capacity().into());
+         };
+         self.inner.permits_in_use.fetch_add(1, Ordering::SeqCst);
+         increment_degradable_leader_permits_in_use();
+@@ -241,6 +239,11 @@ impl DegradableQueryLeaderAdmission {
+             admission: self.inner.clone(),
+         })
+     }
++
++    #[cfg(test)]
++    fn has_available_permit(&self) -> bool {
++        self.inner.admission.try_acquire_degradable().is_some()
++    }
+ }
+ 
+ impl Drop for DegradableQueryLeaderPermit {
+@@ -458,7 +461,7 @@ impl<RT: Runtime> CacheManager<RT> {
+         udf_execution: FunctionExecutionLog<RT>,
+         audit_log_client: AuditLogClient,
+         cache: QueryCache,
+-        degradable_query_leader_capacity: Option<usize>,
++        query_analysis_admission: Option<QueryAnalysisAdmission>,
+     ) -> Self {
+         // each `CacheManager` (for a different deployment) gets its own tenant
+         // ID within `Cache`, which has a _global_ size-limit
+@@ -471,8 +474,8 @@ impl<RT: Runtime> CacheManager<RT> {
+             audit_log_client,
+             tenant_id,
+             cache,
+-            degradable_query_leader_admission: degradable_query_leader_capacity
+-                .map(DegradableQueryLeaderAdmission::new),
++            degradable_query_leader_admission: query_analysis_admission
++                .map(DegradableQueryLeaderAdmission::from_shared),
+         }
+     }
+ 
+@@ -1607,7 +1610,7 @@ mod tests {
+             ),
+             Some(CachePlan::Operation(CacheOp::Ready { .. }, _))
+         ));
+-        assert_eq!(admission.inner.semaphore.available_permits(), 1);
++        assert!(admission.has_available_permit());
+ 
+         let waiting_cache = QueryCache::new(usize::MAX);
+         let normal_leader = plan(
+@@ -1630,7 +1633,7 @@ mod tests {
+             ),
+             Some(CachePlan::Operation(CacheOp::Wait { .. }, _))
+         ));
+-        assert_eq!(admission.inner.semaphore.available_permits(), 1);
++        assert!(admission.has_available_permit());
+         let CachePlan::Operation(
+             CacheOp::Go {
+                 waiting_entry_id: Some(waiting_entry_id),
+@@ -1693,7 +1696,7 @@ mod tests {
+             ),
+             Some(CachePlan::Operation(CacheOp::Wait { .. }, _))
+         ));
+-        assert_eq!(admission.inner.semaphore.available_permits(), 1);
++        assert!(admission.has_available_permit());
+ 
+         let CachePlan::Operation(
+             CacheOp::Go {
+@@ -1708,6 +1711,24 @@ mod tests {
+         cache.remove_waiting(&stored_key, waiting_entry_id);
+     }
+ 
++    #[tokio::test]
++    async fn analysis_reservations_reduce_degradable_admission() {
++        let shared_admission = QueryAnalysisAdmission::new(2);
++        let degradable_admission =
++            DegradableQueryLeaderAdmission::from_shared(shared_admission.clone());
++        let analysis = shared_admission.acquire_analysis().await;
++        let degradable = degradable_admission.try_acquire().unwrap();
++
++        let Err(error) = degradable_admission.try_acquire() else {
++            panic!("analysis did not borrow from degradable capacity")
++        };
++        assert!(error.is_degradable_query_capacity());
++
++        drop(analysis);
++        assert!(degradable_admission.try_acquire().is_ok());
++        drop(degradable);
++    }
++
+     #[test]
+     fn degradable_timestamp_duplicates_require_and_retain_admission() {
+         let key = requested_key();
+@@ -1748,9 +1769,9 @@ mod tests {
+                 ..
+             }
+         ));
+-        assert_eq!(ready_admission.inner.semaphore.available_permits(), 0);
++        assert!(!ready_admission.has_available_permit());
+         drop(ready_duplicate);
+-        assert_eq!(ready_admission.inner.semaphore.available_permits(), 1);
++        assert!(ready_admission.has_available_permit());
+ 
+         let waiting_cache = QueryCache::new(usize::MAX);
+         let normal_leader = plan_at_ts(
+@@ -1802,9 +1823,9 @@ mod tests {
+                 ..
+             }
+         ));
+-        assert_eq!(waiting_admission.inner.semaphore.available_permits(), 0);
++        assert!(!waiting_admission.has_available_permit());
+         drop(waiting_duplicate);
+-        assert_eq!(waiting_admission.inner.semaphore.available_permits(), 1);
++        assert!(waiting_admission.has_available_permit());
+ 
+         let CachePlan::Operation(
+             CacheOp::Go {
+@@ -1855,11 +1876,11 @@ mod tests {
+         else {
+             panic!("admitted degradable miss was not a cache leader")
+         };
+-        assert_eq!(admission.inner.semaphore.available_permits(), 0);
++        assert!(!admission.has_available_permit());
+ 
+         let guard = WaitingEntryGuard::new(Some(*waiting_entry_id), &stored_key, cache.clone());
+         drop(op);
+-        assert_eq!(admission.inner.semaphore.available_permits(), 1);
++        assert!(admission.has_available_permit());
+         drop(guard);
+         assert!(cache.inner.lock().cache.is_empty());
+     }
+@@ -1904,7 +1925,7 @@ mod tests {
+ 
+         drop(op);
+         guard.complete(smallvec![stored_key.clone()], cache_result(&key));
+-        assert_eq!(admission.inner.semaphore.available_permits(), 1);
++        assert!(admission.has_available_permit());
+         assert!(matches!(
+             cache.inner.lock().cache.get(&stored_key),
+             Some(CacheEntry::Ready(_))
+diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
+index dbec81ebbcd13e98117bf7730a07c62a3a6291e9..3b5e15de452333bb03a2b52273cc1c26d0361f79 100644
+--- a/crates/common/src/knobs.rs
++++ b/crates/common/src/knobs.rs
+@@ -1390,8 +1390,9 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
+     )
+ });
+ 
+-/// Maximum concurrent degradable root reactive-query cache-miss leaders.
+-/// Absence disables degradable admission. A configured cap must leave at
++/// Maximum elastic capacity shared by degradable root reactive-query
++/// cache-miss leaders and isolate module analysis. Absence disables degradable
++/// admission and preserves unpaced analysis. A configured cap must leave at
+ /// least one shared-base slot at the application, isolate-worker, and finite
+ /// active-JavaScript gates.
+ pub static APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: LazyLock<Option<usize>> =
+diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
+index c3b71876e482c830894c070e5374352076a9a135..e9af810e3dde8a7e12ff351f3385d81a2de9b274 100644
+--- a/crates/common/src/lib.rs
++++ b/crates/common/src/lib.rs
+@@ -56,6 +56,7 @@ pub mod persistence_helpers;
+ pub mod pii;
+ pub mod pool_stats;
+ pub mod query;
++pub mod query_analysis_admission;
+ pub mod query_journal;
+ pub mod read_write_balance;
+ pub mod retriable_stream;
+diff --git a/crates/common/src/query_analysis_admission.rs b/crates/common/src/query_analysis_admission.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..772e94951a8780d5ef74e38a4885e96d1d4ec265
+--- /dev/null
++++ b/crates/common/src/query_analysis_admission.rs
+@@ -0,0 +1,112 @@
++use std::sync::Arc;
++
++use tokio::sync::{
++    OwnedSemaphorePermit,
++    Semaphore,
++    TryAcquireError,
++};
++
++/// One application-scoped capacity gate shared by degradable query leaders
++/// and isolate module analysis.
++///
++/// Degradable queries require an immediate decision so the sync protocol can
++/// retain stale results instead of adding a waiter. Analysis waits fairly for
++/// the same permits. Consequently, analysis borrows elastic capacity instead
++/// of adding work above the configured degradable-query ceiling.
++#[derive(Clone)]
++pub struct QueryAnalysisAdmission {
++    capacity: usize,
++    semaphore: Arc<Semaphore>,
++}
++
++/// A permit from [`QueryAnalysisAdmission`].
++pub struct QueryAnalysisPermit {
++    _permit: OwnedSemaphorePermit,
++}
++
++impl QueryAnalysisAdmission {
++    pub fn new(capacity: usize) -> Self {
++        assert!(capacity > 0, "query-analysis capacity must be positive");
++        Self {
++            capacity,
++            semaphore: Arc::new(Semaphore::new(capacity)),
++        }
++    }
++
++    pub fn capacity(&self) -> usize {
++        self.capacity
++    }
++
++    /// Attempts immediate admission for a degradable query leader.
++    ///
++    /// A queued analysis waiter receives a released permit before a later
++    /// immediate acquisition can take it because the underlying semaphore is
++    /// fair.
++    pub fn try_acquire_degradable(&self) -> Option<QueryAnalysisPermit> {
++        let permit = match self.semaphore.clone().try_acquire_owned() {
++            Ok(permit) => permit,
++            Err(TryAcquireError::NoPermits) => return None,
++            Err(TryAcquireError::Closed) => {
++                panic!("query-analysis admission semaphore unexpectedly closed")
++            },
++        };
++        Some(QueryAnalysisPermit { _permit: permit })
++    }
++
++    /// Waits fairly for capacity for one isolate module analysis attempt.
++    pub async fn acquire_analysis(&self) -> QueryAnalysisPermit {
++        let permit = self
++            .semaphore
++            .clone()
++            .acquire_owned()
++            .await
++            .expect("query-analysis admission semaphore unexpectedly closed");
++        QueryAnalysisPermit { _permit: permit }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::time::Duration;
++
++    use super::QueryAnalysisAdmission;
++
++    #[tokio::test]
++    async fn analysis_borrows_from_degradable_capacity() {
++        let admission = QueryAnalysisAdmission::new(2);
++        let degradable = admission
++            .try_acquire_degradable()
++            .expect("first degradable query was not admitted");
++        let analysis = admission.acquire_analysis().await;
++
++        assert!(admission.try_acquire_degradable().is_none());
++
++        drop(analysis);
++        let replacement = admission
++            .try_acquire_degradable()
++            .expect("released analysis reservation was not returned");
++        drop(replacement);
++        drop(degradable);
++    }
++
++    #[tokio::test]
++    async fn queued_analysis_precedes_new_degradable_admission() {
++        let admission = QueryAnalysisAdmission::new(1);
++        let degradable = admission
++            .try_acquire_degradable()
++            .expect("degradable query was not admitted");
++        let mut analysis = std::pin::pin!(admission.acquire_analysis());
++        assert!(futures::poll!(&mut analysis).is_pending());
++
++        drop(degradable);
++        // The fair semaphore assigns the released permit to the queued
++        // analysis future before that future is polled again.
++        assert!(admission.try_acquire_degradable().is_none());
++        let analysis = tokio::time::timeout(Duration::from_secs(1), &mut analysis)
++            .await
++            .expect("queued analysis did not receive released capacity");
++        drop(analysis);
++
++        assert!(admission.try_acquire_degradable().is_some());
++    }
++}
+diff --git a/crates/function_runner/src/in_process_function_runner.rs b/crates/function_runner/src/in_process_function_runner.rs
+index 4e2a0a964be455f86cca59cd4bb9fe4a00544cda..624a6fcfa8627d1fec5a2b1a69310d12601afa58 100644
+--- a/crates/function_runner/src/in_process_function_runner.rs
++++ b/crates/function_runner/src/in_process_function_runner.rs
+@@ -34,6 +34,7 @@ use common::{
+         PersistenceReader,
+         RepeatablePersistence,
+     },
++    query_analysis_admission::QueryAnalysisAdmission,
+     runtime::{
+         Runtime,
+         SpawnHandle,
+@@ -364,6 +365,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
+         udf_config: UdfConfig,
+         modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
+         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
++        query_analysis_admission: Option<QueryAnalysisAdmission>,
+     ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
+         self.server
+             .analyze(
+@@ -371,6 +373,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
+                 modules,
+                 environment_variables,
+                 self.deployment.name.clone(),
++                query_analysis_admission,
+             )
+             .await
+     }
+diff --git a/crates/function_runner/src/lib.rs b/crates/function_runner/src/lib.rs
+index 3645b01e62d763dd685ee5671480090dc285bcca..6c88afe0edf2cfcabb590aaa718eebbf58cc2f2c 100644
+--- a/crates/function_runner/src/lib.rs
++++ b/crates/function_runner/src/lib.rs
+@@ -22,6 +22,7 @@ use common::{
+     errors::JsError,
+     execution_context::ExecutionContext,
+     log_lines::LogLine,
++    query_analysis_admission::QueryAnalysisAdmission,
+     runtime::{
+         Runtime,
+         UnixTimestamp,
+@@ -109,6 +110,7 @@ pub trait FunctionRunner<RT: Runtime>: Send + Sync + 'static {
+         udf_config: UdfConfig,
+         modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
+         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
++        query_analysis_admission: Option<QueryAnalysisAdmission>,
+     ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>>;
+ 
+     async fn evaluate_app_definitions(
+diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
+index a131cd52a4e09e6929be030d924649111d1e667e..0753efa7a8c8076590a6239d935bfd0e18525dd9 100644
+--- a/crates/function_runner/src/server.rs
++++ b/crates/function_runner/src/server.rs
+@@ -26,6 +26,7 @@ use common::{
+     knobs::MAX_ISOLATE_WORKERS,
+     log_lines::LogLine,
+     persistence::RetentionValidator,
++    query_analysis_admission::QueryAnalysisAdmission,
+     query_journal::QueryJournal,
+     runtime::{
+         Runtime,
+@@ -547,6 +548,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+         modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
+         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
+         deployment_name: String,
++        query_analysis_admission: Option<QueryAnalysisAdmission>,
+     ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
+         anyhow::ensure!(
+             modules
+@@ -556,7 +558,13 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+         );
+ 
+         self.isolate_client
+-            .analyze(udf_config, modules, environment_variables, deployment_name)
++            .analyze(
++                udf_config,
++                modules,
++                environment_variables,
++                deployment_name,
++                query_analysis_admission,
++            )
+             .await
+     }
+ 
+diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
+index 2e3377dfa2717f939ee77c557d5521b38bfa132f..e9ce04206684b4366e49ad80f67b6494bff42363 100644
+--- a/crates/isolate/src/client.rs
++++ b/crates/isolate/src/client.rs
+@@ -85,6 +85,10 @@ use common::{
+     },
+     log_lines::LogLine,
+     memory_pressure::MemoryPressureSignal,
++    query_analysis_admission::{
++        QueryAnalysisAdmission,
++        QueryAnalysisPermit,
++    },
+     query_journal::QueryJournal,
+     runtime::{
+         shutdown_and_join,
+@@ -227,6 +231,32 @@ use crate::{
+ 
+ const ISOLATE_QUEUE_METRICS_LOG_FREQUENCY: Duration = Duration::from_secs(1);
+ 
++struct AnalysisCapacityReservation {
++    permit: Option<QueryAnalysisPermit>,
++}
++
++impl AnalysisCapacityReservation {
++    fn new(permit: QueryAnalysisPermit) -> Self {
++        metrics::increment_analysis_capacity_reservations_in_use();
++        Self {
++            permit: Some(permit),
++        }
++    }
++}
++
++impl Drop for AnalysisCapacityReservation {
++    fn drop(&mut self) {
++        let permit = self
++            .permit
++            .take()
++            .expect("analysis capacity reservation released twice");
++        // Keep the permit unavailable until after occupancy accounting is
++        // decremented so a replacement cannot make the gauge exceed capacity.
++        metrics::decrement_analysis_capacity_reservations_in_use();
++        drop(permit);
++    }
++}
++
+ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
+ pub const PAUSE_REQUEST: &str = "pause_request";
+ pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
+@@ -1617,6 +1647,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+         modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
+         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
+         instance_name: String,
++        query_analysis_admission: Option<QueryAnalysisAdmission>,
+     ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
+         anyhow::ensure!(
+             modules
+@@ -1624,6 +1655,9 @@ impl<RT: Runtime> IsolateClient<RT> {
+                 .all(|m| m.environment == ModuleEnvironment::Isolate),
+             "Can only analyze Isolate modules"
+         );
++        if let Some(admission) = &query_analysis_admission {
++            metrics::initialize_analysis_capacity_metrics(admission.capacity());
++        }
+         let to_analyze: Vec<_> = modules
+             .keys()
+             .filter(|path| !path.is_deps())
+@@ -1649,20 +1683,32 @@ impl<RT: Runtime> IsolateClient<RT> {
+                 let mut attempt = 1;
+                 const MAX_ATTEMPTS: u32 = 3;
+                 loop {
+-                    let (tx, rx) = oneshot::channel();
+-                    let request = RequestType::Analyze {
+-                        modules: modules.clone(),
+-                        to_analyze: to_analyze.clone(),
+-                        response: tx,
+-                        udf_config: udf_config.clone(),
+-                        environment_variables: environment_variables.clone(),
++                    let response = {
++                        let _analysis_capacity_reservation =
++                            if let Some(admission) = &query_analysis_admission {
++                                let timer = metrics::analysis_capacity_wait_timer();
++                                let permit = admission.acquire_analysis().await;
++                                drop(timer);
++                                Some(AnalysisCapacityReservation::new(permit))
++                            } else {
++                                None
++                            };
++                        let (tx, rx) = oneshot::channel();
++                        let request = RequestType::Analyze {
++                            modules: modules.clone(),
++                            to_analyze: to_analyze.clone(),
++                            response: tx,
++                            udf_config: udf_config.clone(),
++                            environment_variables: environment_variables.clone(),
++                        };
++                        self.send_request(Request::new(
++                            instance_name.clone(),
++                            request,
++                            EncodedSpan::from_parent(),
++                        ))?;
++                        IsolateClient::<RT>::receive_response(rx).await?
+                     };
+-                    self.send_request(Request::new(
+-                        instance_name.clone(),
+-                        request,
+-                        EncodedSpan::from_parent(),
+-                    ))?;
+-                    match IsolateClient::<RT>::receive_response(rx).await? {
++                    match response {
+                         Ok(outcome) => return Ok((to_analyze, outcome)),
+                         Err(e)
+                             if attempt < MAX_ATTEMPTS
+diff --git a/crates/isolate/src/metrics.rs b/crates/isolate/src/metrics.rs
+index 9de604393bbc85ac0a5da9cbf43a423ac883eb9e..5c5ddfa4ed98975aad73e0c65fa7ced30a48ee9c 100644
+--- a/crates/isolate/src/metrics.rs
++++ b/crates/isolate/src/metrics.rs
+@@ -132,6 +132,38 @@ pub fn log_pool_max(name: &'static str, count: usize) {
+     );
+ }
+ 
++register_convex_gauge!(
++    ISOLATE_ANALYSIS_SHARED_CAPACITY_INFO,
++    "Application-scoped capacity shared by degradable query leaders and isolate module analysis"
++);
++register_convex_gauge!(
++    ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO,
++    "Shared-capacity permits currently held by isolate module analysis"
++);
++register_convex_histogram!(
++    ISOLATE_ANALYSIS_CAPACITY_WAIT_SECONDS,
++    "Time isolate module analysis waits to borrow shared degradable-query capacity"
++);
++
++pub fn initialize_analysis_capacity_metrics(capacity: usize) {
++    log_gauge(&ISOLATE_ANALYSIS_SHARED_CAPACITY_INFO, capacity as f64);
++    // Register without resetting reservations held by another concurrent
++    // analysis call.
++    let _ = ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO.get();
++}
++
++pub fn analysis_capacity_wait_timer() -> Timer<VMHistogram> {
++    Timer::new(&ISOLATE_ANALYSIS_CAPACITY_WAIT_SECONDS)
++}
++
++pub fn increment_analysis_capacity_reservations_in_use() {
++    ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO.inc();
++}
++
++pub fn decrement_analysis_capacity_reservations_in_use() {
++    ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO.dec();
++}
++
+ register_convex_gauge!(
+     ISOLATE_POOL_ALLOCATED_COUNT_INFO,
+     "How many isolate workers have been allocated",
+diff --git a/patches/README.md b/patches/README.md
+index 0f893e39c89f061c74a8d98d2dad9f67d0ff76b1..11e78a12bc5bc30d880becc040fd2955a2d33bf3 100644
+--- a/patches/README.md
++++ b/patches/README.md
+@@ -62,6 +62,17 @@ adoption contract documented in the backend essay.
+ - Rollback: roll back the CLI before the backend if codegen must remain available; no data or
+   configuration rollback is required.
+ 
++### [Paced isolate module analysis](deployment_analysis_pacing/README.md)
++
++- Purpose: make each isolate module analysis attempt fairly borrow from the configured degradable
++  query capacity instead of adding deployment fan-out above that elastic root-work ceiling.
++- Prerequisites: degradable reactive-query admission supplies the shared application-scoped gate.
++  The control-plane lane is recommended for typed queue treatment but is not required for pacing.
++- Activation: automatic when `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is configured;
++  no analysis or query behavior changes while it is unset.
++- Rollback: restore the previous backend image. Unsetting the cap also disables pacing, but it
++  simultaneously disables degradable-query backpressure.
++
+ ## Schema reliability
+ 
+ ### [Isolate schema-validation progress OCC](schema_validation_progress_occ/README.md)
+@@ -328,6 +339,8 @@ These files preserve the full earlier analysis without creating additional opera
+ 7. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
+    after cold-miss evidence.
+ 8. Deliver matching backend and client protocol before enabling degradable frontend behavior.
++9. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a
++   controlled multi-module push before changing analysis concurrency or queue deadlines.
+ 9. Change one independent capacity or semantic opt-in at a time unless the documented policy
+    explicitly requires a coupled rollout and rollback order.
+ 
+diff --git a/patches/degradable_reactive_queries/README.md b/patches/degradable_reactive_queries/README.md
+index 14527bd98d2aacdadafa846b7190d576c52d4d54..9b59f40ff32ff8c0880b31908b7501d2ed390cf3 100644
+--- a/patches/degradable_reactive_queries/README.md
++++ b/patches/degradable_reactive_queries/README.md
+@@ -7,7 +7,10 @@ suppression telemetry and follows the previous execution path. The matching `con
+ negotiates lifecycle version 1, validates active and cleared pressure events, and exposes one
+ epoch-scoped retry request. A downstream frontend can keep successful subscriptions mounted,
+ present pressure as visible staleness, and use the explicit cleared event as its catch-up boundary. An
+-HTTP-action extension and an isolate queue lane remain separate optional designs.
++HTTP-action extension and an isolate queue lane remain separate optional designs. The later
++[`deployment-analysis pacing`](../deployment_analysis_pacing/README.md) integration lets isolate
++module analysis fairly borrow from the same configured capacity without changing this client
++protocol.
+ 
+ This patch lets a cooperating sync client declare that its root reactive
+ queries may become temporarily stale during overload. The backend places only
+@@ -531,18 +534,20 @@ The degradable class should remain separate from
+ the other describes a liveness dependency established by the runtime. Combining
+ them into one Boolean would make precedence and metrics ambiguous.
+ 
+-The implemented backend slice does not add an isolate queue lane or change
+-isolate selection. The leader cap is the capacity mechanism: it is validated
+-strictly below shared isolate and finite active-JavaScript capacity, while
+-separately scheduled descendants continue to use the existing backend-derived
+-dependency class. An optional isolate lane may be evaluated later if leader-cap
+-and cache telemetry show a concrete queue-observability gap.
+-
+-The fixed leader cap provides the primary capacity reservation. If its value is
+-below shared isolate and active-JavaScript capacity, degradable root trees
+-cannot consume every slot by themselves. Existing ordinary work can use the
+-remaining capacity, and dependencies can still use their configured overflow.
+-No preemption is required.
++The degradable-query patch itself does not add an isolate queue lane or change
++isolate selection. The cap is validated strictly below shared isolate and
++finite active-JavaScript capacity, while separately scheduled descendants
++continue to use the existing backend-derived dependency class. The later
++deployment-analysis integration shares this gate with typed isolate analysis;
++it does not add a degradable lane or change query scheduler classification.
++
++The configured cap provides the primary elastic capacity boundary. If its
++value is below shared isolate and active-JavaScript capacity, degradable root
++trees cannot consume every slot by themselves. With deployment-analysis pacing
++applied, each active isolate module attempt consumes one permit from that same
++boundary. Existing ordinary work can use the remaining capacity, and
++dependencies can still use their configured overflow. No preemption is
++required.
+ 
+ Queue selection does not add unconditional strict priority below capacity. The
+ fixed cap and immediate deferral provide containment without starving
+@@ -551,10 +556,10 @@ selection, dependency overflow, independent-action caps, and hard expiry remain
+ in force.
+ 
+ This model is intentionally finite. One admitted query can perform expensive
+-work or separately scheduled fan-out. The cap bounds admitted roots, not every
+-possible descendant. Existing transaction limits, action caps, dependency
+-reserve, CPU execution permits, and hard queue age continue to enforce their
+-own boundaries.
++work or separately scheduled fan-out. The cap bounds admitted roots plus
++isolate analysis attempts, not every possible descendant. Existing transaction
++limits, action caps, dependency reserve, CPU execution permits, and hard queue
++age continue to enforce their own boundaries.
+ 
+ ## Configuration and capacity sizing
+ 
+@@ -571,6 +576,12 @@ normal class, no separate queue lane, and no pressure response. When present,
+ the value must contain only ASCII decimal digits and must be strictly positive.
+ Malformed, empty, signed, zero, overflowed, or inconsistent values fail startup.
+ 
++In the final maintained stack this value is the size of the elastic gate shared
++with isolate module analysis. Degradable leaders retain immediate admission;
++analysis waits fairly. With no active analysis, the complete configured value
++remains available to degradable leaders, so the integration adds no permanently
++reserved capacity.
++
+ For the standard in-process self-hosted runner, startup should also require the
+ cap to be below each finite capacity whose complete occupation would defeat the
+ reservation:
+@@ -744,11 +755,12 @@ creating a parallel ancestry mechanism. Operators not carrying an equivalent
+ dependency patch still gain a finite degradable root cap, but cannot claim the
+ dependency-liveness and descendant-override guarantees described here.
+ 
+-[`isolate_queue_control/README.md`](../isolate_queue_control/README.md) remains independent. This
+-slice does not add a degradable lane even when lane-aware queue control is
+-enabled; the leader cap reserves capacity and the existing queue policy remains
+-unchanged. A later lane extension must not change Connect parsing, leader
+-admission, cache bypass, or client pressure semantics.
++[`isolate_queue_control/README.md`](../isolate_queue_control/README.md) remains independently
++adoptable. This slice does not add a degradable lane even when lane-aware queue control is enabled;
++the cap reserves capacity and the existing query policy remains unchanged. The ordered
++[`deployment-analysis pacing`](../deployment_analysis_pacing/README.md) patch composes the two
++admission models without changing Connect parsing, leader admission, cache bypass, client pressure
++semantics, or isolate queue selection.
+ 
+ [`cancellation_safe_database_context_reuse/README.md`](../cancellation_safe_database_context_reuse/README.md)
+ and [`context_reuse_observability/README.md`](../context_reuse_observability/README.md) are
+@@ -760,8 +772,10 @@ pressure semantics. Measure and roll back the features independently.
+ 
+ This patch directly addresses the reactive recomputation wave that can follow a
+ configuration push. Degradable clients absorb part of that wave as temporary
+-staleness. The deployment analysis and configuration mutation themselves remain
+-in their existing backend class.
++staleness. Deployment analysis retains its backend-derived scheduler class. In
++the later pacing integration, each isolate module attempt also waits fairly for
++one permit from the elastic gate before queue admission. Configuration
++evaluation and mutation do not use that gate.
+ 
+ A dedicated control-plane lane is an optional extension implemented by the
+ separate [`isolate_queue_control/README.md`](../isolate_queue_control/README.md) patch. It
+@@ -770,6 +784,12 @@ analysis, evaluation, schema updates, and application traffic. Client metadata
+ must never claim that class. The degradable-client patch does not depend on such
+ a lane and should not encode deployment paths as application allowlists.
+ 
++The pacing integration is intentionally narrower than a worker reservation. It
++makes analysis replace degradable demand at the root-work gate but does not
++reserve shared-base workers or active-JavaScript permits. See its owning essay
++for the source-level CPU evidence, liveness argument, worked capacity example,
++and controlled validation.
++
+ Context reuse and bounded query-context prewarming are also complementary.
+ They can lower module-evaluation CPU and improve warm service time. They do not
+ provide backpressure, do not prevent every first concurrent cold evaluation,
+@@ -811,6 +831,8 @@ The query path should expose at least:
+   `decision={effective,suppressed_disabled}`;
+ - degradable leader admission by `outcome={admitted,deferred}`;
+ - current degradable leader permits in use and the configured capacity;
++- when deployment-analysis pacing is applied, current analysis reservations,
++  configured shared capacity, and analysis capacity wait;
+ - typed temporary deferrals returned to sync workers;
+ - pressure transitions emitted by closed pressure kind and lifecycle state;
+ - bounded pending-query-count observations;
+@@ -967,16 +989,20 @@ resubscription sequence per query.
+ 7. Exercise an ordinary function deployment while representative reactive and
+    worker traffic is present. Verify bounded degradable work and continued
+    mutation, action, worker, and deployment progress.
+-8. Adjust one cap at a time from measured behavior. Do not simultaneously raise
++8. When carrying deployment-analysis pacing, verify that analysis reservations
++   displace degradable permits and their sum stays within the configured cap.
++9. Adjust one cap at a time from measured behavior. Do not simultaneously raise
+    general queue delay or query concurrency.
+-9. Adopt degradable HTTP-action admission separately, starting with proxy
++10. Adopt degradable HTTP-action admission separately, starting with proxy
+    header enforcement and one lower-importance route class.
+ 
+ The fastest client-side rollback is to omit `queryWorkloadClass`. Existing
+ connections must reconnect under a newly constructed client for the change to
+ take effect. The fastest backend rollback is to unset the degradable leader cap
+-and restart. Either rollback leaves data, schemas, subscriptions, and existing
+-normal admission unchanged.
++and restart. When deployment-analysis pacing is applied, unsetting the cap also
++restores unpaced analysis; restoring the prior backend image is the isolated
++pacing rollback. Either rollback leaves data, schemas, subscriptions, and
++existing normal admission unchanged.
+ 
+ If a lifecycle-capable client retains an active epoch during a backend rollback,
+ reconnection resets the connection-local epoch. The frontend also bounds its
+diff --git a/patches/deployment_analysis_pacing/README.md b/patches/deployment_analysis_pacing/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..73499031ec8f3a2ad803d4b14cf25615155c7e9a
+--- /dev/null
++++ b/patches/deployment_analysis_pacing/README.md
+@@ -0,0 +1,178 @@
++# Pace Isolate Module Analysis Through Elastic Query Capacity
++
++This integration patch prevents a function push from adding its complete isolate-module analysis
++fan-out on top of the configured degradable-query load. It uses one application-scoped fair gate:
++
++```text
++degradable query cache-miss leaders + isolate module analysis attempts
++    <= APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS
++```
++
++The gate remains work-conserving. Degradable leaders can use the full capacity when no analysis is
++running. Analysis can use up to the smaller of the configured capacity, the number of modules, and
++`ANALYZE_CONCURRENCY` when degradable leaders are absent. No worker is kept idle for a deployment.
++
++## Patch placement and prerequisites
++
++This is an ordered integration patch on top of two independently useful adoption units:
++
++- [`isolate_queue_control/README.md`](../isolate_queue_control/README.md) identifies typed backend
++  analysis and evaluation work and can place it in the bounded control-plane lane;
++- [`degradable_reactive_queries/README.md`](../degradable_reactive_queries/README.md) supplies the
++  application-scoped immediate-admission gate and typed stale-result pressure behavior.
++
++The queue-control patch precedes the degradable-query patch in the maintained train, so it cannot
++own an implementation that depends on the later gate. Folding deployment pacing into the
++degradable client-protocol patch would also make that adoption unit silently own a separate
++control-plane behavior. Keeping this composition in a small later patch makes the dependency,
++activation, rollback, and future rebase boundary explicit.
++
++The pacing mechanism requires the degradable-query patch. The control-plane lane is recommended
++but is not a code prerequisite: without it, paced analysis retains ordinary queue classification,
++adaptive shedding, and the ordinary hard deadline.
++
++## Why module analysis creates scheduler pressure
++
++The isolate analyzer does not behave like a typical asynchronous action waiting on network or
++database I/O:
++
++- it creates one isolate request for every non-dependency module and runs up to
++  `ANALYZE_CONCURRENCY` requests concurrently;
++- each request registers, instantiates, and evaluates the selected module's import graph in V8,
++  then inspects the resulting exports;
++- the analysis environment rejects asynchronous syscalls and asynchronous ops at import time, so
++  analysis cannot release its active-JavaScript permit around supported application I/O;
++- one rejected-before-execution or overload response can be retried up to two times after the
++  first attempt, for at most three queue entries per module;
++- analysis is not an isolate action, so it does not consume the application V8-action limiter or
++  `MAX_ISOLATE_ACTION_WORKERS`.
++
++With the optional control-plane lane enabled, analysis still consumes shared-base physical workers,
++active-JavaScript permits, CPU, and shared queue entries. It cannot use dependency reserve and has
++no dedicated worker. A lane changes classification, deadline, and shedding policy; it does not add
++service capacity.
++
++This explains why deployment effects vary. A push with few or cheap isolate modules may never
++create a meaningful queue. A push with more modules, larger or repeated import graphs, cold V8
++work, or retries can sustain the configured fan-out long enough to overlap an unrelated query
++recomputation wave. Ambient occupancy determines whether that overlap is absorbed or turns into a
++short rejection burst. Changing only the adaptive-shed age can absorb a brief queue but does not
++change this arrival pattern or execution cost; sustained pressure can move to hard expiry or queue
++admission failure instead.
++
++## Admission and ownership
++
++`ApplicationFunctionRunner` creates one gate for its application when
++`APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is configured. The query cache and every
++isolate analysis call from that runner receive clones of the same gate.
++
++Degradable cache-miss leaders retain their existing contract:
++
++1. inspect the cache without publishing a waiting leader;
++2. attempt immediate gate acquisition;
++3. return the typed degradable-capacity outcome when no permit is available;
++4. recheck the cache after acquisition and retain the permit only for actual leader execution.
++
++Each isolate module analysis future instead waits for one permit immediately before creating and
++sending an `Analyze` isolate request. The permit remains held through queueing, initial
++active-JavaScript admission, and that request's response. It is released before retry backoff, so a
++sleeping retry does not reduce usable capacity. Node module analysis, source upload, schema and
++configuration evaluation, push commit, and the complete deployment lifetime do not hold a permit.
++
++The Tokio semaphore assigns released permits to queued asynchronous waiters before making them
++available to a later immediate acquisition. Once at least one analysis future has entered the fair
++wait queue, a stream of new degradable cache misses cannot repeatedly steal each released permit.
++This supplies practical deployment liveness without a special minimum-one rule. It cannot make
++progress until an existing permit holder completes, and it does not guarantee worker assignment
++after gate admission.
++
++`ANALYZE_CONCURRENCY` remains an upper bound, not a reservation. A configured gate capacity below
++that value deliberately lowers effective analysis concurrency. The existing control-plane queue
++capacity validation can remain based on the upper bound because pacing never increases queue
++fan-out.
++
++## Capacity example and limits
++
++Suppose shared-base worker and active-JavaScript capacity are 32, the elastic gate is 24, and
++analysis concurrency is 4. Before this integration, 24 degradable leaders and four analysis
++attempts could directly present 28 roots to lower execution gates. With this integration, four
++analysis reservations leave at most 20 permits for degradable leaders. At least eight slots remain
++outside this root-level elastic class in either state.
++
++This is intentionally not a mathematical bound on physical workers. One admitted query leader can
++spawn separately scheduled dependencies, and dependency work retains its existing reserve. Normal
++queries, mutations, actions, and non-degradable clients also bypass the elastic gate. The configured
++cap must therefore leave measured headroom at the application query gate, isolate shared base, and
++finite active-JavaScript gate, as required by existing startup validation.
++
++The patch does not add a scheduler reservation. Analysis can still wait after gate admission when
++ordinary non-degradable work or dependencies occupy workers, when active-JavaScript permits are
++full, or when CPU is saturated. This is acceptable for the first intervention: it removes the
++known additive deployment fan-out while preserving ordinary scheduling and dependency liveness.
++A class-aware worker reservation would require global and per-client active-class accounting and
++should be considered only after repeated evidence of gate-admitted analysis approaching its hard
++deadline while CPU and active-JavaScript capacity have headroom.
++
++## Metrics and controlled validation
++
++The integration adds bounded process metrics without application, module, deployment, or caller
++labels:
++
++- `isolate_analysis_shared_capacity_info` reports the configured shared gate capacity after an
++  isolate analysis call observes it;
++- `isolate_analysis_reservations_in_use_info` reports analysis permits currently held;
++- `isolate_analysis_capacity_wait_seconds` records one wait per isolate analysis attempt, including
++  retries and immediate acquisitions.
++
++Correlate these with:
++
++- `degradable_query_leader_permits_in_use_info` and degradable admission outcomes;
++- control-plane queue depth, oldest age, enqueue, dispatch, expiry, lane-full, and queue-full
++  counters when the lane is enabled;
++- active requests by scheduler class, active-JavaScript permit wait, and physical worker occupancy;
++- analysis duration, deployment phase duration and outcome, CPU pressure, and module count.
++
++A focused controlled deployment should hold representative degradable query pressure, then push a
++bundle with enough independent isolate modules to reach the analysis upper bound. Validate all of
++the following:
++
++1. analysis reservations rise while degradable permits fall or new degradable leaders receive
++   typed deferral;
++2. the sum of the two in-use gauges never exceeds the shared-capacity gauge;
++3. analysis-capacity wait is bounded and at least one queued attempt acquires the next released
++   permit;
++4. control-plane queue arrivals are paced instead of appearing as the full analysis fan-out;
++5. ordinary queue age and adaptive shedding decrease without a corresponding rise in control-plane
++   hard expiry, lane-full, or shared queue-full rejection;
++6. total analysis takes longer when the elastic class is busy but the deployment still completes
++   within its outer deadline.
++
++For an A/B comparison, use the same backend configuration and module bundle with and without this
++integration patch. Changing the queue delay threshold in the same experiment would confound
++capacity pacing with rejection timing. An unpaced image may be used only in a controlled
++environment where the prior overload behavior is acceptable.
++
++## Activation, rollout, and rollback
++
++The integration is active whenever
++`APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is configured. It adds no second enable knob.
++When the setting is absent, degradable clients retain normal query admission and isolate analysis
++preserves its previous unpaced behavior.
++
++Roll out with the existing cap unchanged, confirm the shared-capacity gauge, and run one controlled
++push before relying on the behavior under normal deployment traffic. Do not raise
++`ANALYZE_CONCURRENCY` at the same time. The immediate operational rollback is to restore the prior
++backend image. Unsetting the cap also disables pacing, but simultaneously disables degradable-query
++backpressure and is therefore not an equivalent isolated rollback.
++
++Focused tests prove that analysis reservations reduce available degradable admission, a queued
++analysis attempt receives a released permit before a new immediate degradable acquisition, permit
++release restores capacity, and existing query-cache permit ownership remains intact.
++
++## Deliberately excluded alternatives
++
++This patch does not add a dedicated worker pool, permanently idle worker, strict deployment
++priority, dependency-reserve borrowing, deployment-wide query shutdown, module allowlist, larger
++queue, longer deadline, or automatic `ANALYZE_CONCURRENCY` formula. Those choices either leave the
++additive demand unchanged, weaken dependency liveness, introduce idle capacity, or require more
++scheduler state than the current evidence justifies.
+diff --git a/patches/isolate_queue_control/README.md b/patches/isolate_queue_control/README.md
+index 790af71ab08a6432512f9d9eb22b63eb8ea39360..7d09744ad1ad9df9f3855a7bd279f1c025a402d4 100644
+--- a/patches/isolate_queue_control/README.md
++++ b/patches/isolate_queue_control/README.md
+@@ -306,6 +306,12 @@ Each post-admission analysis or evaluation retry is a new queue entry with a new
+ patch does not combine existing bounded attempts into one larger budget or change
+ `ANALYZE_CONCURRENCY`.
+ 
++The ordered [`deployment-analysis pacing`](../deployment_analysis_pacing/README.md) integration
++adds a pre-queue gate only for isolate module analysis. Each module attempt fairly borrows one
++permit from the configured degradable-query capacity and releases it before retry backoff. This
++reduces analysis arrivals under elastic query load but does not alter this lane's classification,
++capacity, deadline, FIFO selection, or evaluation-request behavior.
++
+ Analysis and evaluation requests carry one-shot response senders but no UDF cancellation signal.
+ After selection and before worker allocation, the scheduler checks whether a control-plane caller
+ has disappeared. It also watches response closure while acquiring the initial active-JavaScript
+@@ -322,8 +328,9 @@ analysis duration, active permits, host CPU, deployment endpoint status, and ret
+ 
+ ### Deferred shared-base reservation
+ 
+-The initial patch does not reserve a worker. Consider carving one worker from shared base only if
+-repeated measurements show all of the following:
++The initial patch does not reserve a worker. First apply the work-conserving analysis pacing
++integration when its degradable-query prerequisite is available. Consider carving one worker from
++shared base only if repeated measurements then show all of the following:
+ 
+ - an admitted control-plane request approaches its hard deadline;
+ - non-dependency runtime work continuously occupies shared base;
+@@ -348,7 +355,9 @@ borrowing, preemption, or dynamic-priority protocol without separate evidence an
+    metrics.
+ 5. Run an ordinary push under representative traffic. Verify FIFO dispatch, no adaptive shedding,
+    no dependency-reserve use, finite expiry, and unchanged ordinary deadlines.
+-6. Observe repeated normal and busy pushes before considering a worker reservation or larger cap.
++6. When carrying deployment-analysis pacing, verify that analysis reservations displace
++   degradable permits and pace queue arrivals.
++7. Observe repeated normal and busy pushes before considering a worker reservation or larger cap.
+ 
+ Rollback sets `ISOLATE_CONTROL_PLANE_LANE_ENABLED=false` and restarts the backend. The lane-aware
+ ordinary/dependency/action policy remains active, and no schema or data migration is required.
+@@ -403,6 +412,12 @@ Its reserve and waiter queue are independent of isolate queue capacity. A
+ request can pass HTTP admission and still wait at an application gate or in the
+ isolate queue. Size each stage from its own occupancy and wait metrics.
+ 
++The degradable reactive-query patch supplies a finite application-scoped root
++query gate. The separate deployment-analysis pacing integration lets isolate
++module analysis fairly borrow that elastic capacity before this queue. It is
++work-conserving and does not add a queue lane, scheduler eligibility rule, or
++worker reservation.
++
+ The HTTP action context-reuse patch reduces repeated V8 context initialization
+ and can therefore change isolate service time, queue sojourn, and memory per
+ worker. It does not alter queue classification or capacity. Evaluate context
+diff --git a/patches/isolate_queue_control/deployment_lane_design_reference.md b/patches/isolate_queue_control/deployment_lane_design_reference.md
+index f4b12c92776c6e74c61af8ee55f24fe069b4e112..3d7f50228c66dc19a5fa0583381feb45dbbb4320 100644
+--- a/patches/isolate_queue_control/deployment_lane_design_reference.md
++++ b/patches/isolate_queue_control/deployment_lane_design_reference.md
+@@ -23,8 +23,8 @@ The initial hard deadline default is 30 seconds. The single physical queue
+ continues to select the oldest eligible request, preserving FIFO among
+ eligible control-plane and runtime work. A later one-worker reservation from
+ shared base is deliberately excluded from the initial patch and should be
+-considered only if measurements still show deployment starvation after
+-ordinary query containment is active.
++considered only if measurements still show deployment starvation after the
++work-conserving analysis pacing integration is active.
+ 
+ The classification is derived from Rust request variants. It contains no
+ application module, function, component, route, deployment, client, or tenant
+@@ -38,12 +38,14 @@ lane-aware isolate queue policy. It improves the chance that admitted analysis
+ and evaluation work survives a short runtime burst without weakening the
+ dependency liveness reserve.
+ 
+-The patch does not guarantee that a deployment succeeds under sustained CPU
++The lane patch does not guarantee that a deployment succeeds under sustained CPU
+ saturation, a full shared-base queue, a caller timeout shorter than the lane
+ deadline, or a deployment failure outside the isolate scheduler. It does not
+ reserve execution capacity in its initial form. Operators still need enough
+ shared-base worker and active-JavaScript capacity for the request to dispatch
+-and execute.
++and execute. The later
++[`deployment-analysis pacing`](../deployment_analysis_pacing/README.md) integration reduces
++additive analysis demand before this queue without reserving a worker.
+ 
+ ## Motivation
+ 
+@@ -508,9 +510,12 @@ reserve sizing, action caps, per-client limits, or worker selection.
+ [`degradable_reactive_queries/README.md`](../degradable_reactive_queries/README.md) is
+ complementary demand containment. Its degradable query leader cap can keep a
+ bounded frontend recomputation wave from consuming all shared-base workers.
+-That capacity makes FIFO control-plane progress more likely without reserving a
+-worker. Neither patch requires application module names, and either feature can
+-be disabled independently.
++The ordered [`deployment-analysis pacing`](../deployment_analysis_pacing/README.md) integration
++makes each isolate module analysis attempt fairly borrow from that same application-scoped gate.
++The resulting root-work invariant is
++`degradable leaders + analysis attempts <= configured cap`; no worker is kept idle. The query and
++lane patches remain independently adoptable, while the integration explicitly depends on the
++query gate. None requires application module names.
+ 
+ Database-query context reuse and query-context prewarming can reduce competing
+ runtime service cost and leave more shared capacity available. They do not
+@@ -526,9 +531,18 @@ boundaries.
+ 
+ ## Deferred shared-base worker reservation
+ 
+-Do not reserve a worker in the initial patch. First combine the lane with
+-ordinary query containment and measure deployments under representative busy
+-traffic.
++Do not reserve a worker in the initial patch. First combine the lane with the
++work-conserving analysis pacing integration and measure deployments under
++representative busy traffic. Pacing transfers elastic capacity from degradable
++roots to analysis but deliberately does not reserve a physical worker.
++
++The fair gate also removes the need for a special rule that forces effective
++analysis concurrency to stay at one. Once an analysis future is queued, a
++released elastic permit is assigned to it before a new degradable query can
++take that permit through immediate admission. Analysis can still wait forever
++if an existing permit holder never completes, or wait again in the isolate
++scheduler after gate admission; neither case is repaired by a minimum-one
++counter outside the scheduler.
+ 
+ Consider one statically reserved shared-base worker only when all of the
+ following recur:
+@@ -604,7 +618,10 @@ other's wakeup.
+    reserve use, finite hard expiry, and unchanged ordinary hard deadline.
+ 8. Observe multiple normal deployment cycles before considering any capacity
+    adjustment.
+-9. Do not add the deferred worker reservation unless the evidence conditions in
++9. Apply deployment-analysis pacing when degradable admission is available and
++   verify that analysis reservations replace, rather than add to, degradable
++   occupancy.
++10. Do not add the deferred worker reservation unless the evidence conditions in
+    the previous section are met.
+ 
+ The immediate rollback is:
+diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
+index 55cf711a2639fd74810270c9a72d2a25c0ea69db..cf5ae9b104754a120b253b522020b17dd530c687 100644
+--- a/self-hosted/advanced/knobs.md
++++ b/self-hosted/advanced/knobs.md
+@@ -355,6 +355,32 @@ retaining an isolate worker may raise occupancy above that base. Nested Node
+ actions receive the same treatment at the Node action limit because their
+ parent retains a permit from that limit.
+ 
++`APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is an optional elastic
++capacity inside those ordinary limits. Degradable root query cache-miss leaders
++use immediate admission: when no permit is available, the sync protocol keeps
++their previous values and returns typed temporary pressure. Isolate module
++analysis fairly waits for one permit per module attempt before entering the
++isolate queue. Analysis therefore borrows from the same capacity instead of
++adding its configured fan-out on top of every admitted degradable leader:
++
++```text
++degradable query leaders + isolate analysis attempts <= configured cap
++```
++
++For example, with a cap of 24 and `ANALYZE_CONCURRENCY=4`, four active module
++analyses leave at most 20 permits for degradable leaders. With no analysis, all
++24 remain available to degradable leaders. Normal queries, mutations, actions,
++query dependencies, and Node module analysis do not use this gate. The bound is
++on root query leaders and analysis attempts, not on every dependency a query
++tree can spawn.
++
++The analysis wait is fair with existing permit holders and queued analysis
++attempts. It does not reserve an isolate worker, borrow dependency overflow, or
++guarantee progress while all underlying execution resources remain occupied.
++Unset the knob to preserve the original unpaced analysis behavior. See
++[`patches/deployment_analysis_pacing/README.md`](../../patches/deployment_analysis_pacing/README.md)
++for sizing, telemetry, and rollout guidance.
++
+ ## Isolate worker and queue knobs
+ 
+ `MAX_ISOLATE_WORKERS` is the total number of isolate workers assigned requests
