@@ -135,6 +135,33 @@ pub(crate) fn is_observed() -> bool {
     ACTIVE.with_borrow(|active| active.is_some())
 }
 
+pub(crate) fn record_module_phase(
+    phase: crate::module_diagnostics::ModulePhase,
+    wall: std::time::Duration,
+    cpu: Option<u64>,
+) {
+    use crate::module_diagnostics::ModulePhase;
+    ACTIVE.with_borrow_mut(|active| {
+        if let Some(frame) = active {
+            let module = &mut frame.local.module_initialization;
+            let time = match phase {
+                ModulePhase::Registration | ModulePhase::Cleanup => return,
+                ModulePhase::Compilation => &mut module.compilation,
+                ModulePhase::Serialization => &mut module.serialization,
+                ModulePhase::Instantiation => &mut module.instantiation,
+                ModulePhase::Evaluation => &mut module.evaluation,
+                ModulePhase::ExportInspection => &mut module.export_inspection,
+            };
+            time.poll_wall_nanos += nanos(wall);
+            if let Some(cpu) = cpu {
+                time.cpu_nanos += cpu;
+            } else {
+                frame.local.invalid = Some(ExecutionObservationInvalid::CpuClockUnavailable);
+            }
+        }
+    });
+}
+
 impl Frame {
     fn phase(
         phase: Phase,
