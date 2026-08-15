@@ -38,7 +38,10 @@ use rand::Rng;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use sourcemap::SourceMap;
+use sourcemap::{
+    SourceMap,
+    Token,
+};
 use url::Url;
 use uuid::Uuid;
 use value::{
@@ -707,41 +710,47 @@ impl JsError {
                 ..
             } = frame
             {
-                let Ok(specifier) = Url::parse(f) else {
-                    // We expect the file_name to be fully qualified URL but seems
-                    // this is not always the case. Lets log warning here.
-                    tracing::warn!("Skipping frame with invalid file_name: {f}");
-                    continue;
-                };
-                let source_map = match source_maps.entry(specifier) {
-                    Entry::Vacant(e) => {
-                        let maybe_source_map = match lookup_source_map(e.key()) {
-                            Ok(maybe_source_map) => maybe_source_map,
+                if let Ok(specifier) = Url::parse(f) {
+                    let source_map = match source_maps.entry(specifier) {
+                        Entry::Vacant(e) => match lookup_source_map(e.key()) {
+                            Ok(Some(source_map)) => Some(e.insert(source_map)),
+                            Ok(None) => {
+                                tracing::debug!("Missing source map for {}", e.key());
+                                None
+                            },
                             Err(err) => {
-                                // This is not expected so report an error.
+                                // This is not expected so report an error, but keep
+                                // the generated frame when mapping is unavailable.
                                 let mut err = err
                                     .context(ErrorMetadata::operational_internal_server_error())
                                     .context("Failed to lookup source_map");
                                 report_error_sync(&mut err);
-                                continue;
+                                None
                             },
-                        };
-                        let Some(source_map) = maybe_source_map else {
-                            tracing::debug!("Missing source map for {}", e.key());
-                            continue;
-                        };
-                        e.insert(source_map)
-                    },
-                    Entry::Occupied(e) => e.into_mut(),
-                };
-                if let Some(token) = source_map.lookup_token(l, c) {
-                    if let Some(mapped_name) = token.get_source() {
-                        frame.file_name = Some(mapped_name.to_string());
+                        },
+                        Entry::Occupied(e) => Some(e.into_mut()),
+                    };
+                    if let Some(source_map) = source_map {
+                        // V8 stack frames are one-based; source-map coordinates
+                        // are zero-based. Keep the frame's convention on output.
+                        if let Some(line) = l.checked_sub(1)
+                            && let Some(column) = c.checked_sub(1)
+                            && let Some(token) = lookup_source_map_token(source_map, line, column)
+                            && let Some(mapped_name) = token.get_source()
+                            && let Some(mapped_line) = token.get_src_line().checked_add(1)
+                            && let Some(mapped_column) = token.get_src_col().checked_add(1)
+                        {
+                            frame.file_name = Some(mapped_name.to_string());
+                            frame.line_number = Some(mapped_line);
+                            frame.column_number = Some(mapped_column);
+                        } else {
+                            tracing::debug!("Failed to find token for {f}:{l}:{c}");
+                        }
                     }
-                    frame.line_number = Some(token.get_src_line());
-                    frame.column_number = Some(token.get_src_col());
                 } else {
-                    tracing::debug!("Failed to find token for {f}:{l}:{c}");
+                    // We expect the file_name to be fully qualified URL but seems
+                    // this is not always the case. Lets log warning here.
+                    tracing::warn!("Keeping generated frame with invalid file_name: {f}");
                 }
             } else {
                 tracing::debug!("Skipping incomplete frame: {frame:?}");
@@ -771,6 +780,43 @@ impl JsError {
         }
     }
 
+}
+
+/// Look up a token only on the requested zero-based generated line.
+pub fn lookup_source_map_token(
+    source_map: &SourceMap,
+    line: u32,
+    column: u32,
+) -> Option<Token<'_>> {
+    // The library's closest-token lookup can cross a generated line boundary.
+    // Its range offset then subtracts unrelated columns and can underflow.
+    // Find the first token on this line before letting it apply that offset.
+    let mut left = 0;
+    let mut right = source_map.get_token_count() as usize;
+    while left < right {
+        let mid = left + (right - left) / 2;
+        let token = source_map
+            .get_token(mid)
+            .expect("source map token disappeared");
+        if token.get_dst_line() < line {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    let first = source_map.get_token(left)?;
+    if first.get_dst_line() != line || first.get_dst_col() > column {
+        return None;
+    }
+    let token = source_map.lookup_token(line, column)?;
+    if token.is_range() {
+        // Do not turn an overflowing original column into a saturated position.
+        token
+            .get_raw_token()
+            .src_col
+            .checked_add(column - token.get_dst_col())?;
+    }
+    Some(token)
 }
 
 // Based on deno's `02_error.js:formatLocation`.
@@ -872,3 +918,83 @@ pub fn is_db_deadlock_error(e: &anyhow::Error) -> bool {
 }
 
 pub const AUTH_ERROR: &str = "AuthError";
+
+#[cfg(test)]
+mod source_map_tests {
+    use super::*;
+
+    #[test]
+    fn source_map_ranges_only_offset_columns_on_their_generated_line() -> anyhow::Result<()> {
+        let map = SourceMap::from_slice(
+            br#"{"version":3,"sources":["root.ts"],"names":[],"mappings":"oGAAA;KAAA","rangeMappings":"B;B"}"#,
+        )?;
+        for (line, column, expected_column) in [
+            (0, 99, None),
+            (0, 100, Some(0)),
+            (0, 103, Some(3)),
+            (1, 0, None),
+            (1, 5, Some(0)),
+            (1, 8, Some(3)),
+            (2, 0, None),
+        ] {
+            assert_eq!(
+                lookup_source_map_token(&map, line, column).map(|token| token.get_src_col()),
+                expected_column,
+            );
+        }
+        let overflowing_column = SourceMap::from_slice(
+            br#"{"version":3,"sources":["root.ts"],"names":[],"mappings":"AAAC","rangeMappings":"B"}"#,
+        )?;
+        assert!(lookup_source_map_token(&overflowing_column, 0, u32::MAX).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn js_error_retains_generated_frames_when_mapping_is_unusable() -> anyhow::Result<()> {
+        let generated = FrameData {
+            file_name: Some("convex:/user/root.js".to_owned()),
+            line_number: Some(2),
+            column_number: Some(9),
+            ..FrameData::default()
+        };
+        for (mappings, range_mappings, expected) in [
+            ("oGAAA", "B", generated.clone()),
+            ("oGAAA;oGAAA", "B;B", generated.clone()),
+            ("A;A", "", generated.clone()),
+            (
+                "oGAAA;KAAA",
+                "B;B",
+                FrameData {
+                    file_name: Some("root.ts".to_owned()),
+                    line_number: Some(1),
+                    column_number: Some(4),
+                    ..generated.clone()
+                },
+            ),
+        ] {
+            let map = SourceMap::from_slice(&serde_json::to_vec(&serde_json::json!({
+                "version": 3,
+                "sources": ["root.ts"],
+                "names": [],
+                "mappings": mappings,
+                "rangeMappings": range_mappings,
+            }))?)?;
+            let error = JsError::from_frames(
+                "ordinary error".to_owned(),
+                vec![generated.clone()],
+                None,
+                |_| Ok(Some(map.clone())),
+            );
+            assert_eq!(error.message, "ordinary error");
+            assert_eq!(&error.frames.unwrap().0[..], &[expected]);
+        }
+        let error = JsError::from_frames(
+            "ordinary error".to_owned(),
+            vec![generated.clone()],
+            None,
+            |_| Ok(None),
+        );
+        assert_eq!(&error.frames.unwrap().0[..], &[generated]);
+        Ok(())
+    }
+}
