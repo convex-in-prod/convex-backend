@@ -31,6 +31,7 @@ mod isolate_queue;
 pub mod isolate_worker;
 pub mod metrics;
 pub mod module_cache;
+pub mod module_diagnostics;
 pub mod module_map;
 pub mod ops;
 mod request_scope;
