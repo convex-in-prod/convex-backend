@@ -62,6 +62,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
         isolate: &mut Isolate<RT>,
         context_cache: &mut ContextCache,
         Request {
+            deployment_job: _deployment_job,
             client_id,
             inner,
             parent_trace: _,
@@ -211,8 +212,10 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                 modules,
                 to_analyze,
                 environment_variables,
+                cancellation,
                 response,
             } => {
+                let description = format!("Analyze {}", to_analyze.as_str());
                 let r = AnalyzeEnvironment::analyze::<RT>(
                     isolate,
                     context_cache,
@@ -222,10 +225,14 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                     modules,
                     to_analyze,
                     environment_variables,
+                    cancellation,
                 )
                 .await;
-                let _ = response.send(r);
-                "Analyze".to_string()
+                // This transfers the shared reservation into the response. If
+                // the caller disappeared, failed delivery drops it here only
+                // after V8 analysis has finished.
+                response.send(r);
+                description
             },
             RequestType::HttpAction {
                 request,
@@ -297,6 +304,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                 log_string
             },
             RequestType::EvaluateSchema {
+                cancellation,
                 schema_bundle,
                 source_map,
                 rng_seed,
@@ -311,6 +319,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                     source_map,
                     rng_seed,
                     unix_timestamp,
+                    cancellation,
                 )
                 .await;
 
@@ -318,6 +327,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                 "EvaluateSchema".to_string()
             },
             RequestType::EvaluateAuthConfig {
+                cancellation,
                 auth_config_bundle,
                 source_map,
                 environment_variables,
@@ -330,12 +340,14 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                     auth_config_bundle,
                     source_map,
                     environment_variables,
+                    cancellation,
                 )
                 .await;
                 let _ = response.send(r);
                 "EvaluateAuthConfig".to_string()
             },
             RequestType::EvaluateAppDefinitions {
+                cancellation,
                 app_definition,
                 component_definitions,
                 dependency_graph,
@@ -354,11 +366,14 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                     user_environment_variables,
                     system_env_vars,
                 );
-                let r = env.evaluate(context_cache, permit, isolate).await;
+                let r = env
+                    .evaluate(context_cache, permit, isolate, cancellation)
+                    .await;
                 let _ = response.send(r);
                 "EvaluateAppDefinitions".to_string()
             },
             RequestType::EvaluateComponentInitializer {
+                cancellation,
                 evaluated_definitions,
                 path,
                 definition,
@@ -373,7 +388,9 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                     args,
                     name,
                 );
-                let r = env.evaluate(context_cache, permit, isolate).await;
+                let r = env
+                    .evaluate(context_cache, permit, isolate, cancellation)
+                    .await;
                 let _ = response.send(r);
                 "EvaluateComponentInitializer".to_string()
             },
@@ -394,5 +411,131 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
 
     fn rt(&self) -> &RT {
         &self.rt
+    }
+}
+
+#[cfg(test)]
+mod configuration_cancellation_tests {
+    use std::{
+        collections::BTreeMap,
+        sync::Arc,
+        time::Duration,
+    };
+
+    use common::{
+        components::{
+            ComponentDefinitionPath,
+            ComponentName,
+        },
+        fastrace_helpers::EncodedSpan,
+        runtime::UnixTimestamp,
+    };
+    use model::{
+        config::types::ModuleConfig,
+        modules::module_versions::ModuleSource,
+    };
+    use runtime::prod::ProdRuntime;
+
+    use super::*;
+    use crate::{
+        client::CancellationSignal,
+        isolate::IsolateNotClean,
+        ConcurrencyLimiter,
+    };
+
+    #[test]
+    fn cancellation_interrupts_every_configuration_stage() -> anyhow::Result<()> {
+        crate::client::initialize_v8();
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            enum Stage {
+                Schema,
+                AuthConfig,
+                AppDefinitions,
+                ComponentInitializer,
+            }
+            for stage in [
+                Stage::Schema,
+                Stage::AuthConfig,
+                Stage::AppDefinitions,
+                Stage::ComponentInitializer,
+            ] {
+                let limiter = ConcurrencyLimiter::unlimited();
+                let worker = FunctionRunnerIsolateWorker::new(
+                    rt.clone(),
+                    IsolateConfig::new("configuration_cancellation_test", limiter.clone()),
+                );
+                let mut isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
+                let mut contexts = ContextCache::new();
+                let permit = limiter
+                    .acquire(Arc::new("configuration_test".to_owned()), false)
+                    .await;
+                let cancellation = CancellationSignal::new_for_test();
+                let cancel = cancellation.clone();
+                let source = ModuleSource::new("while (true) {}");
+                let definition = ModuleConfig {
+                    path: "convex.config.js".parse()?,
+                    source: source.clone(),
+                    source_map: None,
+                    environment: common::types::ModuleEnvironment::Isolate,
+                };
+                let inner = match stage {
+                    Stage::Schema => RequestType::EvaluateSchema {
+                        cancellation,
+                        schema_bundle: source,
+                        source_map: None,
+                        rng_seed: [0; 32],
+                        unix_timestamp: UnixTimestamp::from_nanos(0),
+                        response: oneshot::channel().0,
+                    },
+                    Stage::AuthConfig => RequestType::EvaluateAuthConfig {
+                        cancellation,
+                        auth_config_bundle: source,
+                        source_map: None,
+                        environment_variables: BTreeMap::new(),
+                        response: oneshot::channel().0,
+                    },
+                    Stage::AppDefinitions => RequestType::EvaluateAppDefinitions {
+                        cancellation,
+                        app_definition: definition,
+                        component_definitions: BTreeMap::new(),
+                        dependency_graph: Default::default(),
+                        user_environment_variables: BTreeMap::new(),
+                        system_env_vars: BTreeMap::new(),
+                        response: oneshot::channel().0,
+                    },
+                    Stage::ComponentInitializer => RequestType::EvaluateComponentInitializer {
+                        cancellation,
+                        evaluated_definitions: BTreeMap::new(),
+                        path: ComponentDefinitionPath::root(),
+                        definition,
+                        args: BTreeMap::new(),
+                        name: ComponentName::min(),
+                        response: oneshot::channel().0,
+                    },
+                };
+                let cancel_task = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    cancel.cancel_for_test();
+                });
+                worker
+                    .handle_request_inner(
+                        &mut isolate,
+                        &mut contexts,
+                        Request::new("configuration_test".to_owned(), inner, EncodedSpan::empty()),
+                        permit,
+                    )
+                    .await;
+                cancel_task.await?;
+                // A timeout also stops the loop, so require the cancellation
+                // termination reason rather than merely observing completion.
+                assert!(matches!(
+                    isolate.check_isolate_clean(&mut contexts),
+                    Err(IsolateNotClean::SystemError)
+                ));
+            }
+            anyhow::Ok(())
+        })
     }
 }

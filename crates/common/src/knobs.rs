@@ -1594,10 +1594,11 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
     )
 });
 
-/// Maximum concurrent degradable root reactive-query cache-miss leaders.
-/// Absence disables degradable admission. A configured cap leaves at least one
-/// shared-base application and isolate-worker slot. A finite active-JavaScript
-/// gate either exceeds the cap or configures class minimums.
+/// Maximum elastic capacity shared by degradable root reactive-query
+/// cache-miss leaders and isolate module analysis. Absence disables degradable
+/// admission and preserves unpaced analysis. A configured cap leaves at least
+/// one shared-base application and isolate-worker slot. A finite active-
+/// JavaScript gate either exceeds the cap or configures class minimums.
 pub static APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: LazyLock<Option<usize>> =
     LazyLock::new(|| {
         let capacity =
@@ -1755,6 +1756,15 @@ pub static APPLICATION_MAX_CONCURRENT_UPLOADS: LazyLock<usize> =
 /// validates that this is greater than zero.
 pub static ANALYZE_CONCURRENCY: LazyLock<usize> =
     LazyLock::new(|| env_config_usize_strict("ANALYZE_CONCURRENCY", 4));
+
+/// Logical retention budgets per immutable analysis snapshot. Zero disables
+/// retention without changing fresh-context analysis semantics.
+pub static ANALYZE_CODE_CACHE_MAX_BYTES: LazyLock<usize> =
+    LazyLock::new(|| env_config_usize_strict("ANALYZE_CODE_CACHE_MAX_BYTES", 32 << 20));
+/// Logical parsed-source-map retention budget per snapshot; zero disables
+/// retention.
+pub static ANALYZE_SOURCE_MAP_CACHE_MAX_BYTES: LazyLock<usize> =
+    LazyLock::new(|| env_config_usize_strict("ANALYZE_SOURCE_MAP_CACHE_MAX_BYTES", 32 << 20));
 
 /// Set a 64MB limit on the heap size.
 pub static ISOLATE_MAX_USER_HEAP_SIZE: LazyLock<usize> =

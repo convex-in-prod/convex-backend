@@ -63,6 +63,7 @@ use common::{
         LogLine,
         LogLines,
     },
+    query_analysis_admission::QueryAnalysisAdmission,
     query_journal::QueryJournal,
     runtime::{
         Runtime,
@@ -751,6 +752,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
     audit_log_client: AuditLogClient,
 
     cache_manager: CacheManager<RT>,
+    query_analysis_admission: Option<QueryAnalysisAdmission>,
     default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
     node_action_limiter: Limiter<RT>,
     ai_gateway_jwt_minter: Option<Arc<dyn AiGatewayJwtMinter>>,
@@ -781,6 +783,11 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             default_system_env_vars.clone(),
             function_log.clone(),
         );
+        // Construct this gate once per application runner. The cache manager
+        // and isolate analysis must receive clones of the same semaphore or
+        // their loads become additive again.
+        let query_analysis_admission =
+            APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS.map(QueryAnalysisAdmission::new);
         let cache_manager = CacheManager::new(
             runtime.clone(),
             database.clone(),
@@ -788,7 +795,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             function_log.clone(),
             audit_log_client.clone(),
             cache,
-            *APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS,
+            query_analysis_admission.clone(),
         );
 
         let node_action_limiter = Limiter::new(
@@ -812,6 +819,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             function_log,
             audit_log_client,
             cache_manager,
+            query_analysis_admission,
             default_system_env_vars,
             node_action_limiter,
             ai_gateway_jwt_minter,
@@ -1988,6 +1996,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             udf_config,
             isolate_modules,
             environment_variables.clone(),
+            self.query_analysis_admission.clone(),
         );
 
         let node_future = async {

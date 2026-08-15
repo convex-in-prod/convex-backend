@@ -1773,6 +1773,9 @@ impl<RT: Runtime> JsEnvironment<RT> for ActionEnvironment<RT> {
     type AsyncResolver = v8::Global<v8::PromiseResolver>;
     type SyscallProvider = Self;
 
+    const MODULE_REQUEST_KIND: crate::module_diagnostics::ModuleRequestKind =
+        crate::module_diagnostics::ModuleRequestKind::Runtime;
+
     fn syscall_provider(&mut self) -> &mut Self::SyscallProvider {
         self
     }

@@ -51,6 +51,7 @@ use value::NamespacedTableMapping;
 
 use super::ModuleCodeCacheResult;
 use crate::{
+    client::CancellationSignal,
     context_cache::ContextCache,
     environment::{
         helpers::syscall_error::{
@@ -148,7 +149,7 @@ impl<RT: Runtime> SyscallProvider<RT> for SchemaEnvironment {
                 source: self.schema_bundle.clone(),
                 source_map: self.source_map.clone(),
             })),
-            ModuleCodeCacheResult::noop(),
+            ModuleCodeCacheResult::Disabled,
         )))
     }
 
@@ -215,6 +216,7 @@ impl SchemaEnvironment {
         source_map: Option<SourceMap>,
         rng_seed: [u8; 32],
         unix_timestamp: UnixTimestamp,
+        cancellation: CancellationSignal,
     ) -> anyhow::Result<DatabaseSchema> {
         let rng = ChaCha12Rng::from_seed(rng_seed);
         let environment = Self {
@@ -226,6 +228,8 @@ impl SchemaEnvironment {
         let (handle, state, mut timeout) = isolate
             .start_request(context_cache, permit, environment)
             .await?;
+        let _cancellation =
+            cancellation.bind_analysis_execution(handle.clone(), state.context_id.clone());
         scope!(let handle_scope, isolate.isolate());
         let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
         let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);

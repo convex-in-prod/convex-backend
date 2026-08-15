@@ -159,6 +159,39 @@ pub fn log_pool_max(name: &'static str, count: usize) {
     );
 }
 
+register_convex_gauge!(
+    ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO,
+    "Shared-capacity permits currently held by isolate module analysis"
+);
+register_convex_histogram!(
+    ISOLATE_ANALYSIS_CAPACITY_WAIT_SECONDS,
+    "Time isolate module analysis waits to borrow shared degradable-query capacity"
+);
+register_convex_counter!(
+    pub(crate) ISOLATE_ANALYSIS_ATTEMPTS_TOTAL,
+    "Root analysis submissions after shared-capacity admission; retry repeats an existing root",
+    &["attempt"],
+    Duration::MAX,
+);
+
+pub fn initialize_analysis_reservation_metrics() {
+    // Register without resetting reservations held by another concurrent
+    // analysis call.
+    let _ = ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO.get();
+}
+
+pub fn analysis_capacity_wait_timer() -> Timer<VMHistogram> {
+    Timer::new(&ISOLATE_ANALYSIS_CAPACITY_WAIT_SECONDS)
+}
+
+pub fn increment_analysis_capacity_reservations_in_use() {
+    ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO.inc();
+}
+
+pub fn decrement_analysis_capacity_reservations_in_use() {
+    ISOLATE_ANALYSIS_RESERVATIONS_IN_USE_INFO.dec();
+}
+
 fn scheduler_class_labels(
     name: &'static str,
     scheduler_class: &'static str,
@@ -949,9 +982,77 @@ pub fn lookup_source_timer(is_system: bool) -> StatusTimer {
 
 register_convex_histogram!(
     UDF_ISOLATE_COMPILE_MODULE_SECONDS,
-    "Time to compile a single module's source",
+    "Time to compile a single module's source; cached means data was supplied, not necessarily \
+     accepted",
     &["status", "cached"],
 );
+
+pub(crate) enum ModuleCodeCacheOutcome {
+    Disabled,
+    Absent,
+    Accepted,
+    Rejected,
+    Generated,
+    BudgetRefused,
+}
+
+register_convex_counter!(
+    UDF_ISOLATE_CODE_CACHE_OUTCOMES_TOTAL,
+    "Compilation cache events; accepted means supplied data was not rejected, including when V8's \
+     internal cache bypasses deserialization",
+    &["outcome"],
+);
+
+pub(crate) fn log_module_code_cache_outcome(outcome: ModuleCodeCacheOutcome) {
+    let outcome = match outcome {
+        ModuleCodeCacheOutcome::Disabled => "disabled",
+        ModuleCodeCacheOutcome::Absent => "absent",
+        ModuleCodeCacheOutcome::Accepted => "accepted",
+        ModuleCodeCacheOutcome::Rejected => "rejected",
+        ModuleCodeCacheOutcome::Generated => "generated",
+        ModuleCodeCacheOutcome::BudgetRefused => "budget_refused",
+    };
+    log_counter_with_labels(
+        &UDF_ISOLATE_CODE_CACHE_OUTCOMES_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("outcome", outcome)],
+    );
+}
+
+register_convex_histogram!(
+    UDF_ISOLATE_MODULE_PHASE_SECONDS,
+    "Module phases; registration wall includes waits and child phases, thread CPU measures \
+     synchronous work in analysis and observed runtime polls",
+    &["request_kind", "phase", "clock"],
+);
+
+pub(crate) fn log_module_phase(
+    kind: crate::module_diagnostics::ModuleRequestKind,
+    phase: crate::module_diagnostics::ModulePhase,
+    wall: Duration,
+    cpu_nanos: Option<u64>,
+) {
+    let labels = vec![
+        StaticMetricLabel::new("request_kind", kind.label()),
+        StaticMetricLabel::new("phase", phase.label()),
+    ];
+    let mut wall_labels = labels.clone();
+    wall_labels.push(StaticMetricLabel::new("clock", "wall"));
+    log_distribution_with_labels(
+        &UDF_ISOLATE_MODULE_PHASE_SECONDS,
+        wall.as_secs_f64(),
+        wall_labels,
+    );
+    if let Some(cpu_nanos) = cpu_nanos {
+        let mut cpu_labels = labels;
+        cpu_labels.push(StaticMetricLabel::new("clock", "thread_cpu"));
+        log_distribution_with_labels(
+            &UDF_ISOLATE_MODULE_PHASE_SECONDS,
+            cpu_nanos as f64 / 1e9,
+            cpu_labels,
+        );
+    }
+}
 pub fn compile_module_timer(cached: bool) -> StatusTimer {
     let mut timer = StatusTimer::new(&UDF_ISOLATE_COMPILE_MODULE_SECONDS);
     timer.add_label(MetricLabel::new("cached", cached.as_label()));

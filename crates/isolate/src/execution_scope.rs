@@ -343,7 +343,19 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
         // These first two steps of registering and then instantiating the module
         // correspond to `JsRuntime::load_module`. This function is idempotent,
         // so it's safe to rerun.
-        let id = self.register_module(name, timeout).await?;
+        let registration_start = std::time::Instant::now();
+        let diagnostic = self.state()?.environment.analysis_diagnostic();
+        let registration = self.register_module(name, timeout).await;
+        metrics::log_module_phase(
+            E::MODULE_REQUEST_KIND,
+            crate::module_diagnostics::ModulePhase::Registration,
+            registration_start.elapsed(),
+            None,
+        );
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.registration_finished(registration_start.elapsed());
+        }
+        let id = registration?;
 
         // NB: This part is separate from `self.register_module()` since module
         // registration is recursive, compiling and registering dependencies,
@@ -372,7 +384,20 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
             }
         }
         let (id, import_specifiers) = {
+            if let Some(diagnostic) = self.state()?.environment.analysis_diagnostic() {
+                diagnostic.begin(
+                    crate::module_diagnostics::ModulePhase::Registration,
+                    Some(name.as_str()),
+                );
+            }
             let (module_source, code_cache) = self.lookup_source(name, timeout).await?;
+
+            let compilation_phase = crate::module_diagnostics::ModulePhaseGuard::new(
+                E::MODULE_REQUEST_KIND,
+                crate::module_diagnostics::ModulePhase::Compilation,
+                self.state()?.environment.analysis_diagnostic(),
+                Some(name.as_str()),
+            );
 
             // Step 1: Compile the module and discover its imports.
             let timer = metrics::compile_module_timer(matches!(
@@ -393,7 +418,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
 
             let origin = helpers::module_origin(&scope, name_str);
             let (mut v8_source, options) = match &code_cache {
-                ModuleCodeCacheResult::Cached(data) => (
+                ModuleCodeCacheResult::Cached(data, _) => (
                     v8::script_compiler::Source::new_with_cached_data(
                         source_str,
                         Some(&origin),
@@ -401,7 +426,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
                     ),
                     v8::script_compiler::CompileOptions::ConsumeCodeCache,
                 ),
-                ModuleCodeCacheResult::Uncached(_) => (
+                ModuleCodeCacheResult::Disabled | ModuleCodeCacheResult::Uncached(_) => (
                     v8::script_compiler::Source::new(source_str, Some(&origin)),
                     v8::script_compiler::CompileOptions::NoCompileOptions,
                 ),
@@ -417,27 +442,63 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
                     )
                 })??
                 .ok_or_else(|| anyhow!("Unexpected module compilation error"))?;
+            drop(compilation_phase);
 
-            match code_cache {
-                ModuleCodeCacheResult::Cached(data) => {
-                    // N.B.: this is not reflected in rusty-v8's lifetimes,
-                    // but the pointer behind the `v8::CachedData` passed to
-                    // `v8::Source` must stay alive through the call to
-                    // `compile_module2`.
-                    // At this point however it's already been deserialized and
-                    // is safe to drop.
-                    let _: Arc<[u8]> = data;
+            let populate = match code_cache {
+                ModuleCodeCacheResult::Disabled => {
+                    metrics::log_module_code_cache_outcome(
+                        metrics::ModuleCodeCacheOutcome::Disabled,
+                    );
+                    None
+                },
+                ModuleCodeCacheResult::Cached(data, populate) => {
+                    let rejected = v8_source
+                        .get_cached_data()
+                        .expect("compiler source lost supplied cached data")
+                        .rejected();
+                    metrics::log_module_code_cache_outcome(if rejected {
+                        metrics::ModuleCodeCacheOutcome::Rejected
+                    } else {
+                        metrics::ModuleCodeCacheOutcome::Accepted
+                    });
+                    // Source owns CachedData, which borrows these bytes until
+                    // destruction, even after compilation has completed. The
+                    // binding does not express this lifetime in its type.
+                    drop(v8_source);
+                    drop(data);
+                    rejected.then_some(populate)
                 },
                 ModuleCodeCacheResult::Uncached(callback) => {
-                    let timer = metrics::create_code_cache_timer();
-                    let module_script = module.get_unbound_module_script(&scope);
-                    if let Some(cached_data) = module_script.create_code_cache() {
-                        callback(cached_data[..].into());
-                        timer.finish();
-                    }
+                    metrics::log_module_code_cache_outcome(metrics::ModuleCodeCacheOutcome::Absent);
+                    Some(callback)
                 },
+            };
+            if let Some(populate) = populate {
+                let _serialization = crate::module_diagnostics::ModulePhaseGuard::new(
+                    E::MODULE_REQUEST_KIND,
+                    crate::module_diagnostics::ModulePhase::Serialization,
+                    scope.state()?.environment.analysis_diagnostic(),
+                    Some(name.as_str()),
+                );
+                let timer = metrics::create_code_cache_timer();
+                let module_script = module.get_unbound_module_script(&scope);
+                if let Some(cached_data) = module_script.create_code_cache() {
+                    populate(cached_data[..].into());
+                    metrics::log_module_code_cache_outcome(
+                        metrics::ModuleCodeCacheOutcome::Generated,
+                    );
+                    timer.finish();
+                }
             }
 
+            // Successful compilation/serialization returns to registration.
+            // Import resolution failures belong to this module, not the last subphase.
+            if let Some(diagnostic) = scope.state()?.environment.analysis_diagnostic() {
+                diagnostic.begin(
+                    crate::module_diagnostics::ModulePhase::Registration,
+                    Some(name.as_str()),
+                );
+            }
             assert_eq!(module.get_status(), v8::ModuleStatus::Uninstantiated);
             let mut import_specifiers = vec![];
             let module_requests = module.get_module_requests();
@@ -537,7 +598,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
             });
             timer.finish();
             // TODO: should we code-cache system UDFs?
-            return Ok((Arc::new(result), ModuleCodeCacheResult::noop()));
+            return Ok((Arc::new(result), ModuleCodeCacheResult::Disabled));
         }
 
         let state = self.state_mut()?;
@@ -572,6 +633,12 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
         // Instantiate the module, loading its dependencies.
         {
             let timer = metrics::instantiate_module_timer();
+            let _phase = crate::module_diagnostics::ModulePhaseGuard::new(
+                E::MODULE_REQUEST_KIND,
+                crate::module_diagnostics::ModulePhase::Instantiation,
+                self.state()?.environment.analysis_diagnostic(),
+                None,
+            );
             let result = self.with_try_catch(|s| {
                 module.instantiate_module(s, Self::module_resolve_callback)
             })??;
@@ -584,6 +651,12 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
 
         let value = {
             let timer = metrics::evaluate_module_timer();
+            let _phase = crate::module_diagnostics::ModulePhaseGuard::new(
+                E::MODULE_REQUEST_KIND,
+                crate::module_diagnostics::ModulePhase::Evaluation,
+                self.state()?.environment.analysis_diagnostic(),
+                None,
+            );
             let result = self
                 .with_try_catch(|s| module.evaluate(s))??
                 .ok_or_else(|| anyhow!("Missing result from successful module evaluation"))?;
