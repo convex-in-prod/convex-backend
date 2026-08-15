@@ -57,6 +57,13 @@ use crate::{
 /// `ErrorMetadata::bad_request` to signal a user-visible error that will be
 /// turned into a JavaScript exception.
 pub trait JsEnvironment<RT: Runtime>: 'static {
+    const MODULE_REQUEST_KIND: crate::module_diagnostics::ModuleRequestKind =
+        crate::module_diagnostics::ModuleRequestKind::Configuration;
+
+    fn analysis_diagnostic(&self) -> Option<crate::module_diagnostics::AnalysisDiagnostic> {
+        None
+    }
+
     /// Handle the environment uses to complete an async syscall or op that it
     /// started.
     type AsyncResolver;
@@ -141,16 +148,12 @@ pub struct UncatchableDeveloperError {
 }
 
 pub enum ModuleCodeCacheResult {
-    Cached(Arc<[u8]>),
+    /// No consumer will retain compiled data, so do not serialize it.
+    Disabled,
+    /// Supplied bytes may be rejected by V8. Populate a replacement only after
+    /// successful source compilation when V8 rejects this data.
+    Cached(Arc<[u8]>, Box<dyn FnOnce(Arc<[u8]>)>),
     /// The module isn't cached; it can be populated by calling the callback
     /// with the generated CachedData.
     Uncached(Box<dyn FnOnce(Arc<[u8]>)>),
-    /// The module isn't cached, and the cache shouldn't be populated.
-    Disabled,
-}
-
-impl ModuleCodeCacheResult {
-    pub fn noop() -> Self {
-        ModuleCodeCacheResult::Disabled
-    }
 }

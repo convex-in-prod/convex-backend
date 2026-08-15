@@ -1,5 +1,6 @@
 use common::{
     errors::{
+        lookup_source_map_token,
         FrameData,
         JsError,
     },
@@ -83,23 +84,60 @@ impl<RT: Runtime, E: V8IsolateEnvironment<RT>> ExecutionScope<'_, '_, '_, RT, E>
         let source_map = self.lookup_source_map(name)?;
         let orig_line = location.get_line_number();
         let orig_col = location.get_column_number();
-        if let Some(ref source_map) = source_map
-            && let Some(token) = source_map.lookup_token(orig_line as u32, orig_col as u32)
-            && let (line, col) = token.get_src()
-            && let Some(source_view) = token.get_source_view()
-            && let Some(ctx) = source_view.get_line(line)
-        {
-            Err(e.wrap_error_message(|m| {
-                format!(
-                    "{name}:{line}:{col}: {m}\n\n{ctx}\n{}{}",
-                    " ".repeat(col as usize),
-                    "~".repeat(ctx.len() - col as usize)
-                )
-            }))
-        } else {
-            Err(e.wrap_error_message(|m| format!("{name}:{orig_line}:{orig_col}: {m}")))
-        }
+        Err(e.wrap_error_message(|m| {
+            format_error_source_location(name, orig_line, orig_col, source_map.as_ref(), &m)
+        }))
     }
+}
+
+fn format_error_source_location(
+    name: &ModuleSpecifier,
+    generated_line: i32,
+    generated_column: i32,
+    source_map: Option<&SourceMap>,
+    message: &str,
+) -> String {
+    // Minified lines and source-map columns are untrusted. Bound both the copied
+    // excerpt and its marker before allocating diagnostic output.
+    const MAX_SOURCE_EXCERPT_BYTES: usize = 4096;
+    source_map
+        .and_then(|source_map| {
+            let token = lookup_source_map_token(
+                source_map,
+                generated_line.try_into().ok()?,
+                generated_column.try_into().ok()?,
+            )?;
+            token.get_source()?;
+            let (line, column) = token.get_src();
+            let ctx = token.get_source_view()?.get_line(line)?;
+            if ctx.len() > MAX_SOURCE_EXCERPT_BYTES || column as usize > ctx.len() {
+                return None;
+            }
+
+            // Source-map columns count UTF-16 code units, not UTF-8 bytes. Only
+            // accept a character boundary, including the end of the source line.
+            let mut utf16_column = 0;
+            let mut byte_column = 0;
+            let mut padding = 0;
+            for ch in ctx.chars() {
+                if utf16_column >= column {
+                    break;
+                }
+                utf16_column += ch.len_utf16() as u32;
+                byte_column += ch.len_utf8();
+                padding += 1;
+            }
+            if utf16_column != column {
+                return None;
+            }
+            let underline = ctx.get(byte_column..)?.chars().count().max(1);
+            Some(format!(
+                "{name}:{line}:{column}: {message}\n\n{ctx}\n{}{}",
+                " ".repeat(padding),
+                "~".repeat(underline),
+            ))
+        })
+        .unwrap_or_else(|| format!("{name}:{generated_line}:{generated_column}: {message}"))
 }
 
 /// The source-mapped frames of a stack trace, rendered the way
@@ -178,4 +216,61 @@ pub fn extract_source_mapped_error(
     };
     let (message, custom_data) = deserialize_udf_custom_error(message, custom_data)?;
     Ok((message, frame_data, custom_data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_excerpt_preserves_valid_ranges_and_generated_fallback() -> anyhow::Result<()> {
+        let name = ModuleSpecifier::parse("convex:/user/root.js")?;
+        let map = SourceMap::from_slice(
+            br#"{"version":3,"sources":["root.ts"],"sourcesContent":["hello"],"names":[],"mappings":"oGAAA;KAAA","rangeMappings":"B;B"}"#,
+        )?;
+        for (line, column) in [(0, 99), (1, 0), (2, 0), (0, 106), (0, i32::MAX)] {
+            assert_eq!(
+                format_error_source_location(&name, line, column, Some(&map), "invalid import"),
+                format!("{name}:{line}:{column}: invalid import"),
+            );
+        }
+        assert_eq!(
+            format_error_source_location(&name, 0, 102, Some(&map), "invalid import"),
+            format!("{name}:0:2: invalid import\n\nhello\n  ~~~"),
+        );
+        assert_eq!(
+            format_error_source_location(&name, 1, 10, Some(&map), "invalid import"),
+            format!("{name}:0:5: invalid import\n\nhello\n     ~"),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn error_excerpt_validates_utf16_columns_and_limits_output() -> anyhow::Result<()> {
+        let name = ModuleSpecifier::parse("convex:/user/root.js")?;
+        for (content, column, excerpt) in [
+            ("é😀x".to_owned(), 3, Some("é😀x\n  ~")),
+            ("é😀x".to_owned(), 2, None),
+            ("é😀x".to_owned(), 5, None),
+            ("x".repeat(4097), 0, None),
+        ] {
+            let map = SourceMap::from_slice(&serde_json::to_vec(&serde_json::json!({
+                "version": 3,
+                "sources": ["root.ts"],
+                "sourcesContent": [content],
+                "names": [],
+                "mappings": "oGAAA",
+                "rangeMappings": "B",
+            }))?)?;
+            let expected = match excerpt {
+                Some(excerpt) => format!("{name}:0:{column}: invalid import\n\n{excerpt}"),
+                None => format!("{name}:0:{}: invalid import", 100 + column),
+            };
+            assert_eq!(
+                format_error_source_location(&name, 0, 100 + column, Some(&map), "invalid import"),
+                expected,
+            );
+        }
+        Ok(())
+    }
 }

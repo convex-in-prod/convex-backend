@@ -47,6 +47,7 @@ use value::NamespacedTableMapping;
 
 use super::ModuleCodeCacheResult;
 use crate::{
+    client::CancellationSignal,
     context_cache::ContextCache,
     environment::{
         helpers::syscall_error::{
@@ -165,7 +166,7 @@ impl<RT: Runtime> SyscallProvider<RT> for AuthConfigEnvironment {
                 source: self.auth_config_bundle.clone(),
                 source_map: self.source_map.clone(),
             })),
-            ModuleCodeCacheResult::noop(),
+            ModuleCodeCacheResult::Disabled,
         )))
     }
 
@@ -231,6 +232,7 @@ impl AuthConfigEnvironment {
         auth_config_bundle: ModuleSource,
         source_map: Option<SourceMap>,
         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
+        cancellation: CancellationSignal,
     ) -> anyhow::Result<AuthConfig> {
         let environment = Self {
             auth_config_bundle,
@@ -240,6 +242,8 @@ impl AuthConfigEnvironment {
         let (handle, state, mut timeout) = isolate
             .start_request(context_cache, permit, environment)
             .await?;
+        let _cancellation =
+            cancellation.bind_analysis_execution(handle.clone(), state.context_id.clone());
         scope!(let handle_scope, isolate.isolate());
         let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
         let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
