@@ -37,6 +37,7 @@ use common::{
         PersistenceReader,
         RepeatablePersistence,
     },
+    query_analysis_admission::QueryAnalysisAdmission,
     runtime::{
         Runtime,
         SpawnHandle,
@@ -454,6 +455,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
         udf_config: UdfConfig,
         modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
+        query_analysis_admission: Option<QueryAnalysisAdmission>,
     ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
         self.server
             .analyze(
@@ -461,6 +463,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
                 modules,
                 environment_variables,
                 self.deployment.name.clone(),
+                query_analysis_admission,
             )
             .await
     }
