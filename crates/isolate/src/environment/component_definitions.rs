@@ -70,6 +70,7 @@ use super::{
     SyscallProvider,
 };
 use crate::{
+    client::CancellationSignal,
     context_cache::ContextCache,
     environment::{
         helpers::syscall_error::{
@@ -121,6 +122,7 @@ impl AppDefinitionEvaluator {
         context_cache: &mut ContextCache,
         mut permit: ConcurrencyPermit,
         isolate: &mut Isolate<RT>,
+        cancellation: CancellationSignal,
     ) -> anyhow::Result<EvaluateAppDefinitionsResult> {
         let mut in_progress = BTreeSet::new();
         enum TraversalState {
@@ -181,6 +183,7 @@ impl AppDefinitionEvaluator {
                             &definitions,
                             filename,
                             Arc::new(source),
+                            &cancellation,
                         )
                         .await?;
                     permit = permit_;
@@ -201,6 +204,7 @@ impl AppDefinitionEvaluator {
         evaluated_components: &BTreeMap<ComponentDefinitionPath, ComponentDefinitionMetadata>,
         filename: &str,
         source: Arc<V8ModuleSource>,
+        cancellation: &CancellationSignal,
     ) -> anyhow::Result<(ComponentDefinitionMetadata, ConcurrencyPermit)> {
         let environment_variables = if path.is_root() {
             let mut env_vars = self.system_env_vars.clone();
@@ -218,6 +222,10 @@ impl AppDefinitionEvaluator {
 
         let (handle, state, mut timeout) =
             isolate.start_request(context_cache, permit, env).await?;
+        // Rebind for each definition: one canceled traversal must stop its
+        // next context too, without retaining authority over a later request.
+        let _cancellation =
+            cancellation.bind_analysis_execution(handle.clone(), state.context_id.clone());
         scope!(let handle_scope, isolate.isolate());
         let v8_context = v8::Context::new(handle_scope, v8::ContextOptions::default());
         let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
@@ -366,6 +374,7 @@ impl ComponentInitializerEvaluator {
         context_cache: &mut ContextCache,
         permit: ConcurrencyPermit,
         isolate: &mut Isolate<RT>,
+        cancellation: CancellationSignal,
     ) -> anyhow::Result<BTreeMap<Identifier, Resource>> {
         let filename = COMPONENT_CONFIG_FILE_NAME.to_string();
         let env = DefinitionEnvironment {
@@ -379,6 +388,8 @@ impl ComponentInitializerEvaluator {
         };
         let (handle, state, mut timeout) =
             isolate.start_request(context_cache, permit, env).await?;
+        let _cancellation =
+            cancellation.bind_analysis_execution(handle.clone(), state.context_id.clone());
         scope!(let handle_scope, isolate.isolate());
         let v8_context = v8::Context::new(handle_scope, v8::ContextOptions::default());
         let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
@@ -564,7 +575,7 @@ impl<RT: Runtime> SyscallProvider<RT> for DefinitionEnvironment {
         _timeout: &mut Timeout<RT>,
     ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>> {
         if path == &self.expected_filename {
-            return Ok(Some((self.source.clone(), ModuleCodeCacheResult::noop())));
+            return Ok(Some((self.source.clone(), ModuleCodeCacheResult::Disabled)));
         }
         if let Some(remainder) = path.strip_prefix("_componentDeps/") {
             let r: anyhow::Result<_> = try_anyhow!({
@@ -598,7 +609,7 @@ impl<RT: Runtime> SyscallProvider<RT> for DefinitionEnvironment {
             });
             return Ok(Some((
                 Arc::new(synthetic_module),
-                ModuleCodeCacheResult::noop(),
+                ModuleCodeCacheResult::Disabled,
             )));
         }
         anyhow::bail!(ErrorMetadata::bad_request(

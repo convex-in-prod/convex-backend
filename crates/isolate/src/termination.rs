@@ -168,6 +168,25 @@ impl ExecutionHandle {
     /// the stack.
     pub fn terminate(&self, reason: TerminationReason) {
         let mut inner = self.inner.lock();
+        self.terminate_locked(&mut inner, reason);
+    }
+
+    /// Cancellation belongs to one request, even if its sender outlives that
+    /// request and the worker has already accepted another one.
+    pub(crate) fn terminate_if_current(
+        &self,
+        context: &ContextId,
+        reason: TerminationReason,
+    ) -> bool {
+        let mut inner = self.inner.lock();
+        if !inner.context_stack.contains(&context.context_id) || inner.reason.is_some() {
+            return false;
+        }
+        self.terminate_locked(&mut inner, reason);
+        true
+    }
+
+    fn terminate_locked(&self, inner: &mut ExecutionHandleInner, reason: TerminationReason) {
         // N.B.: call terminate_execution under the lock to synchronize with
         // cancel_terminate_execution in `pop_context`
         self.interrupt.interrupt();
@@ -198,6 +217,10 @@ impl ExecutionHandle {
         } else {
             None
         }
+    }
+
+    pub(crate) fn is_terminated(&self) -> bool {
+        self.inner.lock().reason.is_some()
     }
 
     pub fn check_terminated(&self) -> anyhow::Result<()> {
@@ -337,6 +360,29 @@ impl ExecutionHandle {
         if let Some(ref stats) = self.inner.lock().heap_stats {
             stats.store(heap_stats);
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn late_cancellation_cannot_terminate_a_replacement_request() {
+        let handle = ExecutionHandle::cooperative();
+        let previous = handle.push_context(false);
+        handle.pop_context(previous.clone()).unwrap().unwrap();
+        let current = handle.push_context(false);
+        assert!(!handle.terminate_if_current(
+            &previous,
+            IsolateTerminationReason::UserTimeout(Duration::ZERO).into()
+        ));
+        handle.check_terminated().unwrap();
+        assert!(handle.terminate_if_current(
+            &current,
+            IsolateTerminationReason::UserTimeout(Duration::ZERO).into()
+        ));
+        assert!(handle.check_terminated().is_err());
     }
 }
 

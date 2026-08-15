@@ -1,6 +1,5 @@
 use std::{
     collections::{
-        btree_map::Entry,
         BTreeMap,
         VecDeque,
     },
@@ -15,7 +14,10 @@ use anyhow::{
     Context,
 };
 use common::{
-    errors::JsError,
+    errors::{
+        lookup_source_map_token,
+        JsError,
+    },
     json::JsonForm as _,
     knobs::{
         DATABASE_UDF_SYSTEM_TIMEOUT,
@@ -89,6 +91,7 @@ use value::{
 
 use super::ModuleCodeCacheResult;
 use crate::{
+    client::CancellationSignal,
     context_cache::ContextCache,
     environment::{
         helpers::{
@@ -110,7 +113,6 @@ use crate::{
     execution_scope::ExecutionScope,
     helpers::{
         self,
-        source_map_from_slice,
     },
     isolate::Isolate,
     metrics::{
@@ -118,7 +120,16 @@ use crate::{
         log_source_map_origin_in_separate_module,
         log_source_map_token_lookup_failed,
     },
-    module_cache::V8ModuleSource,
+    module_cache::{
+        AnalysisModuleSnapshot,
+        V8ModuleSource,
+    },
+    module_diagnostics::{
+        AnalysisDiagnostic,
+        ModulePhase,
+        ModulePhaseGuard,
+        ModuleRequestKind,
+    },
     request_scope::RequestScope,
     strings::{
         self,
@@ -128,18 +139,397 @@ use crate::{
 };
 
 pub struct AnalyzeEnvironment {
-    modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>>,
-    // This is used to lazily cache the result of sourcemap::SourceMap::from_slice across
-    // modules and functions. There are certain source maps whose source origin we don't
-    // need to construct during analysis (i.e. if all of the UDFs it defines have function
-    // bodies outside the current module), so keeping this mapping lazy allows for avoiding
-    // unnecessary source map parsing.
-    source_maps_cache: BTreeMap<CanonicalizedModulePath, Option<sourcemap::SourceMap>>,
+    diagnostic: AnalysisDiagnostic,
+    modules: Arc<AnalysisModuleSnapshot>,
     rng: ChaCha12Rng,
     unix_timestamp: UnixTimestamp,
     environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
     // Collect logs during analysis for push failure reporting (max 100 entries)
     collected_logs: VecDeque<String>,
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use common::runtime::UnixTimestamp;
+    use errors::ErrorMetadataAnyhowExt;
+    use model::modules::module_versions::{
+        FullModuleSource,
+        ModuleSource,
+    };
+    use runtime::prod::ProdRuntime;
+
+    use super::*;
+    use crate::ConcurrencyLimiter;
+
+    #[test]
+    fn shared_compilation_preserves_fresh_globals_cycles_and_environment() -> anyhow::Result<()> {
+        use rand::Rng;
+        crate::client::initialize_v8();
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let root = "import { check } from './_deps/a.js'; check(); if (globalThis.seen) throw \
+                        new Error('shared globals'); globalThis.seen = true; if \
+                        (process.env.VALUE !== 'one') throw new Error('fresh environment'); if \
+                        (Date.now() !== 123456) throw new Error('import timestamp'); if \
+                        (Math.random().toString() !== process.env.RANDOM) throw new Error('random \
+                        stream was not reset');";
+            let expected_random = ChaCha12Rng::from_seed([7; 32]).random::<f64>().to_string();
+            let modules = Arc::new(AnalysisModuleSnapshot::from(
+                [
+                    ("root.js", root),
+                    ("second.js", root),
+                    ("invalid.js", "\nimport './_deps/unresolvable.js';"),
+                    ("_deps/unresolvable.js", "import 'bare_import';"),
+                    ("throw.js", "\nthrow new Error('source-map fallback');"),
+                    (
+                        "_deps/a.js",
+                        "import { id } from './b.js'; export const tag = 'fresh'; export function \
+                         check() { if (id() !== tag) throw new Error('cycle'); }",
+                    ),
+                    (
+                        "_deps/b.js",
+                        "import { tag } from './a.js'; export function id() { return tag; }",
+                    ),
+                ]
+                .into_iter()
+                .map(|(path, source)| {
+                    Ok((
+                        path.parse()?,
+                        Arc::new(V8ModuleSource::new(FullModuleSource {
+                            source: ModuleSource::new(source),
+                            source_map: matches!(path, "invalid.js" | "throw.js").then(|| {
+                                // The failing code is on line one before the
+                                // previous line's range; keep generated locations.
+                                serde_json::json!({
+                                    "version": 3,
+                                    "sources": ["original.ts"],
+                                    "sourcesContent": ["original"],
+                                    "names": [],
+                                    "mappings": "oGAAA",
+                                    "rangeMappings": "B",
+                                })
+                                .to_string()
+                                .into()
+                            }),
+                        })),
+                    ))
+                })
+                .collect::<anyhow::Result<BTreeMap<_, _>>>()?,
+            ));
+            let mut isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
+            let mut contexts = ContextCache::new();
+            let limiter = ConcurrencyLimiter::unlimited();
+            for (path, environment, expected_error) in [
+                ("root.js", "one", None),
+                ("second.js", "one", None),
+                ("root.js", "two", Some("fresh environment")),
+                ("invalid.js", "one", Some("during registration")),
+                ("throw.js", "one", Some("source-map fallback")),
+            ] {
+                let permit = limiter
+                    .acquire(Arc::new("analysis_snapshot_test".to_owned()), false)
+                    .await;
+                let mut clean = false;
+                let result = AnalyzeEnvironment::analyze(
+                    &mut isolate,
+                    &mut contexts,
+                    permit,
+                    &mut clean,
+                    UdfConfig {
+                        server_version: semver::Version::new(1, 36, 0),
+                        import_phase_rng_seed: [7; 32],
+                        import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
+                    },
+                    modules.clone(),
+                    path.parse()?,
+                    BTreeMap::from([
+                        ("VALUE".parse()?, environment.parse()?),
+                        ("RANDOM".parse()?, expected_random.parse()?),
+                    ]),
+                    CancellationSignal::new_for_test(),
+                )
+                .await?;
+                if let Some(expected_error) = expected_error {
+                    let error = result.unwrap_err();
+                    assert!(error.message.contains(expected_error), "{}", error.message);
+                    if path == "invalid.js" {
+                        assert!(error.message.contains("Analysis of invalid.js"));
+                        assert!(error.message.contains("_deps/unresolvable.js"));
+                        assert!(error.message.contains("convex:/invalid.js:1:"));
+                        assert!(!error.message.contains("original.ts"));
+                    } else if path == "throw.js" {
+                        let frames = error.frames.as_ref().unwrap();
+                        let frame = frames.0.first().unwrap();
+                        assert_eq!(frame.file_name.as_deref(), Some("convex:/throw.js"));
+                        assert_eq!(frame.line_number, Some(2));
+                    }
+                } else {
+                    assert!(result.is_ok());
+                }
+                assert!(clean);
+                if path == "second.js" {
+                    let ModuleCodeCacheResult::Cached(_, replace) =
+                        modules.lookup(&"_deps/a.js".parse()?).unwrap().1
+                    else {
+                        anyhow::bail!("dependency compilation was not retained");
+                    };
+                    // V8 must reject corrupt bytes, compile the original source
+                    // and replace the cache without sharing evaluated globals.
+                    replace(Arc::from([1_u8, 2, 3]));
+                    // V8 checks its isolate-local cache before supplied bytes.
+                    // The first two roots test fresh contexts on one isolate;
+                    // a new isolate forces the third root to check the bytes.
+                    drop(contexts);
+                    drop(isolate);
+                    isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
+                    contexts = ContextCache::new();
+                }
+            }
+            let ModuleCodeCacheResult::Cached(data, _) =
+                modules.lookup(&"_deps/a.js".parse()?).unwrap().1
+            else {
+                anyhow::bail!("rejected cache data was not regenerated");
+            };
+            assert!(data.len() > 3);
+            anyhow::Ok(())
+        })
+    }
+
+    #[test]
+    fn source_mapped_exports_use_zero_based_generated_coordinates() -> anyhow::Result<()> {
+        crate::client::initialize_v8();
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let mut isolate = Isolate::new(rt, Some(Duration::from_secs(10)), 1 << 26);
+            let mut contexts = ContextCache::new();
+            let limiter = ConcurrencyLimiter::unlimited();
+            // Generated line zero maps to original line ten; line one maps to
+            // eleven. Unmapped lines and single-field segments have no position.
+            // A range on a prior line must not subtract its column from this
+            // handler's smaller column, even when this line has a later token.
+            for (prefix, mappings, range_mappings, start_lineno) in [
+                ("", "AAUA;AACA", "", Some(10)),
+                ("", "A;A", "", None),
+                ("\n", "oGAAA", "B", None),
+                ("\n", "oGAAA;oGAAA", "B;B", None),
+                ("\n", "AAAA", "", None),
+            ] {
+                let modules = Arc::new(AnalysisModuleSnapshot::from(BTreeMap::from([(
+                    "http.js".parse()?,
+                    Arc::new(V8ModuleSource::new(FullModuleSource {
+                        source: ModuleSource::new(&format!(
+                            "{prefix}export function run() {{}}\nrun.isQuery = true;\nexport \
+                             default {{ isRouter: true, getRoutes() {{ return [['/test', 'GET', \
+                             run]]; }} }};",
+                        )),
+                        source_map: Some(
+                            serde_json::json!({
+                                "version": 3,
+                                "sources": ["http.ts"],
+                                "sourcesContent": [""],
+                                "names": [],
+                                "mappings": mappings,
+                                "rangeMappings": range_mappings,
+                            })
+                            .to_string()
+                            .into(),
+                        ),
+                    })),
+                )])));
+                let expected = start_lineno.map(|start_lineno| AnalyzedSourcePosition {
+                    path: "http.js".parse().unwrap(),
+                    start_lineno,
+                    start_col: 0,
+                });
+                for _ in 0..2 {
+                    let permit = limiter
+                        .acquire(Arc::new("analysis_source_map_test".to_owned()), false)
+                        .await;
+                    let mut clean = false;
+                    let analyzed = AnalyzeEnvironment::analyze(
+                        &mut isolate,
+                        &mut contexts,
+                        permit,
+                        &mut clean,
+                        UdfConfig {
+                            server_version: semver::Version::new(1, 36, 0),
+                            import_phase_rng_seed: [7; 32],
+                            import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
+                        },
+                        modules.clone(),
+                        "http.js".parse()?,
+                        BTreeMap::new(),
+                        CancellationSignal::new_for_test(),
+                    )
+                    .await??;
+                    assert!(clean);
+                    assert_eq!(analyzed.functions.len(), 1);
+                    assert_eq!(analyzed.functions[0].pos, expected);
+                    let routes = analyzed.http_routes.as_ref().unwrap();
+                    assert_eq!(routes.len(), 1);
+                    assert_eq!(routes[0].pos, expected);
+                    assert_eq!(analyzed.source_index, Some(0));
+                }
+            }
+            anyhow::Ok(())
+        })
+    }
+
+    #[test]
+    fn imported_http_handler_does_not_lookup_root_source_map() -> anyhow::Result<()> {
+        crate::client::initialize_v8();
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let mut isolate = Isolate::new(rt, Some(Duration::from_secs(10)), 1 << 26);
+            let mut contexts = ContextCache::new();
+            let limiter = ConcurrencyLimiter::unlimited();
+            let permit = limiter
+                .acquire(Arc::new("analysis_source_map_test".to_owned()), false)
+                .await;
+            // The root's range starts at column 100 on line zero. Looking up
+            // the imported handler on line one at a smaller column would
+            // underflow the source-map library's range offset.
+            let root = format!(
+                "import {{ run }} from './_deps/routes.js';{}\nexport default {{ isRouter: true, \
+                 getRoutes() {{ return [['/test', 'GET', run]]; }} }};",
+                " ".repeat(80),
+            );
+            let modules = Arc::new(AnalysisModuleSnapshot::from(BTreeMap::from([
+                (
+                    "http.js".parse()?,
+                    Arc::new(V8ModuleSource::new(FullModuleSource {
+                        source: ModuleSource::new(&root),
+                        source_map: Some(
+                            serde_json::json!({
+                                "version": 3,
+                                "sources": ["http.ts"],
+                                "names": [],
+                                "mappings": "oGAAA",
+                                "rangeMappings": "B",
+                            })
+                            .to_string()
+                            .into(),
+                        ),
+                    })),
+                ),
+                (
+                    "_deps/routes.js".parse()?,
+                    Arc::new(V8ModuleSource::new(FullModuleSource {
+                        source: ModuleSource::new("\nexport function run() {}"),
+                        source_map: None,
+                    })),
+                ),
+            ])));
+            let mut clean = false;
+            let analyzed = AnalyzeEnvironment::analyze(
+                &mut isolate,
+                &mut contexts,
+                permit,
+                &mut clean,
+                UdfConfig {
+                    server_version: semver::Version::new(1, 36, 0),
+                    import_phase_rng_seed: [7; 32],
+                    import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
+                },
+                modules,
+                "http.js".parse()?,
+                BTreeMap::new(),
+                CancellationSignal::new_for_test(),
+            )
+            .await??;
+            assert!(clean);
+            let routes = analyzed.http_routes.as_ref().unwrap();
+            assert_eq!(routes.len(), 1);
+            assert_eq!(routes[0].pos, None);
+            anyhow::Ok(())
+        })
+    }
+
+    #[test]
+    fn analysis_termination_preserves_root_and_failing_phase() -> anyhow::Result<()> {
+        crate::client::initialize_v8();
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            for (source, cancel_early, code, phase) in [
+                ("while (true) {}", true, "AnalysisCancelled", "evaluation"),
+                (
+                    "while (true) {}",
+                    false,
+                    "AnalysisExecutionTimeout",
+                    "evaluation",
+                ),
+                (
+                    "export function run() {} run.isQuery = true; run.exportArgs = () => { while \
+                     (true) {} };",
+                    false,
+                    "AnalysisExecutionTimeout",
+                    "export_inspection",
+                ),
+                (
+                    "export default { isRouter: true, getRoutes() { return { length: { valueOf() \
+                     { while (true) {} } } }; } };",
+                    true,
+                    "AnalysisCancelled",
+                    "export_inspection",
+                ),
+                (
+                    "export default { isRouter: true, getRoutes() { return []; } }; export const \
+                     experimental_reuseContext = { get queries() { while (true) {} } };",
+                    true,
+                    "AnalysisCancelled",
+                    "export_inspection",
+                ),
+            ] {
+                let mut isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
+                let mut contexts = ContextCache::new();
+                let limiter = ConcurrencyLimiter::unlimited();
+                let permit = limiter
+                    .acquire(Arc::new("analysis_cancellation_test".to_owned()), false)
+                    .await;
+                let modules = Arc::new(AnalysisModuleSnapshot::from(BTreeMap::from([(
+                    "http.js".parse()?,
+                    Arc::new(V8ModuleSource::new(FullModuleSource {
+                        source: ModuleSource::new(source),
+                        source_map: None,
+                    })),
+                )])));
+                let cancellation = CancellationSignal::new_for_test();
+                let cancel = cancellation.clone();
+                let cancel_task = tokio::spawn(async move {
+                    if cancel_early {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        cancel.cancel();
+                    }
+                });
+                let result = AnalyzeEnvironment::analyze(
+                    &mut isolate,
+                    &mut contexts,
+                    permit,
+                    &mut false,
+                    UdfConfig {
+                        server_version: semver::Version::new(1, 36, 0),
+                        import_phase_rng_seed: [7; 32],
+                        import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
+                    },
+                    modules,
+                    "http.js".parse()?,
+                    BTreeMap::new(),
+                    cancellation,
+                )
+                .await;
+                cancel_task.await?;
+                let error = result.unwrap_err();
+                assert_eq!(error.short_msg(), code);
+                assert!(format!("{error:#}").contains("http.js"));
+                assert!(format!("{error:#}").contains(phase), "{error:#}");
+            }
+            anyhow::Ok(())
+        })
+    }
 }
 
 impl OpProvider for AnalyzeEnvironment {
@@ -203,8 +593,7 @@ impl<RT: Runtime> SyscallProvider<RT> for AnalyzeEnvironment {
         _timeout: &mut Timeout<RT>,
     ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>> {
         let p = ModulePath::from_str(path)?.canonicalize();
-        let result = self.modules.get(&p).cloned();
-        Ok(result.map(|m| (m, ModuleCodeCacheResult::noop())))
+        Ok(self.modules.lookup(&p))
     }
 
     fn syscall(&mut self, name: &str, _args: JsonValue) -> anyhow::Result<JsonValue> {
@@ -225,6 +614,12 @@ impl<RT: Runtime> SyscallProvider<RT> for AnalyzeEnvironment {
 impl<RT: Runtime> JsEnvironment<RT> for AnalyzeEnvironment {
     type AsyncResolver = v8::Global<v8::PromiseResolver>;
     type SyscallProvider = Self;
+
+    const MODULE_REQUEST_KIND: ModuleRequestKind = ModuleRequestKind::Analysis;
+
+    fn analysis_diagnostic(&self) -> Option<AnalysisDiagnostic> {
+        Some(self.diagnostic.clone())
+    }
 
     fn syscall_provider(&mut self) -> &mut Self::SyscallProvider {
         self
@@ -278,16 +673,18 @@ impl AnalyzeEnvironment {
         permit: ConcurrencyPermit,
         isolate_clean: &mut bool,
         udf_config: UdfConfig,
-        modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>>,
+        modules: Arc<AnalysisModuleSnapshot>,
         to_analyze: CanonicalizedModulePath,
         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
+        cancellation: CancellationSignal,
     ) -> anyhow::Result<Result<AnalyzedModule, JsError>> {
         anyhow::ensure!(!to_analyze.is_deps());
         let rng = ChaCha12Rng::from_seed(udf_config.import_phase_rng_seed);
         let unix_timestamp = udf_config.import_phase_unix_timestamp;
+        let diagnostic = AnalysisDiagnostic::new(to_analyze.clone());
         let environment = AnalyzeEnvironment {
+            diagnostic: diagnostic.clone(),
             modules,
-            source_maps_cache: BTreeMap::new(),
             rng,
             unix_timestamp,
             environment_variables,
@@ -296,6 +693,8 @@ impl AnalyzeEnvironment {
         let (handle, state, mut timeout) = isolate
             .start_request(context_cache, permit, environment)
             .await?;
+        let _cancellation =
+            cancellation.bind_analysis_execution(handle.clone(), state.context_id.clone());
         scope!(let handle_scope, isolate.isolate());
         let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
         let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
@@ -306,7 +705,20 @@ impl AnalyzeEnvironment {
         // Perform a microtask checkpoint one last time before taking the environment
         // to ensure the microtask queue is empty. Otherwise, JS from this request may
         // leak to a subsequent one on isolate reuse.
-        isolate_context.checkpoint();
+        {
+            // Optional export reads can return None after termination while
+            // analysis still returns Ok. Preserve that earlier failing phase.
+            let diagnostic = (result.as_ref().is_ok_and(|result| result.is_ok())
+                && !handle.is_terminated())
+            .then(|| diagnostic.clone());
+            let _cleanup = ModulePhaseGuard::new(
+                ModuleRequestKind::Analysis,
+                ModulePhase::Cleanup,
+                diagnostic,
+                None,
+            );
+            isolate_context.checkpoint();
+        }
         *isolate_clean = true;
 
         let error_logs = if let Ok(Err(_)) = result {
@@ -325,11 +737,27 @@ impl AnalyzeEnvironment {
         drop(timeout);
 
         // Suppress the original error if the isolate was forcibly terminated.
-        if let Err(e) = handle.take_termination_error("analyze")? {
+        let user_timeout = matches!(
+            handle.is_not_clean(),
+            Some(crate::isolate::IsolateNotClean::UserTimeout)
+        );
+        if let Err(mut e) = handle
+            .take_termination_error("analyze")
+            .with_context(|| diagnostic.describe())?
+        {
+            e.message = format!("{}: {}", diagnostic.describe(), e.message);
+            if user_timeout {
+                return Err(
+                    ErrorMetadata::bad_request("AnalysisExecutionTimeout", e.message).into(),
+                );
+            }
             return Ok(Err(e));
         }
 
         if let Ok(Err(mut js_error)) = result {
+            // Preserve the same root/module/phase descriptor for ordinary
+            // failures as for forced termination, after cleanup has finished.
+            js_error.message = format!("{}: {}", diagnostic.describe(), js_error.message);
             if !error_logs.is_empty() {
                 let logs_text = error_logs.iter().cloned().collect::<Vec<_>>().join("\n");
                 js_error.message = format!("{}\n\n{}", js_error.message, logs_text);
@@ -337,28 +765,7 @@ impl AnalyzeEnvironment {
             return Ok(Err(js_error));
         }
 
-        result
-    }
-
-    fn get_source_map(
-        &mut self,
-        path: &CanonicalizedModulePath,
-    ) -> anyhow::Result<&Option<sourcemap::SourceMap>> {
-        match self.source_maps_cache.entry(path.clone()) {
-            Entry::Occupied(e) => Ok(e.into_mut()),
-            Entry::Vacant(e) => {
-                let module_config = self
-                    .modules
-                    .get(path)
-                    .context("could not find module config in environment")?;
-                let source_map = module_config
-                    .source_map()
-                    .and_then(|m| source_map_from_slice(m.as_bytes()));
-
-                // cache it
-                Ok(e.insert(source_map))
-            },
-        }
+        result.with_context(|| diagnostic.describe())
     }
 
     async fn run_analyze<RT: Runtime>(
@@ -388,7 +795,9 @@ impl AnalyzeEnvironment {
                     || e.is::<SystemModuleNotFoundError>()
                     || e.is::<InvalidModulePathError>()
                 {
-                    return Ok(Err(JsError::from_message(format!("{e}"))));
+                    // The import wrapper carries the generated location when
+                    // its source map is unusable. Keep it with the same error.
+                    return Ok(Err(JsError::from_message(e.to_string())));
                 }
                 match e.downcast::<JsError>() {
                     Ok(e) => {
@@ -404,14 +813,24 @@ impl AnalyzeEnvironment {
         };
 
         // Gather UDFs, HTTP action routes, and crons
-        let functions = match udf_analyze(&mut scope, &module, &path)? {
+        let _inspection = ModulePhaseGuard::new(
+            ModuleRequestKind::Analysis,
+            ModulePhase::ExportInspection,
+            Some(scope.state()?.environment.diagnostic.clone()),
+            None,
+        );
+        // Keep at most one uncached map per root through inspection. A map
+        // refused by the shared budget must not be reparsed for every export.
+        // Positions from other modules are deliberately not emitted below.
+        let source_map = scope.state()?.environment.modules.source_map(&path)?;
+        let functions = match udf_analyze(&mut scope, &module, &path, source_map.as_deref())? {
             Err(e) => return Ok(Err(e)),
             Ok(funcs) => WithHeapSize::from(funcs),
         };
 
         let mut http_routes = None;
         if path.is_http() {
-            let routes = match http_analyze(&mut scope, &module, &path)? {
+            let routes = match http_analyze(&mut scope, &module, &path, source_map.as_deref())? {
                 Err(err) => {
                     return Ok(Err(err));
                 },
@@ -432,23 +851,17 @@ impl AnalyzeEnvironment {
         }
 
         // Get source_index of current module
-        let source_index = scope
-            .state_mut()?
-            .environment
-            .get_source_map(&path)?
-            .as_ref()
-            .and_then(|source_map| {
-                for (i, filename) in source_map.sources().enumerate() {
-                    if Path::new(filename).file_stem()
-                        != Path::new(module_specifier.path()).file_stem()
-                    {
-                        continue;
-                    }
-
-                    return source_map.get_source_contents(i as u32).map(|_| i as u32);
+        let source_index = source_map.as_ref().and_then(|source_map| {
+            for (i, filename) in source_map.sources().enumerate() {
+                if Path::new(filename).file_stem() != Path::new(module_specifier.path()).file_stem()
+                {
+                    continue;
                 }
-                None
-            });
+
+                return source_map.get_source_contents(i as u32).map(|_| i as u32);
+            }
+            None
+        });
 
         let module_namespace = module
             .get_module_namespace()
@@ -620,11 +1033,13 @@ fn parse_returns_validator<'s, RT: Runtime>(
     };
     Ok(Ok(returns))
 }
+
 #[fastrace::trace]
 fn udf_analyze<RT: Runtime>(
     scope: &mut ExecutionScope<RT, AnalyzeEnvironment>,
     module: &v8::Local<v8::Module>,
     module_path: &CanonicalizedModulePath,
+    source_map: Option<&sourcemap::SourceMap>,
 ) -> anyhow::Result<Result<Vec<AnalyzedFunction>, JsError>> {
     let namespace = module
         .get_module_namespace()
@@ -718,38 +1133,33 @@ fn udf_analyze<RT: Runtime>(
             },
         };
 
-        // These are originally zero-indexed, so we just add 1
+        // V8 and source-map lookup both use zero-based generated coordinates.
         let lineno = handler
             .get_script_line_number()
-            .ok_or_else(|| anyhow!("Failed to get function line number"))?
-            + 1;
+            .ok_or_else(|| anyhow!("Failed to get function line number"))?;
         let linecol = handler
             .get_script_column_number()
-            .ok_or_else(|| anyhow!("Failed to get function column number"))?
-            + 1;
+            .ok_or_else(|| anyhow!("Failed to get function column number"))?;
 
-        // Get the appropriate source map to look in
-        let (fn_source_map, fn_canon_path) = {
+        let fn_canon_path = {
             let resource_name_val = handler
                 .get_script_origin(scope)
                 .resource_name()
                 .context("resource_name was None")?;
             let resource_name = resource_name_val.to_rust_string_lossy(scope);
             let resource_url = module_specifier_from_str(&resource_name)?;
-            let canon_path = path_from_module_specifier(&resource_url)?;
-            (
-                scope.state_mut()?.environment.get_source_map(&canon_path)?,
-                canon_path,
-            )
+            path_from_module_specifier(&resource_url)?
         };
 
         let canonicalized_name: FunctionName = property_name
             .parse()
             .map_err(|e| invalid_function_name_error(module_path, &e))?;
-        if let Some(Some(token)) = fn_source_map.as_ref().map(|sm| sm.lookup_token(lineno, linecol))
-            // This condition is in place so that we don't have to jump to source in source mappings
-            // to get back to the original source. This logic gets complicated and is not strictly necessary now
-            && fn_canon_path.as_str() == module_path.as_str()
+        if fn_canon_path == *module_path
+            && let Some(token) =
+                source_map.and_then(|sm| lookup_source_map_token(sm, lineno, linecol))
+            // Single-field segments explicitly mark generated code as unmapped.
+            // Their inherited source coordinates do not identify a source position.
+            && token.has_source()
         {
             // Source map is valid; proceed with mapping in original source map
             functions.push(AnalyzedFunction::new(
@@ -778,7 +1188,7 @@ fn udf_analyze<RT: Runtime>(
             // Log reason for fallback
             if fn_canon_path.as_str() != module_path.as_str() {
                 log_source_map_origin_in_separate_module();
-            } else if fn_source_map.is_none() {
+            } else if source_map.is_none() {
                 log_source_map_missing();
             } else {
                 log_source_map_token_lookup_failed();
@@ -805,6 +1215,7 @@ fn http_analyze<RT: Runtime>(
     scope: &mut ExecutionScope<RT, AnalyzeEnvironment>,
     module: &v8::Local<v8::Module>,
     module_path: &CanonicalizedModulePath,
+    source_map: Option<&sourcemap::SourceMap>,
 ) -> anyhow::Result<Result<AnalyzedHttpRoutes, JsError>> {
     let mut http_routes: Vec<AnalyzedHttpRoute> = vec![];
 
@@ -897,11 +1308,14 @@ fn http_analyze<RT: Runtime>(
     let Some(len): Option<v8::Local<v8::Value>> = routes_arr.get(scope, length_str) else {
         return routes_error("return value is not an array");
     };
-    let len = len
+    // Numeric conversion can execute user code and be interrupted by
+    // cancellation. Let analysis cleanup report termination instead of panicking.
+    let Some(len) = len
         .int32_value(scope)
-        .expect("length could not be converted to i32")
-        .try_into()
-        .expect("length could not be converted to u32");
+        .and_then(|len| u32::try_from(len).ok())
+    else {
+        return routes_error("array length is not a nonnegative integer");
+    };
 
     for i in 0..len {
         let Some(entry) = routes_arr.get_index(scope, i) else {
@@ -966,43 +1380,38 @@ fn http_analyze<RT: Runtime>(
             },
         };
 
-        // These are originally zero-indexed, so we just add 1
+        // V8 and source-map lookup both use zero-based generated coordinates.
         let lineno = handler
             .get_script_line_number()
-            .ok_or_else(|| anyhow!("Failed to get function line number"))?
-            + 1;
+            .ok_or_else(|| anyhow!("Failed to get function line number"))?;
         let linecol = handler
             .get_script_column_number()
-            .ok_or_else(|| anyhow!("Failed to get function column number"))?
-            + 1;
+            .ok_or_else(|| anyhow!("Failed to get function column number"))?;
 
-        // Get the appropriate source map to look in
-        let (fn_source_map, fn_canon_path) = {
+        let fn_canon_path = {
             let resource_name_val = handler
                 .get_script_origin(scope)
                 .resource_name()
                 .context("resource_name was None")?;
             let resource_name = resource_name_val.to_rust_string_lossy(scope);
             let resource_url = module_specifier_from_str(&resource_name)?;
-            let canon_path = path_from_module_specifier(&resource_url)?;
-            let source_map = scope.state_mut()?.environment.get_source_map(&canon_path)?;
-            (source_map, canon_path)
+            path_from_module_specifier(&resource_url)?
         };
 
-        let source_pos = fn_source_map
-            .as_ref()
-            .and_then(|sm| sm.lookup_token(lineno, linecol))
-            .and_then(|token| {
-                if fn_canon_path.as_str() == module_path.as_str() {
-                    Some(AnalyzedSourcePosition {
-                        path: fn_canon_path,
-                        start_lineno: token.get_src_line(),
-                        start_col: token.get_src_col(),
-                    })
-                } else {
-                    None
-                }
-            });
+        // This map describes only the root. A dependency's coordinates must
+        // not reach its range lookup, even when the position will be omitted.
+        let source_pos = if fn_canon_path == *module_path {
+            source_map
+                .and_then(|sm| lookup_source_map_token(sm, lineno, linecol))
+                .filter(|token| token.has_source())
+                .map(|token| AnalyzedSourcePosition {
+                    path: fn_canon_path,
+                    start_lineno: token.get_src_line(),
+                    start_col: token.get_src_col(),
+                })
+        } else {
+            None
+        };
         if source_pos.is_none() {
             tracing::warn!("Failed to resolve {module_path:?}:{path}");
         }
