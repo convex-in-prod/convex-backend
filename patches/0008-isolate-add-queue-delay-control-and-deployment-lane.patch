@@ -9,6 +9,12 @@ oldest eligible external request, keep deadline-driven expiry active while no
 worker class is eligible, and exempt dependency and control-plane work from
 inappropriate adaptive shedding.
 
+Separate overload detection from adaptive shedding with a shed-age threshold
+that defaults to twice the configured target, preserving target-only
+deployments. Require the shared ordinary, independent-action, and dependency
+hard age to exceed that threshold while retaining the control-plane lane's
+separate longer deadline.
+
 Retain each external entry's hard deadline through low-priority active-
 JavaScript permit acquisition before worker assignment. Keep a non-consuming
 expiry companion polled while a selected request waits for that permit, so every
@@ -42,21 +48,21 @@ rollout, rollback, cancellation, and telemetry contract.
  .../dependency_overflow.rs                    |  302 ---
  .../src/application_function_runner/mod.rs    |   10 +-
  crates/common/src/codel_queue.rs              |  476 +++-
- crates/common/src/knobs.rs                    |  118 +-
+ crates/common/src/knobs.rs                    |  137 +-
  crates/common/src/lib.rs                      |    2 +-
  crates/isolate/Cargo.toml                     |    1 +
- crates/isolate/src/client.rs                  | 1440 ++++++++++--
- crates/isolate/src/isolate_queue.rs           | 2093 +++++++++++++++++
+ crates/isolate/src/client.rs                  | 1444 +++++++++--
+ crates/isolate/src/isolate_queue.rs           | 2171 +++++++++++++++++
  crates/isolate/src/lib.rs                     |    1 +
  crates/isolate/src/metrics.rs                 |  308 ++-
  patches/dependency_capacity/README.md         |    7 +-
  .../dependency_capacity/design_reference.md   |  201 +-
- patches/isolate_queue_control/README.md       |  435 ++++
- .../deployment_lane_design_reference.md       |  782 ++++++
+ patches/isolate_queue_control/README.md       |  442 ++++
+ .../deployment_lane_design_reference.md       |  783 ++++++
  patches/reuse_http_action_contexts/README.md  |    1 +
- self-hosted/advanced/knobs.md                 |   96 +-
- self-hosted/docker/docker-compose.yml         |    7 +
- 18 files changed, 5616 insertions(+), 665 deletions(-)
+ self-hosted/advanced/knobs.md                 |   99 +-
+ self-hosted/docker/docker-compose.yml         |    8 +
+ 18 files changed, 5729 insertions(+), 665 deletions(-)
  delete mode 100644 crates/application/src/application_function_runner/dependency_overflow.rs
  create mode 100644 crates/isolate/src/isolate_queue.rs
  create mode 100644 patches/isolate_queue_control/README.md
@@ -1073,7 +1079,7 @@ index 83106b6e8efa9d9ceada05ba3af13ff4fab65e49..ac93d31370fd607530cc958ccbe453b8
              }
              return Poll::Pending;
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 5ad304f8a63fe9a790401ea07ef6d8f904664ca0..6c1761815d65ad684d550e2bd765cbd79391b83f 100644
+index 5ad304f8a63fe9a790401ea07ef6d8f904664ca0..c9677efe2bdf62027c6fc6412ed239d86f099180 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -68,6 +68,29 @@ fn validate_usize_strict_nonzero(name: &str, value: usize) -> anyhow::Result<usi
@@ -1106,7 +1112,7 @@ index 5ad304f8a63fe9a790401ea07ef6d8f904664ca0..6c1761815d65ad684d550e2bd765cbd7
  /// This exists solely to allow knobs to have separate defaults for local
  /// execution and prod (running in Nomad). Don't export this outside of
  /// this module. We assume that if we're running in Nomad, we're in production
-@@ -968,59 +991,69 @@ pub static DATABASE_UDF_SYSTEM_TIMEOUT: LazyLock<Duration> =
+@@ -968,59 +991,88 @@ pub static DATABASE_UDF_SYSTEM_TIMEOUT: LazyLock<Duration> =
  pub static ISOLATE_ANALYZE_USER_TIMEOUT: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_ANALYZE_USER_TIMEOUT_SECONDS", 4)));
  
@@ -1191,8 +1197,27 @@ index 5ad304f8a63fe9a790401ea07ef6d8f904664ca0..6c1761815d65ad684d550e2bd765cbd7
 +    env_config_duration_millis_strict("ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS", 1000)
 +});
 +
-+/// Hard maximum queue age for every lane under the lane-aware isolate queue
-+/// policy. This must be greater than twice the queueing-delay target.
++/// Queue age above which an overloaded lane adaptively sheds ordinary and
++/// independent-action work. This must be greater than the queueing-delay
++/// target. When unset, this is twice the configured target.
++pub static ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS: LazyLock<Duration> = LazyLock::new(|| {
++    let name = "ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS";
++    let Some(millis) = env_config_optional_usize_strict(name) else {
++        return ISOLATE_QUEUE_DELAY_TARGET_MILLIS
++            .checked_mul(2)
++            .unwrap_or_else(|| {
++                panic!("Invalid value for {name}: twice the delay target overflows")
++            });
++    };
++    let millis = millis
++        .try_into()
++        .unwrap_or_else(|_| panic!("Invalid value for {name}: milliseconds do not fit in u64"));
++    Duration::from_millis(millis)
++});
++
++/// Hard maximum queue age for ordinary, independent-action, and dependency
++/// lanes under the lane-aware isolate queue policy. This must be greater than
++/// the adaptive-shed threshold.
 +pub static ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS: LazyLock<Duration> =
 +    LazyLock::new(|| env_config_duration_millis_strict("ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS", 5000));
 +
@@ -1214,7 +1239,7 @@ index 5ad304f8a63fe9a790401ea07ef6d8f904664ca0..6c1761815d65ad684d550e2bd765cbd7
  
  /// The size of the pending commits in the committer queue. This is a FIFO
  /// queue, so if the queue is too large, we run into a risk of all requests
-@@ -1163,9 +1196,10 @@ pub static APPLICATION_MAX_CONCURRENT_UPLOADS: LazyLock<usize> =
+@@ -1163,9 +1215,10 @@ pub static APPLICATION_MAX_CONCURRENT_UPLOADS: LazyLock<usize> =
  
  /// The number of modules to analyze concurrently during a push.
  ///
@@ -1227,7 +1252,7 @@ index 5ad304f8a63fe9a790401ea07ef6d8f904664ca0..6c1761815d65ad684d550e2bd765cbd7
  
  /// Set a 64MB limit on the heap size.
  pub static ISOLATE_MAX_USER_HEAP_SIZE: LazyLock<usize> =
-@@ -1442,9 +1476,9 @@ pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
+@@ -1442,9 +1495,9 @@ pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
  
  /// The maximum number of CPU cores that can be used simultaneously by the
  /// isolates. Zero means no limit. For self-hosted tuning guidance, see
@@ -1265,7 +1290,7 @@ index 6e4202e9ef89140b2535c32e6512b41b3d885ff9..1946ffa54b175a17cd48668cb6a772b3
  file_storage = { workspace = true }
  futures = { workspace = true }
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30aee84396 100644
+index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..c2d1bafc4b1ff61bd87129c715323490b519e372 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -15,6 +15,7 @@ use std::{
@@ -1286,7 +1311,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          CoDelQueueSender,
          ExpiredInQueue,
      },
-@@ -55,12 +58,21 @@ use common::{
+@@ -55,12 +58,22 @@ use common::{
      },
      knobs::{
          ANALYZE_CONCURRENCY,
@@ -1303,12 +1328,13 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          ISOLATE_MAX_USER_HEAP_SIZE,
 +        ISOLATE_QUEUE_DELAY_CONTROL_ENABLED,
 +        ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS,
++        ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS,
 +        ISOLATE_QUEUE_DELAY_TARGET_MILLIS,
 +        ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS,
          ISOLATE_QUEUE_SIZE,
          MAX_ISOLATE_ACTION_WORKERS,
          REUSE_ISOLATES,
-@@ -143,10 +155,7 @@ use tokio::sync::{
+@@ -143,10 +156,7 @@ use tokio::sync::{
      mpsc,
      oneshot,
  };
@@ -1320,7 +1346,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
  use udf::{
      validation::{
          ValidatedHttpPath,
-@@ -172,6 +181,19 @@ use crate::{
+@@ -172,6 +182,19 @@ use crate::{
          Isolate,
          IsolateHeapStats,
      },
@@ -1340,7 +1366,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
      isolate_worker::FunctionRunnerIsolateWorker,
      metrics::{
          self,
-@@ -193,6 +215,7 @@ use crate::{
+@@ -193,6 +216,7 @@ use crate::{
  // We gather prometheus stats every 30 seconds, so we should make sure we log
  // active permits more frequently than that.
  const ACTIVE_CONCURRENCY_PERMITS_LOG_FREQUENCY: Duration = Duration::from_secs(10);
@@ -1348,7 +1374,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
  
  pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
  pub const PAUSE_REQUEST: &str = "pause_request";
-@@ -203,10 +226,36 @@ struct RequestSchedulingProperties {
+@@ -203,10 +227,36 @@ struct RequestSchedulingProperties {
      unblocks_ancestor: bool,
      can_block_on_descendant: bool,
      is_isolate_action: bool,
@@ -1385,7 +1411,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          match (self.unblocks_ancestor, self.can_block_on_descendant) {
              (false, false) => "independent",
              (false, true) => "descendant_holder",
-@@ -216,6 +265,270 @@ impl IntoLabel for RequestSchedulingProperties {
+@@ -216,6 +266,270 @@ impl IntoLabel for RequestSchedulingProperties {
      }
  }
  
@@ -1656,7 +1682,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
  #[derive(Clone, Copy, Debug, Default)]
  struct ActiveRequestCounts {
      total: usize,
-@@ -254,6 +567,19 @@ struct ActiveRequestGuard {
+@@ -254,6 +568,19 @@ struct ActiveRequestGuard {
      scheduling_properties: RequestSchedulingProperties,
  }
  
@@ -1676,7 +1702,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
  impl ActiveRequestGuard {
      fn new(
          active_workers: Arc<AtomicUsize>,
-@@ -261,7 +587,11 @@ impl ActiveRequestGuard {
+@@ -261,7 +588,11 @@ impl ActiveRequestGuard {
          scheduling_properties: RequestSchedulingProperties,
      ) -> Self {
          active_workers.fetch_add(1, Ordering::Relaxed);
@@ -1689,7 +1715,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          Self {
              active_workers,
              pool_name,
-@@ -280,6 +610,7 @@ impl Drop for ActiveRequestGuard {
+@@ -280,6 +611,7 @@ impl Drop for ActiveRequestGuard {
          metrics::log_scheduler_active_request_finished(
              self.pool_name,
              self.scheduling_properties.as_label(),
@@ -1697,7 +1723,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          );
      }
  }
-@@ -296,25 +627,31 @@ struct SchedulerStateSnapshot {
+@@ -296,25 +628,31 @@ struct SchedulerStateSnapshot {
  
  impl SchedulerStateSnapshot {
      fn can_start_request(&self, properties: RequestSchedulingProperties, client_id: &str) -> bool {
@@ -1742,7 +1768,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
      }
  
      fn dependency_dispatch_uses_reserve(&self) -> bool {
-@@ -322,6 +659,20 @@ impl SchedulerStateSnapshot {
+@@ -322,6 +660,20 @@ impl SchedulerStateSnapshot {
      }
  }
  
@@ -1763,7 +1789,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
  #[derive(Clone)]
  pub struct IsolateConfig {
      // Name of isolate pool, used in metrics.
-@@ -342,7 +693,6 @@ impl IsolateConfig {
+@@ -342,7 +694,6 @@ impl IsolateConfig {
              limiter,
          }
      }
@@ -1771,7 +1797,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
  }
  
  pub struct UdfRequest<RT: Runtime> {
-@@ -407,12 +757,17 @@ impl<RT: Runtime> Request<RT> {
+@@ -407,12 +758,17 @@ impl<RT: Runtime> Request<RT> {
          parent_trace: EncodedSpan,
          scheduler_dependency: SchedulerDependencyClass,
      ) -> Self {
@@ -1791,7 +1817,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
      }
  
      pub fn module(&self) -> Option<CanonicalizedComponentModulePath> {
-@@ -434,7 +789,10 @@ impl<RT: Runtime> Request<RT> {
+@@ -434,7 +790,10 @@ impl<RT: Runtime> Request<RT> {
          })
      }
  
@@ -1803,7 +1829,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          let (can_block_on_descendant, is_isolate_action) = match &self.inner {
              RequestType::Udf { udf_callback, .. } => (udf_callback.is_some(), false),
              RequestType::Action { .. } | RequestType::HttpAction { .. } => (true, true),
-@@ -454,6 +812,7 @@ impl<RT: Runtime> Request<RT> {
+@@ -454,6 +813,7 @@ impl<RT: Runtime> Request<RT> {
              unblocks_ancestor: self.scheduler_dependency.unblocks_ancestor(),
              can_block_on_descendant,
              is_isolate_action,
@@ -1811,7 +1837,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          }
      }
  }
-@@ -531,6 +890,7 @@ pub enum RequestType<RT: Runtime> {
+@@ -531,6 +891,7 @@ pub enum RequestType<RT: Runtime> {
          id: usize,
          can_block_on_descendant: bool,
          is_isolate_action: bool,
@@ -1819,7 +1845,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          fail_worker: bool,
          started: mpsc::UnboundedSender<usize>,
          completion: oneshot::Receiver<()>,
-@@ -538,6 +898,23 @@ pub enum RequestType<RT: Runtime> {
+@@ -538,6 +899,23 @@ pub enum RequestType<RT: Runtime> {
      },
  }
  
@@ -1843,7 +1869,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
  #[allow(async_fn_in_trait)]
  pub trait UdfCallback<RT: Runtime> {
      /// Execute a subfunction in a new V8 context.
-@@ -651,6 +1028,21 @@ impl<RT: Runtime> Request<RT> {
+@@ -651,6 +1029,21 @@ impl<RT: Runtime> Request<RT> {
              RequestType::Test { response, .. } => response.is_closed(),
          }
      }
@@ -1865,7 +1891,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
  }
  
  impl<RT: Runtime> Clone for IsolateClient<RT> {
-@@ -666,6 +1058,7 @@ impl<RT: Runtime> Clone for IsolateClient<RT> {
+@@ -666,6 +1059,7 @@ impl<RT: Runtime> Clone for IsolateClient<RT> {
              concurrency_limiter: self.concurrency_limiter.clone(),
              active_workers: self.active_workers.clone(),
              max_workers: self.max_workers,
@@ -1873,7 +1899,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          }
      }
  }
-@@ -747,7 +1140,7 @@ pub struct IsolateClient<RT: Runtime> {
+@@ -747,7 +1141,7 @@ pub struct IsolateClient<RT: Runtime> {
      rt: RT,
      handles: Arc<Mutex<Vec<IsolateWorkerHandle>>>,
      scheduler: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
@@ -1882,7 +1908,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
      internal_sender: mpsc::UnboundedSender<Request<RT>>,
      pool_name: &'static str,
      concurrency_logger: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
-@@ -756,6 +1149,7 @@ pub struct IsolateClient<RT: Runtime> {
+@@ -756,6 +1150,7 @@ pub struct IsolateClient<RT: Runtime> {
      /// workers across all clients.
      active_workers: Arc<AtomicUsize>,
      max_workers: usize,
@@ -1890,7 +1916,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
  }
  
  impl<RT: Runtime> IsolateClient<RT> {
-@@ -777,6 +1171,12 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -777,6 +1172,12 @@ impl<RT: Runtime> IsolateClient<RT> {
              *ISOLATE_DEPENDENCY_WORKER_RESERVE < max_isolate_workers,
              "ISOLATE_DEPENDENCY_WORKER_RESERVE must be smaller than MAX_ISOLATE_WORKERS"
          );
@@ -1903,13 +1929,14 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          let base_worker_capacity = max_isolate_workers - *ISOLATE_DEPENDENCY_WORKER_RESERVE;
          let max_independent_actions = if *MAX_ISOLATE_ACTION_WORKERS == 0 {
              base_worker_capacity
-@@ -787,6 +1187,24 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -787,6 +1188,25 @@ impl<RT: Runtime> IsolateClient<RT> {
              max_independent_actions <= base_worker_capacity,
              "MAX_ISOLATE_ACTION_WORKERS must not exceed shared base isolate worker capacity"
          );
 +        let queue_config = IsolateQueueConfig::new(
 +            *ISOLATE_QUEUE_DELAY_TARGET_MILLIS,
 +            *ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS,
++            *ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS,
 +            *ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS,
 +            *ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS,
 +            *ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY,
@@ -1928,7 +1955,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          let concurrency_limiter = if *FUNRUN_ISOLATE_ACTIVE_THREADS > 0 {
              ConcurrencyLimiter::new(*FUNRUN_ISOLATE_ACTIVE_THREADS)
          } else {
-@@ -800,15 +1218,18 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -800,15 +1220,18 @@ impl<RT: Runtime> IsolateClient<RT> {
              isolate_config.unwrap_or(IsolateConfig::new("funrun", concurrency_limiter.clone()));
          let pool_name = isolate_config.name;
          metrics::initialize_capacity_counters(pool_name);
@@ -1948,7 +1975,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          );
          let (internal_sender, internal_receiver) = mpsc::unbounded_channel();
          let handles = Arc::new(Mutex::new(Vec::new()));
-@@ -817,9 +1238,8 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -817,9 +1240,8 @@ impl<RT: Runtime> IsolateClient<RT> {
          let _active_workers = active_workers.clone();
          let rt_clone = rt.clone();
          let scheduler = rt.spawn("shared_isolate_scheduler", async move {
@@ -1960,7 +1987,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              let isolate_worker = FunctionRunnerIsolateWorker::new(rt_clone.clone(), isolate_config);
              let scheduler = SharedIsolateScheduler::new(
                  rt_clone,
-@@ -830,6 +1250,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -830,6 +1252,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                  handles_clone,
                  max_percent_per_client,
                  _active_workers,
@@ -1968,7 +1995,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              );
              scheduler.run(receiver, internal_receiver).await
          });
-@@ -844,6 +1265,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -844,6 +1267,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              concurrency_limiter,
              active_workers,
              max_workers: max_isolate_workers,
@@ -1976,7 +2003,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          })
      }
  
-@@ -1330,30 +1752,27 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1330,30 +1754,27 @@ impl<RT: Runtime> IsolateClient<RT> {
      }
  
      fn send_request(&self, request: Request<RT>) -> anyhow::Result<()> {
@@ -2020,7 +2047,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              metrics::log_scheduler_dependency_queue_reserve_enqueue(self.pool_name);
          }
          Ok(())
-@@ -1395,7 +1814,7 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1395,7 +1816,7 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
              // whose caller retains an isolate worker.
              SchedulerDependencyClass::UnblocksAncestor,
          );
@@ -2029,7 +2056,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          self.internal_sender
              .send(request)
              .ok()
-@@ -1465,6 +1884,7 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -1465,6 +1886,7 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      handles: Arc<Mutex<Vec<IsolateWorkerHandle>>>,
      max_workers_per_client: usize,
      base_workers_per_client: usize,
@@ -2037,7 +2064,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
  }
  
  pub struct IdleWorkerInfo {
-@@ -1499,16 +1919,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1499,16 +1921,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          handles: Arc<Mutex<Vec<IsolateWorkerHandle>>>,
          max_percent_per_client: usize,
          active_workers: Arc<AtomicUsize>,
@@ -2060,7 +2087,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          let effective_dependency_reserve =
              dependency_reserve.min(max_workers_per_client.saturating_sub(1));
          let base_workers_per_client = max_workers_per_client - effective_dependency_reserve;
-@@ -1527,6 +1945,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1527,6 +1947,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              handles,
              max_workers_per_client,
              base_workers_per_client,
@@ -2068,7 +2095,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          }
      }
  
-@@ -1583,10 +2002,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1583,10 +2004,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          }
      }
  
@@ -2082,7 +2109,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
      ) {
          log_pool_max(self.worker.config().name, self.max_workers);
          metrics::log_scheduler_capacity(self.worker.config().name, "physical", self.max_workers);
-@@ -1601,77 +2020,152 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1601,77 +2022,152 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              self.max_independent_actions,
          );
          let mut report_stats = self.rt.wait(*HEAP_WORKER_REPORT_INTERVAL_SECONDS);
@@ -2283,7 +2310,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              tokio::select! {
                  biased;
                  completed_worker = self.in_progress_workers.next(),
-@@ -1685,26 +2179,32 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1685,26 +2181,32 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          return;
                      };
                      self.handle_completed_worker(completed_worker, info);
@@ -2332,7 +2359,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
                      let dispatch_state = self.state_snapshot();
                      let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
                          && dispatch_state.dependency_dispatch_uses_reserve();
-@@ -1749,6 +2249,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1749,6 +2251,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          );
                          return;
                      }
@@ -2346,7 +2373,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
                      // Record scheduler-owned state only after the worker
                      // accepted the request. The worker message owns externally
                      // visible active accounting and clears it on every drop path.
-@@ -1776,6 +2283,37 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1776,6 +2285,37 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          );
                      }
                  },
@@ -2384,7 +2411,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
                  _ = &mut report_stats => {
                      let heap_stats = self.aggregate_heap_stats();
                      log_aggregated_heap_stats(&heap_stats);
-@@ -1783,10 +2321,6 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1783,10 +2323,6 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  },
              }
          }
@@ -2395,7 +2422,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
      }
  
      /// Find a worker for the given `client_id`.`
-@@ -1802,12 +2336,16 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1802,12 +2338,16 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          state: &SchedulerStateSnapshot,
      ) -> Result<usize, RejectedBeforeExecutionReason> {
          let client_id = request.client_id.as_str();
@@ -2414,7 +2441,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          }
          // Try to find an existing worker for this client.
          if let Some((client_id, mut workers)) = self.available_workers.remove_entry(client_id) {
-@@ -2063,7 +2601,10 @@ pub(crate) fn should_recreate_isolate<RT: Runtime>(
+@@ -2063,7 +2603,10 @@ pub(crate) fn should_recreate_isolate<RT: Runtime>(
  #[cfg(test)]
  mod tests {
      use std::{
@@ -2426,7 +2453,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          future::Future,
          pin::Pin,
          sync::{
-@@ -2081,10 +2622,9 @@ mod tests {
+@@ -2081,10 +2624,9 @@ mod tests {
  
      use ::metrics::IntoLabel as _;
      use common::{
@@ -2440,7 +2467,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          },
          fastrace_helpers::EncodedSpan,
          knobs::CODEL_QUEUE_IDLE_EXPIRATION_MILLIS,
-@@ -2093,20 +2633,35 @@ mod tests {
+@@ -2093,20 +2635,35 @@ mod tests {
              shutdown_and_join,
              Runtime,
              SpawnHandle,
@@ -2477,7 +2504,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          IdleWorkerInfo,
          IsolateConfig,
          IsolateWorker,
-@@ -2115,6 +2670,8 @@ mod tests {
+@@ -2115,6 +2672,8 @@ mod tests {
          Request,
          RequestSchedulingProperties,
          RequestType,
@@ -2486,7 +2513,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          SchedulerStateSnapshot,
          SharedIsolateHeapStats,
          SharedIsolateScheduler,
-@@ -2122,6 +2679,12 @@ mod tests {
+@@ -2122,6 +2681,12 @@ mod tests {
      use crate::{
          context_cache::ContextCache,
          isolate::Isolate,
@@ -2499,7 +2526,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          ConcurrencyLimiter,
          ConcurrencyPermit,
      };
-@@ -2215,6 +2778,7 @@ mod tests {
+@@ -2215,6 +2780,7 @@ mod tests {
                          id,
                          can_block_on_descendant: _,
                          is_isolate_action: _,
@@ -2507,7 +2534,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
                          fail_worker,
                          started,
                          completion,
-@@ -2266,6 +2830,7 @@ mod tests {
+@@ -2266,6 +2832,7 @@ mod tests {
          DependencyHolder,
          Independent,
          Action,
@@ -2515,7 +2542,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          WorkerFailure,
      }
  
-@@ -2305,6 +2870,7 @@ mod tests {
+@@ -2305,6 +2872,7 @@ mod tests {
                  .expect("expired request response dropped")
                  .expect_err("expired scheduler request unexpectedly succeeded");
              assert!(error.is_rejected_before_execution());
@@ -2523,7 +2550,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          }
      }
  
-@@ -2322,6 +2888,7 @@ mod tests {
+@@ -2322,6 +2890,7 @@ mod tests {
                  TestRequestKind::DependencyHolder | TestRequestKind::Action
              ),
              is_isolate_action: matches!(kind, TestRequestKind::Action),
@@ -2531,7 +2558,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
              started,
              completion: completion_receiver,
-@@ -2338,6 +2905,7 @@ mod tests {
+@@ -2338,6 +2907,7 @@ mod tests {
              },
              TestRequestKind::Independent
              | TestRequestKind::Action
@@ -2539,7 +2566,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              | TestRequestKind::WorkerFailure => {
                  Request::new("deployment".to_string(), inner, EncodedSpan::empty())
              },
-@@ -2349,20 +2917,86 @@ mod tests {
+@@ -2349,20 +2919,86 @@ mod tests {
          }
      }
  
@@ -2628,7 +2655,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
      }
  
      impl SchedulerHarness {
-@@ -2374,10 +3008,63 @@ mod tests {
+@@ -2374,10 +3010,64 @@ mod tests {
              max_percent_per_client: usize,
              queue_capacity: usize,
          ) -> Self {
@@ -2656,6 +2683,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
 +            let queue_config = IsolateQueueConfig::new(
 +                Duration::from_millis(10),
 +                Duration::from_millis(100),
++                Duration::from_millis(20),
 +                Duration::from_secs(1),
 +                Duration::from_secs(30),
 +                queue_capacity,
@@ -2693,7 +2721,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              );
              let (started_sender, started) = mpsc::unbounded_channel();
              let (internal_sender, internal_receiver) = mpsc::unbounded_channel();
-@@ -2395,6 +3082,7 @@ mod tests {
+@@ -2395,6 +3085,7 @@ mod tests {
                  worker_handles.clone(),
                  max_percent_per_client,
                  active_workers.clone(),
@@ -2701,7 +2729,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              );
              Self {
                  sender,
-@@ -2405,6 +3093,7 @@ mod tests {
+@@ -2405,6 +3096,7 @@ mod tests {
                  scheduler: None,
                  worker_handles,
                  active_workers,
@@ -2709,7 +2737,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              }
          }
  
-@@ -2417,13 +3106,29 @@ mod tests {
+@@ -2417,13 +3109,29 @@ mod tests {
                  Some(rt.spawn("scheduler_test", scheduler.run(receiver, internal_receiver)));
          }
  
@@ -2745,7 +2773,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              }
          }
  
-@@ -2432,11 +3137,20 @@ mod tests {
+@@ -2432,11 +3140,20 @@ mod tests {
          }
  
          fn enqueue_internal_test(&self, id: usize) -> InFlightTestRequest {
@@ -2767,7 +2795,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              self.internal_sender
                  .send(request)
                  .expect("test internal scheduler queue is closed");
-@@ -2482,6 +3196,7 @@ mod tests {
+@@ -2482,6 +3199,7 @@ mod tests {
                  scheduler,
                  worker_handles,
                  active_workers: _,
@@ -2775,7 +2803,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
              } = self;
              assert!(
                  pending_scheduler.is_none(),
-@@ -2516,6 +3231,7 @@ mod tests {
+@@ -2516,6 +3234,7 @@ mod tests {
              unblocks_ancestor,
              can_block_on_descendant,
              is_isolate_action,
@@ -2783,7 +2811,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          }
      }
  
-@@ -2551,6 +3267,168 @@ mod tests {
+@@ -2551,6 +3270,168 @@ mod tests {
          );
      }
  
@@ -2952,7 +2980,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
      #[test]
      fn total_base_occupancy_preserves_dependency_overflow() {
          // Four dependencies and one root occupy all five shared base slots.
-@@ -2587,6 +3465,38 @@ mod tests {
+@@ -2587,6 +3468,38 @@ mod tests {
          assert!(!state.can_start_request(properties(true, false, false), "deployment"));
      }
  
@@ -2991,7 +3019,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
      #[test]
      fn per_client_capacity_uses_total_occupancy() {
          let global = ActiveRequestCounts {
-@@ -2730,6 +3640,199 @@ mod tests {
+@@ -2730,6 +3643,200 @@ mod tests {
          });
      }
  
@@ -3123,6 +3151,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
 +                let queue_config = IsolateQueueConfig::new(
 +                    Duration::from_millis(1),
 +                    Duration::from_millis(10),
++                    Duration::from_millis(2),
 +                    Duration::from_millis(50),
 +                    Duration::from_secs(2),
 +                    64,
@@ -3191,7 +3220,7 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
      #[test]
      fn per_client_overflow_stays_within_percentage_derived_total() {
          let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
-@@ -2847,6 +3950,61 @@ mod tests {
+@@ -2847,6 +3954,61 @@ mod tests {
          });
      }
  
@@ -3255,10 +3284,10 @@ index f2e792536b4c88219a2ba5ced35cea72dd4d9d2c..3aaa7e1f49472ebfd80aa6db04848c30
          let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
 diff --git a/crates/isolate/src/isolate_queue.rs b/crates/isolate/src/isolate_queue.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a42bf341a7
+index 0000000000000000000000000000000000000000..cadc841a8106b38484611060b146acf54dbf01e7
 --- /dev/null
 +++ b/crates/isolate/src/isolate_queue.rs
-@@ -0,0 +1,2093 @@
+@@ -0,0 +1,2171 @@
 +use std::{
 +    collections::VecDeque,
 +    future::poll_fn,
@@ -3389,16 +3418,17 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +pub(crate) struct IsolateQueueConfig {
 +    target: Duration,
 +    interval: Duration,
++    shed_threshold: Duration,
 +    hard_max_age: Duration,
 +    control_plane_hard_max_age: Duration,
 +    pub(crate) control_plane_capacity: usize,
-+    shed_threshold: Duration,
 +}
 +
 +impl IsolateQueueConfig {
 +    pub(crate) fn new(
 +        target: Duration,
 +        interval: Duration,
++        shed_threshold: Duration,
 +        hard_max_age: Duration,
 +        control_plane_hard_max_age: Duration,
 +        control_plane_capacity: usize,
@@ -3411,12 +3441,13 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +            !interval.is_zero(),
 +            "isolate queue delay interval must be greater than zero"
 +        );
-+        let shed_threshold = target
-+            .checked_mul(2)
-+            .ok_or_else(|| anyhow::anyhow!("isolate queue delay target overflow"))?;
++        anyhow::ensure!(
++            shed_threshold > target,
++            "isolate queue delay shed threshold must be greater than the delay target"
++        );
 +        anyhow::ensure!(
 +            hard_max_age > shed_threshold,
-+            "isolate queue hard maximum age must be greater than twice the delay target"
++            "isolate queue hard maximum age must be greater than the delay shed threshold"
 +        );
 +        anyhow::ensure!(
 +            !control_plane_hard_max_age.is_zero(),
@@ -3434,6 +3465,10 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +            "isolate queue delay interval is too large"
 +        );
 +        anyhow::ensure!(
++            now.checked_add(shed_threshold).is_some(),
++            "isolate queue delay shed threshold is too large"
++        );
++        anyhow::ensure!(
 +            now.checked_add(hard_max_age).is_some(),
 +            "isolate queue hard maximum age is too large"
 +        );
@@ -3444,10 +3479,10 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +        Ok(Self {
 +            target,
 +            interval,
++            shed_threshold,
 +            hard_max_age,
 +            control_plane_hard_max_age,
 +            control_plane_capacity,
-+            shed_threshold,
 +        })
 +    }
 +}
@@ -3961,6 +3996,11 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +        metrics::log_isolate_queue_config(inner.pool_name, "interval_millis", config.interval);
 +        metrics::log_isolate_queue_config(
 +            inner.pool_name,
++            "shed_threshold_millis",
++            config.shed_threshold,
++        );
++        metrics::log_isolate_queue_config(
++            inner.pool_name,
 +            "hard_max_age_millis",
 +            config.hard_max_age,
 +        );
@@ -4385,6 +4425,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +        IsolateQueueConfig::new(
 +            Duration::from_millis(10),
 +            Duration::from_millis(100),
++            Duration::from_millis(20),
 +            Duration::from_millis(1000),
 +            Duration::from_secs(30),
 +            4,
@@ -4436,6 +4477,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +        assert!(IsolateQueueConfig::new(
 +            Duration::ZERO,
 +            Duration::from_millis(10),
++            Duration::from_millis(20),
 +            Duration::from_millis(100),
 +            Duration::from_secs(30),
 +            4,
@@ -4444,6 +4486,16 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +        assert!(IsolateQueueConfig::new(
 +            Duration::from_millis(1),
 +            Duration::ZERO,
++            Duration::from_millis(2),
++            Duration::from_millis(100),
++            Duration::from_secs(30),
++            4,
++        )
++        .is_err());
++        assert!(IsolateQueueConfig::new(
++            Duration::from_millis(10),
++            Duration::from_millis(100),
++            Duration::from_millis(10),
 +            Duration::from_millis(100),
 +            Duration::from_secs(30),
 +            4,
@@ -4453,6 +4505,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +            Duration::from_millis(10),
 +            Duration::from_millis(100),
 +            Duration::from_millis(20),
++            Duration::from_millis(20),
 +            Duration::from_secs(30),
 +            4,
 +        )
@@ -4460,6 +4513,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +        assert!(IsolateQueueConfig::new(
 +            Duration::from_millis(1),
 +            Duration::MAX,
++            Duration::from_millis(2),
 +            Duration::from_millis(100),
 +            Duration::from_secs(30),
 +            4,
@@ -4468,6 +4522,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +        assert!(IsolateQueueConfig::new(
 +            Duration::from_millis(1),
 +            Duration::from_millis(10),
++            Duration::from_millis(2),
 +            Duration::MAX,
 +            Duration::from_secs(30),
 +            4,
@@ -4476,6 +4531,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +        assert!(IsolateQueueConfig::new(
 +            Duration::from_millis(1),
 +            Duration::from_millis(10),
++            Duration::from_millis(2),
 +            Duration::from_millis(100),
 +            Duration::ZERO,
 +            4,
@@ -4484,6 +4540,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +        assert!(IsolateQueueConfig::new(
 +            Duration::from_millis(1),
 +            Duration::from_millis(10),
++            Duration::from_millis(2),
 +            Duration::from_millis(100),
 +            Duration::MAX,
 +            4,
@@ -4492,11 +4549,54 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +        assert!(IsolateQueueConfig::new(
 +            Duration::from_millis(1),
 +            Duration::from_millis(10),
++            Duration::from_millis(2),
 +            Duration::from_millis(100),
 +            Duration::from_secs(30),
 +            0,
 +        )
 +        .is_err());
++    }
++
++    #[test]
++    fn adaptive_shedding_uses_explicit_queue_age_threshold() {
++        let start = tokio::time::Instant::now();
++        let config = IsolateQueueConfig::new(
++            Duration::from_millis(10),
++            Duration::from_millis(100),
++            Duration::from_millis(40),
++            Duration::from_secs(1),
++            Duration::from_secs(30),
++            4,
++        )
++        .unwrap();
++        let mut queue = IsolateDelayQueue::new(start, 1, 0, config);
++        queue
++            .push("at_threshold", IsolateQueueLane::Ordinary, start)
++            .unwrap();
++        queue.controllers[IsolateQueueLane::Ordinary.index()].overloaded = true;
++
++        let at_threshold = queue
++            .pop_selecting(start + Duration::from_millis(40), &mut eligible)
++            .selected
++            .unwrap();
++        assert_eq!(at_threshold.output.rejection, None);
++
++        queue
++            .push(
++                "above_threshold",
++                IsolateQueueLane::Ordinary,
++                start + Duration::from_millis(40),
++            )
++            .unwrap();
++        queue.controllers[IsolateQueueLane::Ordinary.index()].overloaded = true;
++        let above_threshold = queue
++            .pop_selecting(start + Duration::from_millis(90), &mut eligible)
++            .selected
++            .unwrap();
++        assert_eq!(
++            above_threshold.output.rejection,
++            Some(IsolateQueueRejection::DelayControlShed)
++        );
 +    }
 +
 +    #[test]
@@ -4751,6 +4851,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +        let config = IsolateQueueConfig::new(
 +            Duration::from_millis(10),
 +            Duration::from_millis(100),
++            Duration::from_millis(20),
 +            Duration::from_secs(1),
 +            Duration::from_secs(30),
 +            1,
@@ -5085,6 +5186,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +            IsolateQueueConfig::new(
 +                Duration::from_millis(10),
 +                Duration::from_millis(100),
++                Duration::from_millis(20),
 +                Duration::from_secs(10),
 +                Duration::from_secs(30),
 +                1,
@@ -5124,6 +5226,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +            IsolateQueueConfig::new(
 +                Duration::from_millis(1),
 +                Duration::from_millis(10),
++                Duration::from_millis(2),
 +                Duration::from_millis(3),
 +                Duration::from_secs(30),
 +                1,
@@ -5159,6 +5262,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +            IsolateQueueConfig::new(
 +                Duration::from_millis(1),
 +                Duration::from_millis(10),
++                Duration::from_millis(2),
 +                Duration::from_millis(3),
 +                Duration::from_secs(30),
 +                1,
@@ -5200,6 +5304,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +            IsolateQueueConfig::new(
 +                Duration::from_millis(1),
 +                Duration::from_millis(10),
++                Duration::from_millis(2),
 +                Duration::from_millis(3),
 +                Duration::from_millis(100),
 +                1,
@@ -5257,6 +5362,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +            IsolateQueueConfig::new(
 +                Duration::from_millis(1),
 +                Duration::from_millis(10),
++                Duration::from_millis(2),
 +                Duration::from_secs(60),
 +                Duration::from_secs(90),
 +                1,
@@ -5304,6 +5410,7 @@ index 0000000000000000000000000000000000000000..35889b801f693c6029205d4ac2ccd2a4
 +            IsolateQueueConfig::new(
 +                Duration::from_millis(1),
 +                Duration::from_millis(10),
++                Duration::from_millis(2),
 +                Duration::from_millis(3),
 +                Duration::from_secs(30),
 +                1,
@@ -6135,10 +6242,10 @@ index f67e97ccb187471f3c09666c58524c7682424914..ce6a9121da7afa6468b5fd3c1af0c116
  The opt-in isolate queue policy in
 diff --git a/patches/isolate_queue_control/README.md b/patches/isolate_queue_control/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..fe54f0cd3ff177102e6b490bc1c7582b86be3d96
+index 0000000000000000000000000000000000000000..15179d0f708f0146c03d88cc82710c7c36b0c1f0
 --- /dev/null
 +++ b/patches/isolate_queue_control/README.md
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,442 @@
 +# Isolate Queue Delay Control and Deployment Lane
 +
 +This patch adds a lane-aware queue policy only to the isolate scheduler. It is
@@ -6197,7 +6304,7 @@ index 0000000000000000000000000000000000000000..fe54f0cd3ff177102e6b490bc1c7582b
 +Each lane has independent state:
 +
 +- an observation interval deadline;
-+- minimum dispatch sojourn observed in the current interval;
++- minimum selection sojourn observed in the current interval;
 +- sample count in that interval;
 +- current overloaded state.
 +
@@ -6217,12 +6324,12 @@ index 0000000000000000000000000000000000000000..fe54f0cd3ff177102e6b490bc1c7582b
 +draining a lane clears its controller immediately, including partial interval
 +state. A later enqueue starts that lane with a fresh interval.
 +
-+The controller never changes request eligibility. Once a non-dependency has
-+been selected by normal scheduler eligibility, it is adaptively rejected only
-+when its lane is overloaded and its own sojourn is strictly greater than twice
-+the target. A newer request is not rejected because another request was old.
-+Dependencies are observed and can report overload, but they are never
-+adaptively shed.
++The controller never changes request eligibility. Once an ordinary or
++independent-action request has been selected by normal scheduler eligibility,
++it is adaptively rejected only when its lane is overloaded and its own sojourn
++is strictly greater than `ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS`. A newer
++request is not rejected because another request was old. Dependencies are
++observed and can report overload, but they are never adaptively shed.
 +
 +Ordinary, independent-action, and dependency entries use the same finite hard age,
 +`ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS`. An enabled control-plane entry uses
@@ -6295,16 +6402,22 @@ index 0000000000000000000000000000000000000000..fe54f0cd3ff177102e6b490bc1c7582b
 +- nonzero queue base capacity;
 +- queue base plus dependency reserve to fit in `usize`;
 +- nonzero delay target and observation interval;
-+- twice the target to fit in `Duration`;
-+- hard maximum age greater than twice the target;
-+- interval and hard-age durations representable by the runtime timer.
++- adaptive-shed threshold greater than the delay target;
++- hard maximum age greater than the adaptive-shed threshold;
++- timing durations representable by the runtime timer.
 +
 +The defaults are:
 +
 +- `ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=false`
 +- `ISOLATE_QUEUE_DELAY_TARGET_MILLIS=150`
 +- `ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS=1000`
++- `ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS=300` with the default target
 +- `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS=5000`
++
++When the adaptive-shed threshold is unset, it defaults to twice the configured
++target. Setting only a non-default target therefore preserves the original
++`2 * target` shedding behavior. An explicit threshold decouples overload
++detection from adaptive shedding.
 +
 +The duration knobs have no effect on generic CoDel behavior. They are still
 +validated so a latent malformed configuration cannot become active on a later
@@ -6335,8 +6448,9 @@ index 0000000000000000000000000000000000000000..fe54f0cd3ff177102e6b490bc1c7582b
 +  queue capacity. Lane mode also reports the parsed control-plane sub-cap even
 +  when control-plane classification is disabled.
 +- `isolate_queue_config_millis_info{config_kind}` reports the active queue's
-+  timing configuration. Lane mode reports target, interval, and hard age;
-+  legacy mode reports its idle and congested expiration values.
++  timing configuration. Lane mode reports target, interval, adaptive-shed
++  threshold, ordinary hard age, and control-plane hard age; legacy mode reports
++  its idle and congested expiration values.
 +
 +The remaining metrics in this list are published only while lane delay control
 +is enabled. Legacy mode retains its existing generic CoDel and scheduler
@@ -6576,10 +6690,10 @@ index 0000000000000000000000000000000000000000..fe54f0cd3ff177102e6b490bc1c7582b
 +capacity separately; increasing queue depth alone cannot increase throughput.
 diff --git a/patches/isolate_queue_control/deployment_lane_design_reference.md b/patches/isolate_queue_control/deployment_lane_design_reference.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..b58ec3413cf1354c41eb90744751e9c8ea1a34b6
+index 0000000000000000000000000000000000000000..f4b12c92776c6e74c61af8ee55f24fe069b4e112
 --- /dev/null
 +++ b/patches/isolate_queue_control/deployment_lane_design_reference.md
-@@ -0,0 +1,782 @@
+@@ -0,0 +1,783 @@
 +# Deployment and Control-Plane Isolate Lane
 +
 +> Detailed design reference. This is not a separate adoption unit. The current operator-facing
@@ -6644,9 +6758,10 @@ index 0000000000000000000000000000000000000000..b58ec3413cf1354c41eb90744751e9c8
 +
 +Under the lane-aware queue policy, ordinary requests can be adaptively shed
 +after their lane demonstrates sustained queue delay and the selected request's
-+own age exceeds the shedding threshold. Every lane also shares the same hard
-+maximum age. This policy is designed for short-latency runtime requests rather
-+than a bounded deployment phase.
++own age exceeds `ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS`. Every ordinary,
++independent-action, and dependency entry also shares the hard maximum age from
++`ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS`. This policy is designed for short-latency
++runtime requests rather than a bounded deployment phase.
 +
 +Analysis already limits each push to `ANALYZE_CONCURRENCY` simultaneous module
 +requests. After a request is admitted, analysis retries a rejected-before-
@@ -7375,7 +7490,7 @@ index 971f420b180ea1c95d8340d947990d3f500a9c2b..b6e19fa69bd3a1b4c04d1f0a3c6fb4e4
  
  HTTP action context reuse can reduce action initialization time and therefore
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 89f56f434a5f52afc6f88906e0954bb5dae8281a..1b1d4c2d392ff82210b98a79d52722643d63ee34 100644
+index 89f56f434a5f52afc6f88906e0954bb5dae8281a..0273856b6c9a033f283539e5e35eec061d9d9208 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
 @@ -47,9 +47,13 @@ number of response bodies being streamed concurrently.
@@ -7395,7 +7510,7 @@ index 89f56f434a5f52afc6f88906e0954bb5dae8281a..1b1d4c2d392ff82210b98a79d5272264
  
  ## `HTTP_SERVER_DEPENDENCY_RESERVE`
  
-@@ -113,11 +117,79 @@ HTTP actions that retain workers. `0` derives this cap from shared base worker
+@@ -113,11 +117,82 @@ HTTP actions that retain workers. `0` derives this cap from shared base worker
  capacity. An explicit value cannot exceed base capacity. Queries, mutations,
  and child actions that unblock an ancestor are not subject to this cap.
  
@@ -7422,13 +7537,16 @@ index 89f56f434a5f52afc6f88906e0954bb5dae8281a..1b1d4c2d392ff82210b98a79d5272264
 +
 +- `ISOLATE_QUEUE_DELAY_TARGET_MILLIS`, default `150`;
 +- `ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS`, default `1000`;
++- `ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS`, default twice the configured
++  target (`300` with the default target);
 +- `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS`, default `5000`.
 +
-+The target and interval must be nonzero. Hard maximum age must be greater than
-+twice the target, and every duration must fit the runtime timer. Numeric values
-+must contain only ASCII decimal digits; empty, signed, malformed, non-Unicode,
-+overflowed, and inconsistent settings fail startup. The timing values are
-+validated even when lane control is disabled.
++The target and interval must be nonzero. The adaptive-shed threshold must be
++greater than the target, hard maximum age must be greater than the
++adaptive-shed threshold, and every duration must fit the runtime timer. Numeric
++values must contain only ASCII decimal digits; empty, signed, malformed,
++non-Unicode, overflowed, and inconsistent settings fail startup. The timing
++values are validated even when lane control is disabled.
 +
 +`ISOLATE_CONTROL_PLANE_LANE_ENABLED=true` classifies isolate module analysis,
 +schema evaluation, auth configuration evaluation, app definition evaluation,
@@ -7480,7 +7598,7 @@ index 89f56f434a5f52afc6f88906e0954bb5dae8281a..1b1d4c2d392ff82210b98a79d5272264
  
  A one-worker pool cannot run a function and a separately scheduled descendant
  at the same time. Use at least two workers and a reserve of at least one for
-@@ -129,5 +201,9 @@ parallel fanout can still consume every worker and queue entry.
+@@ -129,5 +204,9 @@ parallel fanout can still consume every worker and queue entry.
  This caps isolates actively executing JavaScript. `0` means unlimited. A
  request can release this permit while waiting for asynchronous work, so this is
  not the same as assigned isolate workers and does not provide dependency-only
@@ -7493,10 +7611,10 @@ index 89f56f434a5f52afc6f88906e0954bb5dae8281a..1b1d4c2d392ff82210b98a79d5272264
 +control CPU oversubscription, and raise it only after checking backend CPU
 +headroom and throttling.
 diff --git a/self-hosted/docker/docker-compose.yml b/self-hosted/docker/docker-compose.yml
-index fc6494ae26ad0b7560019fc99a642bd6f1824598..50b6e39fbdf7ac6bfb63caca02474fe300ccfed5 100644
+index fc6494ae26ad0b7560019fc99a642bd6f1824598..99726cce5b2b0d626525fba6654085c6637bbeb0 100644
 --- a/self-hosted/docker/docker-compose.yml
 +++ b/self-hosted/docker/docker-compose.yml
-@@ -17,7 +17,14 @@ services:
+@@ -17,7 +17,15 @@ services:
        - APPLICATION_MAX_CONCURRENT_QUERIES=${APPLICATION_MAX_CONCURRENT_QUERIES:-16}
        - APPLICATION_MAX_CONCURRENT_V8_ACTIONS=${APPLICATION_MAX_CONCURRENT_V8_ACTIONS:-16}
        - FUNRUN_ISOLATE_ACTIVE_THREADS
@@ -7506,6 +7624,7 @@ index fc6494ae26ad0b7560019fc99a642bd6f1824598..50b6e39fbdf7ac6bfb63caca02474fe3
        - ISOLATE_DEPENDENCY_WORKER_RESERVE
 +      - ISOLATE_QUEUE_DELAY_CONTROL_ENABLED
 +      - ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS
++      - ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS
 +      - ISOLATE_QUEUE_DELAY_TARGET_MILLIS
 +      - ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS
        - ISOLATE_QUEUE_SIZE
