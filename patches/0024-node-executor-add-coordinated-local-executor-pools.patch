@@ -10,11 +10,20 @@ Keep healthy default and named generations serving while one globally coordinate
 Reserve deployment cutover capacity before commit with exact recoverable claims, roll committed cutovers across affected pools, coalesce routine rotations, and support bounded explicit force reclamation without terminating the only serving generation before promotion. Carry signed package-readiness authority, expose bounded lifecycle and coordinator telemetry, and document the composed package, resilience, memory, and routing contracts.
 
 Add focused coverage for declaration and metadata validation, package readiness, promotion and drain ownership, exceptional cleanup retries, deployment recovery, topology removal and reintroduction, pressure handling, global capacity serialization, startup budgets, and metric-label lifecycle.
+
+Extend the scheduled and registered-cron start barrier through Node routing and exact resident-generation admission. Acquire the existing linear active-request guard under the promotion mutex, prepare the selected child, retain the same guard across the durable claim and invocation, and wake pre-start owners on hard generation loss without changing the monotonic job state.
+
+Move the neutral barrier types into common while preserving the function-runner re-export. Start Node service timing after durable release but before request submission with a cancellation-safe observation acknowledgment.
+
+Document the composed ordering, its package-cache lease limitation, and its deliberately narrow recovery contract. Add focused coverage for cancellation, package preparation, graceful drain, hard retirement, simultaneous loss and release, unsupported executors, and timing observation.
 ---
- .../src/application_function_runner/mod.rs    |   174 +-
+ .../src/application_function_runner/mod.rs    |   188 +-
  crates/application/src/deploy_config.rs       |   290 +-
  crates/application/src/lib.rs                 |    29 +-
+ crates/common/src/execution_start.rs          |   193 +
  crates/common/src/knobs.rs                    |    18 +
+ crates/common/src/lib.rs                      |     1 +
+ crates/function_runner/src/server.rs          |   115 +-
  crates/isolate/src/client.rs                  |     1 +
  crates/local_backend/src/deploy_config.rs     |    33 +-
  crates/local_backend/src/deploy_config2.rs    |    30 +-
@@ -27,12 +36,12 @@ Add focused coverage for declaration and metadata validation, package readiness,
  crates/model/src/source_packages/mod.rs       |    15 +
  crates/model/src/source_packages/types.rs     |   216 +-
  .../src/source_packages/upload_download.rs    |   139 +-
- crates/node_executor/src/executor.rs          |   184 +-
+ crates/node_executor/src/executor.rs          |   238 +-
  crates/node_executor/src/lib.rs               |     3 +
- crates/node_executor/src/local.rs             | 12646 +++++++++++-----
+ crates/node_executor/src/local.rs             | 13030 +++++++++++-----
  crates/node_executor/src/metrics.rs           |   606 +-
- crates/node_executor/src/noop.rs              |    20 +
- crates/node_executor/src/routed.rs            |  3664 +++++
+ crates/node_executor/src/noop.rs              |    51 +-
+ crates/node_executor/src/routed.rs            |  3671 +++++
  npm-packages/convex/src/bundler/index.test.ts |   146 +
  npm-packages/convex/src/bundler/index.ts      |   113 +-
  npm-packages/convex/src/cli/deploy.ts         |     3 +
@@ -52,17 +61,21 @@ Add focused coverage for declaration and metadata validation, package readiness,
  .../README.md                                 |     7 +
  patches/backend_memory_resilience/README.md   |   122 +-
  .../local_node_executor_resilience/README.md  |   413 +-
- .../README.md                                 |   569 +
+ .../README.md                                 |   583 +
+ .../scheduled_node_action_admission.md        |   557 +
+ patches/scheduled_action_admission/README.md  |    67 +-
  self-hosted/advanced/knobs.md                 |    96 +-
  self-hosted/docker/docker-compose.yml         |     1 +
- 44 files changed, 16002 insertions(+), 4324 deletions(-)
+ 49 files changed, 17293 insertions(+), 4470 deletions(-)
+ create mode 100644 crates/common/src/execution_start.rs
  create mode 100644 crates/node_executor/src/routed.rs
  create mode 100644 npm-packages/convex/src/bundler/index.test.ts
  create mode 100644 npm-packages/convex/src/cli/lib/deployApi/modules.test.ts
  create mode 100644 patches/pinned_local_node_executor_pools/README.md
+ create mode 100644 patches/pinned_local_node_executor_pools/scheduled_node_action_admission.md
 
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 919851dab86f2d4faab217f269d0453e3c3da657..1ad21e2561c48df4fd0df68dcf1a02ef26895809 100644
+index 919851dab86f2d4faab217f269d0453e3c3da657..49975e4f1d1dd6b79cae9adaa16c7c71521f9f19 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
 @@ -9,7 +9,10 @@ use std::{
@@ -156,7 +169,30 @@ index 919851dab86f2d4faab217f269d0453e3c3da657..1ad21e2561c48df4fd0df68dcf1a02ef
                      user_identity: tx.user_identity(),
                      auth_header: token_to_authorization_header(tx.authentication_token())?,
                      environment_variables,
-@@ -2026,9 +2050,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1808,13 +1832,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                     encoded_parent_trace: EncodedSpan::from_parent().0,
+                 };
+ 
+-                if let Some(start_gate) = function_execution_start {
+-                    start_gate.wait().await?;
+-                }
+-
++                // Keep the gate attached through Node routing. Waiting here
++                // would let the scheduler commit `InProgress` before the exact
++                // resident generation is fenced against deployment promotion.
+                 let node_outcome_future = self
+                     .node_actions
+-                    .execute(request, log_line_sender, source_maps_callback)
++                    .execute(
++                        request,
++                        log_line_sender,
++                        function_execution_start,
++                        source_maps_callback,
++                    )
+                     .boxed();
+                 let (mut node_outcome_result, log_lines) = run_function_and_collect_log_lines(
+                     node_outcome_future,
+@@ -2026,9 +2054,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  }
              }
              // Fetch source and external_deps presigned URI first
@@ -172,7 +208,7 @@ index 919851dab86f2d4faab217f269d0453e3c3da657..1ad21e2561c48df4fd0df68dcf1a02ef
              let mut tx = self.database.begin_system().await?;
              let (source_uri, external_deps_package) =
                  if let Some(external_deps_package_id) = source_package.external_deps_package_id {
-@@ -2036,9 +2063,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2036,9 +2067,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          .get(external_deps_package_id)
                          .await?
                          .into_value();
@@ -186,7 +222,7 @@ index 919851dab86f2d4faab217f269d0453e3c3da657..1ad21e2561c48df4fd0df68dcf1a02ef
  
                      let (source_uri, external_deps_uri) =
                          tokio::try_join!(source_uri_future, external_uri_future)?;
-@@ -2062,6 +2090,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2062,6 +2094,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          sha256: source_package.sha256,
                      },
                      external_deps: external_deps_package,
@@ -194,7 +230,7 @@ index 919851dab86f2d4faab217f269d0453e3c3da657..1ad21e2561c48df4fd0df68dcf1a02ef
                  },
                  environment_variables,
              };
-@@ -2180,6 +2209,123 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2180,6 +2213,123 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          self.node_actions.enable()
      }
  
@@ -918,6 +954,205 @@ index 190da7dc02ca815d952243efe8a40e3065490888..0c1e8a17bff0baee8abd12d7301a3028
      }
  
      pub async fn execute_with_occ_retries<'a, T, F>(
+diff --git a/crates/common/src/execution_start.rs b/crates/common/src/execution_start.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..96da864aff1a736cd4af693954a37f9f56514528
+--- /dev/null
++++ b/crates/common/src/execution_start.rs
+@@ -0,0 +1,193 @@
++use anyhow::Context;
++use tokio::sync::oneshot;
++
++/// Scheduler-side owner of a function execution start barrier.
++///
++/// The paired [`FunctionExecutionStartGate`] reports when the runtime owns its
++/// environment-specific admission. Dropping this controller before `start`
++/// cancels that prepared execution; `start` is used only after the matching
++/// durable state transition completes.
++pub struct FunctionExecutionStartController {
++    ready_receiver: oneshot::Receiver<()>,
++    start_sender: oneshot::Sender<()>,
++}
++
++impl FunctionExecutionStartController {
++    pub async fn wait_until_ready(&mut self) -> anyhow::Result<()> {
++        (&mut self.ready_receiver)
++            .await
++            .context("Function execution ended before reaching its start barrier")
++    }
++
++    pub fn start(self) -> anyhow::Result<()> {
++        self.start_sender
++            .send(())
++            .map_err(|_| anyhow::anyhow!("Function execution ended before its start was released"))
++    }
++}
++
++/// Runtime-side linear owner that reports exact admission and blocks user code
++/// until the controller releases it.
++pub struct FunctionExecutionStartGate {
++    ready_sender: oneshot::Sender<()>,
++    start_receiver: oneshot::Receiver<()>,
++    start_observer: Option<oneshot::Sender<oneshot::Sender<()>>>,
++}
++
++impl FunctionExecutionStartGate {
++    pub async fn wait(self) -> anyhow::Result<()> {
++        self.ready_sender.send(()).map_err(|_| {
++            anyhow::anyhow!("Function execution start controller was dropped before admission")
++        })?;
++        self.start_receiver
++            .await
++            .context("Function execution start controller was dropped before release")?;
++        if let Some(start_observer) = self.start_observer {
++            let (observed_sender, observed_receiver) = oneshot::channel();
++            if start_observer.send(observed_sender).is_ok() {
++                // Keep post-release timing ahead of execution without giving
++                // the observer authority. Dropping either observer endpoint
++                // must not revoke an execution the controller released.
++                let _ = observed_receiver.await;
++            }
++        }
++        Ok(())
++    }
++
++    /// Attach a one-shot observation handshake for post-release timing. The
++    /// observer never owns or revokes execution authority.
++    pub fn with_start_observer(
++        mut self,
++        start_observer: oneshot::Sender<oneshot::Sender<()>>,
++    ) -> Self {
++        assert!(
++            self.start_observer.is_none(),
++            "Function execution start gate already has a start observer"
++        );
++        self.start_observer = Some(start_observer);
++        self
++    }
++
++    /// Convert the gate to the channel pair used by isolate worker admission.
++    pub fn into_channels(self) -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
++        let Self {
++            ready_sender,
++            start_receiver,
++            start_observer,
++        } = self;
++        assert!(
++            start_observer.is_none(),
++            "Observed function execution start gate cannot become an isolate channel pair"
++        );
++        (ready_sender, start_receiver)
++    }
++}
++
++pub fn function_execution_start_barrier(
++) -> (FunctionExecutionStartController, FunctionExecutionStartGate) {
++    let (ready_sender, ready_receiver) = oneshot::channel();
++    let (start_sender, start_receiver) = oneshot::channel();
++    (
++        FunctionExecutionStartController {
++            ready_receiver,
++            start_sender,
++        },
++        FunctionExecutionStartGate {
++            ready_sender,
++            start_receiver,
++            start_observer: None,
++        },
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use tokio::sync::oneshot;
++
++    use super::function_execution_start_barrier;
++
++    #[tokio::test]
++    async fn gate_waits_for_controller_release() {
++        let (mut controller, gate) = function_execution_start_barrier();
++        let gate_task = tokio::spawn(gate.wait());
++
++        controller.wait_until_ready().await.unwrap();
++        assert!(!gate_task.is_finished());
++        controller.start().unwrap();
++        gate_task.await.unwrap().unwrap();
++    }
++
++    #[tokio::test]
++    async fn start_observer_fires_only_after_release() {
++        let (mut controller, gate) = function_execution_start_barrier();
++        let (start_observer, mut execution_started) = oneshot::channel();
++        let gate_task = tokio::spawn(gate.with_start_observer(start_observer).wait());
++
++        controller.wait_until_ready().await.unwrap();
++        assert!(matches!(
++            execution_started.try_recv(),
++            Err(oneshot::error::TryRecvError::Empty)
++        ));
++        controller.start().unwrap();
++        let observed_sender = execution_started.await.unwrap();
++        assert!(!gate_task.is_finished());
++        observed_sender.send(()).unwrap();
++        gate_task.await.unwrap().unwrap();
++    }
++
++    #[tokio::test]
++    async fn dropping_start_observer_does_not_revoke_release() {
++        let (mut controller, gate) = function_execution_start_barrier();
++        let (start_observer, execution_started) = oneshot::channel();
++        drop(execution_started);
++        let gate_task = tokio::spawn(gate.with_start_observer(start_observer).wait());
++
++        controller.wait_until_ready().await.unwrap();
++        controller.start().unwrap();
++        gate_task.await.unwrap().unwrap();
++    }
++
++    #[tokio::test]
++    async fn dropping_start_acknowledgment_does_not_revoke_release() {
++        let (mut controller, gate) = function_execution_start_barrier();
++        let (start_observer, execution_started) = oneshot::channel();
++        let gate_task = tokio::spawn(gate.with_start_observer(start_observer).wait());
++
++        controller.wait_until_ready().await.unwrap();
++        controller.start().unwrap();
++        drop(execution_started.await.unwrap());
++        gate_task.await.unwrap().unwrap();
++    }
++
++    #[tokio::test]
++    async fn dropping_controller_cancels_gate() {
++        let (controller, gate) = function_execution_start_barrier();
++        drop(controller);
++
++        let error = gate.wait().await.unwrap_err();
++        assert!(error.to_string().contains("dropped before admission"));
++    }
++
++    #[tokio::test]
++    async fn dropping_controller_after_admission_cancels_gate() {
++        let (mut controller, gate) = function_execution_start_barrier();
++        let gate_task = tokio::spawn(gate.wait());
++
++        controller.wait_until_ready().await.unwrap();
++        drop(controller);
++
++        let error = gate_task.await.unwrap().unwrap_err();
++        assert!(error.to_string().contains("dropped before release"));
++    }
++
++    #[tokio::test]
++    async fn dropping_gate_cancels_controller_wait() {
++        let (mut controller, gate) = function_execution_start_barrier();
++        drop(gate);
++
++        let error = controller.wait_until_ready().await.unwrap_err();
++        assert!(error
++            .to_string()
++            .contains("before reaching its start barrier"));
++    }
++}
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
 index fd38315bec5bb0e1f9a204b9dd803f575892bef2..dbec81ebbcd13e98117bf7730a07c62a3a6291e9 100644
 --- a/crates/common/src/knobs.rs
@@ -947,6 +1182,155 @@ index fd38315bec5bb0e1f9a204b9dd803f575892bef2..dbec81ebbcd13e98117bf7730a07c62a
  /// Maximum age of a local Node executor generation before graceful retirement.
  /// A finite age bounds retained ESM identities even when RSS remains low.
  pub static LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE: LazyLock<Duration> = LazyLock::new(|| {
+diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
+index c3b71876e482c830894c070e5374352076a9a135..5ca30d6455717ab38119c1ea07fd219280be2157 100644
+--- a/crates/common/src/lib.rs
++++ b/crates/common/src/lib.rs
+@@ -28,6 +28,7 @@ pub mod document_index_keys;
+ pub mod erased_slot;
+ pub mod errors;
+ pub mod execution_context;
++pub mod execution_start;
+ pub mod ext;
+ pub mod fastrace_helpers;
+ pub mod floating_point;
+diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
+index a131cd52a4e09e6929be030d924649111d1e667e..f58938c2bd2b564babd18e9414106b9f40f37a52 100644
+--- a/crates/function_runner/src/server.rs
++++ b/crates/function_runner/src/server.rs
+@@ -9,6 +9,11 @@ use std::{
+ 
+ use anyhow::Context;
+ use async_trait::async_trait;
++pub use common::execution_start::{
++    function_execution_start_barrier,
++    FunctionExecutionStartController,
++    FunctionExecutionStartGate,
++};
+ use common::{
+     auth::AuthConfig,
+     bootstrap_model::components::definition::ComponentDefinitionMetadata,
+@@ -116,68 +121,6 @@ use crate::{
+     FunctionWrites,
+ };
+ 
+-/// Scheduler-side ownership of a function execution start barrier.
+-///
+-/// The paired [`FunctionExecutionStartGate`] is passed down with an action and
+-/// signals after that action reaches its environment-specific admission
+-/// boundary. Dropping this controller before `start` cancels the prepared
+-/// execution.
+-pub struct FunctionExecutionStartController {
+-    ready_receiver: oneshot::Receiver<()>,
+-    start_sender: oneshot::Sender<()>,
+-}
+-
+-impl FunctionExecutionStartController {
+-    pub async fn wait_until_ready(&mut self) -> anyhow::Result<()> {
+-        (&mut self.ready_receiver)
+-            .await
+-            .context("Function execution ended before reaching its start barrier")
+-    }
+-
+-    pub fn start(self) -> anyhow::Result<()> {
+-        self.start_sender
+-            .send(())
+-            .map_err(|_| anyhow::anyhow!("Function execution ended before its start was released"))
+-    }
+-}
+-
+-/// Runtime-side ownership of a function execution start barrier.
+-pub struct FunctionExecutionStartGate {
+-    ready_sender: oneshot::Sender<()>,
+-    start_receiver: oneshot::Receiver<()>,
+-}
+-
+-impl FunctionExecutionStartGate {
+-    pub async fn wait(self) -> anyhow::Result<()> {
+-        self.ready_sender.send(()).map_err(|_| {
+-            anyhow::anyhow!("Function execution start controller was dropped before admission")
+-        })?;
+-        self.start_receiver
+-            .await
+-            .context("Function execution start controller was dropped before release")
+-    }
+-
+-    fn into_channels(self) -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
+-        (self.ready_sender, self.start_receiver)
+-    }
+-}
+-
+-pub fn function_execution_start_barrier(
+-) -> (FunctionExecutionStartController, FunctionExecutionStartGate) {
+-    let (ready_sender, ready_receiver) = oneshot::channel();
+-    let (start_sender, start_receiver) = oneshot::channel();
+-    (
+-        FunctionExecutionStartController {
+-            ready_receiver,
+-            start_sender,
+-        },
+-        FunctionExecutionStartGate {
+-            ready_sender,
+-            start_receiver,
+-        },
+-    )
+-}
+-
+ pub struct RunRequestArgs {
+     pub key_broker: FunctionRunnerKeyBroker,
+     pub index_reader: Arc<dyn IndexReader>,
+@@ -655,51 +598,3 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+             .await
+     }
+ }
+-
+-#[cfg(test)]
+-mod execution_start_tests {
+-    use super::function_execution_start_barrier;
+-
+-    #[tokio::test]
+-    async fn gate_waits_for_controller_release() {
+-        let (mut controller, gate) = function_execution_start_barrier();
+-        let gate_task = tokio::spawn(gate.wait());
+-
+-        controller.wait_until_ready().await.unwrap();
+-        assert!(!gate_task.is_finished());
+-        controller.start().unwrap();
+-        gate_task.await.unwrap().unwrap();
+-    }
+-
+-    #[tokio::test]
+-    async fn dropping_controller_cancels_gate() {
+-        let (controller, gate) = function_execution_start_barrier();
+-        drop(controller);
+-
+-        let error = gate.wait().await.unwrap_err();
+-        assert!(error.to_string().contains("dropped before admission"));
+-    }
+-
+-    #[tokio::test]
+-    async fn dropping_controller_after_admission_cancels_gate() {
+-        let (mut controller, gate) = function_execution_start_barrier();
+-        let gate_task = tokio::spawn(gate.wait());
+-
+-        controller.wait_until_ready().await.unwrap();
+-        drop(controller);
+-
+-        let error = gate_task.await.unwrap().unwrap_err();
+-        assert!(error.to_string().contains("dropped before release"));
+-    }
+-
+-    #[tokio::test]
+-    async fn dropping_gate_cancels_controller_wait() {
+-        let (mut controller, gate) = function_execution_start_barrier();
+-        drop(gate);
+-
+-        let error = controller.wait_until_ready().await.unwrap_err();
+-        assert!(error
+-            .to_string()
+-            .contains("before reaching its start barrier"));
+-    }
+-}
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
 index b1520c83286607fdd2bda9b58d6e4c789beaf198..2e3377dfa2717f939ee77c557d5521b38bfa132f 100644
 --- a/crates/isolate/src/client.rs
@@ -2434,7 +2818,7 @@ index d155e5782f8dcd22e3408fc3412247d546dbc200..70d84c78aa6b6c379bd95b7aafcf53e4
 +    }
 +}
 diff --git a/crates/node_executor/src/executor.rs b/crates/node_executor/src/executor.rs
-index d6bf735c89baac414ebd91937ca196b9a978841a..2ae49535fa9e8c2593a6d88bd305daa20446a73f 100644
+index d6bf735c89baac414ebd91937ca196b9a978841a..b02ff92b051379f936e67d23782c262a67050b87 100644
 --- a/crates/node_executor/src/executor.rs
 +++ b/crates/node_executor/src/executor.rs
 @@ -1,12 +1,18 @@
@@ -2458,7 +2842,15 @@ index d6bf735c89baac414ebd91937ca196b9a978841a..2ae49535fa9e8c2593a6d88bd305daa2
  };
  
  use anyhow::Context;
-@@ -80,6 +86,7 @@ use model::{
+@@ -23,6 +29,7 @@ use common::{
+         JsError,
+     },
+     execution_context::ExecutionContext,
++    execution_start::FunctionExecutionStartGate,
+     knobs::NODE_ANALYZE_MAX_RETRIES,
+     log_lines::{
+         run_function_and_collect_log_lines,
+@@ -80,6 +87,7 @@ use model::{
          },
      },
      source_packages::types::{
@@ -2466,7 +2858,7 @@ index d6bf735c89baac414ebd91937ca196b9a978841a..2ae49535fa9e8c2593a6d88bd305daa2
          PackageSize,
          SourcePackageId,
      },
-@@ -148,6 +155,43 @@ const MAX_STREAMED_RESPONSE_PARTS: usize = 1024;
+@@ -148,14 +156,115 @@ const MAX_STREAMED_RESPONSE_PARTS: usize = 1024;
  #[async_trait]
  pub trait NodeExecutor: Sync + Send {
      fn enable(&self) -> anyhow::Result<()>;
@@ -2510,7 +2902,9 @@ index d6bf735c89baac414ebd91937ca196b9a978841a..2ae49535fa9e8c2593a6d88bd305daa2
      async fn invoke(
          &self,
          request: ExecutorRequest,
-@@ -156,6 +200,69 @@ pub trait NodeExecutor: Sync + Send {
+         log_line_sender: mpsc::UnboundedSender<LogLine>,
++        function_execution_start: Option<FunctionExecutionStartGate>,
+     ) -> anyhow::Result<InvokeResponse>;
      fn shutdown(&self);
  }
  
@@ -2580,7 +2974,7 @@ index d6bf735c89baac414ebd91937ca196b9a978841a..2ae49535fa9e8c2593a6d88bd305daa2
  pub struct InvokeResponse {
      pub response: JsonValue,
      pub aws_request_id: Option<String>,
-@@ -234,6 +341,63 @@ impl<RT: Runtime> NodeActions<RT> {
+@@ -234,6 +343,63 @@ impl<RT: Runtime> NodeActions<RT> {
          self.executor.enable()
      }
  
@@ -2644,7 +3038,95 @@ index d6bf735c89baac414ebd91937ca196b9a978841a..2ae49535fa9e8c2593a6d88bd305daa2
      pub fn shutdown(&self) {
          self.executor.shutdown()
      }
-@@ -582,6 +746,15 @@ impl ExecutorRequest {
+@@ -243,12 +409,12 @@ impl<RT: Runtime> NodeActions<RT> {
+         &self,
+         request: ExecuteRequest,
+         log_line_sender: mpsc::UnboundedSender<LogLine>,
++        function_execution_start: Option<FunctionExecutionStartGate>,
+         source_maps_callback: impl Future<Output = anyhow::Result<
+             BTreeMap<CanonicalizedModulePath, SourceMap>>>
+             + Send,
+     ) -> anyhow::Result<NodeActionOutcome> {
+         let path = request.path_and_args.path().clone();
+-        let timer = node_executor("execute");
+         let request = ExecutorRequest::Execute {
+             request,
+             backend_address: self.convex_origin.clone(),
+@@ -258,10 +424,54 @@ impl<RT: Runtime> NodeActions<RT> {
+             timeout: self.user_timeout,
+             deployment: self.deployment.clone(),
+         };
++        let (function_execution_start, execution_started) =
++            if let Some(function_execution_start) = function_execution_start {
++                let (start_observer, execution_started) = tokio::sync::oneshot::channel();
++                (
++                    Some(function_execution_start.with_start_observer(start_observer)),
++                    Some(execution_started),
++                )
++            } else {
++                (None, None)
++            };
++        let invocation =
++            self.executor
++                .invoke(request, log_line_sender, function_execution_start);
++        tokio::pin!(invocation);
++        let (invoke_response, timer) = if let Some(mut execution_started) = execution_started {
++            tokio::select! {
++                biased;
++                start_result = &mut execution_started => {
++                    let Ok(start_observed) = start_result else {
++                        return match invocation.await {
++                            Err(error) => Err(error),
++                            Ok(_) => Err(anyhow::anyhow!(
++                                "Node invocation completed without observing its execution start"
++                            )),
++                        };
++                    };
++                    let timer = node_executor("execute");
++                    // The gate waits for this diagnostic acknowledgment, so
++                    // the service timer is running before `/invoke` can begin.
++                    // Failed observation must not revoke a released execution.
++                    let _ = start_observed.send(());
++                    (invocation.await?, timer)
++                },
++                response = &mut invocation => {
++                    response?;
++                    anyhow::bail!(
++                        "Node invocation completed before publishing its execution start"
++                    );
++                },
++            }
++        } else {
++            let timer = node_executor("execute");
++            (invocation.await?, timer)
++        };
+         let InvokeResponse {
+             response,
+             aws_request_id,
+-        } = self.executor.invoke(request, log_line_sender).await?;
++        } = invoke_response;
+         // Executor responses can contain application errors and result data.
+         // Keep malformed-protocol errors fixed instead of copying that payload
+         // into a thrown error that can reach infrastructure logs.
+@@ -339,7 +549,7 @@ impl<RT: Runtime> NodeActions<RT> {
+         let InvokeResponse {
+             response,
+             aws_request_id,
+-        } = self.executor.invoke(request, log_line_sender).await?;
++        } = self.executor.invoke(request, log_line_sender, None).await?;
+         let response: BuildDepsResponse = serde_json::from_value(response)
+             .map_err(|_| anyhow::anyhow!("Failed to deserialize Node build_deps response"))?;
+ 
+@@ -389,7 +599,7 @@ impl<RT: Runtime> NodeActions<RT> {
+             let (log_line_sender, log_line_receiver) = mpsc::unbounded_channel();
+             let request = ExecutorRequest::Analyze(request.clone());
+             let (response, log_lines) = run_function_and_collect_log_lines(
+-                self.executor.invoke(request, log_line_sender).boxed(),
++                self.executor.invoke(request, log_line_sender, None).boxed(),
+                 log_line_receiver,
+                 |_| {},
+             )
+@@ -582,6 +792,15 @@ impl ExecutorRequest {
              Self::BuildDeps(_) => "build_deps",
          }
      }
@@ -2660,7 +3142,7 @@ index d6bf735c89baac414ebd91937ca196b9a978841a..2ae49535fa9e8c2593a6d88bd305daa2
  }
  
  impl TryFrom<ExecutorRequest> for JsonValue {
-@@ -673,6 +846,10 @@ pub struct SourcePackage {
+@@ -673,6 +892,10 @@ pub struct SourcePackage {
  
      // Info of external package if external dependencies were specified.
      pub external_deps: Option<Package>,
@@ -2671,7 +3153,7 @@ index d6bf735c89baac414ebd91937ca196b9a978841a..2ae49535fa9e8c2593a6d88bd305daa2
  }
  
  impl From<SourcePackage> for JsonValue {
-@@ -722,6 +899,9 @@ pub struct ExecuteRequest {
+@@ -722,6 +945,9 @@ pub struct ExecuteRequest {
  
      pub source_package: SourcePackage,
      pub source_package_id: SourcePackageId,
@@ -2703,7 +3185,7 @@ index bfde7653b4f955bbf86e50c3541fe2870d2f5ed1..2e47b26e1bac2fbccd68afa04d356b99
      SourcePackage,
      ARGS_TOO_LARGE_RESPONSE_MESSAGE,
 diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
-index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e98119cff2c9 100644
+index ff5bb0a825716e953a2d4be7c6aed04e336aef65..7518c456ef72ad20c91139bc8d5d5b80d9b5f2ab 100644
 --- a/crates/node_executor/src/local.rs
 +++ b/crates/node_executor/src/local.rs
 @@ -10,7 +10,10 @@ use std::os::unix::fs::{
@@ -2718,7 +3200,15 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
      fs,
      io::Write as _,
      path::{
-@@ -103,6 +106,7 @@ const NVMRC_VERSION: &str = include_str!("../../../.nvmrc");
+@@ -43,6 +46,7 @@ use std::{
+ use anyhow::Context;
+ use async_trait::async_trait;
+ use common::{
++    execution_start::FunctionExecutionStartGate,
+     knobs::{
+         LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE,
+         LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES,
+@@ -103,6 +107,7 @@ const NVMRC_VERSION: &str = include_str!("../../../.nvmrc");
  const HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(100);
  const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
  const MAX_HEALTH_RESPONSE_BYTES: usize = 64 * 1024;
@@ -2726,7 +3216,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
  const MAX_INVOKE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
  const MAX_NODE_VERSION_OUTPUT_BYTES: usize = 1024;
  const MAX_HEALTH_CHECK_ATTEMPTS: u32 = 50;
-@@ -138,22 +142,38 @@ const MIB_BYTES: u64 = 1024 * 1024;
+@@ -138,22 +143,38 @@ const MIB_BYTES: u64 = 1024 * 1024;
  
  pub struct LocalNodeExecutor {
      state: Arc<Mutex<LocalNodeExecutorState>>,
@@ -2766,7 +3256,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
      node_process_timeout: Duration,
      /// Overrides the initial callback retry backoff in the spawned node
      /// process (read by syscalls.ts at module load). Tests zero this so
-@@ -172,4312 +192,8725 @@ pub struct LocalNodeExecutorConfig {
+@@ -172,4312 +193,9108 @@ pub struct LocalNodeExecutorConfig {
      max_imported_source_packages: u64,
      diagnostics_dir: Option<PathBuf>,
      diagnostic_pruning_in_progress: Arc<AtomicBool>,
@@ -4619,6 +5109,10 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +    active_requests: AtomicUsize,
 +    retirement_requested: AtomicBool,
 +    idle: Notify,
++    /// Published only when the child can no longer honor an already admitted
++    /// request. Graceful generation drain deliberately leaves this false.
++    execution_unavailable: AtomicBool,
++    execution_unavailable_notify: Notify,
 +    terminate_draining: AtomicBool,
 +    terminate_draining_notify: Notify,
 +    retired: AtomicBool,
@@ -8247,6 +8741,9 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 -                );
 -                let active = *memory_pressure.borrow_and_update();
 -                pressure_tracking_observation
+-                    .lock()
+-                    .expect("Local Node memory-pressure observation lock is poisoned")
+-                    .observe_publication(active, Instant::now());
 +impl LocalNodeExecutorConfig {
 +    fn validate(&self) -> anyhow::Result<()> {
 +        anyhow::ensure!(
@@ -8322,21 +8819,19 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +}
 +
 +impl InnerLocalNodeExecutor {
-+    fn admit_request(
-+        self: &Arc<Self>,
-+        request_metadata: RequestDiagnosticMetadata,
-+        preparation_descriptor: Option<PreparationDescriptor>,
-+    ) -> ActiveRequestGuard {
-+        // Callers hold the generation-state mutex, so descriptor retention and
-+        // the active increment both happen before promotion can close admission.
-+        if let Some(preparation_descriptor) = preparation_descriptor {
-+            PreparationDescriptor::retain_fresher(
-+                &mut self
-+                    .preparation_descriptor
-                     .lock()
--                    .expect("Local Node memory-pressure observation lock is poisoned")
--                    .observe_publication(active, Instant::now());
--            }
++    fn mark_execution_unavailable(&self) {
++        self.execution_unavailable.store(true, Ordering::Release);
++        self.execution_unavailable_notify.notify_waiters();
++    }
++
++    async fn wait_until_execution_unavailable(&self) {
++        loop {
++            let notified = self.execution_unavailable_notify.notified();
++            tokio::pin!(notified);
++            notified.as_mut().enable();
++            if self.execution_unavailable.load(Ordering::Acquire) {
++                return;
+             }
 -        };
 -        tokio::select! {
 -            // A pressure publication and a completed health check can wake this
@@ -8352,11 +8847,8 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 -                config,
 -                memory_pressure_observation,
 -            ) => {},
-+                    .expect("Local Node preparation descriptor lock poisoned"),
-+                preparation_descriptor,
-+            );
++            notified.await;
          }
-+        ActiveRequestGuard::new(self.clone(), request_metadata)
      }
  
 -    async fn watch_generation_checks(
@@ -8370,6 +8862,25 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 -        let mut previous_stack_stats = NodeStackTraceStats::default();
 -        let latest_process_stat = Arc::new(StdMutex::new(None));
 -        let mut process_stat_sequence = 0u64;
++    fn admit_request(
++        self: &Arc<Self>,
++        request_metadata: RequestDiagnosticMetadata,
++        preparation_descriptor: Option<PreparationDescriptor>,
++    ) -> ActiveRequestGuard {
++        // Callers hold the generation-state mutex, so descriptor retention and
++        // the active increment both happen before promotion can close admission.
++        if let Some(preparation_descriptor) = preparation_descriptor {
++            PreparationDescriptor::retain_fresher(
++                &mut self
++                    .preparation_descriptor
++                    .lock()
++                    .expect("Local Node preparation descriptor lock poisoned"),
++                preparation_descriptor,
++            );
++        }
++        ActiveRequestGuard::new(self.clone(), request_metadata)
++    }
++
 +    async fn terminate_startup_child(
 +        server_handle: &Arc<Mutex<ManagedChild>>,
 +    ) -> anyhow::Result<()> {
@@ -8745,6 +9256,8 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +                    active_requests: AtomicUsize::new(0),
 +                    retirement_requested: AtomicBool::new(false),
 +                    idle: Notify::new(),
++                    execution_unavailable: AtomicBool::new(false),
++                    execution_unavailable_notify: Notify::new(),
 +                    terminate_draining: AtomicBool::new(false),
 +                    terminate_draining_notify: Notify::new(),
 +                    retired: AtomicBool::new(false),
@@ -8766,10 +9279,10 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
                  });
              }
 +            tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
-         }
++        }
 +        if cleanup.is_none() {
 +            Self::terminate_startup_child(&server_handle).await?;
-+        }
+         }
 +        Err(CandidateStartupHealthFailed.into())
      }
  
@@ -8981,6 +9494,10 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +    }
 +
 +    async fn terminate(&self) -> anyhow::Result<ChildTerminationObservation> {
++        // Request admission can outlive removal from the executor state. Wake
++        // any pre-start owner before termination so it cannot authorize a
++        // durable claim for a child already selected for hard retirement.
++        self.mark_execution_unavailable();
 +        #[cfg(test)]
 +        if self
 +            .termination_failures_remaining
@@ -8998,6 +9515,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +    async fn terminate_for_hot_cleanup(
 +        &self,
 +    ) -> anyhow::Result<Option<ChildTerminationObservation>> {
++        self.mark_execution_unavailable();
 +        #[cfg(test)]
 +        if self
 +            .termination_failures_remaining
@@ -10233,6 +10751,11 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +                Some(candidate.cleanup.clone())
 +            },
 +            Some(HotTransition::Draining(draining)) => {
++                // Unlike normal drain completion, preemption may terminate the
++                // old child while request guards are still active. Publish the
++                // distinction before waking cleanup so pre-start reservations
++                // cannot race the termination task.
++                draining.old.mark_execution_unavailable();
 +                draining
 +                    .old
 +                    .terminate_draining
@@ -10634,6 +11157,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +            if let Some(HotTransition::Draining(draining)) = &state_guard.hot_transition
 +                && Arc::ptr_eq(&draining.old, expected)
 +            {
++                expected.mark_execution_unavailable();
 +                expected.terminate_draining.store(true, Ordering::Release);
 +                expected.terminate_draining_notify.notify_waiters();
 +                drop(state_guard);
@@ -10649,6 +11173,10 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +                .is_some_and(|current| Arc::ptr_eq(current, expected))
 +            {
 +                // A late result from an old generation cannot retire its replacement.
++                // Publish hard unavailability while admission is still fenced
++                // by this mutex. Normal promotion uses the graceful drain path
++                // and therefore does not publish this signal.
++                expected.mark_execution_unavailable();
 +                state.inner.take();
 +                assert!(state.retiring.is_none());
 +                if let Some(HotTransition::Candidate(candidate)) = &state.hot_transition {
@@ -11614,15 +12142,90 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +}
 +
 +impl LocalNodeExecutor {
++    async fn prepare_and_wait_for_execution_start(
++        &self,
++        inner: &Arc<InnerLocalNodeExecutor>,
++        descriptor: &PreparationDescriptor,
++        start_gate: FunctionExecutionStartGate,
++        request_guard: &mut ActiveRequestGuard,
++    ) -> anyhow::Result<()> {
++        if descriptor.is_expired() {
++            request_guard.set_outcome("package_authority_expired_before_start");
++            anyhow::bail!("Node package authority expired before execution admission");
++        }
++
++        // Preparing through the selected child moves the ordinary package
++        // download before the durable claim without importing or invoking
++        // application code. The endpoint does not retain its package-cache
++        // lease, so `/invoke` can still need the signed authority again.
++        let preparation = inner.prepare_package(descriptor, self.config.node_process_timeout);
++        tokio::pin!(preparation);
++        let hard_shutdown = wait_for_atomic_flag(&self.shutdown_started, &self.transition_changed);
++        tokio::pin!(hard_shutdown);
++        let unavailable = inner.wait_until_execution_unavailable();
++        tokio::pin!(unavailable);
++        let preparation_result = tokio::select! {
++            biased;
++            _ = &mut hard_shutdown => {
++                request_guard.set_outcome("generation_lost_before_start");
++                anyhow::bail!("Local Node executor shut down before execution start");
++            },
++            _ = &mut unavailable => {
++                request_guard.set_outcome("generation_lost_before_start");
++                anyhow::bail!("Local Node executor generation became unavailable before execution start");
++            },
++            result = &mut preparation => result,
++        };
++        if let Err(error) = preparation_result {
++            request_guard.set_outcome("preparation_failed_before_start");
++            return Err(error.context("Node package preparation failed before execution admission"));
++        }
++
++        // `acquire_inner` incremented this exact generation's active count
++        // under the generation-state mutex shared with promotion. Do not
++        // retain that mutex across the durable claim: this linear guard is
++        // sufficient to make graceful drain wait, and it must remain alive
++        // through the eventual `/invoke` response.
++        let start = start_gate.wait();
++        tokio::pin!(start);
++        let hard_shutdown = wait_for_atomic_flag(&self.shutdown_started, &self.transition_changed);
++        tokio::pin!(hard_shutdown);
++        let unavailable = inner.wait_until_execution_unavailable();
++        tokio::pin!(unavailable);
++        let start_result = tokio::select! {
++            biased;
++            _ = &mut hard_shutdown => {
++                request_guard.set_outcome("generation_lost_before_start");
++                anyhow::bail!("Local Node executor shut down before execution start");
++            },
++            _ = &mut unavailable => {
++                request_guard.set_outcome("generation_lost_before_start");
++                anyhow::bail!("Local Node executor generation became unavailable before execution start");
++            },
++            result = &mut start => result,
++        };
++        if let Err(error) = start_result {
++            request_guard.set_outcome("canceled_before_start");
++            return Err(error);
++        }
++        Ok(())
++    }
++
 +    pub(crate) async fn invoke_with_fingerprint(
 +        &self,
 +        request: ExecutorRequest,
 +        log_line_sender: mpsc::UnboundedSender<LogLine>,
 +        resident_fingerprint: Option<ResidentGenerationFingerprint>,
++        function_execution_start: Option<FunctionExecutionStartGate>,
 +    ) -> anyhow::Result<InvokeResponse> {
 +        anyhow::ensure!(
 +            !self.shutting_down.load(Ordering::Acquire),
 +            "Local Node executor is shutting down"
++        );
++        anyhow::ensure!(
++            function_execution_start.is_none()
++                || matches!(&request, ExecutorRequest::Execute { .. }),
++            "Only Node execute requests can have a function execution start barrier"
 +        );
 +        let request_kind = request.kind();
 +        let request_metadata = request_diagnostic_metadata(&request);
@@ -11643,6 +12246,19 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +            self.spawn_watchdog(&inner);
 +        }
 +        let client = inner.client.clone();
++
++        if let Some(start_gate) = function_execution_start {
++            let descriptor = preparation_descriptor
++                .as_ref()
++                .context("Gated Node execute request is missing its package descriptor")?;
++            self.prepare_and_wait_for_execution_start(
++                &inner,
++                descriptor,
++                start_gate,
++                &mut request_guard,
++            )
++            .await?;
++        }
 +
 +        // Use one absolute deadline for both phases. Reqwest's request timeout
 +        // also wraps the response body and would otherwise surface as an
@@ -11875,14 +12491,16 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +        &self,
 +        request: ExecutorRequest,
 +        log_line_sender: mpsc::UnboundedSender<LogLine>,
++        function_execution_start: Option<FunctionExecutionStartGate>,
 +    ) -> anyhow::Result<InvokeResponse> {
-+        self.invoke_with_fingerprint(request, log_line_sender, None)
++        self.invoke_with_fingerprint(request, log_line_sender, None, function_execution_start)
 +            .await
 +    }
 +
 +    fn shutdown(&self) {
 +        self.shutting_down.store(true, Ordering::Release);
 +        if self.shutdown_started.swap(true, Ordering::AcqRel) {
++            self.transition_changed.notify_waiters();
 +            let state = self.state.clone();
 +            tokio::spawn(async move {
 +                Self::preempt_hot_transition_state(&state, "shutdown_canceled").await;
@@ -11891,6 +12509,10 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +            });
 +            return;
 +        }
++        // Wake pre-start reservations synchronously. The asynchronous
++        // retirement task below may not be polled before a scheduler releases
++        // an otherwise ready action.
++        self.transition_changed.notify_waiters();
 +        let state = self.state.clone();
 +        tokio::spawn(async move {
 +            Self::preempt_hot_transition_state(&state, "shutdown_canceled").await;
@@ -11956,7 +12578,10 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +        },
 +    };
 +
-+    use common::types::Timestamp;
++    use common::{
++        execution_start::function_execution_start_barrier,
++        types::Timestamp,
++    };
 +    use futures::future::join_all;
 +    use tokio::{
 +        io::{
@@ -12296,6 +12921,252 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +            .contains("preparation response exceeded its size limit"));
 +        server.await.unwrap();
 +        generation.terminate().await.unwrap();
++    }
++
++    async fn test_inner_with_preparation_response(
++        response_body: &'static str,
++    ) -> (Arc<InnerLocalNodeExecutor>, tokio::task::JoinHandle<()>) {
++        let socket_dir = TempDir::new().unwrap();
++        let socket_path = socket_dir.path().join("executor.sock");
++        let listener = UnixListener::bind(&socket_path).unwrap();
++        let response = format!(
++            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
++             {}\r\nConnection: close\r\n\r\n{response_body}",
++            response_body.len()
++        );
++        let server = tokio::spawn(async move {
++            let _socket_dir = socket_dir;
++            let (mut socket, _) = listener.accept().await.unwrap();
++            let mut request = [0; 4096];
++            assert!(socket.read(&mut request).await.unwrap() > 0);
++            socket.write_all(response.as_bytes()).await.unwrap();
++        });
++        let client = Client::builder()
++            .no_proxy()
++            .unix_socket(socket_path)
++            .build()
++            .unwrap();
++        (test_inner_with_client(1, client).await, server)
++    }
++
++    #[tokio::test]
++    async fn execution_start_ready_holds_exact_generation_admission() {
++        let (inner, server) = test_inner_with_preparation_response(r#"{"type":"success"}"#).await;
++        let (executor, _) = test_executor(inner.clone(), test_config());
++        let guard = match executor
++            .acquire_existing_inner(test_request_metadata(), None)
++            .await
++            .unwrap()
++        {
++            InnerAcquisition::Ready { guard, .. } => guard,
++            InnerAcquisition::Draining(_)
++            | InnerAcquisition::Transition(_)
++            | InnerAcquisition::Missing => panic!("Test generation was not admitted"),
++        };
++        let descriptor = PreparationDescriptor {
++            source_package: test_source_package(),
++        };
++        let (mut controller, gate) = function_execution_start_barrier();
++        let execution_inner = inner.clone();
++        let task = tokio::spawn(async move {
++            let mut guard = guard;
++            executor
++                .prepare_and_wait_for_execution_start(
++                    &execution_inner,
++                    &descriptor,
++                    gate,
++                    &mut guard,
++                )
++                .await
++        });
++
++        controller.wait_until_ready().await.unwrap();
++        assert!(!task.is_finished(), "Execution passed the start gate early");
++        assert_eq!(inner.active_requests.load(Ordering::Acquire), 1);
++        drop(controller);
++        assert!(task.await.unwrap().is_err());
++        assert_eq!(inner.active_requests.load(Ordering::Acquire), 0);
++        server.await.unwrap();
++        inner.terminate().await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn graceful_drain_waits_for_execution_start_reservation() {
++        let (inner, server) = test_inner_with_preparation_response(r#"{"type":"success"}"#).await;
++        let (executor, state) = test_executor(inner.clone(), test_config());
++        let guard = match executor
++            .acquire_existing_inner(test_request_metadata(), None)
++            .await
++            .unwrap()
++        {
++            InnerAcquisition::Ready { guard, .. } => guard,
++            InnerAcquisition::Draining(_)
++            | InnerAcquisition::Transition(_)
++            | InnerAcquisition::Missing => panic!("Test generation was not admitted"),
++        };
++        let descriptor = PreparationDescriptor {
++            source_package: test_source_package(),
++        };
++        let (mut controller, gate) = function_execution_start_barrier();
++        let execution_inner = inner.clone();
++        let execution = tokio::spawn(async move {
++            let mut guard = guard;
++            executor
++                .prepare_and_wait_for_execution_start(
++                    &execution_inner,
++                    &descriptor,
++                    gate,
++                    &mut guard,
++                )
++                .await
++        });
++
++        controller.wait_until_ready().await.unwrap();
++        let diagnostics = GenerationRetirementDiagnostics::topology_change();
++        assert!(
++            LocalNodeExecutor::start_draining_inner_state(&state, &inner, diagnostics.reason).await
++        );
++        let retirement_state = state.clone();
++        let retirement_inner = inner.clone();
++        let retirement = tokio::spawn(async move {
++            LocalNodeExecutor::finish_draining_inner_state(
++                &retirement_state,
++                &retirement_inner,
++                diagnostics,
++            )
++            .await
++        });
++        tokio::task::yield_now().await;
++        assert!(!retirement.is_finished());
++        assert!(!inner.execution_unavailable.load(Ordering::Acquire));
++
++        controller.start().unwrap();
++        execution.await.unwrap().unwrap();
++        assert!(retirement.await.unwrap().unwrap());
++        server.await.unwrap();
++        assert!(inner.retired.load(Ordering::Acquire));
++    }
++
++    #[tokio::test]
++    async fn hard_unavailability_cancels_execution_start_reservation() {
++        let (inner, server) = test_inner_with_preparation_response(r#"{"type":"success"}"#).await;
++        let (executor, _) = test_executor(inner.clone(), test_config());
++        let guard = ActiveRequestGuard::new(inner.clone(), test_request_metadata());
++        let descriptor = PreparationDescriptor {
++            source_package: test_source_package(),
++        };
++        let (mut controller, gate) = function_execution_start_barrier();
++        let execution_inner = inner.clone();
++        let task = tokio::spawn(async move {
++            let mut guard = guard;
++            executor
++                .prepare_and_wait_for_execution_start(
++                    &execution_inner,
++                    &descriptor,
++                    gate,
++                    &mut guard,
++                )
++                .await
++        });
++
++        controller.wait_until_ready().await.unwrap();
++        inner.mark_execution_unavailable();
++        let error = task.await.unwrap().unwrap_err();
++        assert!(error.to_string().contains("became unavailable"));
++        assert_eq!(inner.active_requests.load(Ordering::Acquire), 0);
++        server.await.unwrap();
++        inner.terminate().await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn hard_unavailability_wins_a_simultaneous_start_release() {
++        let (inner, server) = test_inner_with_preparation_response(r#"{"type":"success"}"#).await;
++        let (executor, _) = test_executor(inner.clone(), test_config());
++        let guard = ActiveRequestGuard::new(inner.clone(), test_request_metadata());
++        let descriptor = PreparationDescriptor {
++            source_package: test_source_package(),
++        };
++        let (mut controller, gate) = function_execution_start_barrier();
++        let execution_inner = inner.clone();
++        let task = tokio::spawn(async move {
++            let mut guard = guard;
++            executor
++                .prepare_and_wait_for_execution_start(
++                    &execution_inner,
++                    &descriptor,
++                    gate,
++                    &mut guard,
++                )
++                .await
++        });
++
++        controller.wait_until_ready().await.unwrap();
++        controller.start().unwrap();
++        inner.mark_execution_unavailable();
++        let error = task.await.unwrap().unwrap_err();
++        assert!(error.to_string().contains("became unavailable"));
++        assert_eq!(inner.active_requests.load(Ordering::Acquire), 0);
++        server.await.unwrap();
++        inner.terminate().await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn package_preparation_failure_happens_before_ready() {
++        let (inner, server) = test_inner_with_preparation_response(r#"{"type":"error"}"#).await;
++        let (executor, _) = test_executor(inner.clone(), test_config());
++        let guard = ActiveRequestGuard::new(inner.clone(), test_request_metadata());
++        let descriptor = PreparationDescriptor {
++            source_package: test_source_package(),
++        };
++        let (mut controller, gate) = function_execution_start_barrier();
++        let execution_inner = inner.clone();
++        let task = tokio::spawn(async move {
++            let mut guard = guard;
++            executor
++                .prepare_and_wait_for_execution_start(
++                    &execution_inner,
++                    &descriptor,
++                    gate,
++                    &mut guard,
++                )
++                .await
++        });
++
++        assert!(controller.wait_until_ready().await.is_err());
++        let error = task.await.unwrap().unwrap_err();
++        assert!(error.to_string().contains("before execution admission"));
++        assert_eq!(inner.active_requests.load(Ordering::Acquire), 0);
++        server.await.unwrap();
++        inner.terminate().await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn expired_package_authority_fails_before_ready() {
++        let inner = test_inner(1).await;
++        let (executor, _) = test_executor(inner.clone(), test_config());
++        let guard = ActiveRequestGuard::new(inner.clone(), test_request_metadata());
++        let mut source_package = test_source_package();
++        source_package.download_url_expiration = Instant::now();
++        let descriptor = PreparationDescriptor { source_package };
++        let (mut controller, gate) = function_execution_start_barrier();
++        let execution_inner = inner.clone();
++        let task = tokio::spawn(async move {
++            let mut guard = guard;
++            executor
++                .prepare_and_wait_for_execution_start(
++                    &execution_inner,
++                    &descriptor,
++                    gate,
++                    &mut guard,
++                )
++                .await
++        });
++
++        assert!(controller.wait_until_ready().await.is_err());
++        let error = task.await.unwrap().unwrap_err();
++        assert!(error.to_string().contains("authority expired"));
++        assert_eq!(inner.active_requests.load(Ordering::Acquire), 0);
++        inner.terminate().await.unwrap();
 +    }
 +
 +    #[test]
@@ -13273,6 +14144,8 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +            active_requests: AtomicUsize::new(0),
 +            retirement_requested: AtomicBool::new(false),
 +            idle: Notify::new(),
++            execution_unavailable: AtomicBool::new(false),
++            execution_unavailable_notify: Notify::new(),
 +            terminate_draining: AtomicBool::new(false),
 +            terminate_draining_notify: Notify::new(),
 +            retired: AtomicBool::new(false),
@@ -13506,7 +14379,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +        .unwrap();
      }
  
--    #[test]
+     #[test]
 -    fn cgroup_pressure_retirement_requires_grace_and_material_rss() {
 -        let config = test_config();
 -        let below_hard_limit = config.max_rss_bytes - 1;
@@ -13530,7 +14403,6 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 -            ),
 -            None
 -        );
-+    #[test]
 +    fn tempdir_removal_requires_confirmed_direct_child_reaping() {
 +        assert!(tokio::runtime::Handle::try_current().is_err());
 +        let retained_dir = TempDir::new().unwrap();
@@ -13725,24 +14597,6 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 -        let symlink_path = parent.path().join("artifact-link");
 -        symlink(&directory, &symlink_path).unwrap();
 -        assert!(create_private_diagnostic_directory(&symlink_path).is_err());
--
--        let nonempty_directory = parent.path().join("nonempty");
--        fs::create_dir(&nonempty_directory).unwrap();
--        fs::write(
--            nonempty_directory.join("node-report-existing.json"),
--            b"keep",
--        )
--        .unwrap();
--        fs::set_permissions(&nonempty_directory, fs::Permissions::from_mode(0o755)).unwrap();
--        assert!(create_private_diagnostic_directory(&nonempty_directory).is_err());
--        assert_eq!(
--            fs::metadata(&nonempty_directory)
--                .unwrap()
--                .permissions()
--                .mode()
--                & 0o777,
--            0o755
--        );
 +    fn test_executor(
 +        inner: Arc<InnerLocalNodeExecutor>,
 +        config: LocalNodeExecutorConfig,
@@ -13766,6 +14620,40 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +            config,
 +        };
 +        (executor, state)
++    }
+ 
+-        let nonempty_directory = parent.path().join("nonempty");
+-        fs::create_dir(&nonempty_directory).unwrap();
+-        fs::write(
+-            nonempty_directory.join("node-report-existing.json"),
+-            b"keep",
++    fn test_cleanup_owner(
++        state: &Arc<Mutex<LocalNodeExecutorState>>,
++        transition_changed: &Arc<Notify>,
++        token: u64,
++        status: &Arc<HotTransitionStatus>,
++        reason: GenerationRetirementReason,
++        generation: &Arc<InnerLocalNodeExecutor>,
++    ) -> Arc<HotTransitionCleanupOwner> {
++        HotTransitionCleanupOwner::new(
++            token,
++            state,
++            transition_changed.clone(),
++            status.clone(),
++            reason,
++            generation.pool_name.clone(),
+         )
+-        .unwrap();
+-        fs::set_permissions(&nonempty_directory, fs::Permissions::from_mode(0o755)).unwrap();
+-        assert!(create_private_diagnostic_directory(&nonempty_directory).is_err());
+-        assert_eq!(
+-            fs::metadata(&nonempty_directory)
+-                .unwrap()
+-                .permissions()
+-                .mode()
+-                & 0o777,
+-            0o755
+-        );
      }
  
 -    #[test]
@@ -13825,25 +14713,6 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 -            .path()
 -            .join("node-profile-directory.cpuprofile");
 -        fs::create_dir(&recognized_directory).unwrap();
-+    fn test_cleanup_owner(
-+        state: &Arc<Mutex<LocalNodeExecutorState>>,
-+        transition_changed: &Arc<Notify>,
-+        token: u64,
-+        status: &Arc<HotTransitionStatus>,
-+        reason: GenerationRetirementReason,
-+        generation: &Arc<InnerLocalNodeExecutor>,
-+    ) -> Arc<HotTransitionCleanupOwner> {
-+        HotTransitionCleanupOwner::new(
-+            token,
-+            state,
-+            transition_changed.clone(),
-+            status.clone(),
-+            reason,
-+            generation.pool_name.clone(),
-+        )
-+    }
- 
--        prune_diagnostic_artifacts(diagnostics_dir.path()).unwrap();
 +    #[tokio::test]
 +    async fn preemption_reaps_after_local_state_owner_is_lost() {
 +        let current = test_inner(1).await;
@@ -13884,6 +14753,14 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +            cleanup: cleanup.clone(),
 +        }));
  
+-        prune_diagnostic_artifacts(diagnostics_dir.path()).unwrap();
++        // The exact cleanup watcher, rather than the executor state, now owns
++        // the candidate and its permit through confirmed reaping.
++        drop(executor);
++        drop(state);
++        drop(cleanup);
++        assert_eq!(coordinator.force_preempt_reclaimable(), Some("candidate"));
+ 
 -        let retained_artifacts = fs::read_dir(diagnostics_dir.path())
 -            .unwrap()
 -            .map(Result::unwrap)
@@ -13900,13 +14777,6 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 -        assert!(unrelated_file.exists());
 -        assert!(misleading_file.exists());
 -        assert!(recognized_directory.is_dir());
-+        // The exact cleanup watcher, rather than the executor state, now owns
-+        // the candidate and its permit through confirmed reaping.
-+        drop(executor);
-+        drop(state);
-+        drop(cleanup);
-+        assert_eq!(coordinator.force_preempt_reclaimable(), Some("candidate"));
-+
 +        tokio::time::timeout(Duration::from_secs(1), async {
 +            while coordinator.state.lock().unwrap().occupied.is_some() {
 +                tokio::task::yield_now().await;
@@ -14372,6 +15242,16 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +            Duration::from_secs(1),
 +            coordinator.acquire(SurgePriority::Routine, Arc::from("draining-recovered")),
          )
+-        .unwrap();
+-        assert_eq!(fs::read(&paths.profile_path).unwrap(), b"profile");
+-        assert_eq!(
+-            fs::metadata(&paths.profile_path)
+-                .unwrap()
+-                .permissions()
+-                .mode()
+-                & 0o777,
+-            0o600
+-        );
 +        .await
 +        .unwrap()
 +        .release();
@@ -14417,16 +15297,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +            }
 +        })
 +        .await
-         .unwrap();
--        assert_eq!(fs::read(&paths.profile_path).unwrap(), b"profile");
--        assert_eq!(
--            fs::metadata(&paths.profile_path)
--                .unwrap()
--                .permissions()
--                .mode()
--                & 0o777,
--            0o600
--        );
++        .unwrap();
  
 -        let profile_link = source_dir.path().join("linked-profile-source");
 -        fs::hard_link(&paths.profile_source_path, &profile_link).unwrap();
@@ -14911,7 +15782,12 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +        drop(state_guard);
 +        generation.terminate().await.unwrap();
 +    }
-+
+ 
+-        drop(replacement);
+-        drop(guards);
+-        assert_eq!(generation.active_requests.load(Ordering::Relaxed), 0);
+-        assert!(generation
+-            .active_request_diagnostics
 +    #[tokio::test]
 +    async fn stale_package_fingerprint_cannot_replace_newer_generation() {
 +        let mut current = test_fingerprint(b"current");
@@ -14946,12 +15822,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
 +        )
 +        .await
 +        .expect("Rejected fingerprint replacement did not complete promptly");
- 
--        drop(replacement);
--        drop(guards);
--        assert_eq!(generation.active_requests.load(Ordering::Relaxed), 0);
--        assert!(generation
--            .active_request_diagnostics
++
 +        assert!(result.is_err());
 +        assert!(state.lock().await.hot_transition.is_none());
 +        assert!(state
@@ -15319,7 +16190,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
                  }
                  tokio::task::yield_now().await;
              }
-@@ -4485,100 +8918,141 @@ done
+@@ -4485,100 +9302,141 @@ done
          .await
          .unwrap();
  
@@ -15528,7 +16399,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
      }
  
      #[tokio::test]
-@@ -4586,12 +9060,14 @@ done
+@@ -4586,12 +9444,14 @@ done
          let generation = test_inner(1).await;
          let (executor, state) = test_executor(generation.clone(), test_config());
          let active_guard = match executor
@@ -15545,7 +16416,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
                  panic!("Test generation was not available")
              },
          };
-@@ -4641,8 +9117,10 @@ done
+@@ -4641,8 +9501,10 @@ done
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(old.clone()),
              retiring: None,
@@ -15556,7 +16427,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
          }));
          old.server_handle
              .lock()
-@@ -4695,8 +9173,10 @@ done
+@@ -4695,8 +9557,10 @@ done
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(generation.clone()),
              retiring: None,
@@ -15567,7 +16438,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
          }));
  
          let retirements = (0..8).map(|_| {
-@@ -4750,12 +9230,14 @@ done
+@@ -4750,12 +9614,14 @@ done
          .await
          .unwrap();
          match executor
@@ -15584,7 +16455,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
                  panic!("Unreaped generation did not fence replacement startup")
              },
          }
-@@ -4777,6 +9259,84 @@ done
+@@ -4777,6 +9643,84 @@ done
          assert!(state.lock().await.retiring.is_none());
      }
  
@@ -15669,7 +16540,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
      #[tokio::test]
      async fn watchdog_resets_transient_miss_before_retiring_generation() {
          let socket_dir = TempDir::new().unwrap();
-@@ -4816,8 +9376,10 @@ done
+@@ -4816,8 +9760,10 @@ done
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(generation.clone()),
              retiring: None,
@@ -15680,7 +16551,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
          }));
          let mut config = test_config();
          config.health_check_timeout = Duration::from_secs(1);
-@@ -4898,8 +9460,10 @@ done
+@@ -4898,8 +9844,10 @@ done
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(generation.clone()),
              retiring: None,
@@ -15691,7 +16562,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
          }));
          let pressure = MemoryPressureSignal::new(true);
          let mut config = test_config();
-@@ -4976,8 +9540,10 @@ done
+@@ -4976,8 +9924,10 @@ done
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(generation.clone()),
              retiring: None,
@@ -15702,7 +16573,7 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
          }));
          let mut config = test_config();
          config.health_check_timeout = Duration::from_secs(1);
-@@ -4999,7 +9565,7 @@ done
+@@ -4999,7 +9949,7 @@ done
              .unwrap()
              .unwrap();
  
@@ -15711,7 +16582,39 @@ index ff5bb0a825716e953a2d4be7c6aed04e336aef65..5c4b6c2bfbab6d667dbaa315c204e981
          assert_eq!(generation.active_requests.load(Ordering::Acquire), 1);
          assert!(state.lock().await.inner.is_none());
          assert!(generation.server_handle.lock().await.child.is_none());
-@@ -5204,4 +9770,282 @@ done
+@@ -5038,6 +9988,7 @@ done
+                     upload_url: String::new(),
+                 }),
+                 log_line_sender,
++                None,
+             )
+             .await
+             .unwrap();
+@@ -5078,6 +10029,7 @@ done
+                     upload_url: String::new(),
+                 }),
+                 log_line_sender,
++                None,
+             )
+             .await;
+         assert!(result.is_err());
+@@ -5122,6 +10074,7 @@ done
+                     upload_url: String::new(),
+                 }),
+                 log_line_sender,
++                None,
+             )
+             .await;
+         assert!(result.is_err());
+@@ -5172,6 +10125,7 @@ done
+                     upload_url: String::new(),
+                 }),
+                 log_line_sender,
++                None,
+             )
+             .await
+             .unwrap();
+@@ -5204,4 +10158,282 @@ done
          .unwrap();
          assert!(inner.server_handle.lock().await.child.is_none());
      }
@@ -16972,18 +17875,22 @@ index 5247219264b34e316a109c696e1732594c956d98..e2b9769f7cf218f0e7caf960c95a261b
 +    }
 +}
 diff --git a/crates/node_executor/src/noop.rs b/crates/node_executor/src/noop.rs
-index 70dbec830e3d18017383effc9a8c18cbd9ab0879..92fea21b5b839f50f3196c3ba037674174d8db0f 100644
+index 70dbec830e3d18017383effc9a8c18cbd9ab0879..bad895c1ad14206706bb62ea1caed7ebad3673bd 100644
 --- a/crates/node_executor/src/noop.rs
 +++ b/crates/node_executor/src/noop.rs
-@@ -1,5 +1,7 @@
+@@ -1,5 +1,10 @@
  use async_trait::async_trait;
- use common::log_lines::LogLine;
+-use common::log_lines::LogLine;
++use common::{
++    execution_start::FunctionExecutionStartGate,
++    log_lines::LogLine,
++};
 +use errors::ErrorMetadata;
 +use model::source_packages::types::NodeExecutorPoolTopology;
  use tokio::sync::mpsc;
  
  use crate::executor::{
-@@ -21,6 +23,24 @@ impl NodeExecutor for NoopNodeExecutor {
+@@ -21,13 +26,57 @@ impl NodeExecutor for NoopNodeExecutor {
          Ok(())
      }
  
@@ -17008,12 +17915,45 @@ index 70dbec830e3d18017383effc9a8c18cbd9ab0879..92fea21b5b839f50f3196c3ba0376741
      async fn invoke(
          &self,
          _request: ExecutorRequest,
+         _log_line_sender: mpsc::UnboundedSender<LogLine>,
++        _function_execution_start: Option<FunctionExecutionStartGate>,
+     ) -> anyhow::Result<InvokeResponse> {
+         anyhow::bail!("NoopNodeExecutor cannot be used to invoke code.");
+     }
+ 
+     fn shutdown(&self) {}
+ }
++
++#[cfg(test)]
++mod tests {
++    use common::execution_start::function_execution_start_barrier;
++
++    use super::*;
++
++    #[tokio::test]
++    async fn gated_invocation_fails_before_ready() {
++        let (mut controller, gate) = function_execution_start_barrier();
++        let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
++        let executor = NoopNodeExecutor::new();
++        let invocation = executor.invoke(
++            ExecutorRequest::BuildDeps(crate::executor::BuildDepsRequest {
++                deps: vec![],
++                upload_url: String::new(),
++            }),
++            log_line_sender,
++            Some(gate),
++        );
++
++        assert!(invocation.await.is_err());
++        assert!(controller.wait_until_ready().await.is_err());
++    }
++}
 diff --git a/crates/node_executor/src/routed.rs b/crates/node_executor/src/routed.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..426114528e0303a56a5a7d8893e7ede78f3e6d4b
+index 0000000000000000000000000000000000000000..d58197f51f03dadf4fa79f6e57d86b12b753b2a3
 --- /dev/null
 +++ b/crates/node_executor/src/routed.rs
-@@ -0,0 +1,3664 @@
+@@ -0,0 +1,3671 @@
 +use std::{
 +    collections::{
 +        BTreeMap,
@@ -17033,6 +17973,7 @@ index 0000000000000000000000000000000000000000..426114528e0303a56a5a7d8893e7ede7
 +
 +use async_trait::async_trait;
 +use common::{
++    execution_start::FunctionExecutionStartGate,
 +    knobs::{
 +        LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES,
 +        LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES,
@@ -19262,6 +20203,7 @@ index 0000000000000000000000000000000000000000..426114528e0303a56a5a7d8893e7ede7
 +        &self,
 +        request: ExecutorRequest,
 +        log_line_sender: mpsc::UnboundedSender<LogLine>,
++        function_execution_start: Option<FunctionExecutionStartGate>,
 +    ) -> anyhow::Result<InvokeResponse> {
 +        anyhow::ensure!(
 +            !self.shutting_down.load(Ordering::Acquire),
@@ -19270,7 +20212,12 @@ index 0000000000000000000000000000000000000000..426114528e0303a56a5a7d8893e7ede7
 +        let (executor, fingerprint, request_kind) = self.selected_pool(&request).await?;
 +        crate::metrics::log_local_node_route_request(executor.pool_name(), request_kind);
 +        executor
-+            .invoke_with_fingerprint(request, log_line_sender, fingerprint)
++            .invoke_with_fingerprint(
++                request,
++                log_line_sender,
++                fingerprint,
++                function_execution_start,
++            )
 +            .await
 +    }
 +
@@ -22429,10 +23376,10 @@ index e07d4441bc0dc22f4370fa38e039c78f001b57f3..271cf3376cbf6494e79347f1a99778d1
  direct child. Rust does not create a process group or cgroup for descendants
 diff --git a/patches/pinned_local_node_executor_pools/README.md b/patches/pinned_local_node_executor_pools/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..55c78306e9ba32280ef817bf7adf8a2f27ba55c4
+index 0000000000000000000000000000000000000000..b8584253ccfefb6c501107ec6c45a547f7071929
 --- /dev/null
 +++ b/patches/pinned_local_node_executor_pools/README.md
-@@ -0,0 +1,569 @@
+@@ -0,0 +1,583 @@
 +# Application-Declared Pinned Local Node Executor Pools
 +
 +Status: implemented; named pools require an application declaration and an
@@ -22476,6 +23423,20 @@ index 0000000000000000000000000000000000000000..55c78306e9ba32280ef817bf7adf8a2f
 +[`backend_memory_resilience`](../backend_memory_resilience/README.md) with a
 +total planning allowance for every possible steady local Node process slot and
 +the global surge slot.
++
++The patch also completes its composition with scheduled and registered-cron
++action admission. Their durable start barrier now extends through Node routing,
++package preparation, and exact resident-generation admission. A request that
++loses to candidate promotion ends before `ready` while its job remains
++`Pending`; a request admitted first retains the same linear generation guard
++through `/invoke`, so normal promotion waits for it to drain. Topology can be
++published before either ordering resolves. Hard generation loss is still
++conservative after a visible claim. The ordering and failure contract are
++specified in
++[`scheduled_node_action_admission.md`](scheduled_node_action_admission.md).
++The current preparation endpoint does not retain its zero-owner package-cache
++lease across the claim; the supplemental document records that remaining
++package-authority limitation separately from the completed generation fence.
 +
 +## Source declaration and bundling
 +
@@ -23002,6 +23963,682 @@ index 0000000000000000000000000000000000000000..55c78306e9ba32280ef817bf7adf8a2f
 +deploy before replacing the backend. Remove the force-capable CLI afterward if
 +required; older backends intentionally reject the pool-bearing environment
 +value.
+diff --git a/patches/pinned_local_node_executor_pools/scheduled_node_action_admission.md b/patches/pinned_local_node_executor_pools/scheduled_node_action_admission.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..cfeb3693cf2157fa45d48db3e626240be83d719a
+--- /dev/null
++++ b/patches/pinned_local_node_executor_pools/scheduled_node_action_admission.md
+@@ -0,0 +1,557 @@
++# Scheduled Node Action Admission Across Generation Cutover
++
++Status: the generation-level start fence is implemented with the existing
++linear active-request guard and no new durable state. The current package
++preparation endpoint does not retain its cache lease across the durable claim,
++so the stronger expiring-authority guarantee described below remains open.
++
++## Patch ownership
++
++This work belongs in the coordinated local Node executor pools patch rather
++than in a separate adoption unit. The pool patch introduces the resident
++generation fingerprint, topology publication ordering, candidate promotion,
++old-generation admission closure, and stale-request rejection that create the
++remaining race. It also owns the generation guard needed to close that race.
++
++The existing
++[`scheduled_action_admission`](../scheduled_action_admission/README.md) patch
++supplies the scheduler-side durable-claim controller and the general two-way
++start barrier. This patch carries that barrier through Node routing and
++generation admission so its `ready` signal has the same concrete meaning for
++Node that it already has for an assigned V8 worker.
++
++During development, a focused commit can keep the change reviewable. The final
++patch train should fold that commit into this patch so an adopter cannot apply
++coordinated Node cutover while omitting its required scheduled-action
++composition. No new stored job state, rollout step, or independent activation
++unit is required.
++
++## Problem
++
++Before this completion, the scheduled-action barrier signaled `ready` after
++the application built an `ExecuteRequest`, but immediately before
++`NodeActions::execute`. The scheduler then committed the exact job's monotonic
++`Pending -> InProgress` claim and released the request.
++
++After release, Node execution still had to:
++
++1. serialize the executor request;
++2. reconcile the request's topology snapshot with router publication;
++3. select the exact logical pool incarnation;
++4. reconcile the source-package and environment fingerprint;
++5. wait for or create a compatible local generation;
++6. acquire that generation's active-request guard; and
++7. send the request to the Node child.
++
++A deployment can publish or promote a newer generation between the early
++`ready` signal and those steps. The router correctly rejects a request whose
++older source-package and environment fingerprint is no longer resident, but
++that rejection then occurs after the durable claim. The scheduler cannot move
++the job back to `Pending`, because it cannot generally infer from a
++post-claim failure that user code did not begin. A later scheduler pass
++therefore applies the conservative at-most-once failure contract.
++
++The two mechanisms are individually correct:
++
++- the scheduler does not retry work that may have produced external effects;
++- the router does not run a request in a generation that disagrees with its
++  validated snapshot.
++
++Their prior composition left an ordinary deployment race on the post-claim
++side of the barrier.
++
++## Required guarantee
++
++For a scheduled or registered-cron Node action, a successful `ready` signal
++must mean all of the following:
++
++- request serialization and other deterministic application-side preparation
++  have succeeded;
++- the request agrees with the committed router topology and exact logical pool
++  incarnation;
++- a generation with the compatible source-package and effective-environment
++  identity is resident and admitted;
++- normal candidate promotion and topology drain cannot invalidate that
++  admission;
++- no application module has been imported or invoked for this request.
++
++After `ready`, the scheduler commits the exact durable claim. Only the matching
++prepared invocation may consume the subsequent `start` signal. It must use the
++same generation ownership that justified `ready`; it must not repeat selection
++or reacquire an equivalent-looking generation.
++
++This is a narrower guarantee than exactly-once execution or universal
++failure-free deployment. Backend process loss, an ambiguous claim result,
++hard generation retirement, forced cutover, or transport loss after a visible
++claim can still leave an `InProgress` job whose execution outcome is unknown.
++Those cases retain conservative recovery.
++
++Package preparation currently proves publication only at the preparation
++response. It does not retain package-cache ownership through the claim. The
++remaining limitation is described under **Package authority is not yet
++retained** and must not be presented as part of the implemented guarantee.
++
++## Non-goals
++
++This completion does not add:
++
++- an `InProgress -> Pending` transition;
++- a durable `Preparing` state;
++- a retry based on a Node error string;
++- a global deployment or scheduler lock;
++- a permanent scheduled-action pool or quota;
++- retention or reconstruction of arbitrary historical generations;
++- a change to repeatable-snapshot function semantics;
++- a cross-process parked-request protocol in the Node child; or
++- a promise that forced cutover, host pressure, shutdown, or process failure
++  cannot interrupt an action.
++
++Avoiding generation rotation for a push whose complete Node-relevant package
++and environment are unchanged can reduce cutover work, but it does not close a
++real source, environment, or topology change race and is not part of this
++correctness fix.
++
++## Design
++
++### Extend the existing start barrier
++
++Keep the scheduler-side controller and exact claim flow unchanged. Pass the
++optional runtime-side start gate through `NodeActions::execute` and the
++`NodeExecutor` invocation boundary. Ordinary actions, analysis, dependency
++builds, and HTTP actions do not create the gate and retain their current
++behavior.
++
++For a local execute request, the runtime performs this sequence while the job
++is still `Pending`:
++
++```text
++build ExecuteRequest under its repeatable database snapshot
++acquire the application Node-action permit
++serialize the executor request
++validate topology and module-to-pool selection
++select the exact logical pool incarnation
++reconcile or join the exact cutover target
++acquire a compatible generation under its generation-state mutex
++retain a linear generation admission guard
++prepare the package in the selected child
++signal ready and wait for start
++```
++
++The scheduler then performs:
++
++```text
++open a fresh short transaction
++verify the complete expected Pending job
++commit Pending -> InProgress with its request and execution IDs
++send start
++```
++
++After `start`, the prepared invocation:
++
++```text
++starts the Node request deadline
++sends /invoke through the already selected child
++holds the same generation guard through the complete response
++```
++
++No router lock, generation-state mutex, startup lock, or durable-claim
++transaction is held while waiting for the claim. The function runner's
++repeatable-snapshot transaction remains part of the prepared action state, as
++it does for the V8 barrier; the scheduler opens the fresh short claim
++transaction only after `ready`.
++
++### Use a linear generation admission guard
++
++`LocalNodeExecutor` already increments a generation's active-request count
++under the same state mutex used by promotion to close old admission. That is
++the correct synchronization primitive. The prepared invocation should retain
++that ownership from `ready` until cancellation or response completion.
++
++The guard or prepared-invocation handle must not be cloneable. Dropping it
++before `start` must:
++
++- release the generation admission;
++- release application capacity through the existing future stack;
++- wake a normal old-generation drain if this was its last owner; and
++- record a bounded pre-start outcome rather than an invocation success or user
++  failure.
++
++An advisory fingerprint check is insufficient. A separate `reserve` method is
++also insufficient if `execute` later selects or acquires the generation again.
++The resource that justifies `ready` must be the resource used to send the
++request.
++
++### Linearization with deployment promotion
++
++Let:
++
++- `A` be generation admission, including the active increment under the
++  generation-state mutex; and
++- `P` be candidate promotion, including closing old admission under that same
++  mutex.
++
++Only two orderings are possible:
++
++| Ordering | Required result |
++| --- | --- |
++| `A < P` | The action owns the old generation. Promotion may install the candidate, but old-generation drain waits for the guard. The exact claim can commit and the action can run against its prepared snapshot. |
++| `P < A` | Old admission is closed. The stale request cannot acquire a compatible guard, so it ends before `ready`; its durable job remains `Pending` and a later attempt rebuilds from a fresh snapshot. |
++
++This ordering also permits admission after topology publication but before
++candidate promotion when the older request still matches the sole admitted
++resident generation. Once admitted, that request is assigned old-generation
++work even if its user code begins after candidate promotion. This matches the
++existing hot-drain contract for work assigned before old admission closes.
++The deployment caller waits for old drain before returning.
++
++### Preserve the complete identity fence
++
++Generation admission must retain the existing layered checks. Compatibility
++is not only a source-package comparison. It includes:
++
++- complete committed pool topology or the permitted older-snapshot relation;
++- the module's exact named or default-pool selection;
++- logical pool incarnation, including its introduction version;
++- source-package identity;
++- the canonical effective-environment hash; and
++- cutover publication and target ordering.
++
++A request must not join a candidate for a different source or environment
++target at the same version. A stale request must not recreate a removed pool or
++start a detached generation after that pool incarnation closes. If no exact
++compatible generation remains admitted, the request ends before `ready` and
++the scheduler obtains a fresh snapshot on retry.
++
++### Observe exceptional generation loss
++
++The active-request guard makes normal promotion and graceful retirement wait;
++it does not make the child immortal. Backend shutdown, health retirement,
++cgroup pressure, forced cutover, or child failure can terminate a generation
++with active guards.
++
++While the scheduler claim is in flight, the prepared Node invocation must race
++the start gate against a generation-unavailable signal. Immediate retirement
++must publish that signal before it kills or detaches the child. A normal
++deployment drain must not publish it, because the already admitted guard
++remains executable there.
++
++If exceptional loss wins before a definitely visible claim, the prepared
++future fails without consuming `start`; the pending scheduler retry contract
++applies. If the commit may already be visible, the scheduler retains its
++existing conservative ambiguity handling. A returned error or timeout is not
++proof that a submitted database commit stayed invisible.
++
++The current child health signal cannot prove future execution. A child can
++still die immediately after any check. The purpose of the unavailable signal
++is narrower: never release a reservation that the runtime already knows it has
++lost.
++
++### Package authority is not yet retained
++
++Package URLs are signed before Node routing. An already expired descriptor is a
++pre-admission failure, and `/prepare` moves the ordinary download, checksum,
++and publication work before `ready`.
++
++The existing endpoint acquires and releases a source-package lease before it
++returns success. As documented by
++[`atomic_node_executor_source_packages`](../atomic_node_executor_source_packages/README.md),
++the package is then a zero-owner cache entry. Count or byte pressure can retire
++it before `/invoke`, which will try to acquire the package again and may need
++the same signed URL after the durable claim. In particular, if every older
++cache entry is active while a new preparation releases its lease, bounded
++cache enforcement can retire the newly prepared entry immediately.
++
++The current implementation therefore does not remove expiring package
++authority from an unbounded post-claim path. Closing that gap would require a
++real lease handoff between preparation and invocation, or another bounded
++authority contract. That is a separate child-protocol decision; this document
++must not imply that the process-local generation guard supplies package-cache
++ownership.
++
++### Preserve timeout boundaries
++
++The Node process request deadline and user-facing execution timeout begin only
++after `start`. Claim latency must not consume user execution time or make a
++freshly released request immediately time out.
++
++Application end-to-end action time and durable-admission time may include the
++claim, as they do for the V8 barrier. Node executor service-time and transport
++metrics should preserve their post-release meaning. If the existing active
++guard is reused directly, its diagnostics and request-start metrics need an
++explicit reserved phase or a bounded `canceled_before_start` outcome so a
++canceled claim is not reported as a submitted Node invocation.
++
++## Cancellation and failure behavior
++
++| Point | Durable state | Generation ownership | Result |
++| --- | --- | --- | --- |
++| Serialization, topology, pool, cutover, fingerprint, startup, or authority failure before `ready` | `Pending` | Never acquired or dropped | Existing scheduler retry from a fresh snapshot |
++| Controller or scheduler task drops before `ready` | `Pending` | Dropped | No child request; later scheduler attempt may proceed |
++| Exact job changes while admission waits | Changed by the winning operation | Dropped | No stale action starts |
++| Generation becomes exceptionally unavailable while the claim is in flight | `Pending` if the claim is definitely invisible; otherwise possibly `InProgress` | Dropped without `start` | Pending retry or conservative ambiguous recovery |
++| Claim returns `None` after exact-state comparison | Changed by the winning operation | Dropped | No child request |
++| Claim definitely fails before commit submission | `Pending` | Dropped | Existing scheduler retry |
++| Claim result is ambiguous | Possibly `InProgress` | Never released | Conservative recovery; no inferred retry |
++| Claim commits and `start` delivery fails | `InProgress` | Lost or closing | Existing generic transient failure |
++| Normal deployment promotes after admission | `InProgress` after claim | Old generation remains guarded | Candidate serves new work; old request executes and drains |
++| Hard pressure, shutdown, or force interrupts after claim | `InProgress` | Terminated | Existing conservative action failure |
++| Completion transaction temporarily fails | `InProgress` | Invocation already completed | Existing completion retry loop |
++
++Cancellation after a visible claim retains the current scheduled-action
++contract. A cancellation operation may change the durable job before the
++controller releases `start`, while the already claimed action can still run.
++Completion must continue to compare the exact claimed job and must not
++overwrite a winning cancellation.
++
++## Liveness and progress
++
++### No structural deadlock
++
++The design introduces no lock cycle when implemented with drop-based ownership:
++
++1. request admission briefly takes the generation-state mutex;
++2. it increments active ownership and releases the mutex;
++3. the scheduler commits the job claim in a fresh transaction; and
++4. deployment drain may wait for that ownership to leave.
++
++The claim does not wait for deployment cleanup, and deployment runtime cleanup
++does not hold the database transaction that published it. The wait relation is
++therefore a one-way delay from deployment drain to the admitted action, not a
++deadlock.
++
++Holding a router lock, generation mutex, startup lock, or deployment surge
++coordinator lock across the database claim would invalidate this argument and
++must be rejected.
++
++### Claim stalls can delay deployment completion
++
++An admitted action owns its generation while the short exact-state claim
++commits. A database stall can therefore delay old-generation drain and the
++deployment response. This is head-of-line blocking, not a logical cycle. The
++V8 admission barrier already holds selected runtime capacity across the same
++claim; Node additionally couples that delay to generation drain.
++
++Do not add a blind claim timeout that treats cancellation as proof of an
++invisible commit. A useful timeout contract must distinguish:
++
++- definitely not committed;
++- committed; and
++- result unknown.
++
++The unknown result must retain conservative recovery. Initially, keep the
++claim to one fresh transaction, instrument its latency, and use existing
++database cancellation semantics. Add a more elaborate lease only if observed
++claim stalls justify its state and failure protocol.
++
++### Long actions can hold deployment surge capacity
++
++If admission wins before promotion, the action is legitimate old-generation
++work. Candidate promotion still makes new-generation service available, but
++the old generation and global surge lease remain until its admitted actions
++finish or an exceptional policy terminates them. `finish_push` and a later
++cutover can therefore wait for the full action duration.
++
++This is the existing hot-drain policy, not downtime. The completion expands
++the set of requests correctly classified as admitted instead of failing them,
++so it can make the cost more visible. Application action concurrency and the
++existing execution deadline bound ordinary ownership. Forced cutover remains
++an explicit operator decision that can interrupt external effects.
++
++### Repeated deployments can delay a pending job
++
++A request can repeatedly lose admission if every fresh attempt overlaps a
++newer topology publication. Ordinary scheduled jobs and registered crons
++already apply backoff to pre-admission system failures, so repeated stale
++snapshots do not create a hot retry loop.
++
++The design is not wait-free under infinite deployment churn. It guarantees
++eventual progress after topology churn stops, provided the database, executor,
++and scheduler remain healthy. A special fairness scheduler or deployment
++quiescence protocol is not justified without evidence of persistent
++starvation.
++
++### Concurrent preparations remain safe
++
++The durable job stays `Pending` during admission, so more than one scheduler
++owner can theoretically prepare it. Only the exact fresh claim can win.
++Losing owners drop their generation guards without sending child requests.
++This may consume bounded transient capacity but cannot duplicate user code.
++
++## Observability
++
++The local generation guard records bounded pre-start completion outcomes for
++controller cancellation, package expiry or preparation failure, and known
++generation loss. Existing router and durable-admission metrics continue to
++classify topology, incarnation, and fingerprint failures.
++
++Do not use module paths, source-package IDs, environment names or values,
++fingerprints, request IDs, job IDs, tenants, or function arguments as metric
++labels. Do not copy raw executor or provider payloads into logs.
++
++Control flow must depend on the barrier phase and typed ownership result, not
++the literal stale-fingerprint error string. The string may remain useful as a
++sanitized invariant error, but deployment races are expected pre-admission
++outcomes once this boundary is complete.
++
++The Node execution deadline and service timer start after release. The durable
++claim histogram continues to measure the only interval added to generation
++ownership by this completion.
++
++## Compatibility and rollout
++
++The completion changes no durable job schema, request ID, execution ID, source
++package format, topology format, pool declaration, or Node JSON request body.
++It is process-local and activates automatically when the scheduler,
++application runner, and local Node executor use the completed backend image.
++
++The neutral start-gate type lives in `common` and is re-exported by the function
++runner for compatibility. The Node invocation interface carries that gate
++without serializing it. Node executor code does not depend on scheduler job
++semantics; it owns only `ready`, `start`, cancellation, and generation
++ownership.
++
++The no-op executor must fail before `ready`. A future remote Node executor must
++not report local preparation as remote admission. It would need an explicit
++remote prepare/continue acknowledgment protocol or must reject the optional
++gate. Mixed versions remain only partially protected while an older scheduler
++can still claim before the completed Node boundary.
++
++## Regressions to prevent
++
++- **Advisory readiness:** signaling after a fingerprint check without owning
++  the exact generation leaves the original race intact.
++- **Reacquisition after claim:** dropping the prepared guard and selecting
++  again after `start` turns readiness into a stale hint.
++- **Lock retention:** holding executor locks across the database claim can
++  block promotion, shutdown, and cancellation and can create a real wait
++  cycle.
++- **Deadline drift:** starting the Node timeout before the claim charges
++  database delay to user execution.
++- **Dead reservation release:** ignoring shutdown or hard retirement can
++  commit a job against a child already known to be unavailable.
++- **Expired package authority:** a preparation result without retained package
++  ownership can still leave a deterministic post-claim download failure.
++- **Old-incarnation resurrection:** a removed and reintroduced pool name must
++  not make a prior request eligible for the new slot.
++- **Stale-target joining:** source or environment disagreement at one topology
++  version must fail instead of joining a convenient candidate.
++- **Metric reclassification:** a claim cancellation must not be counted as a
++  child invocation or user-code failure.
++- **Error-string retry:** scheduler behavior must not parse the stale resident
++  fingerprint message.
++
++## Rejected alternatives
++
++### Retry or reset `InProgress`
++
++Moving a claimed job back to `Pending`, or retrying because one runtime path
++reports that it did not start, weakens the durable at-most-once contract. A
++process can fail after user code starts but before publishing that fact. A
++safe durable retry protocol would need a new attempt epoch, exact completion
++fencing, cancellation semantics, garbage collection, mixed-version behavior,
++and a proof that no executor for the old epoch can still run. Moving ordinary
++admission before the existing monotonic claim is smaller and safer.
++
++### Accept or reconstruct stale generations
++
++Keeping enough historical generations to run every prepared snapshot has
++unbounded memory and lifecycle cost, conflicts with the one-surge-slot host
++budget, complicates removed-pool identity, and can execute obsolete code long
++after deployment. Rewriting an old request to use the current package breaks
++the repeatable snapshot that supplied validation, environment, routing, and
++source identity.
++
++### Pause the scheduler during deployment
++
++A global quiescence protocol delays unrelated work, needs coordination across
++backend owners, and still must resolve preparations already in flight. It
++turns a local ordering bug into application-wide deployment downtime.
++
++### Hold the function transaction through cutover
++
++The preparation transaction is a repeatable snapshot, not a generation lease.
++Holding it longer increases snapshot age and OCC exposure without preventing a
++router publication or candidate promotion after the durable job claim.
++
++### Add a child-side parked-request protocol now
++
++A child protocol could serialize and acknowledge a request without importing
++or invoking its application module, then start it after the durable claim. It
++would require bounded parked capacity, reservation IDs, cancellation,
++expiration, child-restart semantics, authentication, cleanup, and
++mixed-version negotiation. It would still not remove backend failure after the
++claim and before `start`. The local generation guard closes the observed
++deployment race without that protocol. Add it only if measured transport or
++child-start ambiguity justifies the additional state machine.
++
++### Avoid rotations for apparently unrelated pushes
++
++A content-addressed Node import-closure identity could reuse generations when
++the complete executable package and environment are unchanged. That is a
++useful optimization but requires a precise package-identity contract. It does
++not protect real Node source, environment, or topology changes and cannot
++replace the admission fix.
++
++## Implementation
++
++The optional execution start gate is carried through `NodeActions::execute`,
++the `NodeExecutor` invocation boundary, routed pool selection, and exact local
++generation acquisition without entering the serialized Node request. The
++local executor prepares the package in the selected child, then reports
++`ready` while retaining that generation's active-request guard. It races the
++claim wait against controller cancellation, backend shutdown, and a distinct
++hard-unavailability signal. Graceful promotion does not publish that signal.
++Package preparation does not retain the child package-cache lease.
++
++After `start`, the same invocation begins its Node request deadline, sends
++`/invoke` through the already selected child, and retains the guard through the
++response. A start-observation handshake begins the Node executor service timer
++after release, and the gate waits for its diagnostic acknowledgment before
++allowing `/invoke`. Durable-claim latency is therefore not charged to Node
++service time, and the timer cannot start after request submission. Pre-start
++exits use bounded outcomes for cancellation, package expiry or preparation
++failure, and generation loss.
++
++The implementation keeps this behavior inside the existing action future. It
++does not add a separate externally visible reservation registry or detached
++task.
++
++## Verification
++
++Current focused tests cover the barrier cancellation contract, exact-generation
++guard retention after `ready`, graceful drain waiting for that guard, hard
++unavailability canceling it, preparation and expiry failure before `ready`, and
++no-op rejection before `ready`.
++
++The following material integration coverage is still missing:
++
++- a prepared older request when promotion wins before generation acquisition:
++  no durable claim and no child invocation;
++- generation acquisition winning before promotion: candidate promotion,
++  old-generation execution, and drain complete without a stale rejection;
++- exact job cancellation or replacement after `ready`, releasing the guard
++  without sending `/invoke`;
++- an ambiguous claim result never releasing `start` and never being treated as
++  safe to retry;
++- pool removal and same-name reintroduction while admission waits;
++- a same-version cutover target disagreement;
++- both ordinary scheduled actions and registered-cron actions; and
++- an instrumented child observing no `/invoke` before the exact durable claim.
++
++Package-cache pressure also needs a regression proving the open lease gap, or a
++future lease-handoff fix, before the stronger package-authority guarantee can
++be accepted.
++
++## Acceptance statement
++
++The implemented generation fence prevents an ordinary coordinated cutover
++from turning a definitively pre-execution stale Node request into an abandoned
++durable action claim. Either the action owns an exact generation before its
++claim and normal drain honors that ownership, or generation cutover wins and
++the action remains pending for a fresh retry. This statement does not close the
++package-cache lease gap described above.
++
++The completion deliberately does not claim that every visible `InProgress`
++action will execute or return a result. That stronger claim is impossible
++across process, database, and transport failure without a larger durable and
++cross-process protocol.
+diff --git a/patches/scheduled_action_admission/README.md b/patches/scheduled_action_admission/README.md
+index a2b9a2325614d1ce55e10f2368aac50e19e39833..7de1b757a9016ba21e9cf0e61caede4fab37dd98 100644
+--- a/patches/scheduled_action_admission/README.md
++++ b/patches/scheduled_action_admission/README.md
+@@ -11,12 +11,14 @@ deterministic validation failures reach a no-runtime boundary because they need
+ 
+ The coordination is a two-way, process-local start barrier. For V8 actions the barrier is reached
+ after the application action permit, isolate queue admission, active-JavaScript permit, and an
+-eligible isolate worker are all owned. For Node actions it is reached after application admission
+-and application-side request preparation, immediately before calling `NodeActions::execute`.
+-Failure before `ready` drops the preparation while the job is still pending. A changed job or
+-failed claim also drops the prepared execution without starting user code; existing retry behavior
+-applies when the claim is definitely not visible, while an ambiguous visible claim retains
+-conservative recovery.
++eligible isolate worker are all owned. With the coordinated local Node executor pools patch, Node
++actions reach it only after application preparation, routing, package preparation in the selected
++child, and exact resident-generation admission. Failure before `ready` drops the preparation while
++the job is still pending. A changed job or failed claim also drops the prepared execution without
++starting user code; existing retry behavior applies when the claim is definitely not visible,
++while an ambiguous visible claim retains conservative recovery. See
++[`scheduled_node_action_admission.md`](../pinned_local_node_executor_pools/scheduled_node_action_admission.md)
++for the generation-cutover composition.
+ 
+ The patch does not change at-most-once recovery after `InProgress` is visible. A process can still
+ fail after the claim commit and before or after the barrier release, and the scheduler still cannot
+@@ -84,8 +86,9 @@ absolute deadline.
+ 
+ Node actions use a separate application limiter and executor transport. Their preparation includes
+ loading the current source package, environment, signed package URLs, and callback credentials.
+-The Node process has no equivalent in-process isolate-worker handoff, so its barrier is immediately
+-before `NodeActions::execute` rather than inside the child process.
++When the coordinated local Node executor pools patch is present, the barrier continues through
++router selection, exact generation admission, and the child's package-preparation endpoint before
++`/invoke`. A future remote executor would need its own admission protocol.
+ 
+ `SCHEDULED_JOB_EXECUTION_PARALLELISM` limits source tasks, not V8 CPU slots. A value such as 64 can
+ be intentional when many actions spend most of their lifetime awaiting `fetch()` or other I/O,
+@@ -144,8 +147,9 @@ The patch preserves these properties:
+ 
+ ### Two-way start barrier
+ 
+-[`function_runner/server.rs`](../../crates/function_runner/src/server.rs) defines a paired
+-controller and gate backed by two one-shot channels:
++[`common/execution_start.rs`](../../crates/common/src/execution_start.rs) defines a paired
++controller and gate backed by two one-shot channels. The function runner re-exports those types for
++compatibility:
+ 
+ - the runtime-owned gate sends `ready` and waits for `start`;
+ - the scheduler-owned controller waits for `ready` and, only after the claim, sends `start`.
+@@ -235,21 +239,27 @@ existing conservative result.
+ 
+ ### Node and invalid-action behavior
+ 
+-A Node action performs database and package preparation and acquires the Node action application
+-permit while the durable job remains pending. It signals `ready` after the complete
+-`ExecuteRequest` is built and immediately before `node_actions.execute`. Dropping the controller
+-releases that permit without sending the request.
+-
+-This boundary prevents application admission and application-side package, environment, and
+-request-preparation failures from consuming the durable claim. After release,
+-`NodeActions::execute` still serializes the executor request, checks executor shutdown, may acquire
+-or start the local Node generation, and sends the HTTP request. The barrier cannot reserve capacity
+-inside the separate Node process or prove where a startup or transport failure occurred relative to
+-user code. Those failures remain on the conservative post-claim side even when the request never
+-reached the child. Package URLs are also signed before `ready`; an unusually slow claim can leave
+-them expired by the time the executor downloads the package, which is another conservative
+-post-claim failure. Moving the protocol into the Node child would be a separate cross-process
+-design.
++A Node action performs database preparation and acquires the Node action application permit while
++the durable job remains pending. The completed local-executor composition serializes and routes the
++request, acquires the exact compatible generation under the mutex shared with promotion, and asks
++that child to prepare the package before signaling `ready`. The resulting linear generation guard
++is retained across the durable claim and the complete `/invoke` response. Dropping the controller
++releases the guard and permit without sending `/invoke`.
++
++This boundary prevents application preparation, topology or fingerprint reconciliation, and
++generation startup failures from consuming the durable claim. Normal promotion closes old
++admission under the same generation mutex and waits for guards admitted first. Backend shutdown or
++hard generation retirement publishes unavailability and wakes a pre-start owner; failure after a
++visible claim remains conservative. The Node request deadline and service timer begin only after
++`start`. The protocol still does not make a child process immortal or provide exactly-once
++execution after the durable claim.
++
++The current `/prepare` endpoint releases its source-package lease before returning. It proves that
++the package was published in the selected child, but bounded cache enforcement can retire a
++zero-owner package before `/invoke` acquires its own lease. Preparation therefore moves the normal
++initial download and validation before the claim, but it does not by itself retain expiring package
++authority across an unbounded claim wait. The package-lifetime contract remains documented in
++[`atomic_node_executor_source_packages`](../atomic_node_executor_source_packages/README.md).
+ 
+ A path or argument validation result that is already a deterministic developer error does not need
+ an isolate or Node worker. It still waits on the gate at the application boundary so the durable
+@@ -321,8 +331,9 @@ contention pressure while admitted runtime capacity is being held.
+ The V8 service timer and JavaScript timeout begin after barrier release, so claim latency is not
+ charged as V8 service or user execution. The application action's end-to-end elapsed time and
+ outer function-runner timers do include the brief claim interval. Node executor timing starts only
+-after release, while the action's outer elapsed time includes preparation and claim. This split is
+-intentional and should be preserved when interpreting cron execution duration.
++after release and acknowledges that timing observation before `/invoke`, while the action's outer
++elapsed time includes preparation and claim. This split is intentional and should be preserved
++when interpreting cron execution duration.
+ 
+ ## Interaction with capacity and queue control
+ 
+@@ -399,7 +410,7 @@ result would violate the at-most-once boundary.
+ Run the focused checks before publishing an image:
+ 
+ ```sh
+-scripts/run_cargo.sh test -p function_runner execution_start_tests
++scripts/run_cargo.sh test -p common execution_start
+ scripts/run_cargo.sh test -p isolate execution_start_tests
+ scripts/run_cargo.sh check -p application
+ ```
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
 index e08a49d632858f8bc6af74cf75f3bad6ce5840ad..55cf711a2639fd74810270c9a72d2a25c0ea69db 100644
 --- a/self-hosted/advanced/knobs.md
