@@ -54,7 +54,10 @@ metrics. `isolate_memory_capacity_bytes` independently retains the raw
 per-worker and aggregate runtime ceilings. The periodic process, allocator, and
 cgroup metrics remain the source for actual use.
 
-The local Node executor also has independent lifetime controls:
+The local Node executor also has independent lifetime controls. The global RSS
+threshold is the fallback for application pools and is always used by the
+internal `_system` pool; a named application pool can override it with
+`maxRssBytes` in `LOCAL_NODE_EXECUTOR_POOL_POLICIES` as described below:
 
 - `LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB`, default `2048`;
 - `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`, default `3221225472` (3 GiB);
@@ -74,7 +77,10 @@ its required packages. Promotion atomically selects the candidate as current
 and closes old admission. Requests already assigned to the old generation
 finish within their existing absolute deadlines before it is terminated and
 reaped. The watchdog continues health checks during that drain; repeated
-health failure can terminate a stuck old generation.
+health failure can terminate a stuck old generation. If the retained package
+authority is already expired when a healthy trigger is observed, the generation
+drains without a candidate because no signer is available at that boundary; the
+next request cold-starts with fresh authority.
 
 The watchdog normally observes direct-child RSS roughly every one to two
 seconds. After promotion, an active invocation can keep the old draining
@@ -104,33 +110,79 @@ both directives in its source prologue:
 The declaration applies to every export in the module. Pool names must match
 `[a-z][a-z0-9_]{0,31}`, `default` is reserved, and one committed deployment can
 use at most eight distinct names. Components do not support Node modules.
-Modules without a pool declaration, package analysis, and dependency builds use
-the default executor.
+Modules without a pool declaration use the default application executor.
+Package analysis and dependency builds use a separate internal `_system`
+executor that cannot run application actions.
 
+`LOCAL_NODE_EXECUTOR_POOL_POLICIES` can override the memory settings for an
+application pool with `maxOldSpaceSizeMib`, `maxRssBytes`, and
+`memoryPressureMinRssBytes`. Pools without a field use the corresponding
+global setting. The reserved internal `_system` pool always uses all global
+values. Each effective old-space and pressure setting must remain below that
+pool's effective `maxRssBytes`; this permits a small pool to use a smaller V8
+heap and pressure boundary rather than inheriting the global 2 GiB values.
 `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` is the host resource policy for
-these pools. It defaults to twice `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`, covering
-the default steady slot and one complete global hot-replacement surge slot. A
-deployment with `N` distinct named pools requires:
+these processes. With `Rdefault` as the effective default-pool threshold,
+`Rsystem` as the global threshold, and `Rpool` as each effective named-pool
+threshold, a deployment requires:
 
 ```text
-(2 + N) * LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES
+Rdefault + Rsystem + sum(Rpool) +
+  max(Rdefault, every Rpool)
 ```
 
-The backend rejects a proposed deployment when this product exceeds the total
+The backend rejects a proposed deployment when this sum exceeds the total
 budget. It also validates the committed topology during startup. Linux startup
 memory feasibility reserves the configured total directly, including capacity
 for lazy steady slots and the lazy surge slot whose Node child has not started.
-The surge reserve uses one complete per-generation RSS allowance, not an
-estimate of a fresh candidate's expected RSS.
+The surge reserve uses one complete allowance for the largest possible
+application generation or candidate, not an estimate of a fresh process's
+expected RSS. Each configured threshold must remain above the old-space and
+cgroup-pressure RSS thresholds.
+If `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` is unset, its default is
+`Rdefault + Rsystem + Rdefault`; with no `default` RSS override this is three
+times `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES` (9 GiB with the documented defaults).
 
-Named pools inherit the ordinary timeout, memory, pressure, health, lifetime,
-and diagnostic controls. A named generation is replaced when its selected
-source package or effective environment changes. Committed module membership
-changes also hot-replace every affected resident named generation and the
-default generation when its exact routed module set changes. Removed named
-slots close admission and drain. One global surge slot serializes candidate
-startup, promotion, and old-generation drain across the default and named
-pools. A named-pool failure does not fall back to default.
+The internal system child starts lazily. It admits one `Analyze` or `BuildDeps`
+operation at a time across both kinds. At most eight callers wait in FIFO order,
+and admission fails after 60 seconds. These bounds are intrinsic runtime policy,
+not environment knobs. Admission occurs before package or upload URLs are
+signed, so queued work either receives fresh authority after admission or fails
+without starting child work. Analysis package URLs remain valid for 120 seconds
+and dependency upload URLs for the configured Node action timeout plus 65
+seconds (665 seconds with the default 600-second timeout), budgeting the local
+build request deadline plus one nominal minute for bounded startup of the lazy
+system child. Signing, scheduling, and dispatch consume the same finite
+authority; this validity is not a separate request deadline. A caller that
+disappears after dispatch does not release the active slot or stop the local
+request timer; the runtime-owned operation retains both through the child result
+and cleanup, then records whether the original result receiver was still
+present. System recycling is cold and does not use the application
+hot-replacement surge slot.
+
+`HTTP_SERVER_TIMEOUT_SECONDS` is an independent outer request deadline and
+defaults to 300 seconds. It covers the complete deployment, codegen, or
+explicit dependency-preparation handler after HTTP admission. Its
+HTTP 408 can end the caller before the longer dependency build finishes;
+runtime ownership still continues through terminal child cleanup, but the
+canceled application caller does not resume package-record publication, and
+the CLI does not retry that POST on a 408. These workflows can include package
+publication, source upload, and later analysis in addition to the build, so no
+single child URL lifetime defines a correct outer deadline. Increase this
+setting and every upstream timeout when the complete initiating workflow is
+intended to permit builds longer than five minutes.
+
+Named pools inherit the ordinary timeout, health, lifetime, and diagnostic
+controls; each memory setting uses its named policy override or the global
+fallback described above. The effective per-pool memory settings are exported
+through the existing old-space, RSS-retirement, and pressure-threshold gauges.
+A named generation is replaced when its selected source package or effective
+environment changes. Committed module membership changes also hot-replace every
+affected resident named generation and the default generation when its exact
+routed module set changes. Removed named slots close admission and drain. One
+global surge slot serializes candidate startup, promotion, and old-generation
+drain across the default and named pools. A named-pool failure does not fall
+back to default.
 
 Changing `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` requires a backend
 restart. Adding, removing, or moving source declarations takes effect only after
