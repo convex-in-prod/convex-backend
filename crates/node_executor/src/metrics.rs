@@ -585,6 +585,20 @@ pub fn set_local_node_consecutive_health_misses(pool_name: &str, misses: u32) {
     );
 }
 
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_EVENT_LOOP_UNRESPONSIVE_BUDGET_SECONDS,
+    "Configured elapsed event-loop unresponsiveness budget for a local Node executor pool; zero \
+     preserves the legacy consecutive-miss policy",
+    &["pool_name"]
+);
+pub fn set_local_node_event_loop_unresponsive_budget(pool_name: &str, budget: Option<Duration>) {
+    log_gauge_with_labels(
+        &LOCAL_NODE_EXECUTOR_EVENT_LOOP_UNRESPONSIVE_BUDGET_SECONDS,
+        budget.map_or(0.0, |budget| budget.as_secs_f64()),
+        vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())],
+    );
+}
+
 register_convex_gauge_evictable!(
     LOCAL_NODE_EXECUTOR_WAITING_REQUESTS,
     "Current requests waiting for a local Node executor generation",
@@ -972,6 +986,7 @@ pub fn clear_local_node_pool_configuration(pool_name: &str) {
         &*LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECONDS,
         &*LOCAL_NODE_EXECUTOR_AGE_RETIREMENT_THRESHOLD_SECONDS,
         &*LOCAL_NODE_EXECUTOR_PACKAGE_RETIREMENT_THRESHOLD_INFO,
+        &*LOCAL_NODE_EXECUTOR_EVENT_LOOP_UNRESPONSIVE_BUDGET_SECONDS,
     ] {
         let _ = gauge.remove_label_values(&[pool_name]);
     }
@@ -1287,6 +1302,7 @@ mod tests {
             Duration::from_secs(5),
             6,
         );
+        set_local_node_event_loop_unresponsive_budget(pool_name, Some(Duration::from_secs(7)));
         clear_local_node_pool_configuration(pool_name);
         assert!(LOCAL_NODE_EXECUTOR_POOL_CONFIGURED_INFO
             .remove_label_values(&[pool_name])
@@ -1297,6 +1313,45 @@ mod tests {
         assert!(LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES
             .remove_label_values(&[pool_name])
             .is_err());
+        assert!(LOCAL_NODE_EXECUTOR_EVENT_LOOP_UNRESPONSIVE_BUDGET_SECONDS
+            .remove_label_values(&[pool_name])
+            .is_err());
+    }
+
+    #[test]
+    fn memory_configuration_metrics_keep_effective_pool_values() {
+        let pool_name = "metrics_memory_configuration_test";
+        set_local_node_memory_configuration(
+            pool_name,
+            512 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            768 * 1024 * 1024,
+            Duration::from_secs(4),
+            Duration::from_secs(5),
+            6,
+        );
+        assert_eq!(
+            LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES
+                .get_metric_with_label_values(&[pool_name])
+                .unwrap()
+                .get(),
+            (512 * 1024 * 1024) as f64
+        );
+        assert_eq!(
+            LOCAL_NODE_EXECUTOR_RSS_RETIREMENT_THRESHOLD_BYTES
+                .get_metric_with_label_values(&[pool_name])
+                .unwrap()
+                .get(),
+            (1024 * 1024 * 1024) as f64
+        );
+        assert_eq!(
+            LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_RSS_THRESHOLD_BYTES
+                .get_metric_with_label_values(&[pool_name])
+                .unwrap()
+                .get(),
+            (768 * 1024 * 1024) as f64
+        );
+        clear_local_node_pool_configuration(pool_name);
     }
 
     #[test]
