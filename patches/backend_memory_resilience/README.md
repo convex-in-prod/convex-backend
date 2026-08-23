@@ -34,17 +34,24 @@ total. This planning control does not weaken the finite cgroup limit or the
 runtime memory-pressure response.
 When application-declared local Node executor pools are available, startup
 memory feasibility reserves `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`.
-Deploy and startup validation separately require the default steady slot, every
-named steady slot, and one global surge slot to fit within that total:
+Deploy and startup validation separately require the default application
+steady slot, the internal system steady slot, every named application steady
+slot, and one global application surge slot to fit within that total:
 
 ```text
-(2 + distinct named pool count) * LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES
+effective_default_rss + LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES +
+  sum(effective_named_pool_rss) +
+  max(effective_default_rss, every effective_named_pool_rss)
 ```
 
-The allowance includes lazy steady slots and the lazy surge slot when they have
-not started a child. It reserves the complete configured generation allowance,
-not the normally smaller RSS of a fresh process. Every pool observes the same
-pressure signal and applies the same grace and RSS floor independently.
+The allowance includes the lazy system and application steady slots and the
+lazy surge slot when they have not started a child. It reserves the complete
+allowance for the largest possible application generation, not the normally
+smaller RSS of a fresh process. A pool without a `maxRssBytes` override in
+`LOCAL_NODE_EXECUTOR_POOL_POLICIES` uses `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`.
+Every pool observes the same pressure signal and applies the same grace
+duration, while its effective RSS floor may be configured independently by
+the later pool-policy composition.
 
 Backend memory resilience is carried as an ordered adoption composition after
 [`local_node_executor_resilience`](../local_node_executor_resilience/README.md), whose generation
@@ -199,10 +206,11 @@ policy in the patch that owns the cache.
 The local Node watchdog observes the same pressure signal. After continuous
 pressure for `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS`, default 60
 seconds, it immediately retires the current generation only when a successful
-direct-child RSS sample is at or above
-`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`, default 2 GiB. The pressure
-RSS floor must be positive and strictly below the ordinary RSS replacement
-threshold.
+direct-child RSS sample is at or above its effective pressure RSS floor.
+Without a per-pool override, that floor is
+`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`, default 2 GiB. The
+pressure RSS floor must be positive and strictly below the ordinary RSS
+replacement threshold.
 
 Trigger policy distinguishes ordinary generation maintenance from actual
 cgroup pressure:
@@ -282,8 +290,10 @@ would consume the headroom the controller is trying to recover.
 
 Reserving only expected fresh-process RSS was rejected because package
 preparation and concurrent work can grow the candidate before the old child is
-reaped. Startup feasibility reserves one complete
-`LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES` allowance for the global surge slot.
+reaped. Startup feasibility reserves one complete allowance for the largest
+possible application generation for the global surge slot. Without a pool RSS
+override this is `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`; with pool policies it is
+the largest effective default or named-pool allowance.
 
 Randomized age thresholds were not added. Age is a soft trigger, the global
 coordinator queues and coalesces simultaneous rotations, and completed

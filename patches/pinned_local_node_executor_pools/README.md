@@ -14,9 +14,12 @@ local executor pool:
 
 The declaration applies to the complete module, so every export uses the same
 pool. Modules without a pool declaration use the default local Node executor.
-The application declares required runtime isolation; the host supplies only a
-generic resource limit. There is no host module allowlist, pool-name allowlist,
-or duplicate route configuration.
+The application declares required runtime isolation; this routing patch asks
+the host only for a generic resource limit. There is no host module allowlist,
+pool-name allowlist, or duplicate route configuration. The optional
+[`local_node_executor_pool_admission`](../local_node_executor_pool_admission/README.md)
+patch can separately attach host capacity and health policy to those declared
+names without changing their routes.
 
 A named process can retain rebuildable module-level state between invocations,
 but it remains disposable. Timeouts, health failure, memory or lifetime limits,
@@ -411,9 +414,11 @@ local lifecycle protocol and does not invoke application code.
 
 ## Resource policy
 
-Each pool inherits the existing local executor timeout, old-space, pressure,
-age, imported-package, health, and diagnostic settings. In this homogeneous
-routing prefix, the host-wide total policy is:
+Each pool inherits the existing local executor timeout, age, imported-package,
+health, and diagnostic settings. Its old-space and pressure settings can be
+overridden together with its RSS retirement threshold by the later per-pool
+policy composition. In this homogeneous routing prefix, the host-wide total
+policy is:
 
 ```text
 LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES
@@ -432,14 +437,15 @@ The backend checks the proposed deployment before commit and the committed
 topology during startup. The Linux startup memory-feasibility calculation
 reserves the configured total Node RSS budget directly, including capacity for
 lazy steady slots and the lazy surge slot that have no child yet. The surge
-reserve is one complete global `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES` allowance,
+reserve is one complete allowance for the largest effective application pool,
 not the expected smaller RSS of a fresh process. The system slot is a full
 steady allowance even though its child starts lazily.
 This is a planning allowance, not a hard aggregate limit; sampled child RSS
 can grow between checks and while requests drain.
 
 All pools receive the same cgroup-pressure signal and apply their ordinary
-per-generation pressure rules independently. Pressure also cancels the global
+per-generation pressure rules independently; later pool policy can give each
+pool its own compatible pressure floor. Pressure also cancels the global
 candidate or terminates its draining old generation before additional external
 admission is shed. Named pools isolate JavaScript event loops and process
 globals, but they still share CPU, cgroup memory, database capacity, outbound
