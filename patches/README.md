@@ -122,8 +122,10 @@ adoption contract documented in the backend essay.
 ### [Atomic Node executor source packages](atomic_node_executor_source_packages/README.md)
 
 - Purpose: publish source and external packages atomically, bound their retained filesystem and
-  stack-root lifetime without deleting active trees, expose preparation-only acquisition for
-  candidate readiness, and keep concurrent external-dependency builds private, output-size- and
+  stack-root lifetime without deleting owned trees, reuse current entries by immutable identity
+  without recurring completeness scans, expose warm and resident preparation modes and bounded
+  package-stage timing, keep preparation-only acquisition for candidate readiness, and keep
+  concurrent external-dependency builds private, output-size- and
   time-bounded, and responsive to the local event-loop watchdog. On Unix, an npm supervisor also
   attempts to stop its process group if the Node executor generation exits.
 - Prerequisites: none.

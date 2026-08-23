@@ -17,6 +17,7 @@ use std::{
         max,
         min,
     },
+    collections::BTreeMap,
     num::{
         NonZeroU32,
         NonZeroUsize,
@@ -25,9 +26,21 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context as _;
 use cmd_util::env::env_config;
+use serde::{
+    de::{
+        Error as _,
+        MapAccess,
+        Visitor,
+    },
+    Deserialize,
+    Deserializer,
+};
 
 use crate::fastrace_helpers::SamplingConfig;
+
+const MAX_LOCAL_NODE_EXECUTOR_POOL_POLICIES: usize = 9;
 
 fn parse_usize_strict(name: &str, value: &str) -> anyhow::Result<usize> {
     anyhow::ensure!(
@@ -88,12 +101,36 @@ fn env_config_optional_usize_strict(name: &str) -> Option<usize> {
     value
 }
 
-/// Optional admission and watchdog policy for one local Node executor pool.
+fn env_config_optional_bool_strict(name: &str) -> Option<bool> {
+    let value = match std::env::var(name) {
+        Ok(value) if value == "0" => Some(false),
+        Ok(value) if value == "1" => Some(true),
+        Ok(_) => panic!("Invalid value for {name}: expected 0 or 1"),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(..)) => {
+            panic!("Invalid non-Unicode value for {name}")
+        },
+    };
+    if let Some(value) = value {
+        tracing::info!("Overriding {name} to {value:?} from environment");
+    }
+    value
+}
+
+/// Optional admission, memory, and watchdog policy for one local Node executor
+/// pool.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocalNodeExecutorPoolPolicy {
     /// Maximum independent Node actions admitted concurrently to this pool.
     pub max_concurrency: Option<usize>,
+    /// Sampled direct-child RSS threshold for graceful generation retirement.
+    pub max_rss_bytes: Option<usize>,
+    /// V8 old-space allowance for the local Node executor child, in MiB.
+    pub max_old_space_size_mib: Option<usize>,
+    /// Sampled direct-child RSS threshold for retirement during sustained
+    /// cgroup memory pressure.
+    pub memory_pressure_min_rss_bytes: Option<usize>,
     /// Maximum failed-health interval tolerated before retiring this pool's
     /// event loop.
     pub max_event_loop_unresponsive_seconds: Option<u64>,
@@ -173,6 +210,9 @@ fn parse_local_node_executor_pool_policies(
         );
         anyhow::ensure!(
             policy.max_concurrency.is_some()
+                || policy.max_rss_bytes.is_some()
+                || policy.max_old_space_size_mib.is_some()
+                || policy.memory_pressure_min_rss_bytes.is_some()
                 || policy.max_event_loop_unresponsive_seconds.is_some()
                 || policy.queue_warning_seconds.is_some(),
             "Node pool {pool_name:?} has an empty policy"
@@ -180,6 +220,20 @@ fn parse_local_node_executor_pool_policies(
         if let Some(max_concurrency) = policy.max_concurrency {
             validate_usize_strict_nonzero("maxConcurrency", max_concurrency)?;
         }
+        anyhow::ensure!(
+            policy.max_rss_bytes.is_none_or(|bytes| bytes > 0),
+            "Node pool {pool_name:?} maxRssBytes must be greater than zero"
+        );
+        anyhow::ensure!(
+            policy.max_old_space_size_mib.is_none_or(|mib| mib > 0),
+            "Node pool {pool_name:?} maxOldSpaceSizeMib must be greater than zero"
+        );
+        anyhow::ensure!(
+            policy
+                .memory_pressure_min_rss_bytes
+                .is_none_or(|bytes| bytes > 0),
+            "Node pool {pool_name:?} memoryPressureMinRssBytes must be greater than zero"
+        );
         anyhow::ensure!(
             policy.queue_warning_seconds.is_none() || policy.max_concurrency.is_some(),
             "Node pool {pool_name:?} queueWarningSeconds requires maxConcurrency"
@@ -200,11 +254,13 @@ fn parse_local_node_executor_pool_policies(
     Ok(policies)
 }
 
-/// Per-pool local Node admission and event-loop watchdog overrides.
+/// Per-pool local Node admission, memory, RSS-retirement, and event-loop
+/// watchdog overrides.
 ///
 /// The value is a strict JSON object keyed by the application-declared pool
 /// name. The reserved `default` key configures the ordinary Node pool. Missing
-/// pools retain the existing application-wide concurrency and watchdog policy.
+/// pools retain the existing application-wide concurrency, memory, RSS, and
+/// watchdog policy.
 pub static LOCAL_NODE_EXECUTOR_POOL_POLICIES: LazyLock<
     BTreeMap<String, LocalNodeExecutorPoolPolicy>,
 > = LazyLock::new(
@@ -226,6 +282,70 @@ pub static LOCAL_NODE_EXECUTOR_POOL_POLICIES: LazyLock<
         },
     },
 );
+
+fn effective_local_node_executor_pool_rss_bytes(
+    policies: &BTreeMap<String, LocalNodeExecutorPoolPolicy>,
+    global_rss_bytes: usize,
+    pool_name: &str,
+) -> usize {
+    policies
+        .get(pool_name)
+        .and_then(|policy| policy.max_rss_bytes)
+        .unwrap_or(global_rss_bytes)
+}
+
+fn effective_local_node_executor_pool_old_space_size_mib(
+    policies: &BTreeMap<String, LocalNodeExecutorPoolPolicy>,
+    global_old_space_size_mib: usize,
+    pool_name: &str,
+) -> usize {
+    policies
+        .get(pool_name)
+        .and_then(|policy| policy.max_old_space_size_mib)
+        .unwrap_or(global_old_space_size_mib)
+}
+
+fn effective_local_node_executor_pool_memory_pressure_min_rss_bytes(
+    policies: &BTreeMap<String, LocalNodeExecutorPoolPolicy>,
+    global_memory_pressure_min_rss_bytes: usize,
+    pool_name: &str,
+) -> usize {
+    policies
+        .get(pool_name)
+        .and_then(|policy| policy.memory_pressure_min_rss_bytes)
+        .unwrap_or(global_memory_pressure_min_rss_bytes)
+}
+
+/// Returns the effective sampled direct-child RSS allowance for an application
+/// pool. Pools without a `maxRssBytes` policy use the global allowance.
+pub fn local_node_executor_pool_rss_bytes(pool_name: &str) -> usize {
+    effective_local_node_executor_pool_rss_bytes(
+        &LOCAL_NODE_EXECUTOR_POOL_POLICIES,
+        *LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES,
+        pool_name,
+    )
+}
+
+/// Returns the effective V8 old-space allowance for an application pool. Pools
+/// without a `maxOldSpaceSizeMib` policy use the global allowance.
+pub fn local_node_executor_pool_old_space_size_mib(pool_name: &str) -> usize {
+    effective_local_node_executor_pool_old_space_size_mib(
+        &LOCAL_NODE_EXECUTOR_POOL_POLICIES,
+        *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB,
+        pool_name,
+    )
+}
+
+/// Returns the effective cgroup-pressure RSS threshold for an application
+/// pool. Pools without a `memoryPressureMinRssBytes` policy use the global
+/// threshold.
+pub fn local_node_executor_pool_memory_pressure_min_rss_bytes(pool_name: &str) -> usize {
+    effective_local_node_executor_pool_memory_pressure_min_rss_bytes(
+        &LOCAL_NODE_EXECUTOR_POOL_POLICIES,
+        *LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES,
+        pool_name,
+    )
+}
 
 fn env_config_duration_millis_strict(name: &str, default: usize) -> Duration {
     let millis = env_config_usize_strict(name, default)
@@ -486,14 +606,20 @@ pub static LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES: LazyLock<usize> = LazyLock::new(||
 });
 
 /// Total planning allowance for all local Node executor process slots. A
-/// deployment needs one default slot, one slot for each distinct dedicated
-/// pool, and one complete hot-replacement surge slot. The value must cover the
-/// default steady slot and the surge slot even when both are still lazy.
+/// deployment needs one default slot, one internal system slot, one slot for
+/// each distinct dedicated pool, and one complete hot-replacement surge slot.
+/// The default covers the effective default slot, the global system slot, and
+/// one surge slot sized for the effective default allowance. Deployment
+/// topology validation adds each named pool and sizes surge for the largest
+/// application allowance. The value must cover all required slots even when
+/// they are still lazy.
 pub static LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let default_rss_bytes = local_node_executor_pool_rss_bytes("default");
     let value = env_config_usize_strict(
         "LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES",
-        LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES
-            .checked_mul(2)
+        default_rss_bytes
+            .checked_add(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES)
+            .and_then(|value| value.checked_add(default_rss_bytes))
             .expect("Default local Node executor RSS budget overflow"),
     );
     assert!(
@@ -2815,5 +2941,148 @@ mod strict_capacity_tests {
         assert!(validate_active_javascript_class_minimums(28, 15, 14, Some(32)).is_err());
         assert!(validate_active_javascript_class_minimums(28, 4, 14, None).is_err());
         assert!(validate_active_javascript_class_minimums(28, 4, 14, Some(8)).is_err());
+    }
+
+    #[test]
+    fn local_node_pool_policies_are_strict_and_bounded() {
+        let policies = parse_local_node_executor_pool_policies(
+            r#"{
+                "default": {
+                    "maxConcurrency": 2,
+                    "maxRssBytes": 1073741824,
+                    "maxOldSpaceSizeMib": 512,
+                    "memoryPressureMinRssBytes": 536870912,
+                    "queueWarningSeconds": 5
+                },
+                "planning": {
+                    "maxRssBytes": 2147483648,
+                    "maxOldSpaceSizeMib": 1024,
+                    "memoryPressureMinRssBytes": 1073741824,
+                    "maxConcurrency": 1,
+                    "maxEventLoopUnresponsiveSeconds": 30
+                },
+                "watchdog": {
+                    "maxEventLoopUnresponsiveSeconds": 10
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(policies["planning"].max_concurrency, Some(1));
+        assert_eq!(
+            policies["planning"].max_rss_bytes,
+            Some(2 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(policies["planning"].max_old_space_size_mib, Some(1024));
+        assert_eq!(
+            policies["planning"].memory_pressure_min_rss_bytes,
+            Some(1024 * 1024 * 1024)
+        );
+        assert_eq!(policies["default"].queue_warning_seconds, Some(5));
+
+        assert_eq!(
+            effective_local_node_executor_pool_rss_bytes(
+                &policies,
+                3 * 1024 * 1024 * 1024,
+                "unconfigured"
+            ),
+            3 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            effective_local_node_executor_pool_rss_bytes(
+                &policies,
+                3 * 1024 * 1024 * 1024,
+                "default"
+            ),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            effective_local_node_executor_pool_rss_bytes(
+                &policies,
+                3 * 1024 * 1024 * 1024,
+                "planning"
+            ),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            effective_local_node_executor_pool_rss_bytes(
+                &policies,
+                3 * 1024 * 1024 * 1024,
+                "watchdog"
+            ),
+            3 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            effective_local_node_executor_pool_old_space_size_mib(&policies, 2048, "unconfigured"),
+            2048
+        );
+        assert_eq!(
+            effective_local_node_executor_pool_old_space_size_mib(&policies, 2048, "default"),
+            512
+        );
+        assert_eq!(
+            effective_local_node_executor_pool_old_space_size_mib(&policies, 2048, "planning"),
+            1024
+        );
+        assert_eq!(
+            effective_local_node_executor_pool_memory_pressure_min_rss_bytes(
+                &policies,
+                2 * 1024 * 1024 * 1024,
+                "unconfigured",
+            ),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            effective_local_node_executor_pool_memory_pressure_min_rss_bytes(
+                &policies,
+                2 * 1024 * 1024 * 1024,
+                "default",
+            ),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            effective_local_node_executor_pool_memory_pressure_min_rss_bytes(
+                &policies,
+                2 * 1024 * 1024 * 1024,
+                "planning",
+            ),
+            1024 * 1024 * 1024
+        );
+
+        for invalid in [
+            r#"{"planning": {}}"#,
+            r#"{"default": {"maxConcurrency": 0}}"#,
+            r#"{"planning": {"maxRssBytes": 0}}"#,
+            r#"{"planning": {"maxRssBytes": 18446744073709551616}}"#,
+            r#"{"planning": {"maxOldSpaceSizeMib": 0}}"#,
+            r#"{"planning": {"memoryPressureMinRssBytes": 0}}"#,
+            r#"{"planning": {"max_rss_bytes": 1}}"#,
+            r#"{"planning": {"maxRssBytes": 1, "maxRssBytes": 2}}"#,
+            r#"{"Default": {"maxConcurrency": 1}}"#,
+            r#"{"planning": {"unknown": 1}}"#,
+            r#"{"planning": {"queueWarningSeconds": 5}}"#,
+            r#"{"planning": {"maxEventLoopUnresponsiveSeconds": 0}}"#,
+            r#"{"planning": {"queueWarningSeconds": 0}}"#,
+            r#"{
+                "planning": {"maxConcurrency": 1},
+                "planning": {"maxConcurrency": 2}
+            }"#,
+            r#"{
+                "pool_0": {"maxConcurrency": 1},
+                "pool_1": {"maxConcurrency": 1},
+                "pool_2": {"maxConcurrency": 1},
+                "pool_3": {"maxConcurrency": 1},
+                "pool_4": {"maxConcurrency": 1},
+                "pool_5": {"maxConcurrency": 1},
+                "pool_6": {"maxConcurrency": 1},
+                "pool_7": {"maxConcurrency": 1},
+                "pool_8": {"maxConcurrency": 1},
+                "pool_9": {"maxConcurrency": 1}
+            }"#,
+        ] {
+            assert!(
+                parse_local_node_executor_pool_policies(invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 }
