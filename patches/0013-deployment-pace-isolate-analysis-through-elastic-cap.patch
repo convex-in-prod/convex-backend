@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Sat, 15 Aug 2026 16:15:21 +0800
-Subject: [PATCH 26/28] deployment: pace isolate analysis through elastic
+Subject: [PATCH 13/28] deployment: pace isolate analysis through elastic
  capacity
 
 Module analysis creates one isolate request per non-dependency module, evaluates its import graph in V8 without supported asynchronous ops, and can keep up to ANALYZE_CONCURRENCY attempts active per analysis call. Rejected-before-execution and overload responses can also create bounded retries. This work bypasses application action limits while still consuming shared-base isolate workers, active-JavaScript permits, CPU, and queue entries.
@@ -17,7 +17,7 @@ Expose analysis reservation occupancy and gate-wait metrics. Add focused fairnes
  .../src/application_function_runner/mod.rs    |  11 +-
  crates/application/src/cache/metrics.rs       |   2 +-
  crates/application/src/cache/mod.rs           |  83 ++--
- crates/common/src/knobs.rs                    |   5 +-
+ crates/common/src/knobs.rs                    |   9 +-
  crates/common/src/lib.rs                      |   1 +
  crates/common/src/query_analysis_admission.rs | 112 +++++
  .../src/in_process_function_runner.rs         |   3 +
@@ -26,21 +26,21 @@ Expose analysis reservation occupancy and gate-wait metrics. Add focused fairnes
  crates/isolate/src/client.rs                  | 406 ++++++++++++++++--
  crates/isolate/src/isolate_worker.rs          |   5 +-
  crates/isolate/src/metrics.rs                 |  27 ++
- patches/README.md                             |  15 +-
- patches/degradable_reactive_queries/README.md |  93 ++--
- patches/deployment_analysis_pacing/README.md  | 198 +++++++++
+ patches/README.md                             |  17 +-
+ patches/degradable_reactive_queries/README.md |  65 ++-
+ patches/deployment_analysis_pacing/README.md  | 203 +++++++++
  patches/isolate_queue_control/README.md       |  26 +-
  .../deployment_lane_design_reference.md       |  50 ++-
- self-hosted/advanced/knobs.md                 |  33 ++
- 18 files changed, 969 insertions(+), 113 deletions(-)
+ self-hosted/advanced/knobs.md                 |  34 ++
+ 18 files changed, 965 insertions(+), 101 deletions(-)
  create mode 100644 crates/common/src/query_analysis_admission.rs
  create mode 100644 patches/deployment_analysis_pacing/README.md
 
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 49975e4f1d1dd6b79cae9adaa16c7c71521f9f19..c050139d895801011b7d844ba80fe612b875f731 100644
+index f1b217ea90b352327b104c9854b0f5901987d961..bd85d5e7e05b9259cba1d32b96168c62dab9485f 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
-@@ -65,6 +65,7 @@ use common::{
+@@ -62,6 +62,7 @@ use common::{
          LogLine,
          LogLines,
      },
@@ -48,7 +48,7 @@ index 49975e4f1d1dd6b79cae9adaa16c7c71521f9f19..c050139d895801011b7d844ba80fe612
      query_journal::QueryJournal,
      runtime::{
          Runtime,
-@@ -716,6 +717,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
+@@ -701,6 +702,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
      audit_log_client: AuditLogClient,
  
      cache_manager: CacheManager<RT>,
@@ -56,7 +56,7 @@ index 49975e4f1d1dd6b79cae9adaa16c7c71521f9f19..c050139d895801011b7d844ba80fe612
      default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
      node_action_limiter: Limiter<RT>,
      ai_gateway_jwt_minter: Option<Arc<dyn AiGatewayJwtMinter>>,
-@@ -746,6 +748,11 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -731,6 +733,11 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              default_system_env_vars.clone(),
              function_log.clone(),
          );
@@ -68,7 +68,7 @@ index 49975e4f1d1dd6b79cae9adaa16c7c71521f9f19..c050139d895801011b7d844ba80fe612
          let cache_manager = CacheManager::new(
              runtime.clone(),
              database.clone(),
-@@ -753,7 +760,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -738,7 +745,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              function_log.clone(),
              audit_log_client.clone(),
              cache,
@@ -77,7 +77,7 @@ index 49975e4f1d1dd6b79cae9adaa16c7c71521f9f19..c050139d895801011b7d844ba80fe612
          );
  
          let node_action_limiter = Limiter::new(
-@@ -777,6 +784,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -762,6 +769,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              function_log,
              audit_log_client,
              cache_manager,
@@ -85,7 +85,7 @@ index 49975e4f1d1dd6b79cae9adaa16c7c71521f9f19..c050139d895801011b7d844ba80fe612
              default_system_env_vars,
              node_action_limiter,
              ai_gateway_jwt_minter,
-@@ -2031,6 +2039,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1851,6 +1859,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              udf_config,
              isolate_modules,
              environment_variables.clone(),
@@ -107,7 +107,7 @@ index 10783261d8e567a7188c062723c29e467fbdcd8e..f28b3b338738b8c6c1b2b3874bf1dc55
  register_convex_counter!(
      DEGRADABLE_QUERY_CACHE_RECHECK_TOTAL,
 diff --git a/crates/application/src/cache/mod.rs b/crates/application/src/cache/mod.rs
-index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931a52df556 100644
+index 38fea8e1799ab11e35391d628a1d87c3e870b7ff..d29b90c9676914f24d57a6e9c57bc9a31370db59 100644
 --- a/crates/application/src/cache/mod.rs
 +++ b/crates/application/src/cache/mod.rs
 @@ -36,6 +36,10 @@ use common::{
@@ -121,7 +121,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
      query_journal::QueryJournal,
      runtime::Runtime,
      types::{
-@@ -103,11 +107,6 @@ use sync_types::{
+@@ -104,11 +108,6 @@ use sync_types::{
      types::SerializedArgs,
      QueryWorkloadClass,
  };
@@ -133,7 +133,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
  use udf::{
      validation::{
          PendingArgsPolicy,
-@@ -203,36 +202,35 @@ struct DegradableQueryLeaderAdmission {
+@@ -204,36 +203,35 @@ struct DegradableQueryLeaderAdmission {
  }
  
  struct DegradableQueryLeaderAdmissionInner {
@@ -182,7 +182,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
          };
          self.inner.permits_in_use.fetch_add(1, Ordering::SeqCst);
          increment_degradable_leader_permits_in_use();
-@@ -241,6 +239,11 @@ impl DegradableQueryLeaderAdmission {
+@@ -242,6 +240,11 @@ impl DegradableQueryLeaderAdmission {
              admission: self.inner.clone(),
          })
      }
@@ -194,7 +194,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
  }
  
  impl Drop for DegradableQueryLeaderPermit {
-@@ -458,7 +461,7 @@ impl<RT: Runtime> CacheManager<RT> {
+@@ -459,7 +462,7 @@ impl<RT: Runtime> CacheManager<RT> {
          udf_execution: FunctionExecutionLog<RT>,
          audit_log_client: AuditLogClient,
          cache: QueryCache,
@@ -203,7 +203,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
      ) -> Self {
          // each `CacheManager` (for a different deployment) gets its own tenant
          // ID within `Cache`, which has a _global_ size-limit
-@@ -471,8 +474,8 @@ impl<RT: Runtime> CacheManager<RT> {
+@@ -472,8 +475,8 @@ impl<RT: Runtime> CacheManager<RT> {
              audit_log_client,
              tenant_id,
              cache,
@@ -214,7 +214,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
          }
      }
  
-@@ -1607,7 +1610,7 @@ mod tests {
+@@ -1618,7 +1621,7 @@ mod tests {
              ),
              Some(CachePlan::Operation(CacheOp::Ready { .. }, _))
          ));
@@ -223,7 +223,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
  
          let waiting_cache = QueryCache::new(usize::MAX);
          let normal_leader = plan(
-@@ -1630,7 +1633,7 @@ mod tests {
+@@ -1641,7 +1644,7 @@ mod tests {
              ),
              Some(CachePlan::Operation(CacheOp::Wait { .. }, _))
          ));
@@ -232,7 +232,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
          let CachePlan::Operation(
              CacheOp::Go {
                  waiting_entry_id: Some(waiting_entry_id),
-@@ -1693,7 +1696,7 @@ mod tests {
+@@ -1704,7 +1707,7 @@ mod tests {
              ),
              Some(CachePlan::Operation(CacheOp::Wait { .. }, _))
          ));
@@ -241,7 +241,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
  
          let CachePlan::Operation(
              CacheOp::Go {
-@@ -1708,6 +1711,24 @@ mod tests {
+@@ -1719,6 +1722,24 @@ mod tests {
          cache.remove_waiting(&stored_key, waiting_entry_id);
      }
  
@@ -266,7 +266,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
      #[test]
      fn degradable_timestamp_duplicates_require_and_retain_admission() {
          let key = requested_key();
-@@ -1748,9 +1769,9 @@ mod tests {
+@@ -1759,9 +1780,9 @@ mod tests {
                  ..
              }
          ));
@@ -278,7 +278,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
  
          let waiting_cache = QueryCache::new(usize::MAX);
          let normal_leader = plan_at_ts(
-@@ -1802,9 +1823,9 @@ mod tests {
+@@ -1813,9 +1834,9 @@ mod tests {
                  ..
              }
          ));
@@ -290,7 +290,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
  
          let CachePlan::Operation(
              CacheOp::Go {
-@@ -1855,11 +1876,11 @@ mod tests {
+@@ -1866,11 +1887,11 @@ mod tests {
          else {
              panic!("admitted degradable miss was not a cache leader")
          };
@@ -304,7 +304,7 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
          drop(guard);
          assert!(cache.inner.lock().cache.is_empty());
      }
-@@ -1904,7 +1925,7 @@ mod tests {
+@@ -1915,7 +1936,7 @@ mod tests {
  
          drop(op);
          guard.complete(smallvec![stored_key.clone()], cache_result(&key));
@@ -314,26 +314,30 @@ index ae18b7d74d3409496a2a98b1a69e7e38c5921568..4435b7b69468ae220a946a440a3c2931
              cache.inner.lock().cache.get(&stored_key),
              Some(CacheEntry::Ready(_))
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 30ad72c42ef53937a8d53aff0effaf0a41b8ebc7..92e88585743f25d781bd94f1c8afec52822a2eb9 100644
+index 032fd220485525d1759f5bb4820ff2a52b09471c..0a560a0039b977c5b2e75b4b810d7a98da82a43c 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -1396,8 +1396,9 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
+@@ -1194,10 +1194,11 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
      )
  });
  
 -/// Maximum concurrent degradable root reactive-query cache-miss leaders.
--/// Absence disables degradable admission. A configured cap must leave at
+-/// Absence disables degradable admission. A configured cap leaves at least one
+-/// shared-base application and isolate-worker slot. A finite active-JavaScript
+-/// gate either exceeds the cap or configures class minimums.
 +/// Maximum elastic capacity shared by degradable root reactive-query
 +/// cache-miss leaders and isolate module analysis. Absence disables degradable
-+/// admission and preserves unpaced analysis. A configured cap must leave at
- /// least one shared-base slot at the application, isolate-worker, and finite
- /// active-JavaScript gates.
++/// admission and preserves unpaced analysis. A configured cap leaves at least
++/// one shared-base application and isolate-worker slot. A finite active-
++/// JavaScript gate either exceeds the cap or configures class minimums.
  pub static APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: LazyLock<Option<usize>> =
+     LazyLock::new(|| {
+         let capacity = env_config_optional_usize_strict_nonzero(
 diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
-index 5ca30d6455717ab38119c1ea07fd219280be2157..384ab297def852e34f89cec3231279729321b3d9 100644
+index a2dd2132f43e484f65dc638cb164a92bbbb84378..1f87ebae1e422d6ee1bb803c8bae201e6281c9e4 100644
 --- a/crates/common/src/lib.rs
 +++ b/crates/common/src/lib.rs
-@@ -57,6 +57,7 @@ pub mod persistence_helpers;
+@@ -55,6 +55,7 @@ pub mod persistence_helpers;
  pub mod pii;
  pub mod pool_stats;
  pub mod query;
@@ -460,10 +464,10 @@ index 0000000000000000000000000000000000000000..772e94951a8780d5ef74e38a4885e96d
 +    }
 +}
 diff --git a/crates/function_runner/src/in_process_function_runner.rs b/crates/function_runner/src/in_process_function_runner.rs
-index 4e2a0a964be455f86cca59cd4bb9fe4a00544cda..624a6fcfa8627d1fec5a2b1a69310d12601afa58 100644
+index e0b2cfea7afcacde73c6b2b77804078390bb078e..17a0b41c6cdfd4bcf10f191fa252b992c2a5f6ca 100644
 --- a/crates/function_runner/src/in_process_function_runner.rs
 +++ b/crates/function_runner/src/in_process_function_runner.rs
-@@ -34,6 +34,7 @@ use common::{
+@@ -36,6 +36,7 @@ use common::{
          PersistenceReader,
          RepeatablePersistence,
      },
@@ -471,7 +475,7 @@ index 4e2a0a964be455f86cca59cd4bb9fe4a00544cda..624a6fcfa8627d1fec5a2b1a69310d12
      runtime::{
          Runtime,
          SpawnHandle,
-@@ -364,6 +365,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
+@@ -341,6 +342,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
          udf_config: UdfConfig,
          modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
          environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
@@ -479,7 +483,7 @@ index 4e2a0a964be455f86cca59cd4bb9fe4a00544cda..624a6fcfa8627d1fec5a2b1a69310d12
      ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
          self.server
              .analyze(
-@@ -371,6 +373,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
+@@ -348,6 +350,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
                  modules,
                  environment_variables,
                  self.deployment.name.clone(),
@@ -488,7 +492,7 @@ index 4e2a0a964be455f86cca59cd4bb9fe4a00544cda..624a6fcfa8627d1fec5a2b1a69310d12
              .await
      }
 diff --git a/crates/function_runner/src/lib.rs b/crates/function_runner/src/lib.rs
-index 3645b01e62d763dd685ee5671480090dc285bcca..6c88afe0edf2cfcabb590aaa718eebbf58cc2f2c 100644
+index cd61703cf92ce25891499358abcee5d9ac0ee804..b5e6a1fe5980a667ca08d84c5815e03d09163505 100644
 --- a/crates/function_runner/src/lib.rs
 +++ b/crates/function_runner/src/lib.rs
 @@ -22,6 +22,7 @@ use common::{
@@ -499,7 +503,7 @@ index 3645b01e62d763dd685ee5671480090dc285bcca..6c88afe0edf2cfcabb590aaa718eebbf
      runtime::{
          Runtime,
          UnixTimestamp,
-@@ -109,6 +110,7 @@ pub trait FunctionRunner<RT: Runtime>: Send + Sync + 'static {
+@@ -107,6 +108,7 @@ pub trait FunctionRunner<RT: Runtime>: Send + Sync + 'static {
          udf_config: UdfConfig,
          modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
          environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
@@ -508,10 +512,10 @@ index 3645b01e62d763dd685ee5671480090dc285bcca..6c88afe0edf2cfcabb590aaa718eebbf
  
      async fn evaluate_app_definitions(
 diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
-index f58938c2bd2b564babd18e9414106b9f40f37a52..9620c31b07ca3e651a255655244d2bc360ad2e9f 100644
+index 79f065ccd78aec162d9637b0e76391621c078403..f089b0d6e000f6add17a9b2d62147b8c6f1052cc 100644
 --- a/crates/function_runner/src/server.rs
 +++ b/crates/function_runner/src/server.rs
-@@ -31,6 +31,7 @@ use common::{
+@@ -26,6 +26,7 @@ use common::{
      knobs::MAX_ISOLATE_WORKERS,
      log_lines::LogLine,
      persistence::RetentionValidator,
@@ -519,7 +523,7 @@ index f58938c2bd2b564babd18e9414106b9f40f37a52..9620c31b07ca3e651a255655244d2bc3
      query_journal::QueryJournal,
      runtime::{
          Runtime,
-@@ -490,6 +491,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -476,6 +477,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
          modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
          environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
          deployment_name: String,
@@ -527,7 +531,7 @@ index f58938c2bd2b564babd18e9414106b9f40f37a52..9620c31b07ca3e651a255655244d2bc3
      ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
          anyhow::ensure!(
              modules
-@@ -499,7 +501,13 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -485,7 +487,13 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
          );
  
          self.isolate_client
@@ -543,13 +547,13 @@ index f58938c2bd2b564babd18e9414106b9f40f37a52..9620c31b07ca3e651a255655244d2bc3
      }
  
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51810ecb73 100644
+index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed3322faef 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
-@@ -85,6 +85,10 @@ use common::{
+@@ -82,6 +82,10 @@ use common::{
+         V8_THREADS,
      },
      log_lines::LogLine,
-     memory_pressure::MemoryPressureSignal,
 +    query_analysis_admission::{
 +        QueryAnalysisAdmission,
 +        QueryAnalysisPermit,
@@ -557,7 +561,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
      query_journal::QueryJournal,
      runtime::{
          shutdown_and_join,
-@@ -227,6 +231,82 @@ use crate::{
+@@ -224,6 +228,82 @@ use crate::{
  
  const ISOLATE_QUEUE_METRICS_LOG_FREQUENCY: Duration = Duration::from_secs(1);
  
@@ -640,7 +644,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
  pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
  pub const PAUSE_REQUEST: &str = "pause_request";
  pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
-@@ -998,7 +1078,8 @@ pub enum RequestType<RT: Runtime> {
+@@ -1066,7 +1146,8 @@ pub enum RequestType<RT: Runtime> {
          modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>>,
          to_analyze: CanonicalizedModulePath,
          environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
@@ -650,7 +654,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
      },
      EvaluateSchema {
          schema_bundle: ModuleSource,
-@@ -1137,7 +1218,7 @@ impl<RT: Runtime> Request<RT> {
+@@ -1192,7 +1273,7 @@ impl<RT: Runtime> Request<RT> {
                  let _ = response.send(Err(error));
              },
              RequestType::Analyze { response, .. } => {
@@ -659,7 +663,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
              },
              RequestType::EvaluateSchema { response, .. } => {
                  let _ = response.send(Err(error));
-@@ -1617,6 +1698,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1632,6 +1713,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
          environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
          instance_name: String,
@@ -667,7 +671,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
      ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
          anyhow::ensure!(
              modules
-@@ -1624,6 +1706,9 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1639,6 +1721,9 @@ impl<RT: Runtime> IsolateClient<RT> {
                  .all(|m| m.environment == ModuleEnvironment::Isolate),
              "Can only analyze Isolate modules"
          );
@@ -677,7 +681,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
          let to_analyze: Vec<_> = modules
              .keys()
              .filter(|path| !path.is_deps())
-@@ -1649,20 +1734,36 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1664,20 +1749,36 @@ impl<RT: Runtime> IsolateClient<RT> {
                  let mut attempt = 1;
                  const MAX_ATTEMPTS: u32 = 3;
                  loop {
@@ -727,8 +731,8 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
                          Ok(outcome) => return Ok((to_analyze, outcome)),
                          Err(e)
                              if attempt < MAX_ATTEMPTS
-@@ -2888,9 +2989,11 @@ mod tests {
-             ComponentId,
+@@ -3010,9 +3111,11 @@ mod tests {
+             ComponentDefinitionPath,
              ComponentName,
          },
 +        errors::JsError,
@@ -739,7 +743,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
          runtime::{
              shutdown_and_join,
              Runtime,
-@@ -2904,6 +3007,14 @@ mod tests {
+@@ -3027,6 +3130,14 @@ mod tests {
      };
      use errors::ErrorMetadataAnyhowExt as _;
      use futures::future::FusedFuture;
@@ -754,13 +758,14 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
      use parking_lot::Mutex;
      use runtime::prod::ProdRuntime;
      use semver::Version;
-@@ -2924,11 +3035,13 @@ mod tests {
+@@ -3046,12 +3157,14 @@ mod tests {
          wait_for_external_permit,
          worker_rejection_reason,
          ActiveRequestCounts,
 +        AnalyzeResponseSender,
          CancelUdfOnDrop,
          CancellationSignal,
+         ConcurrencyPermitPhase,
          ExternalPermitWaitOutcome,
          IdleWorkerInfo,
          IdleWorkerState,
@@ -768,7 +773,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
          IsolateConfig,
          IsolateWorker,
          IsolateWorkerHandle,
-@@ -2965,6 +3078,8 @@ mod tests {
+@@ -3087,6 +3200,8 @@ mod tests {
  
      const SCHEDULER_TEST_TIMEOUT: Duration = Duration::from_secs(5);
  
@@ -777,7 +782,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
      #[derive(Clone)]
      struct SchedulerTestRuntime {
          inner: ProdRuntime,
-@@ -3026,10 +3141,18 @@ mod tests {
+@@ -3148,10 +3263,18 @@ mod tests {
          }
      }
  
@@ -796,7 +801,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
      }
  
      #[async_trait::async_trait(?Send)]
-@@ -3047,7 +3170,7 @@ mod tests {
+@@ -3169,7 +3292,7 @@ mod tests {
                  active_request_guard,
              }) = requests.recv().await
              {
@@ -805,7 +810,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
                      RequestType::Test {
                          id,
                          can_block_on_descendant: _,
-@@ -3058,15 +3181,39 @@ mod tests {
+@@ -3180,15 +3303,39 @@ mod tests {
                          started,
                          completion,
                          response,
@@ -852,7 +857,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
                  drop(permit);
                  drop(active_request_guard);
                  if done
-@@ -3099,6 +3246,55 @@ mod tests {
+@@ -3221,6 +3368,55 @@ mod tests {
          }
      }
  
@@ -908,7 +913,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
      #[derive(Clone, Copy)]
      enum TestRequestKind {
          Dependency,
-@@ -3225,7 +3421,7 @@ mod tests {
+@@ -3358,7 +3554,7 @@ mod tests {
                  modules: Arc::new(BTreeMap::new()),
                  to_analyze: module_path,
                  environment_variables: BTreeMap::new(),
@@ -917,15 +922,15 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
              },
              RequestType::EvaluateSchema {
                  schema_bundle: model::modules::module_versions::ModuleSource::new(""),
-@@ -3356,6 +3552,7 @@ mod tests {
+@@ -3486,6 +3682,7 @@ mod tests {
                  TestIsolateWorker {
                      rt: rt.clone(),
-                     config: IsolateConfig::new(pool_name, ConcurrencyLimiter::unlimited()),
+                     config: IsolateConfig::new("scheduler_test", ConcurrencyLimiter::unlimited()),
 +                    analyze_test_control: None,
                  },
                  max_workers,
                  base_worker_capacity,
-@@ -3548,6 +3745,166 @@ mod tests {
+@@ -3683,6 +3880,166 @@ mod tests {
          assert!(nested_signal.is_cancelled());
      }
  
@@ -1092,7 +1097,7 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
      #[test]
      fn dependency_and_descendant_capability_are_independent() {
          assert_eq!(properties(false, false, false).as_label(), "independent");
-@@ -3841,6 +4198,7 @@ mod tests {
+@@ -3976,6 +4333,7 @@ mod tests {
              TestIsolateWorker {
                  rt: scheduler_rt.clone(),
                  config: IsolateConfig::new("scheduler_test", ConcurrencyLimiter::unlimited()),
@@ -1101,10 +1106,10 @@ index 017222b0ca6c3f6b6277eeae572396999d6418c4..bb2f3624f9ed6d48a5e960a60b14db51
              1,
              1,
 diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
-index f74f3ea12985eec06055f224a1ba1e1490491112..567eea29b101966566e046c31865ba692e651cfb 100644
+index 05c08724c088a620d94741822ea2edef01120363..f2d43634740c7e16a41ba9f953440297800c75c6 100644
 --- a/crates/isolate/src/isolate_worker.rs
 +++ b/crates/isolate/src/isolate_worker.rs
-@@ -225,7 +225,10 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -196,7 +196,10 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                      environment_variables,
                  )
                  .await;
@@ -1117,10 +1122,10 @@ index f74f3ea12985eec06055f224a1ba1e1490491112..567eea29b101966566e046c31865ba69
              },
              RequestType::HttpAction {
 diff --git a/crates/isolate/src/metrics.rs b/crates/isolate/src/metrics.rs
-index 9de604393bbc85ac0a5da9cbf43a423ac883eb9e..c59b50ecab7d542d581a677826bcbca3e1970a77 100644
+index 13dc8a08159dc0ad12dca8144a6c6f3293981d34..2f0cca108cf978d04887533065e73b438663f761 100644
 --- a/crates/isolate/src/metrics.rs
 +++ b/crates/isolate/src/metrics.rs
-@@ -132,6 +132,33 @@ pub fn log_pool_max(name: &'static str, count: usize) {
+@@ -129,6 +129,33 @@ pub fn log_pool_max(name: &'static str, count: usize) {
      );
  }
  
@@ -1155,13 +1160,15 @@ index 9de604393bbc85ac0a5da9cbf43a423ac883eb9e..c59b50ecab7d542d581a677826bcbca3
      ISOLATE_POOL_ALLOCATED_COUNT_INFO,
      "How many isolate workers have been allocated",
 diff --git a/patches/README.md b/patches/README.md
-index 0f893e39c89f061c74a8d98d2dad9f67d0ff76b1..11d5c84159b4cd02135c3c67b496801bd6e598c6 100644
+index 829094b31fcc55846145be05a0b198688154b09e..cc05a9f907cc13ebf2e6b741d6a2ba0eb1656a40 100644
 --- a/patches/README.md
 +++ b/patches/README.md
-@@ -62,6 +62,17 @@ adoption contract documented in the backend essay.
- - Rollback: roll back the CLI before the backend if codegen must remain available; no data or
-   configuration rollback is required.
+@@ -29,6 +29,19 @@ of degradable reactive-query backpressure.
+ - Activation: only through the privileged repair endpoint; dry-run is the default.
+ - Rollback: do not execute a stale plan. There is no generic undo after destructive finalization.
  
++## Deployment and code generation
++
 +### [Paced isolate module analysis](deployment_analysis_pacing/README.md)
 +
 +- Purpose: make each isolate module analysis attempt fairly borrow from the configured degradable
@@ -1173,79 +1180,47 @@ index 0f893e39c89f061c74a8d98d2dad9f67d0ff76b1..11d5c84159b4cd02135c3c67b496801b
 +- Rollback: restore the previous backend image. Unsetting the cap also disables pacing, but it
 +  simultaneously disables degradable-query backpressure.
 +
- ## Schema reliability
+ ## Build and runtime packaging
  
- ### [Isolate schema-validation progress OCC](schema_validation_progress_occ/README.md)
-@@ -328,7 +339,9 @@ These files preserve the full earlier analysis without creating additional opera
- 7. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
+ ### [Backend build improvements](backend_build_improvements/README.md)
+@@ -168,7 +181,9 @@ These files preserve the full earlier analysis without creating additional opera
+ 5. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
     after cold-miss evidence.
- 8. Deliver matching backend and client protocol before enabling degradable frontend behavior.
--9. Change one independent capacity or semantic opt-in at a time unless the documented policy
-+9. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a
+ 6. Deliver matching backend and client protocol before enabling degradable frontend behavior.
+-7. Change one independent capacity or semantic opt-in at a time unless the documented policy
++7. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a
 +   controlled multi-module push before changing analysis concurrency or queue deadlines.
-+10. Change one independent capacity or semantic opt-in at a time unless the documented policy
++8. Change one independent capacity or semantic opt-in at a time unless the documented policy
     explicitly requires a coupled rollout and rollback order.
  
  Do not use module, function, route, client, deployment, or tenant names in generic backend logic or
 diff --git a/patches/degradable_reactive_queries/README.md b/patches/degradable_reactive_queries/README.md
-index 14527bd98d2aacdadafa846b7190d576c52d4d54..72e5189b1b9a3a4a1167e2346ef9d074a13904b0 100644
+index 7a26345046576db73e3377958c7251a7970f19f9..0d5a291ccd16a8832ea5c3c933e22b837e76ddd1 100644
 --- a/patches/degradable_reactive_queries/README.md
 +++ b/patches/degradable_reactive_queries/README.md
-@@ -7,7 +7,10 @@ suppression telemetry and follows the previous execution path. The matching `con
+@@ -7,9 +7,11 @@ suppression telemetry and follows the previous execution path. The matching `con
  negotiates lifecycle version 1, validates active and cleared pressure events, and exposes one
  epoch-scoped retry request. A downstream frontend can keep successful subscriptions mounted,
  present pressure as visible staleness, and use the explicit cleared event as its catch-up boundary. An
--HTTP-action extension and an isolate queue lane remain separate optional designs.
+-HTTP-action extension and an isolate queue lane remain separate optional designs. Optional
+-active-JavaScript service floors let the leader cap exceed active execution capacity while
+-preserving protected and degradable progress.
 +HTTP-action extension and an isolate queue lane remain separate optional designs. The later
 +[`deployment-analysis pacing`](../deployment_analysis_pacing/README.md) integration lets isolate
 +module analysis fairly borrow from the same configured capacity without changing this client
-+protocol.
++protocol. Optional active-JavaScript service floors let the leader cap exceed active execution
++capacity while preserving protected and degradable progress.
  
  This patch lets a cooperating sync client declare that its root reactive
  queries may become temporarily stale during overload. The backend places only
-@@ -531,30 +534,34 @@ The degradable class should remain separate from
- the other describes a liveness dependency established by the runtime. Combining
- them into one Boolean would make precedence and metrics ambiguous.
+@@ -554,11 +556,15 @@ permit acquisition finishes. Requests that remain queued retain queue expiry
+ and delay accounting. These mechanics are detailed in
+ [`active_javascript_admission.md`](active_javascript_admission.md).
  
--The implemented backend slice does not add an isolate queue lane or change
--isolate selection. The leader cap is the capacity mechanism: it is validated
--strictly below shared isolate and finite active-JavaScript capacity, while
--separately scheduled descendants continue to use the existing backend-derived
--dependency class. An optional isolate lane may be evaluated later if leader-cap
--and cache telemetry show a concrete queue-observability gap.
--
--The fixed leader cap provides the primary capacity reservation. If its value is
--below shared isolate and active-JavaScript capacity, degradable root trees
--cannot consume every slot by themselves. Existing ordinary work can use the
--remaining capacity, and dependencies can still use their configured overflow.
--No preemption is required.
-+The degradable-query patch itself does not add an isolate queue lane or change
-+isolate selection. The cap is validated strictly below shared isolate and
-+finite active-JavaScript capacity, while separately scheduled descendants
-+continue to use the existing backend-derived dependency class. The later
-+deployment-analysis integration shares this gate with typed isolate analysis;
-+it does not add a degradable lane or change query scheduler classification.
++With deployment-analysis pacing applied, each active isolate module attempt
++consumes one permit from the root-work gate. Analysis remains protected at the
++active-JavaScript gate; it does not claim degradable or dependency status.
 +
-+The configured cap provides the primary elastic capacity boundary. If its
-+value is below shared isolate and active-JavaScript capacity, degradable root
-+trees cannot consume every slot by themselves. With deployment-analysis pacing
-+applied, each active isolate module attempt consumes one permit from that same
-+boundary. Existing ordinary work can use the remaining capacity, and
-+dependencies can still use their configured overflow. No preemption is
-+required.
- 
- Queue selection does not add unconditional strict priority below capacity. The
--fixed cap and immediate deferral provide containment without starving
--degradable work whenever normal work is present. Existing eligibility-aware
--selection, dependency overflow, independent-action caps, and hard expiry remain
--in force.
-+fixed cap and immediate deferral keep the elastic class from consuming every
-+finite lower-stage slot by itself, leaving configured headroom for normal work.
-+Existing eligibility-aware selection, dependency overflow, independent-action
-+caps, and hard expiry remain in force. Continuous queued analysis can still use
-+the complete elastic gate and defer degradable leaders as described by the
-+deployment-analysis pacing contract.
- 
  This model is intentionally finite. One admitted query can perform expensive
 -work or separately scheduled fan-out. The cap bounds admitted roots, not every
 -possible descendant. Existing transaction limits, action caps, dependency
@@ -1258,7 +1233,7 @@ index 14527bd98d2aacdadafa846b7190d576c52d4d54..72e5189b1b9a3a4a1167e2346ef9d074
  
  ## Configuration and capacity sizing
  
-@@ -571,6 +578,12 @@ normal class, no separate queue lane, and no pressure response. When present,
+@@ -577,6 +583,12 @@ normal class, no separate queue lane, and no pressure response. When present,
  the value must contain only ASCII decimal digits and must be strictly positive.
  Malformed, empty, signed, zero, overflowed, or inconsistent values fail startup.
  
@@ -1268,10 +1243,10 @@ index 14527bd98d2aacdadafa846b7190d576c52d4d54..72e5189b1b9a3a4a1167e2346ef9d074
 +remains available to degradable leaders, so the integration adds no permanently
 +reserved capacity.
 +
- For the standard in-process self-hosted runner, startup should also require the
- cap to be below each finite capacity whose complete occupation would defeat the
- reservation:
-@@ -744,11 +757,12 @@ creating a parallel ancestry mechanism. Operators not carrying an equivalent
+ For the standard in-process self-hosted runner, startup requires the cap to be
+ strictly below:
+ 
+@@ -756,11 +768,12 @@ creating a parallel ancestry mechanism. Operators not carrying an equivalent
  dependency patch still gain a finite degradable root cap, but cannot claim the
  dependency-liveness and descendant-override guarantees described here.
  
@@ -1289,7 +1264,7 @@ index 14527bd98d2aacdadafa846b7190d576c52d4d54..72e5189b1b9a3a4a1167e2346ef9d074
  
  [`cancellation_safe_database_context_reuse/README.md`](../cancellation_safe_database_context_reuse/README.md)
  and [`context_reuse_observability/README.md`](../context_reuse_observability/README.md) are
-@@ -760,8 +774,10 @@ pressure semantics. Measure and roll back the features independently.
+@@ -772,8 +785,10 @@ pressure semantics. Measure and roll back the features independently.
  
  This patch directly addresses the reactive recomputation wave that can follow a
  configuration push. Degradable clients absorb part of that wave as temporary
@@ -1302,20 +1277,21 @@ index 14527bd98d2aacdadafa846b7190d576c52d4d54..72e5189b1b9a3a4a1167e2346ef9d074
  
  A dedicated control-plane lane is an optional extension implemented by the
  separate [`isolate_queue_control/README.md`](../isolate_queue_control/README.md) patch. It
-@@ -770,6 +786,12 @@ analysis, evaluation, schema updates, and application traffic. Client metadata
+@@ -782,6 +797,13 @@ analysis, evaluation, schema updates, and application traffic. Client metadata
  must never claim that class. The degradable-client patch does not depend on such
  a lane and should not encode deployment paths as application allowlists.
  
-+The pacing integration is intentionally narrower than a worker reservation. It
-+makes analysis replace degradable demand at the root-work gate but does not
-+reserve shared-base workers or active-JavaScript permits. See its owning essay
-+for the source-level CPU evidence, liveness argument, worked capacity example,
-+and controlled validation.
++The pacing integration makes analysis replace degradable demand at the
++root-work gate. Analysis uses protected active-JavaScript admission and shares
++the protected floor with other normal work; it has no dedicated worker or
++active permit reservation. See its owning essay for the source-level CPU
++evidence, liveness argument, worked capacity example, and controlled
++validation.
 +
  Context reuse and bounded query-context prewarming are also complementary.
  They can lower module-evaluation CPU and improve warm service time. They do not
  provide backpressure, do not prevent every first concurrent cold evaluation,
-@@ -811,6 +833,8 @@ The query path should expose at least:
+@@ -823,6 +845,8 @@ The query path should expose at least:
    `decision={effective,suppressed_disabled}`;
  - degradable leader admission by `outcome={admitted,deferred}`;
  - current degradable leader permits in use and the configured capacity;
@@ -1324,7 +1300,7 @@ index 14527bd98d2aacdadafa846b7190d576c52d4d54..72e5189b1b9a3a4a1167e2346ef9d074
  - typed temporary deferrals returned to sync workers;
  - pressure transitions emitted by closed pressure kind and lifecycle state;
  - bounded pending-query-count observations;
-@@ -967,16 +991,21 @@ resubscription sequence per query.
+@@ -981,16 +1005,21 @@ resubscription sequence per query.
  7. Exercise an ordinary function deployment while representative reactive and
     worker traffic is present. Verify bounded degradable work and continued
     mutation, action, worker, and deployment progress.
@@ -1352,10 +1328,10 @@ index 14527bd98d2aacdadafa846b7190d576c52d4d54..72e5189b1b9a3a4a1167e2346ef9d074
  reconnection resets the connection-local epoch. The frontend also bounds its
 diff --git a/patches/deployment_analysis_pacing/README.md b/patches/deployment_analysis_pacing/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..9c8c77630d65565606a948b34ff51683969db914
+index 0000000000000000000000000000000000000000..c9bc3f9fdfab1b81ab96bba6b967c1399ab84dc2
 --- /dev/null
 +++ b/patches/deployment_analysis_pacing/README.md
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,203 @@
 +# Pace Isolate Module Analysis Through Elastic Query Capacity
 +
 +This integration patch prevents a function push from adding its complete isolate-module analysis
@@ -1463,25 +1439,26 @@ index 0000000000000000000000000000000000000000..9c8c77630d65565606a948b34ff51683
 +
 +## Capacity example and limits
 +
-+Suppose shared-base worker and active-JavaScript capacity are 32, the elastic gate is 24, and
-+analysis concurrency is 4. Before this integration, 24 degradable leaders and four analysis
-+attempts could directly present 28 roots to lower execution gates. With this integration, four
-+analysis reservations leave at most 20 permits for degradable leaders. At least eight slots remain
-+outside this root-level elastic class in either state.
++Suppose shared-base worker capacity is 48, active-JavaScript capacity is 28, the elastic root-work
++gate is 32, and analysis concurrency is 4. Before this integration, 32 degradable leaders and four
++analysis attempts could directly present 36 roots to lower execution gates. With this integration,
++four analysis reservations leave at most 28 root-work permits for degradable leaders. The active
++gate independently guarantees protected and degradable progress through its configured service
++floors; analysis uses the protected class.
 +
 +This is intentionally not a mathematical bound on physical workers. One admitted query leader can
 +spawn separately scheduled dependencies, and dependency work retains its existing reserve. Normal
 +queries, mutations, actions, and non-degradable clients also bypass the elastic gate. The configured
 +cap must therefore leave measured headroom at the application query gate, isolate shared base, and
-+finite active-JavaScript gate, as required by existing startup validation.
++other lifetime limits. With active-JavaScript service floors enabled, the cap can exceed finite
++active capacity because these gates bound different resources. Without service floors, startup
++still requires finite active capacity to exceed the cap.
 +
-+The patch does not add a scheduler reservation. Analysis can still wait after gate admission when
-+ordinary non-degradable work or dependencies occupy workers, when active-JavaScript permits are
-+full, or when CPU is saturated. This is acceptable for the first intervention: it removes the
-+known additive deployment fan-out while preserving ordinary scheduling and dependency liveness.
-+A class-aware worker reservation would require global and per-client active-class accounting and
-+should be considered only after repeated evidence of gate-admitted analysis approaching its hard
-+deadline while CPU and active-JavaScript capacity have headroom.
++The patch does not add an analysis-specific scheduler reservation. Analysis can still wait after
++gate admission when protected work or dependencies occupy workers, when active-JavaScript permits
++are full, or when CPU is saturated. Protected active admission gives analysis access to the shared
++protected floor without prioritizing deployment work over other protected requests. A dedicated
++analysis reservation requires separate evidence and policy.
 +
 +## Metrics and controlled validation
 +
@@ -1493,6 +1470,9 @@ index 0000000000000000000000000000000000000000..9c8c77630d65565606a948b34ff51683
 +- `isolate_analysis_reservations_in_use_info` reports analysis permits currently held;
 +- `isolate_analysis_capacity_wait_seconds` records each analysis acquisition wait, including
 +  retries, immediate acquisitions, and canceled waiters.
++- `active_javascript_capacity_info`, `active_javascript_occupancy_info`,
++  `active_javascript_waiters_info`, and class-and-phase labels on active permit acquisition report
++  the lower execution gate independently from the root-work gate.
 +
 +These gauges are process-global. The direct occupancy-sum check below assumes the standard process
 +model with one live application runner. A process that intentionally hosts multiple live runners
@@ -1504,7 +1484,8 @@ index 0000000000000000000000000000000000000000..9c8c77630d65565606a948b34ff51683
 +- `degradable_query_leader_permits_in_use_info` and degradable admission outcomes;
 +- control-plane queue depth, oldest age, enqueue, dispatch, expiry, lane-full, and queue-full
 +  counters when the lane is enabled;
-+- active requests by scheduler class, active-JavaScript permit wait, and physical worker occupancy;
++- active requests by scheduler class, active-JavaScript occupancy and wait by class and phase, and
++  physical worker occupancy;
 +- analysis duration, deployment phase duration and outcome, CPU pressure, and module count.
 +
 +A focused controlled deployment should hold representative degradable query pressure, then push a
@@ -1555,7 +1536,7 @@ index 0000000000000000000000000000000000000000..9c8c77630d65565606a948b34ff51683
 +additive demand unchanged, weaken dependency liveness, introduce idle capacity, or require more
 +scheduler state than the current evidence justifies.
 diff --git a/patches/isolate_queue_control/README.md b/patches/isolate_queue_control/README.md
-index 790af71ab08a6432512f9d9eb22b63eb8ea39360..b3ba08a7639ebf284bba7086c7bab25ea59eab5e 100644
+index 15179d0f708f0146c03d88cc82710c7c36b0c1f0..7938e094c4b761b7189868a8b6e0b0366ed64344 100644
 --- a/patches/isolate_queue_control/README.md
 +++ b/patches/isolate_queue_control/README.md
 @@ -306,6 +306,12 @@ Each post-admission analysis or evaluation retry is a new queue entry with a new
@@ -1606,7 +1587,7 @@ index 790af71ab08a6432512f9d9eb22b63eb8ea39360..b3ba08a7639ebf284bba7086c7bab25e
  
  Rollback sets `ISOLATE_CONTROL_PLANE_LANE_ENABLED=false` and restarts the backend. The lane-aware
  ordinary/dependency/action policy remains active, and no schema or data migration is required.
-@@ -403,6 +415,12 @@ Its reserve and waiter queue are independent of isolate queue capacity. A
+@@ -399,6 +411,12 @@ Its reserve and waiter queue are independent of isolate queue capacity. A
  request can pass HTTP admission and still wait at an application gate or in the
  isolate queue. Size each stage from its own occupancy and wait metrics.
  
@@ -1720,15 +1701,15 @@ index f4b12c92776c6e74c61af8ee55f24fe069b4e112..b99201265602d77ef1efa357051762df
  
  The immediate rollback is:
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 55cf711a2639fd74810270c9a72d2a25c0ea69db..cdd124b467a6bad124e4c3c754f36ea39c9a1f5c 100644
+index f570db42992c5d87bf1e8dcaaab32a46e84144f0..63be611c8d1e34f534d9b453effe2c4f39690366 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
-@@ -355,6 +355,39 @@ retaining an isolate worker may raise occupancy above that base. Nested Node
+@@ -102,6 +102,40 @@ retaining an isolate worker may raise occupancy above that base. Nested Node
  actions receive the same treatment at the Node action limit because their
  parent retains a permit from that limit.
  
 +`APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is an optional elastic
-+capacity sized below the relevant ordinary and lower execution limits.
++capacity sized below the application query and isolate shared-base limits.
 +Degradable root query cache-miss leaders use immediate admission: when no permit
 +is available, the sync protocol keeps their previous values and returns typed
 +temporary pressure. Isolate module analysis fairly waits for one permit per
@@ -1750,8 +1731,9 @@ index 55cf711a2639fd74810270c9a72d2a25c0ea69db..cdd124b467a6bad124e4c3c754f36ea3
 +`ANALYZE_CONCURRENCY` is a per-call limit. `N` concurrent analysis calls can
 +collectively reach `min(24, N * 4)` in this example. Continuous queued analysis
 +can use the complete elastic gate and keep new degradable leaders in typed
-+deferral; the fair handoff protects deployment progress, not a degradable
-+minimum.
++deferral. The separate active-JavaScript class minimums described below provide
++execution liveness after degradable leaders are admitted; they do not change
++this root-work gate.
 +
 +The analysis wait is fair with existing permit holders and queued analysis
 +attempts. It does not reserve an isolate worker, borrow dependency overflow, or
