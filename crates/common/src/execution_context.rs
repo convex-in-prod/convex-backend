@@ -21,7 +21,10 @@ use value::{
 
 use crate::{
     components::ComponentId,
-    types::FunctionCaller,
+    types::{
+        FunctionCaller,
+        MutationPriority,
+    },
 };
 
 /// A client IP address extracted from HTTP headers, with max length
@@ -108,6 +111,7 @@ impl HeapSize for RequestMetadata {
 pub struct RequestContext {
     pub request_id: RequestId,
     pub request_metadata: RequestMetadata,
+    pub mutation_priority: MutationPriority,
 }
 
 impl RequestContext {
@@ -115,6 +119,7 @@ impl RequestContext {
         Self {
             request_id,
             request_metadata,
+            mutation_priority: MutationPriority::Normal,
         }
     }
 
@@ -124,6 +129,7 @@ impl RequestContext {
         Self {
             request_id,
             request_metadata: RequestMetadata::system(),
+            mutation_priority: MutationPriority::Normal,
         }
     }
 
@@ -145,6 +151,7 @@ pub struct ExecutionContext {
     is_root: bool,
     /// Metadata about the originating HTTP request (IP, user agent).
     pub request_metadata: RequestMetadata,
+    pub mutation_priority: MutationPriority,
 }
 
 impl ExecutionContext {
@@ -155,6 +162,7 @@ impl ExecutionContext {
             parent_scheduled_job: caller.parent_scheduled_job(),
             is_root: caller.is_root(),
             request_metadata: request_context.request_metadata,
+            mutation_priority: request_context.mutation_priority,
         }
     }
 
@@ -171,6 +179,7 @@ impl ExecutionContext {
             parent_scheduled_job,
             is_root,
             request_metadata,
+            mutation_priority: MutationPriority::Normal,
         }
     }
 
@@ -301,6 +310,7 @@ impl From<ExecutionContext> for pb::common::ExecutionContext {
             is_root: Some(value.is_root),
             client_ip: value.request_metadata.ip.map(|ip| ip.into_string()),
             client_user_agent: value.request_metadata.user_agent.map(|ua| ua.into_string()),
+            mutation_high_priority: Some(value.mutation_priority == MutationPriority::High),
         }
     }
 }
@@ -321,6 +331,11 @@ impl TryFrom<pb::common::ExecutionContext> for ExecutionContext {
             },
             parent_scheduled_job: parent_document_id.map(|id| (parent_component_id, id)),
             is_root: value.is_root.unwrap_or_default(),
+            mutation_priority: if value.mutation_high_priority.unwrap_or(false) {
+                MutationPriority::High
+            } else {
+                MutationPriority::Normal
+            },
             request_metadata: RequestMetadata {
                 ip: value.client_ip.map(ClientIp::from),
                 user_agent: value.client_user_agent.map(ClientUserAgent::from),
@@ -341,5 +356,31 @@ impl From<ExecutionContext> for JsonValue {
             "ip": value.request_metadata.ip.map(|ip| ip.into_string()),
             "userAgent": value.request_metadata.user_agent.map(|ua| ua.into_string()),
         })
+    }
+}
+
+#[cfg(test)]
+mod mutation_priority_tests {
+    use super::*;
+
+    #[test]
+    fn mutation_priority_survives_execution_context_protobuf() {
+        let mut request = RequestContext::new_for_system_request(RequestId::new());
+        assert_eq!(request.mutation_priority, MutationPriority::Normal);
+        request.mutation_priority = MutationPriority::High;
+        let context = ExecutionContext::new(request, &FunctionCaller::Cron);
+        assert_eq!(context.mutation_priority, MutationPriority::High);
+        let proto: pb::common::ExecutionContext = context.clone().into();
+        assert_eq!(ExecutionContext::try_from(proto.clone()).unwrap(), context);
+        let old_proto = pb::common::ExecutionContext {
+            mutation_high_priority: None,
+            ..proto
+        };
+        assert_eq!(
+            ExecutionContext::try_from(old_proto)
+                .unwrap()
+                .mutation_priority,
+            MutationPriority::Normal
+        );
     }
 }

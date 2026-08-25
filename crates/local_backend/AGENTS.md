@@ -12,6 +12,16 @@ in `src/router.rs`, each with a checked-in spec:
 | `DashboardApiDoc` | `/api/dashboard_openapi.json` | `npm-packages/dashboard/dashboard-deployment-openapi.json`         |
 
 After changing anything that feeds the specs — a route, its
-`#[utoipa::path(...)]` annotation, or a docstring baked into a description — run
-`just generate-api-specs`, or `test_api_specs_match` will fail. Commit the
-regenerated JSON specs and TypeScript clients alongside the Rust change.
+`#[utoipa::path(...)]` annotation, or a docstring baked into a description —
+regenerate the affected checked-in JSON specs and TypeScript clients alongside
+the Rust change.
+
+For the public API spec, run this command from the repository root:
+
+```sh
+UPDATE_API_SPECS=1 scripts/run_cargo.sh test -p local_backend --lib test_public_api_spec_matches
+```
+
+Without `UPDATE_API_SPECS`, the same test checks that the generated public spec
+matches the checked-in file. This checkout does not define the
+`just generate-api-specs` recipe referenced by some package scripts.
