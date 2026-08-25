@@ -195,6 +195,7 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
                 *FUNRUN_ISOLATE_ACTIVE_THREADS,
                 *FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN,
                 *FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN,
+                *common::knobs::ISOLATE_CONTROL_PLANE_LANE_ENABLED,
             )
         } else {
             ConcurrencyLimiter::unlimited()

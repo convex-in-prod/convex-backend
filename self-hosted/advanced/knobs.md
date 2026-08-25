@@ -537,28 +537,40 @@ schema evaluation, auth configuration evaluation, app definition evaluation,
 and component initializer evaluation into a `control_plane` lane. It does not
 match application module or component names. The lane remains in the same FIFO
 and uses only shared-base queue and worker capacity. It does not use dependency
-reserve, receive dispatch priority, or reserve a worker. It is exempt from
-adaptive delay shedding but retains a finite hard queue deadline.
+overflow. It reserves queue and worker space inside that base, preserving FIFO
+among eligible requests. It is exempt from adaptive delay shedding but retains
+a finite hard queue deadline.
 
 The control-plane settings are:
 
 - `ISOLATE_CONTROL_PLANE_LANE_ENABLED`, default `false`;
 - `ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY`, default `16`;
-- `ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS`, default `30000`.
+- `ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS`, default `30000`;
+- `ISOLATE_CONTROL_PLANE_WORKER_RESERVE`, default `1`.
 
-The capacity is a positive sub-cap inside `ISOLATE_QUEUE_SIZE`, not reserved
-capacity. The deadline bounds time from external queue enqueue through initial
-active-permit acquisition, not execution or the complete push. All three
-settings are parsed and intrinsically validated when the lane is disabled.
+The queue capacity is both a positive lane cap and a reservation inside
+`ISOLATE_QUEUE_SIZE`. For base queue capacity `Q`, lane cap `R` and current
+control-plane depth `C`, ordinary admission stops at `Q - max(0, R - C)`;
+control-plane admission stops at `Q`. Dependency overflow remains separate.
+The deadline bounds time from external queue enqueue through initial
+active-permit acquisition, not execution or the complete push. Lane enable,
+queue capacity and deadline are parsed and validated when the lane is disabled.
 `ANALYZE_CONCURRENCY` must also be greater than zero because
 zero would stall isolate analysis before enqueue. When enabled, lane-aware
 delay control must also be enabled, the lane capacity must be at least
-`ANALYZE_CONCURRENCY` and no greater than `ISOLATE_QUEUE_SIZE`, and the lane
+`ANALYZE_CONCURRENCY` and strictly less than `ISOLATE_QUEUE_SIZE`, and the lane
 deadline must be greater than the ordinary hard queue age. A queued control-
 plane request is discarded before worker assignment if its response receiver
 has already closed. Immediate physical-queue and lane-cap admission errors
 return directly; the isolate client's bounded retry loops cover only errors
 received after successful enqueue.
+
+The worker reserve is clipped globally and per client to leave one ordinary
+base slot. `0` disables this worker allowance. Pending initial JavaScript
+permits and running requests both consume worker eligibility. Disabling the
+lane also disables its worker allowance and separate JavaScript class; it does
+not remove dependency reserve. The Compose template passes the worker setting
+through without overriding the backend default.
 
 `isolate_control_plane_lane_enabled_info{pool_name}` is `1` only when this
 classification is effective and `0` when the five request variants retain
@@ -571,11 +583,11 @@ for the exact classification, capacity, deadline, metrics, and rollout contract.
 
 Lane control publishes pool-scoped queue policy, configuration, capacity,
 depth, oldest age, dispatch sojourn, overload, rejection, and ineligibility
-metrics. To roll back only queue behavior, set
+metrics. To roll back the deployment lane, set
 `ISOLATE_CONTROL_PLANE_LANE_ENABLED=false` to return analysis and evaluation to
-ordinary queue behavior, or set `ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=false`
+ordinary queue, worker and JavaScript behavior, or set `ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=false`
 after disabling the control-plane lane to restore generic CoDel. Worker
-reserves, application and HTTP admission, action caps, and HTTP action context
+dependency reserves, application and HTTP admission, action caps, and HTTP action context
 reuse are unchanged. See
 [`patches/isolate_queue_control/README.md`](../../patches/isolate_queue_control/README.md) for
 the exact policy and rollout guidance.
@@ -653,19 +665,27 @@ With these floors enabled, dependency work receives the next available permit
 because completing it releases an isolate-holding ancestor. The service class
 follows an execution across every release and reacquisition.
 Only an admitted degradable root query cache-miss leader uses the degradable
-class. Cache hits, followers, ordinary roots, actions, deployment analysis, and
-other backend work use the protected class unless backend-derived ancestry
-classifies the request as a dependency.
+class. With the deployment lane enabled, typed configuration work uses
+`ControlPlane`, sharing the protected group's floor and elastic capacity.
+Otherwise it uses `Protected`, along with ordinary roots, actions and other
+backend work unless backend-derived ancestry makes the request a dependency.
+Cache hits and followers do not execute their own JavaScript.
 
 The floors apply when both protected and degradable work are runnable and no
 dependency grant is pending. They do not preempt JavaScript that is already
 active and do not keep permits idle. Either class borrows all capacity that the
 other class does not need. After both floors are met, elastic occupancy is
 balanced between the two classes; resumptions precede initial starts within a
-selected class.
+selected class. When both ordinary protected and control-plane requests wait,
+their grants alternate inside the combined protected group. Dependencies
+retain precedence over that alternation.
 
-Both minimums are `0` by default, which preserves the ordinary two-phase
-admission behavior. Positive minimums require a finite
+Both minimums are `0` by default, which preserves ordinary two-phase admission
+when the deployment lane is disabled. An enabled deployment lane still
+alternates with ordinary work. With both minimums zero, a configured degradable leader
+cap must be strictly smaller than any configured finite
+`FUNRUN_ISOLATE_ACTIVE_THREADS`; `0` continues to mean unlimited. Positive
+minimums require a finite
 `FUNRUN_ISOLATE_ACTIVE_THREADS`, require
 `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS`, and their sum cannot
 exceed the active-thread total. The degradable minimum cannot exceed the
@@ -680,3 +700,21 @@ nineteen degradable active executions after non-preemptive convergence. If
 either class is idle, the other can use all 28 permits. Use the total to
 control CPU oversubscription and select the minimums from measured progress,
 wait time, CPU headroom, and throttling.
+
+The backend publishes these bounded active-admission metric families:
+
+- `active_javascript_capacity_info{capacity_kind}`, where `capacity_kind` is
+  `total`, `protected_minimum`, or `degradable_minimum`; `total=0` means
+  unlimited;
+- `active_javascript_occupancy_info{active_javascript_class}`, which includes
+  permits that are held or granted but not yet collected;
+- `active_javascript_waiters_info{active_javascript_class,phase}`, which
+  excludes granted permits; and
+- `concurrency_permit_acquire_seconds{active_javascript_class,phase,status}`.
+
+The class labels are the fixed values `dependency`, `protected`, `control_plane`,
+and `degradable`; sum `protected` and `control_plane` occupancy when comparing
+against the protected floor. Phase is `initial` or `resume`, and acquisition status is
+`success` or `canceled`. See the
+[active-JavaScript admission design](../../patches/degradable_reactive_queries/active_javascript_admission.md)
+for the scheduler exposure invariant and grant policy.

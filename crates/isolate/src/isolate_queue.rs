@@ -26,14 +26,16 @@ pub(crate) enum IsolateQueueLane {
     ControlPlane,
     IndependentAction,
     Ordinary,
+    HighPriorityMutation,
 }
 
 impl IsolateQueueLane {
-    const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Dependency,
         Self::ControlPlane,
         Self::IndependentAction,
         Self::Ordinary,
+        Self::HighPriorityMutation,
     ];
 
     fn index(self) -> usize {
@@ -42,6 +44,7 @@ impl IsolateQueueLane {
             Self::ControlPlane => 1,
             Self::IndependentAction => 2,
             Self::Ordinary => 3,
+            Self::HighPriorityMutation => 4,
         }
     }
 
@@ -51,6 +54,7 @@ impl IsolateQueueLane {
             Self::ControlPlane => "control_plane",
             Self::IndependentAction => "independent_action",
             Self::Ordinary => "ordinary",
+            Self::HighPriorityMutation => "high_priority_mutation",
         }
     }
 }
@@ -140,6 +144,7 @@ pub(crate) struct IsolateQueueConfig {
     hard_max_age: Duration,
     control_plane_hard_max_age: Duration,
     pub(crate) control_plane_capacity: usize,
+    pub(crate) control_plane_reserved_capacity: usize,
 }
 
 impl IsolateQueueConfig {
@@ -201,6 +206,7 @@ impl IsolateQueueConfig {
             hard_max_age,
             control_plane_hard_max_age,
             control_plane_capacity,
+            control_plane_reserved_capacity: 0,
         })
     }
 }
@@ -331,7 +337,7 @@ pub(crate) struct IsolateQueueOutput<T> {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct IneligibleCounts([[usize; 6]; 4]);
+struct IneligibleCounts([[usize; 6]; 5]);
 
 impl IneligibleCounts {
     fn increment(&mut self, lane: IsolateQueueLane, eligibility: IsolateQueueEligibility) {
@@ -360,11 +366,12 @@ struct SelectionAttempt<T> {
 
 struct IsolateDelayQueue<T> {
     buffer: VecDeque<QueueEntry<T>>,
-    lane_depths: [usize; 4],
+    lane_depths: [usize; 5],
     capacity: usize,
     capacity_with_reserve: usize,
     config: IsolateQueueConfig,
-    controllers: [LaneDelayController; 4],
+    controllers: [LaneDelayController; 5],
+    high_priority_streak: u8,
 }
 
 impl<T> IsolateDelayQueue<T> {
@@ -377,13 +384,18 @@ impl<T> IsolateDelayQueue<T> {
         let capacity_with_reserve = capacity
             .checked_add(reserved_capacity)
             .expect("isolate queue capacity overflow");
+        assert!(
+            config.control_plane_reserved_capacity < capacity,
+            "control-plane queue reservation must leave ordinary capacity"
+        );
         Self {
             buffer: VecDeque::new(),
-            lane_depths: [0; 4],
+            lane_depths: [0; 5],
             capacity,
             capacity_with_reserve,
             config,
-            controllers: [LaneDelayController::new(now, config.interval); 4],
+            controllers: [LaneDelayController::new(now, config.interval); 5],
+            high_priority_streak: 0,
         }
     }
 
@@ -396,10 +408,20 @@ impl<T> IsolateDelayQueue<T> {
         // The scheduler derives the lane once from request properties. Using
         // that same value as the reserve authority prevents admission and
         // delay-control classification from drifting apart.
-        let capacity = if lane == IsolateQueueLane::Dependency {
-            self.capacity_with_reserve
-        } else {
-            self.capacity
+        let capacity = match lane {
+            IsolateQueueLane::Dependency => self.capacity_with_reserve,
+            IsolateQueueLane::ControlPlane => self.capacity,
+            IsolateQueueLane::Ordinary
+            | IsolateQueueLane::IndependentAction
+            | IsolateQueueLane::HighPriorityMutation => {
+                // Count occupied control-plane slots only once. Dependencies
+                // retain access to the complete queue so ancestors can finish.
+                self.capacity
+                    - self
+                        .config
+                        .control_plane_reserved_capacity
+                        .saturating_sub(self.lane_depths[IsolateQueueLane::ControlPlane.index()])
+            },
         };
         if self.buffer.len() >= capacity {
             // Return ownership so the sender can drop arbitrary request
@@ -463,17 +485,47 @@ impl<T> IsolateDelayQueue<T> {
         }
 
         let mut ineligible = IneligibleCounts::default();
-        let mut selected_index = None;
+        let mut first = None;
+        let mut ordinary = None;
+        let mut high = None;
+        let mut platform = None;
         for (index, entry) in self.buffer.iter().enumerate() {
             let eligibility = select(&entry.item);
             if eligibility.is_eligible() {
-                if selected_index.is_none() {
-                    selected_index = Some(index);
+                first.get_or_insert(index);
+                match entry.lane {
+                    IsolateQueueLane::HighPriorityMutation => {
+                        high.get_or_insert(index);
+                    },
+                    IsolateQueueLane::Dependency | IsolateQueueLane::ControlPlane => {
+                        platform.get_or_insert(index);
+                    },
+                    IsolateQueueLane::Ordinary | IsolateQueueLane::IndependentAction => {
+                        ordinary.get_or_insert(index);
+                    },
                 }
             } else {
                 ineligible.increment(entry.lane, eligibility);
             }
         }
+        // A client hint cannot cross an eligible platform request in the queue.
+        // Keep FIFO at that barrier rather than promoting later platform work
+        // indefinitely ahead of older ordinary work. Otherwise high gets at
+        // most two selections before the oldest eligible ordinary request.
+        let selected_index = match high {
+            None => first,
+            Some(_) if ordinary.is_some() && self.high_priority_streak >= 2 => {
+                // Paying the ordinary turn must not move it ahead of an older
+                // platform request either. That finite prefix drains first.
+                match (ordinary, platform) {
+                    (Some(ordinary), Some(platform)) => Some(ordinary.min(platform)),
+                    (ordinary, None) => ordinary,
+                    (None, Some(_)) => unreachable!("ordinary waiter was checked above"),
+                }
+            },
+            Some(high) if platform.is_some_and(|platform| platform < high) => first,
+            Some(high) => Some(high),
+        };
         let Some(selected_index) = selected_index else {
             return SelectionAttempt {
                 selected: None,
@@ -482,6 +534,15 @@ impl<T> IsolateDelayQueue<T> {
         };
 
         let entry = self.remove(selected_index);
+        match entry.lane {
+            IsolateQueueLane::HighPriorityMutation => {
+                self.high_priority_streak = self.high_priority_streak.saturating_add(1).min(2)
+            },
+            IsolateQueueLane::Ordinary | IsolateQueueLane::IndependentAction => {
+                self.high_priority_streak = 0
+            },
+            IsolateQueueLane::Dependency | IsolateQueueLane::ControlPlane => (),
+        }
         let sojourn = now.saturating_duration_since(entry.enqueued_at);
         let controller = &mut self.controllers[entry.lane.index()];
         let mut transitions = controller.observe(now, sojourn, self.config);
@@ -573,9 +634,10 @@ impl<T> IsolateDelayQueue<T> {
     fn drain(
         &mut self,
         now: tokio::time::Instant,
-    ) -> (VecDeque<QueueEntry<T>>, [ControllerTransitions; 4]) {
+    ) -> (VecDeque<QueueEntry<T>>, [ControllerTransitions; 5]) {
         let queued = std::mem::take(&mut self.buffer);
-        self.lane_depths = [0; 4];
+        self.lane_depths = [0; 5];
+        self.high_priority_streak = 0;
         let transitions = IsolateQueueLane::ALL
             .map(|lane| self.controllers[lane.index()].reset(now, self.config.interval));
         (queued, transitions)
@@ -1156,6 +1218,134 @@ mod tests {
     }
 
     #[test]
+    fn mutation_priority_has_bounded_turns_and_respects_platform_fifo() {
+        use IsolateQueueLane::{
+            ControlPlane,
+            Dependency,
+            HighPriorityMutation as High,
+            Ordinary,
+        };
+        let now = tokio::time::Instant::now();
+        let mut queue = IsolateDelayQueue::new(now, 16, 2, config());
+        for (item, lane) in [
+            ("ordinary-first", Ordinary),
+            ("dependency", Dependency),
+            ("high-first", High),
+            ("ordinary-second", Ordinary),
+            ("high-second", High),
+            ("high-third", High),
+            ("control", ControlPlane),
+            ("high-fourth", High),
+        ] {
+            queue.push(item, lane, now).unwrap();
+        }
+        for expected in [
+            "ordinary-first",
+            "dependency",
+            "high-first",
+            "high-second",
+            "ordinary-second",
+            "high-third",
+            "control",
+            "high-fourth",
+        ] {
+            let selected = queue.pop_selecting(now, &mut eligible).selected.unwrap();
+            assert_eq!(selected.output.item, expected);
+            assert_eq!(selected.output.rejection, None);
+        }
+        // The ordinary turn cannot cross a platform request that arrived
+        // between it and the remaining high request.
+        queue.push("high-fifth", High, now).unwrap();
+        queue.push("control-second", ControlPlane, now).unwrap();
+        queue.push("ordinary-third", Ordinary, now).unwrap();
+        for expected in ["control-second", "ordinary-third", "high-fifth"] {
+            assert_eq!(
+                queue
+                    .pop_selecting(now, &mut eligible)
+                    .selected
+                    .unwrap()
+                    .output
+                    .item,
+                expected
+            );
+        }
+        assert!(queue.is_empty());
+        assert_eq!(queue.lane_depths, [0; 5]);
+    }
+
+    #[test]
+    fn mutation_priority_does_not_use_reserves_or_block_on_ineligible_work() {
+        use IsolateQueueLane::{
+            ControlPlane,
+            Dependency,
+            HighPriorityMutation as High,
+            Ordinary,
+        };
+        let now = tokio::time::Instant::now();
+        let mut config = config();
+        config.control_plane_reserved_capacity = 1;
+        let mut queue = IsolateDelayQueue::new(now, 3, 1, config);
+        queue.push("blocked-high", High, now).unwrap();
+        queue.push("ordinary", Ordinary, now).unwrap();
+        assert_eq!(
+            queue.push("high-rejected", High, now),
+            Err((IsolateQueueSendError::QueueFull, "high-rejected"))
+        );
+        queue.push("control", ControlPlane, now).unwrap();
+        assert_eq!(
+            queue.push("high-rejected", High, now),
+            Err((IsolateQueueSendError::QueueFull, "high-rejected"))
+        );
+        assert!(queue.push("dependency", Dependency, now).unwrap());
+        let mut eligibility = |item: &&str| IsolateQueueEligibility {
+            physical_total: *item == "blocked-high",
+            ..IsolateQueueEligibility::eligible()
+        };
+        assert_eq!(
+            queue
+                .pop_selecting(now, &mut eligibility)
+                .selected
+                .unwrap()
+                .output
+                .item,
+            "ordinary"
+        );
+        assert_eq!(
+            queue
+                .pop_selecting(now, &mut eligibility)
+                .selected
+                .unwrap()
+                .output
+                .item,
+            "control"
+        );
+        assert_eq!(
+            queue
+                .pop_selecting(now, &mut eligibility)
+                .selected
+                .unwrap()
+                .output
+                .item,
+            "dependency"
+        );
+        assert!(queue
+            .pop_selecting(now, &mut eligibility)
+            .selected
+            .is_none());
+        let expired = queue
+            .pop_selecting(now + config.hard_max_age, &mut eligibility)
+            .selected
+            .unwrap();
+        assert_eq!(expired.output.item, "blocked-high");
+        assert_eq!(
+            expired.output.rejection,
+            Some(IsolateQueueRejection::HardExpired)
+        );
+        assert_eq!(queue.lane_depths, [0; 5]);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
     fn controller_requires_two_slow_samples_from_a_complete_interval() {
         let start = tokio::time::Instant::now();
         let config = config();
@@ -1613,6 +1803,71 @@ mod tests {
                 .0,
             IsolateQueueSendError::QueueFull,
         );
+    }
+
+    #[test]
+    fn control_plane_reservation_survives_ordinary_saturation_without_using_dependency_overflow() {
+        let start = tokio::time::Instant::now();
+        let mut config = config();
+        config.control_plane_capacity = 2;
+        config.control_plane_reserved_capacity = 2;
+        let mut queue = IsolateDelayQueue::new(start, 4, 1, config);
+        for item in ["ordinary-1", "ordinary-2"] {
+            assert!(!queue.push(item, IsolateQueueLane::Ordinary, start).unwrap());
+        }
+        assert_eq!(
+            queue
+                .push("excess-ordinary", IsolateQueueLane::Ordinary, start)
+                .unwrap_err()
+                .0,
+            IsolateQueueSendError::QueueFull
+        );
+        for item in ["deployment-1", "deployment-2"] {
+            assert!(!queue
+                .push(item, IsolateQueueLane::ControlPlane, start)
+                .unwrap());
+        }
+        assert!(queue
+            .push("dependency", IsolateQueueLane::Dependency, start)
+            .unwrap());
+        assert_eq!(queue.buffer.len(), 5);
+        assert_eq!(
+            queue
+                .push("excess-deployment", IsolateQueueLane::ControlPlane, start)
+                .unwrap_err()
+                .0,
+            IsolateQueueSendError::QueueFull
+        );
+        // With ordinary workers occupied, selection still exposes deployment
+        // demand to its reserved worker and separate JavaScript wait queue.
+        let next = queue
+            .pop_selecting(start, &mut |item| IsolateQueueEligibility {
+                shared_base: item.starts_with("ordinary"),
+                ..Default::default()
+            })
+            .selected
+            .unwrap();
+        assert_eq!(next.output.item, "deployment-1");
+        assert_eq!(
+            queue
+                .push("replacement", IsolateQueueLane::ControlPlane, start)
+                .unwrap_err()
+                .0,
+            IsolateQueueSendError::QueueFull
+        );
+        assert_eq!(
+            queue
+                .pop_selecting(start, &mut eligible)
+                .selected
+                .unwrap()
+                .output
+                .item,
+            "ordinary-1"
+        );
+        assert!(!queue
+            .push("replacement", IsolateQueueLane::ControlPlane, start)
+            .unwrap());
+        assert_eq!(queue.buffer.len(), 4);
     }
 
     #[test]

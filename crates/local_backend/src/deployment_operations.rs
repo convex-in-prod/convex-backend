@@ -257,6 +257,7 @@ pub async fn capabilities(
     authorize(&st, req.admin_key).await?;
     Ok(axum::Json(json!({
         "protocolVersion": 1,
+        "mutationPriorityProtocol": if *common::knobs::ISOLATE_QUEUE_DELAY_CONTROL_ENABLED { 1 } else { 0 },
         "sessionId": st.deployment_operations.session_id,
         "lifetimeSeconds": LIFETIME.as_secs(),
         "maxOperations": MAX_OPERATIONS,
