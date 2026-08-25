@@ -6,6 +6,17 @@
 > prerequisites, rollout, and rollback. This reference preserves the original combined rationale,
 > benchmark tables, stage interaction analysis, and coverage matrix.
 
+The subsequent [deployment admission extension](../non_committing_codegen_analysis/deployment_operations.md)
+adds control-plane queue/worker reservations within shared base and fair
+configuration admission within protected JavaScript capacity. Its contract
+supersedes the baseline phase-only behavior when that lane is enabled. It also
+carves three deployment allowances from the main HTTP ordinary ceiling; the
+`H - D` HTTP model below records the baseline before that extension.
+
+The later [HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority)
+adds a separate high-mutation class with bounded preference, including when
+service floors and the control-plane lane are disabled.
+
 This document covers two patches that can be applied independently:
 
 - the runtime admission patch makes the self-hosted HTTP gates configurable,
@@ -181,8 +192,12 @@ CPU oversubscription control for V8 work.
 
 The stock self-hosted Compose file passes through `MAX_ISOLATE_WORKERS`,
 `ISOLATE_DEPENDENCY_WORKER_RESERVE`, `MAX_ISOLATE_ACTION_WORKERS`,
-`ISOLATE_QUEUE_SIZE`, and `FUNRUN_ISOLATE_ACTIVE_THREADS`. Unset values continue
-to use backend defaults.
+`MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION`,
+`ISOLATE_QUEUE_SIZE`, `FUNRUN_ISOLATE_ACTIVE_THREADS`,
+`APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS`,
+`FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN`, and
+`FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN`. Unset values continue to use
+backend defaults.
 
 ## Scheduler Dependency-Reserve Patch
 
@@ -211,8 +226,10 @@ action cap. There is no additional first-caller or role-combination policy.
 
 Upstream splits scheduler ingress by ownership boundary. A direct nested UDF
 callback enters an internal unbounded channel, is polled before the external
-stream, has no CoDel deadline, and requests its active-JavaScript permit at high
-priority before worker assignment. The scheduler buffers internal arrivals,
+stream, and has no CoDel deadline. With positive class minimums it requests an
+initial-phase `Dependency` active-JavaScript permit before worker assignment;
+the zero-floor compatibility policy maps that request to the resume phase. The
+scheduler buffers internal arrivals,
 discards closed callers, and selects the oldest callback eligible in one worker
 snapshot. It can therefore skip a per-client-ineligible callback without letting
 newer eligible callbacks from other clients lose otherwise usable physical
@@ -234,11 +251,15 @@ The worker policy has three capacities:
 - `B = T - R`, the shared base assigned-worker capacity;
 - `R = ISOLATE_DEPENDENCY_WORKER_RESERVE`, dependency-only overflow above `B`.
 
-Every request class, including dependencies, consumes shared base occupancy
-while total occupancy is below `B`. A non-dependency can start only when global
-and per-client total occupancy are both below their base limits. A dependency
-can start up to the corresponding global and per-client totals. Therefore, once
-occupancy reaches `B`, only dependencies can use the remaining `R` slots. There
+Worker occupancy includes assigned requests and pending active-JavaScript
+waits that already reserved worker eligibility. Every request class, including
+dependencies, consumes shared base occupancy while total occupancy is below `B`.
+A non-dependency can acquire a new claim only when global and per-client total
+occupancy are both below their base limits. A dependency can acquire a claim up
+to the corresponding global and per-client totals. Therefore, once occupancy
+reaches `B`, only dependencies can claim the remaining `R` slots. Dispatch
+transfers an existing claim to a worker; an earlier base claim remains valid
+even if dependency work dispatched first and used overflow. There
 is no target number of active dependencies and no dependency-first priority
 below `B`. Completion accounting remains the first branch of the scheduler's
 biased selection loop, matching upstream ordering; the rejected dependency-
@@ -266,12 +287,13 @@ shaping and mixed-traffic protection; the dependency overflow is the liveness
 mechanism.
 
 The optional `MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION` bounds each validated function inside the
-global action allowance. It uses client and
+global action allowance, including pending initial-permit reservations. It uses client and
 component identity. HTTP actions additionally use the analyzed registered method and route;
 prefix matches share their registered prefix, HEAD shares GET, and unmatched requests share a
 component-router allowance. Concrete URLs never define admission identities. Zero retains the
 global-only policy. Queries, mutations, and ancestor-unblocking descendants are exempt. Selection skips a
-capped function without hiding other eligible work; completion releases the function count. See [Action cap](README.md#action-cap) for configuration and limits.
+capped function without hiding other eligible work; completion and canceled/expired reservations
+release the function count. See [Action cap](README.md#action-cap) for configuration and limits.
 
 The application query, mutation, V8-action, and Node-action limiters use the
 same total-occupancy rule before the isolate queue. Their effective dependency
@@ -324,7 +346,8 @@ concurrently. Configure `R >= 1` and `T >= 2` for applications using these call
 patterns. Queue deadlines still wake and reject stalled work, but expiry is a
 failure signal rather than successful progress. Construction rejects
 `MAX_ISOLATE_WORKERS=0`, `ISOLATE_QUEUE_SIZE=0`, `R >= T`, and an explicit
-`MAX_ISOLATE_ACTION_WORKERS > B`. Malformed or non-Unicode values for these
+`MAX_ISOLATE_ACTION_WORKERS > B`, or an explicit per-function action cap above the resolved global
+cap. Malformed or non-Unicode values for these
 knobs and `FUNRUN_ISOLATE_ACTIVE_THREADS` fail startup instead of falling back
 to defaults.
 
@@ -360,8 +383,9 @@ policy, and overload response:
    `min(R, configured_limit - 1)` above shared base occupancy. Outstanding,
    wait-duration, and wait-timeout metrics identify this stage.
 4. Equal query cache misses can coalesce, making followers wait for one peer
-   computation without entering the isolate queue. A protected direct action
-   query bypasses an independent peer and may duplicate the query instead.
+   computation without entering the isolate queue. An ancestor-unblocking
+   direct action query bypasses an independent peer and may duplicate the query
+   instead.
 5. Externally submitted isolate work shares one bounded queue. Its shared base
    capacity is `ISOLATE_QUEUE_SIZE`, with `R` extra external dependency-only
    slots. Queue-full sends fail immediately. The default policy assigns the `5`
@@ -369,34 +393,33 @@ policy, and overload response:
    generic CoDel depth. The opt-in lane policy uses its configured hard age and
    lane-specific depth, delay, overload, and rejection metrics. Scheduler
    counters separate class-specific enqueue, dispatch, expiry, and rejection in
-   both modes. Direct nested UDF callbacks bypass this queue through upstream's
-   internal high-priority channel and have no queue expiry.
+   both modes. Direct nested UDF callbacks bypass this queue through the
+   internal dependency channel and have no queue expiry.
 6. The isolate scheduler assigns at most `MAX_ISOLATE_WORKERS` requests to
-   workers. This is not another backlog: eligible work remains in the queue until a
-   worker is available. Every class shares occupancy below `B`; only
-   ancestor-unblocking work can raise occupancy from `B` to `T`; independent
+   workers. It counts pending active-JavaScript waits against the same
+   total, reserving worker eligibility before taking those requests out of the
+   queue. Every class shares occupancy below `B`; only ancestor-unblocking work
+   can acquire new claims from `B` to `T`; independent
    V8/HTTP actions are additionally capped by
    `MAX_ISOLATE_ACTION_WORKERS`.
 7. `FUNRUN_ISOLATE_ACTIVE_THREADS` separately limits JavaScript actively using
-   CPU, and upstream acquires its permit before assigning a worker. An action
-   retains its assigned isolate worker while awaiting supported asynchronous
-   operations but releases its active execution permit. The upstream limiter
-   keeps one fixed permit total and two FIFO waiter tiers. It always hands an
-   available permit to a high-priority waiter before a low-priority waiter.
-   Direct separately scheduled nested transactional functions and every
-   suspended-permit reacquisition use the high-priority tier; initial external
-   root and action requests use the low-priority tier. The tiers add no active
-   permits and do not preempt JavaScript already running. Permit acquisition
-   latency and backend CPU throttling identify this stage. The original external
-   queue deadline continues to bound low-priority initial permit acquisition
-   after queue selection: the applicable CoDel expiration or lane hard deadline.
-   An action callback retains this bound even when it is a scheduler dependency.
-   Separately scheduled nested transactional functions use the internal path and
-   wait without an external deadline because they cannot be retried safely.
-   Scheduler dependency ownership and active-permit priority are deliberately
-   separate: an action callback can use scheduler overflow but start at low
-   priority, while an already-started independent root reacquires at high
-   priority.
+   CPU, and the scheduler acquires an initial permit before assigning a worker.
+   An action retains its assigned isolate worker while awaiting supported
+   asynchronous operations but releases its active execution permit. With
+   positive class minimums, the limiter gives backend-derived dependency work
+   the next grant. Protected and degradable application work receive
+   non-preemptive floors, borrow unused capacity from each other, and prefer
+   resumptions over initial starts within the selected class. With zero
+   minimums and the control-plane lane disabled, the compatibility policy remains phase-only: all resumptions
+   precede all initial starts. Neither policy adds active permits or preempts
+   JavaScript already running. Permit acquisition latency by class and phase,
+   together with backend CPU throttling, identifies this stage. The original
+   external queue deadline continues to bound initial permit acquisition after
+   queue selection: the applicable CoDel expiration or lane hard deadline. An
+   action callback retains this bound even when backend-derived ancestry places
+   it in the dependency class. Separately scheduled nested transactional
+   functions use the internal path and wait without an external deadline
+   because they cannot be retried safely.
 8. A Node action does not use an isolate worker, but it has its own application
    action permit and executor capacity. Every Node `ctx.run*` callback re-enters
    the main HTTP service and then the corresponding application and isolate
@@ -576,18 +599,16 @@ Direct internal nested UDF callbacks have no external queue deadline.
 Use
 `isolate_scheduler_requests_rejected_total{pool_name, scheduler_class, reason}`
 to distinguish queue-full or lane-full admission rejection, delay-control
-shedding, a caller dropping a control-plane response before dispatch, and an
-unexpected no-worker rejection. `reason="queue_full"` or `reason="lane_full"`
+shedding, and a caller dropping a control-plane response before dispatch.
+`reason="queue_full"` or `reason="lane_full"`
 points at admission pressure before the scheduler can choose a worker.
 `reason="delay_control_shed"` is a queue delay-control decision and
 `reason="caller_dropped"` avoids dispatching abandoned control-plane work.
-`reason="no_worker"` should be rare; it means a request selected for dispatch no
-longer satisfied scheduler capacity checks.
 `reason="scheduler_closed"` means the scheduler already exited, for example
 after an isolate worker or worker channel failed. New sends after the receiver
 closes increment this reason. Requests already queued are dropped so their
 callers receive a shutdown error rather than hanging, but those drops are not
-individually added to the rejection counter. These six reason values and the
+individually added to the rejection counter. These five reason values and the
 five scheduler classes below are closed metric-label contracts.
 
 Use
@@ -603,7 +624,7 @@ paired increments and decrements so concurrent worker completions cannot publish
 an older absolute count after a newer one.
 
 Use `isolate_scheduler_capacity_info{pool_name,capacity_kind}` to confirm the
-resolved `physical`, `base`, and `independent_action` capacities. This is
+resolved `physical`, `base`, `independent_action`, and `independent_action_per_function` capacities. This is
 the fastest way to detect a missing or stale deployment knob.
 
 Use `scheduled_job_execution_parallelism_info` to confirm the resolved
@@ -661,8 +682,9 @@ actually entered each HTTP admission wait, and
 in permit handoff or cancellation. Immediate admission produces neither.
 When isolate queue delay control is enabled,
 `isolate_queue_ineligible_info{lane,reason="independent_action_cap"}` reports the
-latest queued count blocked by the action cap, but not the duration of that
-wait.
+latest queued count blocked by the global action cap. The
+`independent_action_function_cap` reason reports the per-function cap. Neither reports the duration
+of that wait or uses function names as labels.
 Metrics still do not include queued depth by scheduler role, resolved per-client
 capacities, application-limit reserve use, call-chain depth, or time spent
 specifically waiting on a descendant.
@@ -713,7 +735,7 @@ that code pattern.
 | A query calls `ctx.runQuery`, or a mutation calls `ctx.runQuery` or `ctx.runMutation`, with `SUBFUNCTIONS_IN_SAME_ISOLATE=false`                                    | Covered as a finite chain: every separately scheduled child is dependency-marked and may itself be a descendant-holder. Size `R` for expected nesting and fanout; a chain requiring more than `T` simultaneous workers can still fail. `useStaleSnapshot` and `transactionLimits` do not change isolate placement.                           |
 | The application runs many independent V8 or HTTP actions                                                                                                            | `MAX_ISOLATE_ACTION_WORKERS` limits assigned independent action shells without reducing query/mutation worker capacity. A lower value protects mixed traffic; a higher value can improve an action-only route. There is no universal ratio, so document whether the selected value is benchmarked or an informed starting point.             |
 | `HTTP_SERVER_MAX_CONCURRENT_REQUESTS <= HTTP_SERVER_DEPENDENCY_RESERVE`                                                                                             | The standard local backend does not start because the configured overflow would leave no shared base HTTP admission. Set the HTTP total above the HTTP reserve. This matters for `"use node"` chains; V8-only callbacks do not re-enter through HTTP.                                                                    |
-| `concurrency_permit_acquire_seconds` rises or root-style functions report `InitialPermitTimeoutError` while dependency work is queued                              | Worker reserve is available, but the shared active-JavaScript permits or CPU are saturated. Initial nested transactional waits and all permit reacquisitions use the high-priority tier; nested transactional initial waits have no external deadline. Initial roots and actions, including action callbacks that are scheduler dependencies, use the low-priority tier and remain bounded by the original applicable CoDel or lane queue deadline. Check backend CPU throttling and long-running JavaScript. Reduce admitted CPU work or raise active permits only after confirming CPU headroom; tiering does not add active capacity. |
+| `concurrency_permit_acquire_seconds` rises or root-style functions report `InitialPermitTimeoutError` while dependency work is queued                              | Worker reserve is available, but active-JavaScript permits or CPU are saturated. With positive class minimums, dependency work receives the next grant; protected and degradable service follows their non-preemptive floors and within-class phase order. Direct nested transactional initial waits have no external deadline. External initial roots and actions remain bounded by the applicable CoDel or lane queue deadline, including action callbacks whose backend-derived ancestry places them in the dependency class. Check acquisition latency by class and phase, backend CPU throttling, and long-running JavaScript. Reduce admitted CPU work or raise active permits only after confirming CPU headroom; class-aware admission does not add active capacity. |
 | Public clients can reach `/api/actions/*`                                                                                                                           | Callback tokens protect operations, but the outer HTTP gate classifies reserve use before token authentication. Restrict this path to the backend or Node executor network source where practical, verify legitimate callbacks after the rule, and keep bounded public admission.                                                            |
 | `isolate_scheduler_requests_rejected_total{scheduler_class=~"dependency.*",reason="queue_full"}` or dependency expiry rises continuously during representative load | The bounded reserve is exhausted. Correlate with action failures, HTTP errors, backend CPU, active-permit wait, and dependency dispatch. Reduce or shape admitted traffic, reduce nesting/fanout, or add measured capacity. Do not increase queue depth alone: it can replace rejection with longer latency without increasing service rate. |
 
