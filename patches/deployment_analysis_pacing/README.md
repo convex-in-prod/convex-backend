@@ -123,8 +123,8 @@ spawn separately scheduled dependencies, and dependency work retains its existin
 queries, mutations, actions, and non-degradable clients also bypass the elastic gate. The configured
 cap must therefore leave measured headroom at the application query gate, isolate shared base, and
 other lifetime limits. With active-JavaScript service floors enabled, the cap can exceed finite
-active capacity because these gates bound different resources. Without service floors, startup
-still requires finite active capacity to exceed the cap.
+active capacity because these gates bound different resources. Without service floors, any
+configured finite active capacity must exceed the cap; `0` continues to mean unlimited.
 
 Root pacing creates no additional worker or CPU capacity. The enabled
 deployment lane reserves queue and worker space within the existing base and
