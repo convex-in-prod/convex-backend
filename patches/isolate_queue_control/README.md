@@ -11,6 +11,18 @@ evaluation requests into a bounded `control_plane` lane with a longer hard deadl
 shedding. Neither feature creates execution capacity, replaces worker limits, or grants
 unconditional dispatch priority.
 
+The detailed
+[`IsolateDelayQueue` design reference](isolate_delay_queue_design_reference.md)
+documents the queue's classification axes, selection and lifecycle mechanics,
+and interactions with dependency capacity, degradable queries, active-JavaScript
+admission, deployment pacing, HTTP admission, scheduled actions, and context
+reuse. The
+[`deployment-lane design reference`](deployment_lane_design_reference.md)
+preserves the control-plane-specific motivation and alternatives.
+
+The [HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority)
+adds bounded high-mutation preference within ordinary capacity at queue and CPU admission.
+
 ## Relationship to generic CoDel
 
 The isolate scheduler constructs exactly one external queue implementation when
@@ -41,8 +53,8 @@ the policy is disabled so malformed latent configuration fails at startup.
 delay, but it neither wraps nor implements the generic CoDel algorithm. After
 the generic queue remains continuously nonempty for its idle-expiration period,
 it dispatches unexpired work in LIFO rather than FIFO order and returns expired
-oldest entries separately. The isolate-specific policy instead preserves FIFO
-among simultaneously eligible requests and adds scheduler-aware eligibility,
+oldest entries separately. The isolate-specific policy selects eligible requests
+with bounded high-mutation preference and adds scheduler-aware eligibility,
 per-lane delay observations, adaptive shedding, and absolute hard deadlines.
 
 ## Queue and lane model
@@ -56,6 +68,7 @@ Each request is classified from the scheduler properties already propagated by
 the dependency-reserve patch:
 
 - `dependency` when `unblocks_ancestor` is true;
+- `high_priority_mutation` for a mutation carrying the per-call high hint;
 - `independent_action` when it is an isolate action and does not unblock an
   ancestor;
 - `ordinary` otherwise.
@@ -70,19 +83,22 @@ unblocks an isolate-holding ancestor is in the dependency lane, while active
 request metrics retain `is_isolate_action` separately. This prevents action
 identity and ancestry role from being collapsed into one classification.
 
-The queue remains physically FIFO. On each dispatch attempt, the scheduler
-evaluates entries against one immutable snapshot of worker state and selects
-the oldest eligible request in the entire queue. It may skip an older request
-only when that request is currently blocked by one or more of:
+The queue stores entries in arrival order. On each dispatch attempt, the scheduler
+evaluates entries against one immutable snapshot of worker state. High mutations
+receive at most two turns before eligible ordinary or independent-action work.
+They cannot cross an older eligible dependency or control-plane request. Otherwise
+selection uses the oldest eligible request. A request is ineligible when blocked by:
 
 - the physical worker total;
 - shared-base worker capacity;
 - the per-client total;
 - the per-client shared base;
-- the independent-action cap.
+- the independent-action cap;
+- an already exposed initial active-JavaScript waiter for the same effective
+  service class.
 
-This selection rule preserves FIFO among simultaneously eligible requests and
-allows work for one client or class to proceed around an ineligible head. It
+This selection rule allows work for one client or class to proceed around an
+ineligible head while preserving the platform barriers above. It
 does not grant queue admission beyond the class's finite capacity.
 
 ## Per-lane delay controller
@@ -110,14 +126,14 @@ not synthesize a minimum and does not change overload state. Completely
 draining a lane clears its controller immediately, including partial interval
 state. A later enqueue starts that lane with a fresh interval.
 
-The controller never changes request eligibility. Once an ordinary or
-independent-action request has been selected by normal scheduler eligibility,
+The controller never changes request eligibility. Once an ordinary, high-mutation,
+or independent-action request has been selected by normal scheduler eligibility,
 it is adaptively rejected only when its lane is overloaded and its own sojourn
 is strictly greater than `ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS`. A newer
 request is not rejected because another request was old. Dependencies are
 observed and can report overload, but they are never adaptively shed.
 
-Ordinary, independent-action, and dependency entries use the same finite hard age,
+Ordinary, high-mutation, independent-action, and dependency entries use the same finite hard age,
 `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS`. An enabled control-plane entry uses
 `ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS`. Each entry stores its absolute deadline, and the
 consuming receiver and its non-consuming expiry companion arm the earliest deadline across the
@@ -160,12 +176,14 @@ in the same snapshot; FIFO remains intact among simultaneously eligible
 internal callbacks.
 
 After an external entry becomes scheduler-eligible, its original hard deadline
-continues to bound the low-priority active-JavaScript permit wait. The worker is
+continues to bound its initial active-JavaScript permit wait. The worker is
 assigned only after that permit is acquired. Direct internal callbacks instead
-use upstream's high-priority permit wait without a CoDel deadline because those
-nested requests cannot be retried safely. Both paths still consume the same
-physical worker total and dependency reserve when the scheduler assigns a
-worker.
+use the backend-owned dependency class without a CoDel deadline because those
+nested requests cannot be retried safely. When class-aware admission is
+disabled, non-high work retains the phase-only compatibility policy; high mutations
+retain a separate class with bounded preference. Both paths
+still consume the same physical worker total and dependency reserve when the
+scheduler assigns a worker.
 
 The periodic lane metrics reporter shares only the locked queue state. It does
 not clone receiver wake state or keep the queue logically open. The expiry
@@ -213,26 +231,29 @@ Construction additionally requires:
   intervals react faster but are more sensitive to sparse samples.
 - `ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS` is derived as twice the configured
   target when unset, which is `300` with the built-in target. An overloaded
-  ordinary or independent-action lane sheds a selected request only when that
+  ordinary, high-mutation, or independent-action lane sheds a selected request only when that
   request's own queue age exceeds this value. Set it above the target and below
   the ordinary hard maximum age. It never adaptively sheds dependency or
   control-plane work.
 - `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS` has built-in patch value `5000`. It is the
-  absolute enqueue-to-initial-active-permit deadline for ordinary,
+  absolute enqueue-to-initial-active-permit deadline for ordinary, high-mutation,
   independent-action, and dependency requests. Set it above the adaptive-shed
   threshold but below relevant outer request timeouts.
 - `ISOLATE_CONTROL_PLANE_LANE_ENABLED` has built-in patch value `false`. It
   classifies only the five typed analysis and configuration-evaluation request
-  variants. It requires lane delay control and grants neither priority nor
-  reserved queue or worker capacity.
+  variants. It requires lane delay control and enables queue/worker reservation
+  inside shared base plus fair configuration admission inside protected JavaScript capacity.
 - `ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY` has built-in patch value `16`. It is a
-  queued-entry sub-cap inside `ISOLATE_QUEUE_SIZE`, not a separate queue or a
-  reservation. When the lane is enabled it must be at least
-  `ANALYZE_CONCURRENCY` and no greater than `ISOLATE_QUEUE_SIZE`.
+  queued-entry cap and reservation inside `ISOLATE_QUEUE_SIZE`. When the lane is
+  enabled it must be at least `ANALYZE_CONCURRENCY` and strictly less than
+  `ISOLATE_QUEUE_SIZE`.
 - `ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS` has built-in patch value `30000`.
   It gives control-plane work a finite enqueue-to-initial-active-permit budget
   and must exceed the ordinary hard maximum age. Keep caller, proxy, and
   deployment-phase timeouts long enough for this wait plus execution.
+- `ISOLATE_CONTROL_PLANE_WORKER_RESERVE` defaults to `1`. With the lane enabled,
+  it is clipped to leave one ordinary slot globally and per client. `0` disables
+  the worker allowance while retaining the queue and JavaScript policies.
 - `CODEL_QUEUE_IDLE_EXPIRATION_MILLIS` has default `5000` in unmodified
   `get-convex/convex-backend`. It controls when the generic CoDel queue changes
   from its idle FIFO regime to congestion handling; it is not a hard maximum
@@ -242,15 +263,15 @@ Construction additionally requires:
   CoDel queue's congested regime. It does not configure lane-mode shedding or
   hard deadlines.
 
-The eight `ISOLATE_QUEUE_DELAY_*`, `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS`, and
+The `ISOLATE_QUEUE_DELAY_*`, `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS`, and
 `ISOLATE_CONTROL_PLANE_*` knobs above are introduced by this patch. Their
 built-in values are part of the patch contract, not defaults in unmodified
 `get-convex/convex-backend`.
 
-All three `ISOLATE_CONTROL_PLANE_*` values and `ANALYZE_CONCURRENCY` are parsed
+The lane-enable, queue-capacity and hard-deadline values and `ANALYZE_CONCURRENCY` are parsed
 strictly even while the lane is disabled. Intrinsic values must be positive and
 representable by the runtime timer. When enabled, lane-aware queueing must also
-be enabled, the lane cap must be at least `ANALYZE_CONCURRENCY` and no greater
+be enabled, the lane cap must be at least `ANALYZE_CONCURRENCY` and strictly less
 than `ISOLATE_QUEUE_SIZE`, and the control-plane hard deadline must exceed the
 ordinary hard deadline. These checks prevent one push from rejecting its
 configured fan-out and keep the longer contract explicit.
@@ -296,7 +317,7 @@ control-plane classification is disabled. Enabling the deployment lane also adds
 `scheduler_class="control_plane"`; `isolate_control_plane_lane_enabled_info{pool_name}` proves
 whether that classification is effective.
 Rejection reasons distinguish `lane_full`, `queue_full`, `hard_expired`, `caller_dropped`,
-`scheduler_closed`, and `no_worker`. `delay_control_shed` and dependency-reserve use for
+`scheduler_closed`, and `delay_control_shed`. Delay-control shedding and dependency-reserve use for
 `control_plane` are invariant violations and must remain zero.
 
 The patch extends the dependency-capacity scheduler counter initialization with the control-plane
@@ -345,7 +366,7 @@ the lane. Classification never matches application module, function, component, 
 client, or tenant names.
 
 When disabled, these requests retain ordinary scheduler class, deadline, and shedding behavior.
-When enabled, they remain in the same physical FIFO and use only shared-base queue and worker
+When enabled, they remain in the same physical queue and use only shared-base queue and worker
 capacity. An older eligible ordinary request runs before a newer control-plane request, and an older
 eligible control-plane request runs before newer ordinary work. Existing eligibility may skip an
 older entry blocked by physical, shared-base, per-client, or action-cap constraints; the lane adds
@@ -358,15 +379,17 @@ control_plane_depth < ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY
 total_shared_depth < ISOLATE_QUEUE_SIZE
 ```
 
-The cap does not reserve entries from ordinary work and does not add to physical capacity. A full
-control-plane lane rejects another control-plane request while ordinary work can still use shared
-space. A full shared base rejects control-plane work even when dependency-reserve entries remain.
+The cap reserves entries from ordinary work within existing physical capacity.
+Ordinary admission stops at `ISOLATE_QUEUE_SIZE - max(0, control_plane_capacity - control_plane_depth)`.
+A full shared base still rejects control-plane work even when dependency overflow remains.
+A full control-plane lane rejects another control-plane request while ordinary
+work can use any remaining shared space.
 
 Control-plane entries participate in delay observations and overload metrics but are never rejected
 by adaptive delay shedding. They still fail on lane-full or shared-queue admission, caller drop,
 their finite hard deadline, scheduler closure, or worker failure. The built-in 30-second deadline is
-an enqueue-to-active-permit budget: it bounds both queue residence and the low-priority
-active-JavaScript permit wait that now precedes worker assignment. V8 execution, HTTP, proxy, CLI,
+an enqueue-to-active-permit budget: it bounds both queue residence and the initial
+active-JavaScript permit wait that precedes worker assignment. V8 execution, HTTP, proxy, CLI,
 and deployment-phase timeouts remain separate.
 
 Each post-admission analysis or evaluation retry is a new queue entry with a new deadline. The
@@ -377,41 +400,37 @@ The ordered [`deployment-analysis pacing`](../deployment_analysis_pacing/README.
 adds a pre-queue gate only for isolate module analysis. Each module attempt fairly borrows one
 permit from the configured degradable-query capacity and releases it before retry backoff. This
 reduces analysis arrivals under elastic query load but does not alter this lane's classification,
-capacity, deadline, FIFO selection, or evaluation-request behavior.
+capacity, deadline, selection policy, or evaluation-request behavior.
 
-Analysis and evaluation requests carry one-shot response senders but no UDF cancellation signal.
+Analysis and all four configuration evaluation variants carry one-shot response
+senders and execution-fenced cancellation. Dispatched requests that belong to a
+whole job retain its lease through their environment cleanup.
 After selection and before worker allocation, the scheduler checks whether a control-plane caller
 has disappeared. It also watches response closure while acquiring the initial active-JavaScript
 permit, canceling that permit wait when the caller disappears. A closed caller is removed with
 reason `caller_dropped` without incrementing active-worker accounting. Cancellation is lazy while
 queued: a canceled entry can remain counted until selection or hard expiry, but the lane cap and
-deadline bound retained state. If the caller drops after the final pre-dispatch check, evaluation
-or analysis can still begin and response delivery fails normally. When deployment-analysis pacing
-is active, the queued analysis response sender owns its shared-capacity reservation. A discarded
-request releases it; a dispatched request retains it until the analysis attempt produces its
-terminal result even when its caller has disappeared.
+deadline bound retained state. If the caller drops after the final pre-dispatch check, the request
+can still reach a worker; binding its cancellation signal interrupts only that execution.
+When deployment-analysis pacing is active, the queued analysis response sender owns its
+shared-capacity reservation. A discarded request releases it; a dispatched request retains it
+until the analysis attempt produces its terminal result even when its caller has disappeared.
 
 The longer deadline does not guarantee deployment success. A request can still approach hard
 expiry when shared-base workers, active-JavaScript permits, or CPU remain saturated, or fail at an
 outer HTTP, source-storage, Node, database, or caller boundary. Correlate lane age and dispatch with
 analysis duration, active permits, host CPU, deployment endpoint status, and retries.
 
-### Deferred shared-base reservation
+### Shared-base reservation and JavaScript admission
 
-The initial patch does not reserve a worker. First apply the work-conserving analysis pacing
-integration when its degradable-query prerequisite is available. Consider carving one worker from
-shared base only if repeated measurements then show all of the following:
-
-- an admitted control-plane request approaches its hard deadline;
-- non-dependency runtime work continuously occupies shared base;
-- the control-plane lane is below its cap and dependency reserve is healthy;
-- active-JavaScript permits and CPU have headroom;
-- no outer service or caller deadline is responsible.
-
-That later design would reduce the ordinary ceiling from `B` to `B - 1` while allowing
-control-plane work to use `B`; it would not add capacity above `T` or borrow dependency reserve.
-Correct implementation would need global and per-client active-class accounting. Do not add a
-borrowing, preemption, or dynamic-priority protocol without separate evidence and review.
+`ISOLATE_CONTROL_PLANE_WORKER_RESERVE` defaults to one when the lane is enabled,
+clipped to leave ordinary worker capacity. It reserves global and per-client
+eligibility before active-permit acquisition. A separate control-plane JavaScript
+queue alternates grants with combined ordinary/high-mutation demand within the protected
+service floor and elastic share. Dependency precedence and degradable floors
+remain intact; totals are unchanged. See
+[deployment operations](../non_committing_codegen_analysis/deployment_operations.md)
+for HTTP admission, whole-job ownership, cancellation and replay limits.
 
 ### Deployment-lane rollout
 
@@ -423,14 +442,14 @@ borrowing, preemption, or dynamic-priority protocol without separate evidence an
    backend population.
 4. Confirm enabled state, lane capacity, deadline, and zero initial depth locally and in remote
    metrics.
-5. Run an ordinary push under representative traffic. Verify FIFO dispatch, no adaptive shedding,
+5. Run an ordinary push under representative traffic. Verify eligible platform barriers, no adaptive shedding,
    no dependency-reserve use, finite expiry, and unchanged ordinary deadlines.
 6. When carrying deployment-analysis pacing, verify that analysis reservations displace
    degradable permits and pace queue arrivals.
-7. Observe repeated normal and busy pushes before considering a worker reservation or larger cap.
+7. Observe repeated normal and busy pushes before changing the worker reservation or queue cap.
 
 Rollback sets `ISOLATE_CONTROL_PLANE_LANE_ENABLED=false` and restarts the backend. The lane-aware
-ordinary/dependency/action policy remains active, and no schema or data migration is required.
+ordinary/high-mutation/dependency/action policy remains active, and no schema or data migration is required.
 
 ### Deployment-lane verification
 
@@ -441,10 +460,9 @@ strict configuration, and bounded metrics. Production verification uses an ordin
 traffic; a dedicated deployment stress fixture is not required.
 
 Rejected designs include treating deployment as a dependency, unconditional priority, a second
-queue or worker pool, immediate deployment/control-plane worker reservation before normal
-selection, borrowing dependency reserve, globally longer ordinary deadlines, deployment-wide
-shedding switches, larger total queues, HTTP-path or module-name classification, and relying on
-retries alone. Each either weakens liveness/fairness, adds substantial state, or fails to classify
+physical queue or worker pool, borrowing dependency reserve, globally longer ordinary deadlines,
+deployment-wide shedding switches, larger total queues, HTTP-path or module-name classification,
+and relying on retries alone. Each either weakens liveness/fairness, adds substantial state, or fails to classify
 the typed work the isolate scheduler actually executes. The separate
 [`scheduled-action admission patch`](../scheduled_action_admission/README.md) does not reserve idle
 capacity for a class: after a concrete scheduled action wins normal admission, it briefly holds
@@ -453,7 +471,7 @@ that selected worker while committing the action's durable at-most-once claim.
 ## Resource cost and current evidence
 
 Lane mode stores an enqueue timestamp and lane with each bounded queue entry.
-Expiry discovery, oldest-eligible selection, and earliest-deadline discovery
+Expiry discovery, eligible selection, and earliest-deadline discovery
 scan at most `ISOLATE_QUEUE_SIZE + ISOLATE_DEPENDENCY_WORKER_RESERVE` entries;
 removing an interior `VecDeque` entry can also move entries. The once-per-second
 metrics refresh scans the queue for each lane. The expiry companion repeats a
@@ -496,10 +514,11 @@ has an unambiguous rollback. Context reuse can be disabled without changing
 queue state; queue control can be disabled without changing context semantics.
 
 `FUNRUN_ISOLATE_ACTIVE_THREADS` remains a separate CPU-execution gate. An external request acquires
-its initial low-priority active-thread permit before worker assignment. Once execution begins, it
+its initial class-aware active-thread permit before worker assignment. Once execution begins, it
 can temporarily release that permit during an asynchronous wait while retaining the assigned
-worker, then use the existing high-priority reacquisition path. Queue delay control cannot create
-CPU capacity or reserve active-thread permits for dependencies.
+worker, then reacquire in the resume phase of the same class. Backend-derived dependencies take
+precedence when class-aware admission is enabled. Queue delay control cannot create CPU capacity
+or reserve active-thread permits for dependencies.
 
 Query coalescing and application dependency gates run before the isolate queue.
 They must continue propagating dependency role so a child does not wait behind
@@ -514,19 +533,21 @@ dependency requests dispatch through worker reserve under a bounded saturation
 test and that independent actions obey their cap.
 
 Enable the queue policy on one controlled backend population and restart. Check
-that policy and duration metrics match the intended configuration, all four
+that policy and duration metrics match the intended configuration, all five
 lane gauges initialize, dependency shedding stays at zero, hard expiry remains
 finite, and oldest age returns to zero after drain. Compare adaptive shedding
 with actual dispatch sojourn rather than with end-to-end request latency.
 
 The immediate rollback is:
 
-1. Set `ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=false`.
+1. Set `ISOLATE_CONTROL_PLANE_LANE_ENABLED=false` and
+   `ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=false`.
 2. Restart the affected backend process.
 3. Confirm `isolate_queue_policy_info{policy="legacy_codel"}` and the legacy
    expiration configuration.
 
-This rollback leaves dependency propagation, HTTP and application admission,
-worker reserve, queue capacity, action caps, and context-reuse policy unchanged.
+This rollback removes the deployment lane's queue/worker allowances and separate
+JavaScript class. Dependency propagation and reserve, HTTP and application
+admission, total queue capacity, action caps, and context-reuse policy remain unchanged.
 If overload continues after rollback, reduce incoming admission or execution
 capacity separately; increasing queue depth alone cannot increase throughput.

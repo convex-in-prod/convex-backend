@@ -164,11 +164,12 @@ service protections are deliberately local:
 - degradable roots have a finite sub-cap;
 - normal and dependency queries bypass an in-flight degradable cache leader.
 
-The active-JavaScript gate maps normal roots and backend work to `Protected`,
-maps only admitted degradable cache-miss leaders to `Degradable`, and gives
-`Dependency` the next grant. Protected and degradable work use work-conserving
-minimums rather than global strict priority. Normal still means unaffected by
-the degradable sub-cap, not permission to claim an unbounded priority class.
+The active-JavaScript gate maps normal roots and nondependency backend work to
+`Protected` and maps only admitted degradable cache-miss leaders to
+`Degradable`. With positive class minimums it gives `Dependency` the next
+grant. Protected and degradable work use work-conserving minimums rather than
+global strict priority. Normal still means unaffected by the degradable
+sub-cap, not permission to claim an unbounded priority class.
 
 The client field only opts work down. A forged degradable value can reduce the sender's own
 service. Omitting the field remains possible, so the mechanism is not an overload defense against
@@ -538,16 +539,22 @@ them into one Boolean would make precedence and metrics ambiguous.
 
 The degradable-query patch does not add an isolate queue lane. The leader cap
 remains strictly below application and isolate-worker shared-base capacity.
-The active-JavaScript gate separately applies backend-owned `Dependency`,
-`Protected`, and `Degradable` classes. Only an actual admitted cache-miss
+The active-JavaScript gate separately applies `Dependency`, `Protected`,
+`HighPriorityMutation`, `ControlPlane`, and `Degradable` classes. Only an actual admitted cache-miss
 leader receives `Degradable`; separately scheduled descendants override it
 with the existing backend-derived dependency class.
 
 Protected and degradable minimums are non-preemptive service floors. Either
-class borrows every permit that the other class does not need. Dependencies
-receive the next grant because they release isolate-holding ancestors. After
-both application floors are met, elastic occupancy is balanced between the two
-classes, and resumptions precede initial starts within a selected class.
+class borrows every permit that the other class does not need. With positive
+class minimums or the control-plane lane enabled, dependencies receive the next
+grant because they release isolate-holding ancestors. After both application
+floors are met, elastic occupancy is balanced between the two classes, and
+resumptions precede initial starts within a selected class. With zero minimums and the control-plane
+lane disabled, non-high classes retain the phase-only compatibility policy. High mutations keep a
+separate class under the [HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority).
+The enabled control-plane lane alternates configuration grants with combined ordinary/high-mutation
+demand within the existing protected share; see
+[deployment operations](../non_committing_codegen_analysis/deployment_operations.md).
 
 The scheduler exposes at most one external initial waiter per active class so
 a wave from one class cannot hide the other class behind serial permit waits.
@@ -557,8 +564,10 @@ and delay accounting. These mechanics are detailed in
 [`active_javascript_admission.md`](active_javascript_admission.md).
 
 With deployment-analysis pacing applied, each active isolate module attempt
-consumes one permit from the root-work gate. Analysis remains protected at the
-active-JavaScript gate; it does not claim degradable or dependency status.
+consumes one permit from the root-work gate. With finite active-JavaScript
+capacity, analysis uses `ControlPlane` when its lane is enabled and `Protected`
+otherwise. Both classes share the protected group; analysis does not claim
+degradable or dependency status. Unlimited capacity has no permit wait.
 
 This model is intentionally finite. One admitted query can perform expensive
 work or separately scheduled fan-out. The cap bounds admitted roots plus
@@ -601,8 +610,9 @@ minimums require finite `FUNRUN_ISOLATE_ACTIVE_THREADS`, require the leader
 cap, cannot sum above active capacity, and cannot set the degradable minimum
 above the leader cap. With positive minimums the leader cap can exceed active
 capacity because the cap bounds admitted tree lifetime while active capacity
-bounds instantaneous JavaScript execution. With zero minimums, the previous
-validation remains: a finite active capacity must exceed the leader cap.
+bounds instantaneous JavaScript execution. With zero minimums, any configured
+finite active capacity must exceed the leader cap, while `0` continues to mean
+unlimited.
 
 If a custom runner does not expose equivalent capacity, it cannot claim the
 same normal-capacity reservation from this cap alone.
@@ -775,9 +785,8 @@ the cap reserves capacity and the existing query policy remains unchanged. The o
 admission models without changing Connect parsing, leader admission, cache bypass, client pressure
 semantics, or isolate queue selection.
 
-[`cancellation_safe_database_context_reuse/README.md`](../cancellation_safe_database_context_reuse/README.md)
-and [`context_reuse_observability/README.md`](../context_reuse_observability/README.md) are
-independent service-cost patches. Reuse can change query service time and the
+[`context_reuse/README.md`](../context_reuse/README.md) is an
+independent service-cost patch. Reuse can change query service time and the
 leader-cap value that is appropriate, but it does not change workload class or
 pressure semantics. Measure and roll back the features independently.
 
@@ -798,11 +807,12 @@ must never claim that class. The degradable-client patch does not depend on such
 a lane and should not encode deployment paths as application allowlists.
 
 The pacing integration makes analysis replace degradable demand at the
-root-work gate. Analysis uses protected active-JavaScript admission and shares
-the protected floor with other normal work; it has no dedicated worker or
-active permit reservation. See its owning essay for the source-level CPU
-evidence, liveness argument, worked capacity example, and controlled
-validation.
+root-work gate. With the control-plane lane enabled, analysis alternates with
+combined ordinary/high-mutation demand within the protected service floor and elastic share.
+It uses the control-plane allowance within shared-base worker capacity. These policies
+add no worker or active-JavaScript permits. See its owning essay for the
+source-level CPU evidence, liveness argument, worked capacity example, and
+controlled validation.
 
 Context reuse and bounded query-context prewarming are also complementary.
 They can lower module-evaluation CPU and improve warm service time. They do not

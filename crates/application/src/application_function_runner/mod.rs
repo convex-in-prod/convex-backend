@@ -361,19 +361,40 @@ fn node_action_gate_dependency(
     scheduler_dependency.unblocks_ancestor() || !caller.is_root()
 }
 
+/// Keeps query-only active admission out of mutation call sites.
+pub(crate) enum DatabaseFunctionKind {
+    Query(ActiveJavascriptClass),
+    Mutation,
+}
+
 impl<RT: Runtime> FunctionRouter<RT> {
     #[fastrace::trace]
     pub(crate) async fn execute_query_or_mutation(
         &self,
         tx: Transaction<RT>,
         path_and_args: ValidatedPathAndArgs,
-        udf_type: UdfType,
+        function_kind: DatabaseFunctionKind,
         journal: QueryJournal,
         context: ExecutionContext,
         scheduler_dependency: SchedulerDependencyClass,
-        active_javascript_class: ActiveJavascriptClass,
     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
-        anyhow::ensure!(udf_type == UdfType::Query || udf_type == UdfType::Mutation);
+        let (udf_type, function_metadata) = match function_kind {
+            DatabaseFunctionKind::Query(active_javascript_class) => (
+                UdfType::Query,
+                FunctionMetadata::Query {
+                    journal,
+                    path_and_args,
+                    active_javascript_class,
+                },
+            ),
+            DatabaseFunctionKind::Mutation => (
+                UdfType::Mutation,
+                FunctionMetadata::Mutation {
+                    journal,
+                    path_and_args,
+                },
+            ),
+        };
         // All queries and mutations are run in the isolate environment.
         let timer = function_total_timer(ModuleEnvironment::Isolate, udf_type);
         let (tx, outcome) = self
@@ -382,11 +403,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 udf_type,
                 context,
                 None,
-                Some(FunctionMetadata {
-                    journal,
-                    path_and_args,
-                    active_javascript_class,
-                }),
+                Some(function_metadata),
                 None,
                 None,
                 scheduler_dependency,
@@ -415,11 +432,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 UdfType::Action,
                 context,
                 Some(log_line_sender),
-                Some(FunctionMetadata {
-                    journal: QueryJournal::new(),
-                    path_and_args,
-                    active_javascript_class: ActiveJavascriptClass::Protected,
-                }),
+                Some(FunctionMetadata::Action { path_and_args }),
                 None,
                 function_execution_start,
                 scheduler_dependency,
@@ -1149,11 +1162,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     .execute_query_or_mutation(
                         tx,
                         path_and_args,
-                        UdfType::Query,
+                        DatabaseFunctionKind::Query(ActiveJavascriptClass::Protected),
                         QueryJournal::new(),
                         context.clone(),
                         SchedulerDependencyClass::Independent,
-                        ActiveJavascriptClass::Protected,
                     )
                     .await?
             },
@@ -1659,11 +1671,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             .execute_query_or_mutation(
                 tx,
                 path_and_args,
-                UdfType::Mutation,
+                DatabaseFunctionKind::Mutation,
                 QueryJournal::new(),
                 context.clone(),
                 scheduler_dependency,
-                ActiveJavascriptClass::Protected,
             )
             .await?;
         let mutation_outcome = match outcome {

@@ -651,3 +651,28 @@ pub fn cors() -> CorsLayer {
         .allow_origin(AllowOrigin::mirror_request())
         .max_age(Duration::from_secs(86400))
 }
+
+#[cfg(test)]
+mod public_api_spec_tests {
+    use super::*;
+
+    #[test]
+    fn test_public_api_spec_matches() -> anyhow::Result<()> {
+        let (_, actual) = OpenApiRouter::<RouterState>::with_openapi(PublicApiDoc::openapi())
+            .merge(public_api_router())
+            .split_for_parts();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../npm-packages/@convex-dev/platform/public-deployment-openapi.json");
+        if std::env::var_os("UPDATE_API_SPECS").is_some() {
+            std::fs::write(&path, format!("{}\n", actual.to_pretty_json()?))?;
+        }
+        let expected: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        assert_eq!(
+            serde_json::to_value(actual)?,
+            expected,
+            "Regenerate with UPDATE_API_SPECS=1 cargo test -p local_backend --lib \
+             test_public_api_spec_matches"
+        );
+        Ok(())
+    }
+}

@@ -1550,8 +1550,9 @@ pub static ISOLATE_ANALYZE_USER_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_ANALYZE_USER_TIMEOUT_SECONDS", 4)));
 
 /// Shared isolate queue capacity. The default policy uses generic CoDel. The
-/// strict opt-in lane-aware policy keeps FIFO ordering and applies its own
-/// delay controller. Both policies add dependency-only capacity configured by
+/// strict opt-in lane-aware policy gives high mutations bounded preference
+/// among eligible requests and applies its own delay controller. Both policies
+/// add dependency-only capacity configured by
 /// `ISOLATE_DEPENDENCY_WORKER_RESERVE`. Larger values retain more UDF arguments
 /// and can increase overload latency.
 pub static ISOLATE_QUEUE_SIZE: LazyLock<usize> =
@@ -1592,9 +1593,9 @@ pub static ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS: LazyLock<Duration> = LazyLock::n
     env_config_duration_millis_strict("ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS", 1000)
 });
 
-/// Queue age above which an overloaded lane adaptively sheds ordinary and
-/// independent-action work. This must be greater than the queueing-delay
-/// target. When unset, this is twice the configured target.
+/// Queue age above which an overloaded lane adaptively sheds ordinary,
+/// high-mutation, and independent-action work. This must exceed the
+/// queueing-delay target. When unset, this is twice the configured target.
 pub static ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS: LazyLock<Duration> = LazyLock::new(|| {
     let name = "ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS";
     let Some(millis) = env_config_optional_usize_strict(name) else {
@@ -1621,8 +1622,8 @@ pub static ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS: LazyLock<Duration> =
 pub static ISOLATE_CONTROL_PLANE_LANE_ENABLED: LazyLock<bool> =
     LazyLock::new(|| env_config_bool_strict("ISOLATE_CONTROL_PLANE_LANE_ENABLED", false));
 
-/// Maximum queued control-plane requests. This is a sub-cap inside
-/// `ISOLATE_QUEUE_SIZE`, not reserved capacity.
+/// Maximum queued control-plane requests. When the lane is enabled, this
+/// capacity is reserved inside `ISOLATE_QUEUE_SIZE`, below dependency overflow.
 pub static ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY: LazyLock<usize> =
     LazyLock::new(|| env_config_usize_strict("ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY", 16));
 
@@ -1848,7 +1849,7 @@ pub fn validate_active_javascript_class_minimums(
     );
     if protected_active_minimum > 0 {
         anyhow::ensure!(
-            active_javascript_capacity > 0,
+            active_javascript_capacity > 0 && active_javascript_capacity != usize::MAX,
             "active-JavaScript class minimums require finite FUNRUN_ISOLATE_ACTIVE_THREADS"
         );
         let combined_minimum = protected_active_minimum
@@ -2248,20 +2249,21 @@ pub static TICKETMASTER_CLUSTER_NAME: LazyLock<String> =
 pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("PROBER_PROBE_TIMEOUT", 5)));
 
-/// The maximum number of CPU cores that can be used simultaneously by the
-/// isolates. Zero means no limit. For self-hosted tuning guidance, see
-/// patches/dependency_capacity/README.md.
+/// Maximum isolates admitted to execute JavaScript at once. An isolate can
+/// release this permit around supported asynchronous work. Zero means no
+/// finite active-JavaScript limit.
 pub static FUNRUN_ISOLATE_ACTIVE_THREADS: LazyLock<usize> =
     LazyLock::new(|| env_config_usize_strict("FUNRUN_ISOLATE_ACTIVE_THREADS", 0));
 
-/// Minimum protected active-JavaScript occupancy under protected/degradable
-/// contention. Zero disables class-aware admission and requires the matching
-/// degradable minimum to be zero.
+/// Non-preemptive protected active-JavaScript service floor under
+/// protected/degradable contention. Zero disables class-aware admission and
+/// requires the matching degradable minimum to be zero.
 pub static FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN: LazyLock<usize> =
     LazyLock::new(|| env_config_usize_strict("FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN", 0));
 
-/// Minimum degradable active-JavaScript occupancy under protected/degradable
-/// contention. Capacity unused by either class remains available to the other.
+/// Non-preemptive degradable active-JavaScript service floor under
+/// protected/degradable contention. Capacity unused by either class remains
+/// available to the other.
 pub static FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN: LazyLock<usize> =
     LazyLock::new(|| env_config_usize_strict("FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN", 0));
 
@@ -2997,9 +2999,21 @@ mod strict_capacity_tests {
         assert!(validate_active_javascript_class_minimums(28, 0, 0, None).is_ok());
         assert!(validate_active_javascript_class_minimums(28, 0, 14, Some(32)).is_err());
         assert!(validate_active_javascript_class_minimums(0, 4, 14, Some(32)).is_err());
+        assert!(validate_active_javascript_class_minimums(usize::MAX, 1, 1, Some(32)).is_err());
         assert!(validate_active_javascript_class_minimums(28, 15, 14, Some(32)).is_err());
         assert!(validate_active_javascript_class_minimums(28, 4, 14, None).is_err());
         assert!(validate_active_javascript_class_minimums(28, 4, 14, Some(8)).is_err());
+    }
+
+    #[test]
+    fn active_javascript_minimum_sum_rejects_overflow() {
+        let error =
+            validate_active_javascript_class_minimums(usize::MAX - 1, usize::MAX, 1, Some(1))
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "active-JavaScript class minimums overflow"
+        );
     }
 
     #[test]

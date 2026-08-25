@@ -139,32 +139,62 @@ pub enum SchedulerDependencyClass {
 
 impl SchedulerDependencyClass {
     pub fn unblocks_ancestor(&self) -> bool {
-        matches!(self, Self::UnblocksAncestor)
+        match self {
+            Self::Independent => false,
+            Self::UnblocksAncestor => true,
+        }
+    }
+}
+
+/// Per-call scheduling preference; it grants no additional execution authority.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum MutationPriority {
+    #[default]
+    Normal,
+    High,
+}
+
+impl MutationPriority {
+    pub fn active_javascript_class(self) -> ActiveJavascriptClass {
+        match self {
+            Self::Normal => ActiveJavascriptClass::Protected,
+            Self::High => ActiveJavascriptClass::HighPriorityMutation,
+        }
     }
 }
 
 /// Service class used by the finite active-JavaScript admission gate.
 ///
-/// The class is backend-owned. A client can opt an independent root query down
-/// to `Degradable`, but only the runtime can create `Dependency` work.
+/// The backend derives classes from execution ancestry and admission. The
+/// bounded mutation preference additionally accepts a client hint. The query
+/// cache assigns `Degradable` only after
+/// admitting an independent root query cache miss; a client declaration alone
+/// does not assign it. Only runtime-derived ancestry creates `Dependency` work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ActiveJavascriptClass {
     Dependency,
     Protected,
+    /// Client-requested preference within ordinary protected capacity.
+    HighPriorityMutation,
     Degradable,
+    /// Backend configuration evaluation, sharing the protected service floor
+    /// with ordinary protected work through a separate fair queue.
+    ControlPlane,
 }
 
 impl ActiveJavascriptClass {
     pub fn for_scheduler_dependency(self, dependency: SchedulerDependencyClass) -> Self {
-        if dependency.unblocks_ancestor() {
-            Self::Dependency
-        } else {
-            assert_ne!(
-                self,
-                Self::Dependency,
-                "dependency active JavaScript requires ancestor-unblocking scheduler ownership"
-            );
-            self
+        match dependency {
+            SchedulerDependencyClass::Independent => {
+                assert_ne!(
+                    self,
+                    Self::Dependency,
+                    "dependency active JavaScript requires ancestor-unblocking scheduler ownership"
+                );
+                self
+            },
+            SchedulerDependencyClass::UnblocksAncestor => Self::Dependency,
         }
     }
 }

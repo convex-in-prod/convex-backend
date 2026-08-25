@@ -3,8 +3,9 @@
 This design lets the degradable query leader cap exceed the number of isolates
 actively executing JavaScript without admitting degradable query trees that can
 start and then lose all execution progress. The implementation extends the
-existing active-JavaScript limiter with two application service classes and the
-existing backend-derived dependency class. It does not add arbitrary weights,
+existing active-JavaScript limiter with protected and degradable service groups
+and the backend-derived dependency class. The enabled deployment lane gives
+configuration work a separate class inside the protected group. It does not add arbitrary weights,
 per-function policy, preemption, or another worker pool.
 
 ## Resource model
@@ -24,11 +25,16 @@ that coupling while retaining a finite CPU gate.
 
 ## Classification and propagation
 
-The active gate has exactly three backend-owned classes:
+The active gate has five classes:
 
 - `Dependency` is work whose completion releases an isolate-holding ancestor.
-- `Protected` is ordinary root work, actions, analysis and evaluation, and
-  every other request without a narrower classification.
+- `Protected` is ordinary root work, actions, and every other request without a
+  narrower classification.
+- `HighPriorityMutation` is a mutation carrying the per-call high hint. It shares
+  protected capacity with bounded preference over ordinary protected work.
+- `ControlPlane` is typed backend configuration evaluation. With its lane enabled,
+  it alternates grants with combined ordinary/high-mutation demand inside the protected floor
+  and elastic share; otherwise it uses ordinary protected admission.
 - `Degradable` is an admitted degradable root query cache-miss leader.
 
 A client declaration alone never creates `Degradable` active work. The query
@@ -36,7 +42,7 @@ cache assigns `Degradable` only to a `CacheOp::Go` that still owns the acquired
 degradable leader permit after the cache recheck. Cache hits, followers, normal
 bypasses, and rejected admission do not carry the class into execution.
 
-Backend-derived dependency ownership overrides either application class. This
+Backend-derived dependency ownership overrides every application class. This
 keeps separately scheduled descendants on the ancestor-unblocking path even
 when the root leader is degradable. The resulting class is stored in the
 isolate request and in every suspended active permit. Reacquisition therefore
@@ -53,6 +59,13 @@ Let:
 - `E = A - P - G` be elastic capacity.
 
 The limiter applies these rules whenever a permit becomes available:
+
+For these comparisons, protected demand and occupancy include `HighPriorityMutation`
+and `ControlPlane`. After choosing that group, the limiter alternates application
+and control-plane grants when both wait. Within application demand, high mutations
+receive at most two grants before a waiting ordinary protected request. Resume
+priority applies within each class. See the
+[HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority).
 
 1. A dependency waiter receives the next grant.
 2. If only protected or only degradable work is waiting, that class receives
@@ -95,9 +108,11 @@ class. Requests from that class remain in the queue until the exposed waiter
 acquires a permit, times out at the original queue deadline, or loses its
 caller. One direct internal dependency waiter is exposed separately and has no
 external queue deadline because that callback cannot be retried safely.
-When class-aware admission is disabled, all external classes collapse to the
-single existing phase-only initial wait instead of changing default scheduler
-concurrency.
+When both service floors are zero, degradable requests use the protected slot.
+An enabled deployment lane retains separate control-plane and dependency slots.
+With that lane disabled too, non-high external classes collapse to the single
+existing phase-only initial wait. High mutations retain their separate slot.
+Unlimited active capacity has no permit wait.
 
 Every exposed waiter reserves its global and per-client worker eligibility
 while waiting for the active permit. The reservation prevents concurrent
@@ -117,24 +132,34 @@ Positive values require all of the following:
 - `P + G <= A` without integer overflow;
 - `G` no larger than the degradable leader cap.
 
-When both minimums are zero, class-aware admission is disabled completely. The
-active limiter retains the existing behavior in which all resumptions precede
-initial starts; dependencies and degradable execution both use ordinary active
-admission for their phase. In that mode the leader cap remains strictly below
-finite active capacity. With positive minimums, the leader cap can exceed `A`
-because `G` supplies admitted degradable execution progress.
+When both minimums are zero and the control-plane lane is disabled, service-floor
+and dependency-class admission are disabled. Dependencies and degradable execution
+use ordinary active admission for their phase. High mutations retain their separate
+class with bounded preference; resumptions precede initial starts within each
+effective class. In that mode the leader cap remains strictly below
+any configured finite active capacity; `0` continues to mean unlimited. With
+positive minimums, the leader cap can exceed `A` because `G` supplies admitted
+degradable execution progress.
 
 The leader cap remains strictly below the application query shared base and
 the isolate worker shared base. Active admission does not replace lifetime and
 worker bounds, and one admitted root can still create separately scheduled
 dependencies.
 
+The enabled control-plane lane retains separate fair admission even with zero
+class minimums. Its grants alternate with combined ordinary/high-mutation demand; dependencies retain
+precedence. No extra CPU permits are created. See
+[deployment operations](../non_committing_codegen_analysis/deployment_operations.md).
+When comparing occupancy with the protected floor, sum `protected`,
+`high_priority_mutation`, and `control_plane`.
+
 ## Observability and tests
 
 The active limiter exports bounded metrics for:
 
 - configured total, protected minimum, and degradable minimum;
-- held or granted occupancy by `dependency`, `protected`, and `degradable`;
+- held or granted occupancy by `dependency`, `protected`, `high_priority_mutation`,
+  `control_plane`, and `degradable`;
 - waiters by class and `initial` or `resume` phase;
 - acquisition latency by the same class and phase labels.
 
@@ -151,3 +176,11 @@ or a dedicated degradable worker pool. The two service classes correspond to
 the existing trust and overload contract. Additional policy requires evidence
 that these classes and bounded metrics cannot express a measured scheduling
 problem.
+
+
+For protected-floor comparisons, `active_javascript_protected_group_occupancy_info`
+records protected plus high-mutation plus control-plane occupancy before scraping. Do not add
+separate class maxima, including maxima within the same aligned bucket: their
+peaks need not be simultaneous. Older images without this gauge have missing
+combined-occupancy evidence. The sum does not change dependency precedence,
+non-preemptive turnover, or the degradable floor.
