@@ -87,6 +87,7 @@ pub use functions::{
     AllowedVisibility,
     FunctionCaller,
     ModuleEnvironment,
+    MutationPriority,
     QueryInvocation,
     SchedulerDependencyClass,
     UdfIdentifier,

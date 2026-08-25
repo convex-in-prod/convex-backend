@@ -44,8 +44,10 @@ streaming responses do. They retain their separate body-stream deadline.
 With the control-plane queue enabled, `ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY`
 reserves space inside `ISOLATE_QUEUE_SIZE` as well as bounding its lane. It must
 leave ordinary queue capacity. Dependency overflow retains access to the total
-queue to release ancestors. FIFO selection among eligible requests remains;
-worker eligibility can skip an ordinary backlog to select configuration work.
+queue to release ancestors. High mutations receive bounded preference without
+crossing older eligible dependency or configuration requests; worker eligibility
+can skip an ordinary backlog to select configuration work. See the
+[HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority).
 
 `ISOLATE_CONTROL_PLANE_WORKER_RESERVE`
 (default 1) preserves worker capacity inside the existing base limit. It is
@@ -54,14 +56,15 @@ existing limit. The scheduler reserves a worker before exposing an initial
 JavaScript waiter, with separate pending slots for effective service classes.
 
 Configuration evaluation uses a distinct `control_plane` JavaScript queue. It
-alternates grants with ordinary protected work whenever both are waiting, inside
+alternates grants with combined ordinary/high-mutation demand whenever both are waiting, inside
 the existing protected group's service floor and elastic share. Resumptions
 precede initial starts within each queue; ordinary resumptions cannot hide
 deployment demand. Dependency work retains precedence, and the degradable floor
 is unchanged. Without protected/degradable floors, the enabled control-plane
-lane still alternates with ordinary work. Disabling the lane restores the prior
-JavaScript policy. No extra permits or preemption are introduced. For occupancy
-comparisons against the protected minimum, sum `protected` and `control_plane`.
+lane still alternates with application work. Disabling the lane leaves bounded
+high-mutation preference in place. No extra permits or preemption are introduced.
+For occupancy comparisons against the protected minimum, sum `protected`,
+`high_priority_mutation`, and `control_plane`.
 
 These are non-preemptive service and finite-queue bounds. Existing executions,
 dependency callbacks, shared query/analysis permits and external resources must
