@@ -384,6 +384,12 @@ fn node_action_gate_dependency(
     scheduler_dependency.unblocks_ancestor() || !caller.is_root()
 }
 
+/// Keeps query-only active admission out of mutation call sites.
+pub(crate) enum DatabaseFunctionKind {
+    Query(ActiveJavascriptClass),
+    Mutation,
+}
+
 impl<RT: Runtime> FunctionRouter<RT> {
     pub(crate) async fn acquire_permit(
         &self,
@@ -415,13 +421,28 @@ impl<RT: Runtime> FunctionRouter<RT> {
         tx: Transaction<RT>,
         permit: RequestGuard<'_, RT>,
         path_and_args: ValidatedPathAndArgs,
-        udf_type: UdfType,
+        function_kind: DatabaseFunctionKind,
         journal: QueryJournal,
         context: ExecutionContext,
         scheduler_dependency: SchedulerDependencyClass,
-        active_javascript_class: ActiveJavascriptClass,
     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
-        anyhow::ensure!(udf_type == UdfType::Query || udf_type == UdfType::Mutation);
+        let (udf_type, function_metadata) = match function_kind {
+            DatabaseFunctionKind::Query(active_javascript_class) => (
+                UdfType::Query,
+                FunctionMetadata::Query {
+                    journal,
+                    path_and_args,
+                    active_javascript_class,
+                },
+            ),
+            DatabaseFunctionKind::Mutation => (
+                UdfType::Mutation,
+                FunctionMetadata::Mutation {
+                    journal,
+                    path_and_args,
+                },
+            ),
+        };
         anyhow::ensure!(
             permit.limiter.udf_type == udf_type,
             "Running a {udf_type} with a {} permit",
@@ -436,18 +457,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 udf_type,
                 context,
                 None,
-                Some(match udf_type {
-                    UdfType::Query => FunctionMetadata::Query {
-                        journal,
-                        path_and_args,
-                        active_javascript_class,
-                    },
-                    UdfType::Mutation => FunctionMetadata::Mutation {
-                        journal,
-                        path_and_args,
-                    },
-                    _ => anyhow::bail!("Invalid database UDF type"),
-                }),
+                Some(function_metadata),
                 None,
                 None,
                 scheduler_dependency,
@@ -793,7 +803,9 @@ impl<RT: Runtime> Limiter<RT> {
             } => match x {},
             _ = async {
                 match deadline {
-                    Some(deadline) => rt.wait(deadline.saturating_duration_since(rt.monotonic_now())).await,
+                    Some(deadline) => {
+                        rt.wait(deadline.saturating_duration_since(rt.monotonic_now())).await
+                    },
                     None => future::pending().await,
                 }
             } => {
@@ -1283,11 +1295,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         tx,
                         permit,
                         path_and_args,
-                        UdfType::Query,
+                        DatabaseFunctionKind::Query(ActiveJavascriptClass::Protected),
                         QueryJournal::new(),
                         context.clone(),
                         SchedulerDependencyClass::Independent,
-                        ActiveJavascriptClass::Protected,
                     )
                     .await?
             },
@@ -1911,11 +1922,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 tx,
                 permit,
                 path_and_args,
-                UdfType::Mutation,
+                DatabaseFunctionKind::Mutation,
                 QueryJournal::new(),
                 context.clone(),
                 scheduler_dependency,
-                ActiveJavascriptClass::Protected,
             )
             .await?;
         let mutation_outcome = match outcome {

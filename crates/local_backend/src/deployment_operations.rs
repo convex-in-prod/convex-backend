@@ -300,6 +300,7 @@ pub async fn capabilities(
         "protocolVersion": 1,
         "publicationStatusProtocol": 1,
         "finishCompletionProtocol": 1,
+        "mutationPriorityProtocol": if *common::knobs::ISOLATE_QUEUE_DELAY_CONTROL_ENABLED { 1 } else { 0 },
         "sessionId": st.deployment_operations.session_id,
         "lifetimeSeconds": LIFETIME.as_secs(),
         "maxOperations": MAX_OPERATIONS,

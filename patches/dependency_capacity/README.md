@@ -14,7 +14,7 @@ degradable-query integration gives dependency work the next grant at the already
 active-JavaScript gate when its service floors are enabled because that grant releases an
 isolate-holding ancestor.
 
-Upstream now has a distinct internal path for direct nested UDF callbacks. Those requests bypass
+Upstream has a distinct internal path for direct nested UDF callbacks. Those requests bypass
 CoDel and are selected before external queued requests. The active-JavaScript integration
 classifies them as dependencies. This patch keeps that upstream path intact. Its bounded `Q + R`
 CoDel admission remains
@@ -55,11 +55,16 @@ Let:
 - `B = T - R`, the shared worker base;
 - `Q = ISOLATE_QUEUE_SIZE`, the shared queue base.
 
-Every request class consumes shared base worker capacity while it is available. Only a dependency
-may raise worker occupancy above `B`, up to `T`. At the external CoDel boundary, only a dependency
+Worker occupancy counts both assigned requests and pending active-JavaScript waits that
+already reserved worker eligibility. Every request class consumes shared base worker capacity
+while it is available. Only a dependency may acquire a new worker claim at or above `B`, up to `T`.
+At the external CoDel boundary, only a dependency
 may raise queue occupancy above `Q`, up to `Q + R`. Direct internal nested-UDF callbacks use
 upstream's separate priority channel and therefore do not consume CoDel entries. Dependencies do
-not reserve idle workers or ordinary queue entries: ordinary work can use all shared base capacity.
+not reserve idle workers or ordinary queue entries. With the deployment lane
+disabled, ordinary work can use all shared base capacity. The enabled deployment
+extension reserves queue and worker space for configuration work inside that
+base; dependencies retain their original total ceilings.
 The reserve is bounded and cannot make unbounded recursion or parallel fan-out safe.
 
 The same rule applies independently per isolate client. Global capacity being available does not
@@ -74,7 +79,8 @@ because their parent retains a permit from that gate.
 
 ## Action cap
 
-`MAX_ISOLATE_ACTION_WORKERS` separately caps assigned independent V8 and HTTP actions. `0` derives
+`MAX_ISOLATE_ACTION_WORKERS` separately caps independent V8 and HTTP actions retaining or reserving
+workers. `0` derives
 the cap from `B`; an explicit value cannot exceed `B`. Queries, mutations, and dependency actions
 do not consume this class cap. The cap protects mixed traffic without reducing total query or
 mutation worker capacity.
@@ -94,10 +100,13 @@ cannot create admission identities. Different routes still consume the same glob
 route isolation does not reserve capacity for authentication or any other handler.
 The cap does not apply to Node execution, queries, mutations, or ancestor-unblocking descendants.
 
-Counts track initial active-JavaScript reservations and assigned workers, including workers
-suspended on external I/O. Cancellation or expiry releases pending reservations.
-Completion releases worker ownership and removes empty function entries.
-Queued selection skips capped functions without hiding eligible requests.
+Both generic CoDel and lane-aware selection skip a capped function while considering other
+eligible requests. Counts include initial active-JavaScript permit reservations and assigned
+workers, including workers suspended on external I/O. Reservation release and worker assignment
+are synchronous within one scheduler turn. Cancellation or expiry before dispatch releases the
+reservation; completion releases worker ownership. Empty function entries are removed, so the map
+is bounded by worker occupancy. There is no per-function queue or new retry loop. Existing queue
+capacity and deadlines still apply, so this does not guarantee admission under a full shared queue.
 
 ## Propagation and request ownership
 
@@ -128,8 +137,8 @@ but it preserves the ancestor-release contract and is counted separately.
 The scheduler has two ingress paths with intentionally different waiting semantics:
 
 - Direct nested UDF callbacks use upstream's internal unbounded channel. The scheduler polls this
-  path before the external stream, it has no CoDel expiry, and it acquires a dependency-class
-  active-JavaScript permit before worker assignment. Its local
+  path before the external stream, it has no CoDel expiry, and it acquires its active-JavaScript
+  permit before worker assignment. Its local
   buffer discards closed callers and selects the oldest request eligible in the current worker
   snapshot, so an older callback at one client's total cannot hide an eligible callback for
   another client.
@@ -139,19 +148,21 @@ The scheduler has two ingress paths with intentionally different waiting semanti
   [`isolate_queue_control/README.md`](../isolate_queue_control/README.md) retain these capacities
   and external dependency semantics.
 
-Both paths use the same worker-selection and accounting rules. Every dispatch counts against the
-same physical `T`; only an ancestor-unblocking request can use occupancy above `B`. Direct internal
-priority therefore cannot duplicate reserve capacity. Worker completion updates global and
+Both paths use the same worker-selection and accounting rules. Dispatch transfers an existing
+pending claim to its worker without increasing total occupancy. An earlier base claim remains
+valid when a dependency dispatches first and uses overflow; dispatch does not repeat the
+class-sensitive admission check. Direct internal priority therefore cannot duplicate reserve
+capacity. Worker completion updates global and
 per-client accounting before another dispatch decision. External dependencies do not jump older
-eligible external work below shared base capacity; they become the only externally eligible class
+eligible ordinary or independent-action work below shared base capacity; they become the only externally eligible class
 when the shared base is full.
 
 `FUNRUN_ISOLATE_ACTIVE_THREADS` remains a separate active-JavaScript permit gate with one fixed
-total. With the degradable-query patch applied, dependency work receives the next available grant,
-protected and degradable application work use work-conserving service floors, and resumptions
-precede initial starts within the selected class. The floors reserve no idle permits and add no
-capacity. A dependency can be eligible for worker overflow and still wait for an active permit or
-CPU behind non-preemptible JavaScript that already holds the finite gate.
+total. When active-JavaScript service floors are enabled, dependency work receives the next
+available grant, protected and degradable application work use work-conserving service floors, and
+resumptions precede initial starts within the selected class. The floors reserve no idle permits
+and add no capacity. A dependency can be eligible for worker overflow and still wait for an active
+permit or CPU behind non-preemptible JavaScript that already holds the finite gate.
 
 Initial external permit waits remain bounded by the request's original queue deadline: the
 applicable CoDel expiration or lane hard deadline. Direct separately scheduled nested transactional
@@ -162,13 +173,17 @@ permit. The scheduler exposes one external waiter per active class and one inter
 waiter, reserving worker eligibility for each exposed request. A non-consuming queue expiry
 companion continues enforcing every retained entry's deadline.
 
-Scheduler dependency ownership and active-permit priority intentionally differ at resource
-boundaries. A transactional descendant that retains an isolate-holding ancestor is eligible for
-scheduler overflow and receives high active-permit priority. An action callback can be eligible for
-scheduler overflow while retaining root-style, low-priority initial active-permit acquisition. An
-already-started independent root reacquires its suspended permit at high priority even though it is
-not a scheduler dependency. The patch does not add active-permit overflow because doing so could
-oversubscribe the host and move rather than remove the bottleneck.
+Scheduler dependency ownership and active-permit phase are separate properties. With
+active-JavaScript service floors enabled, every ancestor-unblocking request, including an external
+action callback, uses the `Dependency` class and receives the next available grant. An independent
+root stays in its application class when it reacquires a suspended permit; resumption priority
+applies within that class. With both floors and the control-plane lane disabled, non-high classes
+collapse to the phase-only compatibility policy: direct internal callbacks and reacquisitions use
+the resumption tier, while external callbacks remain initial starts bounded by their original queue
+deadline. High mutations retain their separate class with bounded preference under the
+[HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority). Neither mode
+adds active-permit overflow because doing so could oversubscribe the host and move rather than
+remove the bottleneck.
 
 ## Configuration
 
@@ -188,7 +203,8 @@ They redistribute the finite active total without changing `T`, `B`, or `R`; see
 
 Isolate capacities use strict parsing. `T` and `Q` must be positive, `R` must be smaller than `T`,
 `Q + R` must fit in `usize`, and an explicit independent-action cap cannot exceed `B`. Invalid
-present values fail startup rather than silently falling back.
+present values fail startup rather than silently falling back. An explicit per-function action cap
+cannot exceed the resolved global action cap.
 
 Choose `R` from measured maximum nested depth and bounded fan-out, not CPU count alone. A larger
 reserve increases the number of assigned workers and retained request state; it does not add CPU.
@@ -223,7 +239,8 @@ sampled histograms until another job finishes.
 Use these bounded metric families together:
 
 - `isolate_scheduler_capacity_info{pool_name,capacity_kind}` for physical, shared-base, and
-  independent-action worker capacities;
+  independent-action worker capacities, plus `independent_action_per_function` for the effective
+  per-function allowance. No function names are metric labels;
 - `isolate_scheduler_requests_enqueued_total{pool_name,scheduler_class}` and
   `isolate_scheduler_requests_dispatched_total{...}` for role progress;
 - `isolate_scheduler_requests_expired_total{...}` and
@@ -317,3 +334,16 @@ deployment operations. A synthetic stress fixture is not required.
   Work-conserving service floors within the existing finite total avoid that failure mode.
 - Unlimited dependency admission cannot be made safe because recursive depth, fan-out, memory, and
   CPU remain finite.
+
+The enabled control-plane lane adds fair configuration admission inside protected
+JavaScript capacity and reserves queue/worker space inside shared base. Dependency
+overflow and dependency precedence are preserved. See
+[deployment operations](../non_committing_codegen_analysis/deployment_operations.md).
+
+The per-function cap tests cover pending reservations, deployment/component/function separation,
+registered HTTP route and method separation, the shared unmatched allowance, and the global cap.
+They also cover dependency exemption, eligible work passing a capped function in both queue policies,
+and release after worker completion or a canceled/expired initial-permit wait. Routing tests cover
+exact paths, prefix identities, longest-prefix selection, and HEAD normalization. The later
+queue-control and active-JavaScript patches preserve this capacity policy; their selection and
+initial-permit reservations use the same function counts.

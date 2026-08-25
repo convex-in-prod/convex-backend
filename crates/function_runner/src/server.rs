@@ -414,7 +414,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         match udf_type {
             UdfType::Init => anyhow::bail!("Unexpected init function"),
             UdfType::Query | UdfType::Mutation => {
-                anyhow::ensure!(function_execution_start.is_none(), "Database functions cannot have an action execution start barrier");
+                anyhow::ensure!(
+                    function_execution_start.is_none(),
+                    "Database functions cannot have an action execution start barrier"
+                );
                 let function_metadata =
                     function_metadata.context("Missing function metadata for query or mutation")?;
                 let (path_and_args, journal, active_javascript_class) = match udf_type {
@@ -435,7 +438,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                         } => (
                             path_and_args,
                             journal,
-                            ActiveJavascriptClass::Protected,
+                            context.mutation_priority.active_javascript_class(),
                         ),
                         FunctionMetadata::Query { .. } | FunctionMetadata::Action { .. } => {
                             anyhow::bail!("Function metadata does not match {udf_type}")
