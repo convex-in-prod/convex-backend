@@ -31,7 +31,10 @@ use common::{
         ExtractResolvedHostname,
         HttpResponseError,
     },
-    knobs::MAX_BACKEND_PUBLIC_API_REQUEST_SIZE,
+    knobs::{
+        ISOLATE_QUEUE_DELAY_CONTROL_ENABLED,
+        MAX_BACKEND_PUBLIC_API_REQUEST_SIZE,
+    },
     types::{
         FunctionCaller,
         QueryInvocation,
@@ -652,13 +655,42 @@ pub async fn public_query_batch_post(
     Ok(Json(QueryBatchResponse { results }))
 }
 
+fn mutation_args_schema() -> utoipa::openapi::schema::Schema {
+    use utoipa::openapi::schema::{
+        ArrayBuilder,
+        ObjectBuilder,
+        OneOfBuilder,
+        SchemaType,
+    };
+
+    OneOfBuilder::new()
+        .item(ObjectBuilder::new())
+        .item(ArrayBuilder::new().items(ObjectBuilder::new().schema_type(SchemaType::AnyValue)))
+        .build()
+        .into()
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct MutationPostRequest {
+    // Keep raw arguments directly on the request: serde flatten buffers fields
+    // through Content and cannot preserve UdfArgsJson's RawValue.
+    path: String,
+    #[schema(schema_with = mutation_args_schema)]
+    args: UdfArgsJson,
+    format: Option<String>,
+    /// Bounded scheduling preference. Defaults to normal and does not change
+    /// authorization.
+    #[serde(default)]
+    priority: common::types::MutationPriority,
+}
+
 /// Execute mutation
 ///
 /// Execute a mutation function.
 #[utoipa::path(
     post,
     path = "/mutation",
-    request_body = UdfPostRequest,
+    request_body = MutationPostRequest,
     responses((status = 200, body = UdfResponse)),
 )]
 #[debug_handler]
@@ -670,10 +702,20 @@ pub async fn public_mutation_post(
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractAuthenticationToken(auth_token): ExtractAuthenticationToken,
     ExtractClientVersion(client_version): ExtractClientVersion,
-    Json(req): Json<UdfPostRequest>,
+    Json(req): Json<MutationPostRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
+    if req.priority == common::types::MutationPriority::High
+        && !*ISOLATE_QUEUE_DELAY_CONTROL_ENABLED
+    {
+        return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+            "MutationPriorityUnavailable",
+            "High mutation priority requires the isolate lane scheduler",
+        ))
+        .into());
+    }
     let export_path = parse_export_path(&req.path)?;
-    let request_context = RequestContext::new(request_id, request_metadata);
+    let mut request_context = RequestContext::new(request_id, request_metadata);
+    request_context.mutation_priority = req.priority;
     // NOTE: We could coalesce authenticating and executing the query into one
     // rpc but we keep things simple by reusing the same method as the sync worker.
     // Round trip latency between Usher and Backend is much smaller than between
@@ -786,4 +828,53 @@ where
         .routes(utoipa_axum::routes!(public_function_post))
         .routes(utoipa_axum::routes!(public_function_post_with_path))
         .layer(DefaultBodyLimit::max(*MAX_BACKEND_PUBLIC_API_REQUEST_SIZE))
+}
+
+#[cfg(test)]
+mod mutation_priority_tests {
+    use common::types::MutationPriority;
+    use serde_json::json;
+
+    use super::MutationPostRequest;
+
+    #[test]
+    fn mutation_priority_defaults_to_normal_and_rejects_unknown_hints() {
+        let normal: MutationPostRequest =
+            serde_json::from_str(&json!({"path": "example:write", "args": [{}]}).to_string())
+                .unwrap();
+        assert_eq!(normal.priority, MutationPriority::Normal);
+        for (hint, expected) in [
+            ("normal", MutationPriority::Normal),
+            ("high", MutationPriority::High),
+        ] {
+            let request: MutationPostRequest = serde_json::from_str(
+                &json!({"path": "example:write", "args": [{}], "priority": hint}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(request.priority, expected);
+            assert_eq!(request.path, "example:write");
+        }
+        for hint in [json!("administrator"), json!(true), json!(null), json!(1)] {
+            assert!(serde_json::from_str::<MutationPostRequest>(
+                &json!({"path": "example:write", "args": [{}], "priority": hint}).to_string()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn mutation_priority_preserves_raw_named_and_positional_arguments() {
+        for priority in ["", ",\"priority\":\"normal\"", ",\"priority\":\"high\""] {
+            for args in [r#"{"number":1e+09}"#, r#"[{"number":1e+09}]"#] {
+                let request: MutationPostRequest = serde_json::from_str(&format!(
+                    r#"{{"path":"example:write","args":{args}{priority}}}"#,
+                ))
+                .unwrap();
+                assert_eq!(
+                    request.args.into_serialized_args().unwrap().get(),
+                    r#"[{"number":1e+09}]"#,
+                );
+            }
+        }
+    }
 }
