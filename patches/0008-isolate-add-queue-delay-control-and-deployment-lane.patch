@@ -57,12 +57,12 @@ rollout, rollback, cancellation, and telemetry contract.
  crates/isolate/src/metrics.rs                 |  308 ++-
  patches/dependency_capacity/README.md         |    7 +-
  .../dependency_capacity/design_reference.md   |  201 +-
- patches/isolate_queue_control/README.md       |  442 ++++
- .../deployment_lane_design_reference.md       |  783 ++++++
+ patches/isolate_queue_control/README.md       |  509 ++++
+ .../deployment_lane_design_reference.md       |  784 ++++++
  patches/reuse_http_action_contexts/README.md  |    1 +
  self-hosted/advanced/knobs.md                 |   99 +-
  self-hosted/docker/docker-compose.yml         |    8 +
- 18 files changed, 5744 insertions(+), 664 deletions(-)
+ 18 files changed, 5812 insertions(+), 664 deletions(-)
  delete mode 100644 crates/application/src/application_function_runner/dependency_overflow.rs
  create mode 100644 crates/isolate/src/isolate_queue.rs
  create mode 100644 patches/isolate_queue_control/README.md
@@ -6242,10 +6242,10 @@ index f67e97ccb187471f3c09666c58524c7682424914..ce6a9121da7afa6468b5fd3c1af0c116
  The opt-in isolate queue policy in
 diff --git a/patches/isolate_queue_control/README.md b/patches/isolate_queue_control/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..15179d0f708f0146c03d88cc82710c7c36b0c1f0
+index 0000000000000000000000000000000000000000..05d1e791f317cd57d348749f6e2ef813843b6f7b
 --- /dev/null
 +++ b/patches/isolate_queue_control/README.md
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,509 @@
 +# Isolate Queue Delay Control and Deployment Lane
 +
 +This patch adds a lane-aware queue policy only to the isolate scheduler. It is
@@ -6258,6 +6258,40 @@ index 0000000000000000000000000000000000000000..15179d0f708f0146c03d88cc82710c7c
 +evaluation requests into a bounded `control_plane` lane with a longer hard deadline and no adaptive
 +shedding. Neither feature creates execution capacity, replaces worker limits, or grants
 +unconditional dispatch priority.
++
++## Relationship to generic CoDel
++
++The isolate scheduler constructs exactly one external queue implementation when
++the isolate client starts. `new_scheduler_queue` selects:
++
++- `SchedulerQueueSender::Legacy` and `SchedulerQueueReceiver::Legacy`, backed
++  by the generic `CoDelQueue`, when
++  `ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=false`;
++- `SchedulerQueueSender::LaneDelayControl` and
++  `SchedulerQueueReceiver::LaneDelayControl`, backed by the isolate-specific
++  `IsolateDelayQueue` through `IsolateQueueSender` and
++  `IsolateQueueReceiver`, when the knob is true.
++
++These are alternative implementations, not consecutive queue stages. An
++external isolate request enters one of them, never both. Generic `CoDelQueue`
++instances used by caches, thread pools, search, or other backend components are
++independent of this scheduler choice.
++
++`CODEL_QUEUE_IDLE_EXPIRATION_MILLIS` and
++`CODEL_QUEUE_CONGESTED_EXPIRATION_MILLIS` configure the legacy isolate queue
++and other generic CoDel users. They have no effect on `IsolateDelayQueue`.
++Conversely, the `ISOLATE_QUEUE_DELAY_*` and
++`ISOLATE_CONTROL_PLANE_*` duration and lane settings do not change generic
++CoDel behavior. The isolate client still parses the lane-policy settings while
++the policy is disabled so malformed latent configuration fails at startup.
++
++`IsolateDelayQueue` shares CoDel's broad goal of bounding sustained queueing
++delay, but it neither wraps nor implements the generic CoDel algorithm. After
++the generic queue remains continuously nonempty for its idle-expiration period,
++it dispatches unexpired work in LIFO rather than FIFO order and returns expired
++oldest entries separately. The isolate-specific policy instead preserves FIFO
++among simultaneously eligible requests and adds scheduler-aware eligibility,
++per-lane delay observations, adaptive shedding, and absolute hard deadlines.
 +
 +## Queue and lane model
 +
@@ -6406,35 +6440,68 @@ index 0000000000000000000000000000000000000000..15179d0f708f0146c03d88cc82710c7c
 +- hard maximum age greater than the adaptive-shed threshold;
 +- timing durations representable by the runtime timer.
 +
-+The defaults are:
++### Knob reference
 +
-+- `ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=false`
-+- `ISOLATE_QUEUE_DELAY_TARGET_MILLIS=150`
-+- `ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS=1000`
-+- `ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS=300` with the default target
-+- `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS=5000`
++- `ISOLATE_QUEUE_SIZE` has default `2000` in unmodified
++  `get-convex/convex-backend`. It is the shared-base queue capacity under
++  either policy, not a throughput target. Larger values retain more request
++  arguments and stale work during overload. Dependency-only entries supplied
++  by `ISOLATE_DEPENDENCY_WORKER_RESERVE` are additional capacity owned by the
++  dependency-capacity patch.
++- `ISOLATE_QUEUE_DELAY_CONTROL_ENABLED` has built-in patch value `false` when
++  unset. Enabling it selects `IsolateDelayQueue` at startup; changing it
++  requires a process restart and should be verified through
++  `isolate_queue_policy_info`.
++- `ISOLATE_QUEUE_DELAY_TARGET_MILLIS` has built-in patch value `150`. It is the
++  minimum-sojourn target used to classify a completed observation interval,
++  not a request deadline. Lower values detect delay sooner; set it from healthy
++  queue-sojourn measurements rather than end-to-end request latency.
++- `ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS` has built-in patch value `1000`. Each
++  lane evaluates its minimum observed sojourn over this interval. Shorter
++  intervals react faster but are more sensitive to sparse samples.
++- `ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS` is derived as twice the configured
++  target when unset, which is `300` with the built-in target. An overloaded
++  ordinary or independent-action lane sheds a selected request only when that
++  request's own queue age exceeds this value. Set it above the target and below
++  the ordinary hard maximum age. It never adaptively sheds dependency or
++  control-plane work.
++- `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS` has built-in patch value `5000`. It is the
++  absolute enqueue-to-initial-active-permit deadline for ordinary,
++  independent-action, and dependency requests. Set it above the adaptive-shed
++  threshold but below relevant outer request timeouts.
++- `ISOLATE_CONTROL_PLANE_LANE_ENABLED` has built-in patch value `false`. It
++  classifies only the five typed analysis and configuration-evaluation request
++  variants. It requires lane delay control and grants neither priority nor
++  reserved queue or worker capacity.
++- `ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY` has built-in patch value `16`. It is a
++  queued-entry sub-cap inside `ISOLATE_QUEUE_SIZE`, not a separate queue or a
++  reservation. When the lane is enabled it must be at least
++  `ANALYZE_CONCURRENCY` and no greater than `ISOLATE_QUEUE_SIZE`.
++- `ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS` has built-in patch value `30000`.
++  It gives control-plane work a finite enqueue-to-initial-active-permit budget
++  and must exceed the ordinary hard maximum age. Keep caller, proxy, and
++  deployment-phase timeouts long enough for this wait plus execution.
++- `CODEL_QUEUE_IDLE_EXPIRATION_MILLIS` has default `5000` in unmodified
++  `get-convex/convex-backend`. It controls when the generic CoDel queue changes
++  from its idle FIFO regime to congestion handling; it is not a hard maximum
++  request age.
++- `CODEL_QUEUE_CONGESTED_EXPIRATION_MILLIS` has default `50` in unmodified
++  `get-convex/convex-backend`. It controls item expiration in the generic
++  CoDel queue's congested regime. It does not configure lane-mode shedding or
++  hard deadlines.
 +
-+When the adaptive-shed threshold is unset, it defaults to twice the configured
-+target. Setting only a non-default target therefore preserves the original
-+`2 * target` shedding behavior. An explicit threshold decouples overload
-+detection from adaptive shedding.
++The eight `ISOLATE_QUEUE_DELAY_*`, `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS`, and
++`ISOLATE_CONTROL_PLANE_*` knobs above are introduced by this patch. Their
++built-in values are part of the patch contract, not defaults in unmodified
++`get-convex/convex-backend`.
 +
-+The duration knobs have no effect on generic CoDel behavior. They are still
-+validated so a latent malformed configuration cannot become active on a later
-+restart without failing clearly.
-+
-+The optional deployment lane adds:
-+
-+- `ISOLATE_CONTROL_PLANE_LANE_ENABLED=false`;
-+- `ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY=16`;
-+- `ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS=30000`.
-+
-+All three values and `ANALYZE_CONCURRENCY` are parsed strictly even while the lane is disabled.
-+Intrinsic values must be positive and representable by the runtime timer. When enabled, lane-aware
-+queueing must also be enabled, the lane cap must be at least `ANALYZE_CONCURRENCY` and no greater
-+than `ISOLATE_QUEUE_SIZE`, and the control-plane hard deadline must exceed the ordinary hard
-+deadline. These checks prevent one push from rejecting its configured fan-out and keep the longer
-+contract explicit.
++All three `ISOLATE_CONTROL_PLANE_*` values and `ANALYZE_CONCURRENCY` are parsed
++strictly even while the lane is disabled. Intrinsic values must be positive and
++representable by the runtime timer. When enabled, lane-aware queueing must also
++be enabled, the lane cap must be at least `ANALYZE_CONCURRENCY` and no greater
++than `ISOLATE_QUEUE_SIZE`, and the control-plane hard deadline must exceed the
++ordinary hard deadline. These checks prevent one push from rejecting its
++configured fan-out and keep the longer contract explicit.
 +
 +## Metrics and interpretation
 +
@@ -6545,7 +6612,7 @@ index 0000000000000000000000000000000000000000..15179d0f708f0146c03d88cc82710c7c
 +
 +Control-plane entries participate in delay observations and overload metrics but are never rejected
 +by adaptive delay shedding. They still fail on lane-full or shared-queue admission, caller drop,
-+their finite hard deadline, scheduler closure, or worker failure. The default 30-second deadline is
++their finite hard deadline, scheduler closure, or worker failure. The built-in 30-second deadline is
 +an enqueue-to-active-permit budget: it bounds both queue residence and the low-priority
 +active-JavaScript permit wait that now precedes worker assignment. V8 execution, HTTP, proxy, CLI,
 +and deployment-phase timeouts remain separate.
@@ -6632,7 +6699,7 @@ index 0000000000000000000000000000000000000000..15179d0f708f0146c03d88cc82710c7c
 +latency, memory, or scan cost. The existing scheduler load results in
 +the dependency-capacity design reference predate this policy and are not validation of it.
 +Current evidence is deterministic queue and scheduler regression coverage; a
-+mixed-load comparison remains required before enabling the policy by default.
++mixed-load comparison remains required before changing the policy from opt-in.
 +
 +## Interaction with other backend patches
 +
@@ -6690,10 +6757,10 @@ index 0000000000000000000000000000000000000000..15179d0f708f0146c03d88cc82710c7c
 +capacity separately; increasing queue depth alone cannot increase throughput.
 diff --git a/patches/isolate_queue_control/deployment_lane_design_reference.md b/patches/isolate_queue_control/deployment_lane_design_reference.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..f4b12c92776c6e74c61af8ee55f24fe069b4e112
+index 0000000000000000000000000000000000000000..39ff0eb8d9e67a67f234d4bda7dee40aeedcec84
 --- /dev/null
 +++ b/patches/isolate_queue_control/deployment_lane_design_reference.md
-@@ -0,0 +1,783 @@
+@@ -0,0 +1,784 @@
 +# Deployment and Control-Plane Isolate Lane
 +
 +> Detailed design reference. This is not a separate adoption unit. The current operator-facing
@@ -6715,7 +6782,7 @@ index 0000000000000000000000000000000000000000..f4b12c92776c6e74c61af8ee55f24fe0
 +- exemption from adaptive queue-delay shedding;
 +- a finite hard queue deadline longer than the ordinary request deadline.
 +
-+The initial hard deadline default is 30 seconds. The single physical queue
++The built-in patch value for the initial hard deadline is 30 seconds. The single physical queue
 +continues to select the oldest eligible request, preserving FIFO among
 +eligible control-plane and runtime work. A later one-worker reservation from
 +shared base is deliberately excluded from the initial patch and should be
@@ -7028,7 +7095,7 @@ index 0000000000000000000000000000000000000000..f4b12c92776c6e74c61af8ee55f24fe0
 +shares queue state but does not keep admission open after the consuming
 +receiver closes.
 +
-+The initial control-plane default should be 30 seconds. Upstream now acquires
++The initial control-plane built-in value should be 30 seconds. Upstream now acquires
 +the low-priority active-JavaScript permit before worker assignment, so this is
 +an enqueue-to-active-permit budget: the original deadline bounds both queue
 +residence and that permit wait. It is not a total deployment or JavaScript
@@ -7089,7 +7156,7 @@ index 0000000000000000000000000000000000000000..f4b12c92776c6e74c61af8ee55f24fe0
 +zero, overflowing, non-representable, and other intrinsically invalid values
 +always fail. Cross-setting policy checks apply when the lane is enabled; this
 +preserves startup for an operator whose existing ordinary deadline or queue
-+size is intentionally outside the new lane's default relationship.
++size is intentionally outside the new lane's built-in relationship.
 +
 +Intrinsic validation requires:
 +
@@ -7110,15 +7177,16 @@ index 0000000000000000000000000000000000000000..f4b12c92776c6e74c61af8ee55f24fe0
 +  `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS`;
 +- `ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=true`.
 +
-+The default lane capacity of 16 is generic rather than host-sized. With the
-+upstream default `ANALYZE_CONCURRENCY=4`, it permits one push's module fan-out,
-+its evaluation requests, and limited overlap while preventing concurrent pushes
++The built-in patch lane capacity of 16 is generic rather than host-sized. With
++the default `ANALYZE_CONCURRENCY=4` in unmodified
++`get-convex/convex-backend`, it permits one push's module fan-out, its
++evaluation requests, and limited overlap while preventing concurrent pushes
 +from filling a large shared queue with bundles. Operators that raise analysis
 +concurrency must raise the lane cap explicitly before enabling the feature.
 +
 +The self-hosted Compose template should pass all three values through without
 +supplying deployment-specific overrides. The backend remains the source of
-+defaults and strict validation.
++built-in values and strict validation.
 +
 +There is intentionally no control-plane worker-reserve setting in the initial
 +patch. Do not add a dormant optional value before measurements justify that
@@ -7157,7 +7225,7 @@ index 0000000000000000000000000000000000000000..f4b12c92776c6e74c61af8ee55f24fe0
 +The five request variants are already a closed set, but the initial scheduler
 +metrics do not need another operation label. Existing analysis and evaluation
 +timers can identify service cost. Add a closed `operation` label only if those
-+signals cannot answer which variant dominates, not as a default.
++signals cannot answer which variant dominates, not in the initial design.
 +
 +Useful trace properties are effective lane, request variant as a closed enum,
 +queue admission outcome, queue rejection reason, and caller-drop outcome. Do
