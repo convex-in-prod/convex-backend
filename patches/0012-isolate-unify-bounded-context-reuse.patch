@@ -22,7 +22,7 @@ Remove the startup-time HTTP context-reuse switch and consolidate the adoption c
  crates/isolate/src/environment/udf/mod.rs     |  367 ++--
  crates/isolate/src/isolate.rs                 |   41 +-
  crates/isolate/src/isolate_worker.rs          |   58 +-
- crates/isolate/src/metrics.rs                 |  347 +++-
+ crates/isolate/src/metrics.rs                 |  360 +++-
  crates/isolate/src/request_scope.rs           |   32 +
  crates/isolate/src/strings.rs                 |    4 +
  crates/isolate/src/termination.rs             |    3 +
@@ -40,12 +40,12 @@ Remove the startup-time HTTP context-reuse switch and consolidate the adoption c
  .../dependency_capacity/design_reference.md   |   17 +-
  self-hosted/advanced/knobs.md                 |   44 +-
  self-hosted/docker/docker-compose.yml         |    3 +-
- 29 files changed, 4404 insertions(+), 452 deletions(-)
+ 29 files changed, 4417 insertions(+), 452 deletions(-)
  create mode 100644 patches/context_reuse/README.md
  create mode 100644 patches/context_reuse/design_reference.md
 
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index df13e21963346ff382b497afaee4bd9fb05ef62e..8c4a768f82056f3e9741a76d8ca6f4697efa8911 100644
+index 8e38ef69279e3fd65d752a6ee895c2e40de01785..5fefde850c9039cf1860cf225db3eac2f9bf771b 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -1277,6 +1277,30 @@ pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS",
@@ -4792,10 +4792,10 @@ index def74d47a808666c972a94cb3c7139a778b38c5b..50a984a0ea8c75d05961e8c789cc56b4
                      app_definition,
                      component_definitions,
 diff --git a/crates/isolate/src/metrics.rs b/crates/isolate/src/metrics.rs
-index 2999de5d86209ca0cde50bb3abcc50a8f8d9df10..c64f047837464bc8cec798211e8905691063db36 100644
+index afae9f5fd90334d1acbaa03362ea83401b7db612..fff23c24ffab9cf22a15928e67c435f00e80f552 100644
 --- a/crates/isolate/src/metrics.rs
 +++ b/crates/isolate/src/metrics.rs
-@@ -40,10 +40,53 @@ use prometheus::VMHistogram;
+@@ -39,10 +39,53 @@ use prometheus::VMHistogram;
  
  use crate::{
      client::NO_AVAILABLE_WORKERS,
@@ -4846,13 +4846,26 @@ index 2999de5d86209ca0cde50bb3abcc50a8f8d9df10..c64f047837464bc8cec798211e890569
 +    }
 +}
 +
- register_convex_histogram!(
-     UDF_EXECUTE_SECONDS,
-     "Duration of an UDF execution",
-@@ -103,6 +146,23 @@ pub fn log_pool_allocated_count(name: &'static str, count: usize) {
+ // `client_id` is unbounded and a client that disconnects stops updating this
+ // gauge, leaving a stale frozen value, so evict label sets that go idle.
+ register_convex_gauge_evictable!(
+@@ -74,6 +117,36 @@ pub fn log_pool_max(name: &'static str, count: usize) {
      );
  }
  
++register_convex_gauge!(
++    ISOLATE_POOL_ALLOCATED_COUNT_INFO,
++    "How many isolate workers have been allocated",
++    &["pool_name"]
++);
++pub fn log_pool_allocated_count(name: &'static str, count: usize) {
++    log_gauge_with_labels(
++        &ISOLATE_POOL_ALLOCATED_COUNT_INFO,
++        count as f64,
++        vec![StaticMetricLabel::new("pool_name", name)],
++    );
++}
++
 +#[cfg(test)]
 +pub(crate) fn pool_allocated_count_for_test(name: &str) -> Option<usize> {
 +    use prometheus::core::Collector;
@@ -4873,7 +4886,7 @@ index 2999de5d86209ca0cde50bb3abcc50a8f8d9df10..c64f047837464bc8cec798211e890569
  fn scheduler_class_labels(
      name: &'static str,
      scheduler_class: &'static str,
-@@ -139,6 +199,49 @@ pub fn log_scheduler_request_dispatched(name: &'static str, scheduler_class: &'s
+@@ -110,6 +183,49 @@ pub fn log_scheduler_request_dispatched(name: &'static str, scheduler_class: &'s
      );
  }
  
@@ -4923,7 +4936,7 @@ index 2999de5d86209ca0cde50bb3abcc50a8f8d9df10..c64f047837464bc8cec798211e890569
  register_convex_counter!(
      ISOLATE_SCHEDULER_REQUESTS_EXPIRED_TOTAL,
      "Number of isolate scheduler requests that reached their original queue deadline before \
-@@ -633,6 +736,70 @@ pub fn finish_service_request_timer(timer: StatusTimer, status: RequestStatus) {
+@@ -604,6 +720,70 @@ pub fn finish_service_request_timer(timer: StatusTimer, status: RequestStatus) {
      };
  }
  
@@ -4994,7 +5007,7 @@ index 2999de5d86209ca0cde50bb3abcc50a8f8d9df10..c64f047837464bc8cec798211e890569
  register_convex_histogram!(
      UDF_ISOLATE_BUILD_SECONDS,
      "Time to build isolate context",
-@@ -1215,7 +1382,7 @@ pub fn log_user_function_execution_time(udf_type: UdfType, execution_time: Durat
+@@ -1186,7 +1366,7 @@ pub fn log_user_function_execution_time(udf_type: UdfType, execution_time: Durat
  
  register_convex_counter!(
      REUSABLE_CONTEXT_INIT_TOTAL,
@@ -5003,7 +5016,7 @@ index 2999de5d86209ca0cde50bb3abcc50a8f8d9df10..c64f047837464bc8cec798211e890569
      &["udf_type", "reused"],
  );
  
-@@ -1243,6 +1410,184 @@ pub fn log_normalize_id_old_format(format: &'static str) {
+@@ -1214,6 +1394,184 @@ pub fn log_normalize_id_old_format(format: &'static str) {
      );
  }
  
@@ -5455,7 +5468,7 @@ index bfcd47b6e534ebb368ff2a17b539dd2820fc02e0..f0c4860de2ff1e918957bb200dd54d1f
  
      let application = Application::new(
 diff --git a/crates/model/src/modules/module_versions.rs b/crates/model/src/modules/module_versions.rs
-index 1e71f8e5e0848d2b46048dc8c7f9b974427370e0..2a74d8e8e7c4fbfe3d364f070370c2ab88c7437a 100644
+index d3f886ad4b6f655dad45448050d96905ef69670f..12527b66456b144e661b4c1efc2be39f6fc3292f 100644
 --- a/crates/model/src/modules/module_versions.rs
 +++ b/crates/model/src/modules/module_versions.rs
 @@ -89,6 +89,58 @@ impl SizedValue for FullModuleSource {
@@ -5574,7 +5587,7 @@ index 1e71f8e5e0848d2b46048dc8c7f9b974427370e0..2a74d8e8e7c4fbfe3d364f070370c2ab
          })
      }
  }
-@@ -573,3 +638,108 @@ impl TryFrom<AnalyzedModule> for SerializedMappedModule {
+@@ -574,3 +639,108 @@ impl TryFrom<AnalyzedModule> for SerializedMappedModule {
          })
      }
  }
