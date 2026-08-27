@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Tue, 4 Aug 2026 17:39:00 +0800
-Subject: [PATCH 22/29] runtime: harden backend memory pressure
+Subject: [PATCH 19/26] runtime: harden backend memory pressure
 
 Harden the composed memory-control, bounded-context, and local-Node lifecycle patches at their integration boundaries. Resolve the process's effective cgroup-v2 directory through procfs mount metadata instead of assuming the hierarchy root. Validate memory and Node settings before database initialization, reject unsupported non-Linux controls, and pass every documented setting through the stock self-hosted Compose file.
 
@@ -24,10 +24,10 @@ On a representative long-running self-hosted workload, one glibc trim took 4.122
  10 files changed, 1016 insertions(+), 158 deletions(-)
 
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 813517efa9acf4bd5485348425d53a67b65c58bb..e84f27dcf61056ed6f8a2ebf495e3e2b6ffa754b 100644
+index c689648e8ee17a9b85dc6d18cf4d91757367868d..33b910c4d803c30e66ae144eba8b0fb4b502684a 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -399,7 +399,11 @@ pub static LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES: LazyLock<usize> = LazyLock:
+@@ -538,7 +538,11 @@ pub static LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES: LazyLock<usize> = LazyLock:
  /// Minimum time between explicit glibc trim attempts during one or more
  /// pressure episodes.
  pub static LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN: LazyLock<Duration> = LazyLock::new(|| {
@@ -40,7 +40,7 @@ index 813517efa9acf4bd5485348425d53a67b65c58bb..e84f27dcf61056ed6f8a2ebf495e3e2b
  });
  
  /// Minimum sampled direct-child RSS for sustained cgroup pressure to retire a
-@@ -415,10 +419,11 @@ pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES: LazyLock<usize> =
+@@ -554,10 +558,11 @@ pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES: LazyLock<usize> =
  /// Time internal cgroup pressure must remain active before it may retire a
  /// material local Node executor generation.
  pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE: LazyLock<Duration> = LazyLock::new(|| {
@@ -1577,7 +1577,7 @@ index ee5c10ea3e7c140bbf6088a603a2287f0475cc5e..ff5bb0a825716e953a2d4be7c6aed04e
      async fn unhealthy_watchdog_preempts_stuck_proactive_drain() {
          let socket_dir = TempDir::new().unwrap();
 diff --git a/patches/README.md b/patches/README.md
-index ea399edccd88a0a3e27b8b8848824d4e59a1c7b7..bfe38cb3559f9c2892da884d644d4a458336fde0 100644
+index c1adc89768f930dc90b9624af942f12ffbe8da74..3e1554e9fc68892330437283419a0dab73290b2e 100644
 --- a/patches/README.md
 +++ b/patches/README.md
 @@ -5,8 +5,10 @@ They are operator adoption units, not one all-or-nothing fork. Read the owning e
@@ -1605,7 +1605,7 @@ index ea399edccd88a0a3e27b8b8848824d4e59a1c7b7..bfe38cb3559f9c2892da884d644d4a45
    or data change is required.
  
 diff --git a/patches/backend_memory_resilience/README.md b/patches/backend_memory_resilience/README.md
-index 754ec1f034f57a77038ee4f25d5c48e7b707a73a..65c4b88c1f06606564311e10b4f85c6b2309c7af 100644
+index 1010d9e3006fb1d463a08ce95e6973a01643b49e..89441454663abe72aa083a641e61c7168a0d23f8 100644
 --- a/patches/backend_memory_resilience/README.md
 +++ b/patches/backend_memory_resilience/README.md
 @@ -3,8 +3,8 @@
@@ -1710,7 +1710,7 @@ index 754ec1f034f57a77038ee4f25d5c48e7b707a73a..65c4b88c1f06606564311e10b4f85c6b
  
  Trim failure is an optional-recovery failure. It is counted and logged, but it does not suppress the
  shared pressure signal or the Node consumer. A diagnostic or allocator failure must not disable the
-@@ -94,9 +116,9 @@ positive and strictly below the ordinary RSS retirement threshold.
+@@ -93,9 +115,9 @@ positive and strictly below the ordinary RSS retirement threshold.
  
  The ordinary RSS limit remains the first proactive decision, followed by cgroup pressure, imported
  package count, and generation age. Missing RSS telemetry, a smaller child, a shorter pressure
@@ -1723,7 +1723,7 @@ index 754ec1f034f57a77038ee4f25d5c48e7b707a73a..65c4b88c1f06606564311e10b4f85c6b
  
  ## Observability
  
-@@ -124,11 +146,12 @@ distinguish measured zero from unsupported or failed telemetry.
+@@ -123,11 +145,12 @@ distinguish measured zero from unsupported or failed telemetry.
  
  ## Activation and verification
  
@@ -1767,7 +1767,7 @@ index 70c57a9d14ff597e51c13fe8dd5cd72470073d22..e07d4441bc0dc22f4370fa38e039c78f
  - graceful admission closure and drain before proactive retirement;
  - unhealthy watchdog retirement preempting a proactive drain blocked by a
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index b975d8b001a0be04f64089c9e0377cf8b059c1c2..bd1fda605791d5ee36bdd12bfc0bd6a02f7dfcd9 100644
+index 8610ce5804a4457685eebb8e150f50d08393a367..8590880e85f93eddd2c22848d6899af5771c0830 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
 @@ -77,6 +77,9 @@ different defaults. Changing one requires a backend restart.
@@ -1810,7 +1810,7 @@ index b975d8b001a0be04f64089c9e0377cf8b059c1c2..bd1fda605791d5ee36bdd12bfc0bd6a0
  The reclamation exit threshold must exceed its entry threshold and remain below the cgroup limit.
  When reclamation and external shedding are both enabled, both reclamation thresholds must preserve
 diff --git a/self-hosted/docker/docker-compose.yml b/self-hosted/docker/docker-compose.yml
-index e846b0698a656cb1badd491a814f29e4ea08bf93..a66159b663a1df12bb5db9c81e890364e702a844 100644
+index e71d0230bde28cf574412c060b5223435a4a98ee..06404580775dc60db08bb270cdfb7b6bfa8028d3 100644
 --- a/self-hosted/docker/docker-compose.yml
 +++ b/self-hosted/docker/docker-compose.yml
 @@ -14,12 +14,20 @@ services:

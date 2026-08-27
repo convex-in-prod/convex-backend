@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Sat, 15 Aug 2026 16:15:21 +0800
-Subject: [PATCH 13/29] deployment: pace isolate analysis through elastic
+Subject: [PATCH 14/26] deployment: pace isolate analysis through elastic
  capacity
 
 Module analysis creates one isolate request per non-dependency module, evaluates its import graph in V8 without supported asynchronous ops, and can keep up to ANALYZE_CONCURRENCY attempts active per analysis call. Rejected-before-execution and overload responses can also create bounded retries. This work bypasses application action limits while still consuming shared-base isolate workers, active-JavaScript permits, CPU, and queue entries.
@@ -23,16 +23,15 @@ Expose analysis reservation occupancy and gate-wait metrics. Add focused fairnes
  .../src/in_process_function_runner.rs         |   3 +
  crates/function_runner/src/lib.rs             |   2 +
  crates/function_runner/src/server.rs          |  10 +-
- crates/isolate/src/client.rs                  | 406 ++++++++++++++++--
+ crates/isolate/src/client.rs                  | 403 ++++++++++++++++--
  crates/isolate/src/isolate_worker.rs          |   5 +-
  crates/isolate/src/metrics.rs                 |  27 ++
- patches/README.md                             |  17 +-
  patches/degradable_reactive_queries/README.md |  65 ++-
  patches/deployment_analysis_pacing/README.md  | 203 +++++++++
  patches/isolate_queue_control/README.md       |  26 +-
  .../deployment_lane_design_reference.md       |  50 ++-
  self-hosted/advanced/knobs.md                 |  34 ++
- 18 files changed, 965 insertions(+), 101 deletions(-)
+ 17 files changed, 945 insertions(+), 101 deletions(-)
  create mode 100644 crates/common/src/query_analysis_admission.rs
  create mode 100644 patches/deployment_analysis_pacing/README.md
 
@@ -314,10 +313,10 @@ index 38fea8e1799ab11e35391d628a1d87c3e870b7ff..d29b90c9676914f24d57a6e9c57bc9a3
              cache.inner.lock().cache.get(&stored_key),
              Some(CacheEntry::Ready(_))
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 5ee173f0c9e1dfe42779bee18b83d03c0452c6f8..41c7c468d99e458fecfdee9e35b46976b99ec669 100644
+index 4fd87e1b002c078fa43085241bcce71a8f6dc36a..c689648e8ee17a9b85dc6d18cf4d91757367868d 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -1194,10 +1194,11 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
+@@ -1505,10 +1505,11 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
      )
  });
  
@@ -332,12 +331,12 @@ index 5ee173f0c9e1dfe42779bee18b83d03c0452c6f8..41c7c468d99e458fecfdee9e35b46976
 +/// JavaScript gate either exceeds the cap or configures class minimums.
  pub static APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: LazyLock<Option<usize>> =
      LazyLock::new(|| {
-         let capacity = env_config_optional_usize_strict_nonzero(
+         let capacity =
 diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
-index a2dd2132f43e484f65dc638cb164a92bbbb84378..1f87ebae1e422d6ee1bb803c8bae201e6281c9e4 100644
+index c3b71876e482c830894c070e5374352076a9a135..e9af810e3dde8a7e12ff351f3385d81a2de9b274 100644
 --- a/crates/common/src/lib.rs
 +++ b/crates/common/src/lib.rs
-@@ -55,6 +55,7 @@ pub mod persistence_helpers;
+@@ -56,6 +56,7 @@ pub mod persistence_helpers;
  pub mod pii;
  pub mod pool_stats;
  pub mod query;
@@ -464,10 +463,10 @@ index 0000000000000000000000000000000000000000..772e94951a8780d5ef74e38a4885e96d
 +    }
 +}
 diff --git a/crates/function_runner/src/in_process_function_runner.rs b/crates/function_runner/src/in_process_function_runner.rs
-index e0b2cfea7afcacde73c6b2b77804078390bb078e..17a0b41c6cdfd4bcf10f191fa252b992c2a5f6ca 100644
+index 74322431d0eec038615bdac847f7ad9dc9fb057e..45d7f14cc291616d2d15f923beb87007eb89ccc1 100644
 --- a/crates/function_runner/src/in_process_function_runner.rs
 +++ b/crates/function_runner/src/in_process_function_runner.rs
-@@ -36,6 +36,7 @@ use common::{
+@@ -38,6 +38,7 @@ use common::{
          PersistenceReader,
          RepeatablePersistence,
      },
@@ -475,7 +474,7 @@ index e0b2cfea7afcacde73c6b2b77804078390bb078e..17a0b41c6cdfd4bcf10f191fa252b992
      runtime::{
          Runtime,
          SpawnHandle,
-@@ -341,6 +342,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
+@@ -376,6 +377,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
          udf_config: UdfConfig,
          modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
          environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
@@ -483,7 +482,7 @@ index e0b2cfea7afcacde73c6b2b77804078390bb078e..17a0b41c6cdfd4bcf10f191fa252b992
      ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
          self.server
              .analyze(
-@@ -348,6 +350,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
+@@ -383,6 +385,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
                  modules,
                  environment_variables,
                  self.deployment.name.clone(),
@@ -547,21 +546,10 @@ index 79f065ccd78aec162d9637b0e76391621c078403..f089b0d6e000f6add17a9b2d62147b8c
      }
  
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed3322faef 100644
+index 0759dfd76a89448f469d4d7f5a9e7c3ac91e0695..c28150ac1039b7d8a50e7e2bfde484d1406fde80 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
-@@ -82,6 +82,10 @@ use common::{
-         V8_THREADS,
-     },
-     log_lines::LogLine,
-+    query_analysis_admission::{
-+        QueryAnalysisAdmission,
-+        QueryAnalysisPermit,
-+    },
-     query_journal::QueryJournal,
-     runtime::{
-         shutdown_and_join,
-@@ -224,6 +228,82 @@ use crate::{
+@@ -234,6 +234,82 @@ use crate::{
  
  const ISOLATE_QUEUE_METRICS_LOG_FREQUENCY: Duration = Duration::from_secs(1);
  
@@ -644,7 +632,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
  pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
  pub const PAUSE_REQUEST: &str = "pause_request";
  pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
-@@ -1066,7 +1146,8 @@ pub enum RequestType<RT: Runtime> {
+@@ -1125,7 +1201,8 @@ pub enum RequestType<RT: Runtime> {
          modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>>,
          to_analyze: CanonicalizedModulePath,
          environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
@@ -654,7 +642,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
      },
      EvaluateSchema {
          schema_bundle: ModuleSource,
-@@ -1192,7 +1273,7 @@ impl<RT: Runtime> Request<RT> {
+@@ -1264,7 +1341,7 @@ impl<RT: Runtime> Request<RT> {
                  let _ = response.send(Err(error));
              },
              RequestType::Analyze { response, .. } => {
@@ -663,7 +651,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
              },
              RequestType::EvaluateSchema { response, .. } => {
                  let _ = response.send(Err(error));
-@@ -1632,6 +1713,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1754,6 +1831,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
          environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
          instance_name: String,
@@ -671,7 +659,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
      ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
          anyhow::ensure!(
              modules
-@@ -1639,6 +1721,9 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1761,6 +1839,9 @@ impl<RT: Runtime> IsolateClient<RT> {
                  .all(|m| m.environment == ModuleEnvironment::Isolate),
              "Can only analyze Isolate modules"
          );
@@ -681,7 +669,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
          let to_analyze: Vec<_> = modules
              .keys()
              .filter(|path| !path.is_deps())
-@@ -1664,20 +1749,36 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1786,20 +1867,36 @@ impl<RT: Runtime> IsolateClient<RT> {
                  let mut attempt = 1;
                  const MAX_ATTEMPTS: u32 = 3;
                  loop {
@@ -731,8 +719,8 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
                          Ok(outcome) => return Ok((to_analyze, outcome)),
                          Err(e)
                              if attempt < MAX_ATTEMPTS
-@@ -3010,9 +3111,11 @@ mod tests {
-             ComponentDefinitionPath,
+@@ -3144,9 +3241,11 @@ mod tests {
+             ComponentId,
              ComponentName,
          },
 +        errors::JsError,
@@ -743,7 +731,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
          runtime::{
              shutdown_and_join,
              Runtime,
-@@ -3027,6 +3130,14 @@ mod tests {
+@@ -3161,6 +3260,14 @@ mod tests {
      };
      use errors::ErrorMetadataAnyhowExt as _;
      use futures::future::FusedFuture;
@@ -758,12 +746,13 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
      use parking_lot::Mutex;
      use runtime::prod::ProdRuntime;
      use semver::Version;
-@@ -3046,12 +3157,14 @@ mod tests {
+@@ -3181,12 +3288,14 @@ mod tests {
          wait_for_external_permit,
          worker_rejection_reason,
          ActiveRequestCounts,
+-		CancelExecutionOnDrop,
 +        AnalyzeResponseSender,
-         CancelUdfOnDrop,
++        CancelExecutionOnDrop,
          CancellationSignal,
          ConcurrencyPermitPhase,
          ExternalPermitWaitOutcome,
@@ -773,7 +762,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
          IsolateConfig,
          IsolateWorker,
          IsolateWorkerHandle,
-@@ -3087,6 +3200,8 @@ mod tests {
+@@ -3224,6 +3333,8 @@ mod tests {
  
      const SCHEDULER_TEST_TIMEOUT: Duration = Duration::from_secs(5);
  
@@ -782,7 +771,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
      #[derive(Clone)]
      struct SchedulerTestRuntime {
          inner: ProdRuntime,
-@@ -3148,10 +3263,18 @@ mod tests {
+@@ -3285,10 +3396,18 @@ mod tests {
          }
      }
  
@@ -801,7 +790,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
      }
  
      #[async_trait::async_trait(?Send)]
-@@ -3169,7 +3292,7 @@ mod tests {
+@@ -3306,7 +3425,7 @@ mod tests {
                  active_request_guard,
              }) = requests.recv().await
              {
@@ -810,7 +799,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
                      RequestType::Test {
                          id,
                          can_block_on_descendant: _,
-@@ -3180,15 +3303,39 @@ mod tests {
+@@ -3317,15 +3436,39 @@ mod tests {
                          started,
                          completion,
                          response,
@@ -857,7 +846,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
                  drop(permit);
                  drop(active_request_guard);
                  if done
-@@ -3221,6 +3368,55 @@ mod tests {
+@@ -3358,6 +3501,55 @@ mod tests {
          }
      }
  
@@ -913,7 +902,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
      #[derive(Clone, Copy)]
      enum TestRequestKind {
          Dependency,
-@@ -3358,7 +3554,7 @@ mod tests {
+@@ -3495,7 +3687,7 @@ mod tests {
                  modules: Arc::new(BTreeMap::new()),
                  to_analyze: module_path,
                  environment_variables: BTreeMap::new(),
@@ -922,15 +911,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
              },
              RequestType::EvaluateSchema {
                  schema_bundle: model::modules::module_versions::ModuleSource::new(""),
-@@ -3486,6 +3682,7 @@ mod tests {
-                 TestIsolateWorker {
-                     rt: rt.clone(),
-                     config: IsolateConfig::new("scheduler_test", ConcurrencyLimiter::unlimited()),
-+                    analyze_test_control: None,
-                 },
-                 max_workers,
-                 base_worker_capacity,
-@@ -3683,6 +3880,166 @@ mod tests {
+@@ -3824,6 +4016,166 @@ mod tests {
          assert!(nested_signal.is_cancelled());
      }
  
@@ -1097,7 +1078,7 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
      #[test]
      fn dependency_and_descendant_capability_are_independent() {
          assert_eq!(properties(false, false, false).as_label(), "independent");
-@@ -3976,6 +4333,7 @@ mod tests {
+@@ -4127,6 +4479,7 @@ mod tests {
              TestIsolateWorker {
                  rt: scheduler_rt.clone(),
                  config: IsolateConfig::new("scheduler_test", ConcurrencyLimiter::unlimited()),
@@ -1106,10 +1087,10 @@ index 366fb8828971d2c7b54e33145922aa2300e7aaa4..49670c82a26a75159eecab6cee6402ed
              1,
              1,
 diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
-index 05c08724c088a620d94741822ea2edef01120363..f2d43634740c7e16a41ba9f953440297800c75c6 100644
+index 50017a1826d7176373827362d7da201153757616..a8d381fabf15651331036eb9865b746f94717afb 100644
 --- a/crates/isolate/src/isolate_worker.rs
 +++ b/crates/isolate/src/isolate_worker.rs
-@@ -196,7 +196,10 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -214,7 +214,10 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                      environment_variables,
                  )
                  .await;
@@ -1122,10 +1103,10 @@ index 05c08724c088a620d94741822ea2edef01120363..f2d43634740c7e16a41ba9f953440297
              },
              RequestType::HttpAction {
 diff --git a/crates/isolate/src/metrics.rs b/crates/isolate/src/metrics.rs
-index 13dc8a08159dc0ad12dca8144a6c6f3293981d34..2f0cca108cf978d04887533065e73b438663f761 100644
+index 2370f0b14bd0d9be132bc63b78b5a4fe47e7a33f..76e789ad192e9d82bbfc707195607f20f8d51174 100644
 --- a/crates/isolate/src/metrics.rs
 +++ b/crates/isolate/src/metrics.rs
-@@ -129,6 +129,33 @@ pub fn log_pool_max(name: &'static str, count: usize) {
+@@ -139,6 +139,33 @@ pub fn log_pool_max(name: &'static str, count: usize) {
      );
  }
  
@@ -1159,41 +1140,6 @@ index 13dc8a08159dc0ad12dca8144a6c6f3293981d34..2f0cca108cf978d04887533065e73b43
  register_convex_gauge!(
      ISOLATE_POOL_ALLOCATED_COUNT_INFO,
      "How many isolate workers have been allocated",
-diff --git a/patches/README.md b/patches/README.md
-index 829094b31fcc55846145be05a0b198688154b09e..cc05a9f907cc13ebf2e6b741d6a2ba0eb1656a40 100644
---- a/patches/README.md
-+++ b/patches/README.md
-@@ -29,6 +29,19 @@ of degradable reactive-query backpressure.
- - Activation: only through the privileged repair endpoint; dry-run is the default.
- - Rollback: do not execute a stale plan. There is no generic undo after destructive finalization.
- 
-+## Deployment and code generation
-+
-+### [Paced isolate module analysis](deployment_analysis_pacing/README.md)
-+
-+- Purpose: make each isolate module analysis attempt fairly borrow from the configured degradable
-+  query capacity instead of adding deployment fan-out above that elastic root-work ceiling.
-+- Prerequisites: degradable reactive-query admission supplies the shared application-scoped gate.
-+  The control-plane lane is recommended for typed queue treatment but is not required for pacing.
-+- Activation: automatic when `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is configured;
-+  no analysis or query behavior changes while it is unset.
-+- Rollback: restore the previous backend image. Unsetting the cap also disables pacing, but it
-+  simultaneously disables degradable-query backpressure.
-+
- ## Build and runtime packaging
- 
- ### [Backend build improvements](backend_build_improvements/README.md)
-@@ -168,7 +181,9 @@ These files preserve the full earlier analysis without creating additional opera
- 5. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
-    after cold-miss evidence.
- 6. Deliver matching backend and client protocol before enabling degradable frontend behavior.
--7. Change one independent capacity or semantic opt-in at a time unless the documented policy
-+7. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a
-+   controlled multi-module push before changing analysis concurrency or queue deadlines.
-+8. Change one independent capacity or semantic opt-in at a time unless the documented policy
-    explicitly requires a coupled rollout and rollback order.
- 
- Do not use module, function, route, client, deployment, or tenant names in generic backend logic or
 diff --git a/patches/degradable_reactive_queries/README.md b/patches/degradable_reactive_queries/README.md
 index 7a26345046576db73e3377958c7251a7970f19f9..0d5a291ccd16a8832ea5c3c933e22b837e76ddd1 100644
 --- a/patches/degradable_reactive_queries/README.md
@@ -1536,7 +1482,7 @@ index 0000000000000000000000000000000000000000..c9bc3f9fdfab1b81ab96bba6b967c139
 +additive demand unchanged, weaken dependency liveness, introduce idle capacity, or require more
 +scheduler state than the current evidence justifies.
 diff --git a/patches/isolate_queue_control/README.md b/patches/isolate_queue_control/README.md
-index f1075dacf76b590e07ac2165715be47820ec5b2f..3eea54bf0867b39ab10359c2e06ae11f7942703b 100644
+index 6da2fb50709838ec8cf54654e279bd26d1e6e903..d6692aaf50241a5d939cd739ccc6be4910b646bc 100644
 --- a/patches/isolate_queue_control/README.md
 +++ b/patches/isolate_queue_control/README.md
 @@ -373,6 +373,12 @@ Each post-admission analysis or evaluation retry is a new queue entry with a new
@@ -1597,11 +1543,11 @@ index f1075dacf76b590e07ac2165715be47820ec5b2f..3eea54bf0867b39ab10359c2e06ae11f
 +work-conserving and does not add a queue lane, scheduler eligibility rule, or
 +worker reservation.
 +
- The HTTP action context-reuse patch reduces repeated V8 context initialization
- and can therefore change isolate service time, queue sojourn, and memory per
- worker. It does not alter queue classification or capacity. Evaluate context
+ The unified context-reuse patch reduces repeated V8 context initialization for
+ eligible modules and can therefore change isolate service time, queue sojourn,
+ and memory per worker. It does not alter queue classification or capacity. Evaluate context
 diff --git a/patches/isolate_queue_control/deployment_lane_design_reference.md b/patches/isolate_queue_control/deployment_lane_design_reference.md
-index 4abb0fedba2d4adf3bfee3601f51e637cda0c67a..1f9d6e882eeb19e27baafc62b28cdee6a12762c8 100644
+index a8eeefb775d1791e95e7ab44ada46a36ca368945..0113722fb1931a39583ed988a12e4bc4504e7a8a 100644
 --- a/patches/isolate_queue_control/deployment_lane_design_reference.md
 +++ b/patches/isolate_queue_control/deployment_lane_design_reference.md
 @@ -23,8 +23,8 @@ The built-in patch value for the initial hard deadline is 30 seconds. The single
@@ -1664,9 +1610,9 @@ index 4abb0fedba2d4adf3bfee3601f51e637cda0c67a..1f9d6e882eeb19e27baafc62b28cdee6
 +lane patches remain independently adoptable, while the integration explicitly depends on the
 +query gate. None requires application module names.
  
- Database-query context reuse and query-context prewarming can reduce competing
- runtime service cost and leave more shared capacity available. They do not
-@@ -522,9 +530,18 @@ boundaries.
+ Context reuse and query-context prewarming can reduce competing runtime service
+ cost and leave more shared capacity available. Context reuse supports the
+@@ -524,9 +532,18 @@ boundaries.
  
  ## Deferred shared-base worker reservation
  
@@ -1688,7 +1634,7 @@ index 4abb0fedba2d4adf3bfee3601f51e637cda0c67a..1f9d6e882eeb19e27baafc62b28cdee6
  
  Consider one statically reserved shared-base worker only when all of the
  following recur:
-@@ -600,7 +617,10 @@ other's wakeup.
+@@ -602,7 +619,10 @@ other's wakeup.
     reserve use, finite hard expiry, and unchanged ordinary hard deadline.
  8. Observe multiple normal deployment cycles before considering any capacity
     adjustment.
@@ -1701,10 +1647,10 @@ index 4abb0fedba2d4adf3bfee3601f51e637cda0c67a..1f9d6e882eeb19e27baafc62b28cdee6
  
  The immediate rollback is:
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index f570db42992c5d87bf1e8dcaaab32a46e84144f0..63be611c8d1e34f534d9b453effe2c4f39690366 100644
+index 1b86c9c7efe53c3404e77935773af25d5a619710..8afe143cc639cbb8501849866dd737fed1b5ebc3 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
-@@ -102,6 +102,40 @@ retaining an isolate worker may raise occupancy above that base. Nested Node
+@@ -234,6 +234,40 @@ retaining an isolate worker may raise occupancy above that base. Nested Node
  actions receive the same treatment at the Node action limit because their
  parent retains a permit from that limit.
  

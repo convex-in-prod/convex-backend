@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Fri, 24 Jul 2026 17:19:25 +0800
-Subject: [PATCH 19/29] scheduler: admit durable actions before claim
+Subject: [PATCH 16/26] scheduler: admit durable actions before claim
 
 Prepare scheduled and registered-cron actions while their durable jobs remain Pending. Add a two-way execution-start barrier so V8 owns normal queue, active-permit, and selected-worker capacity, and Node completes application-side preparation, before a fresh exact-state transaction commits Pending to InProgress.
 
@@ -17,12 +17,12 @@ Add bounded admission and claim metrics, focused barrier coverage, patch-train i
  crates/function_runner/src/lib.rs             |   2 +
  crates/function_runner/src/server.rs          | 123 +++++
  crates/isolate/src/client.rs                  |   3 +
- crates/isolate/src/isolate_worker.rs          | 140 ++++--
+ crates/isolate/src/isolate_worker.rs          | 166 +++++--
  patches/README.md                             |  34 +-
  patches/dependency_capacity/README.md         |   5 +
  patches/isolate_queue_control/README.md       |  21 +-
  patches/scheduled_action_admission/README.md  | 455 ++++++++++++++++++
- 13 files changed, 1030 insertions(+), 106 deletions(-)
+ 13 files changed, 1043 insertions(+), 119 deletions(-)
  create mode 100644 patches/scheduled_action_admission/README.md
 
 diff --git a/crates/application/src/application_function_runner/metrics.rs b/crates/application/src/application_function_runner/metrics.rs
@@ -839,10 +839,10 @@ index f089b0d6e000f6add17a9b2d62147b8c6f1052cc..478c2ef91a943b8c5723c84bcd569612
 +    }
 +}
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 9869a6b3e1b6e6f678de04b9c852bd62d37ec6aa..06b30775e1eaa5f8cea2b6ccaee0831ed3d716b7 100644
+index c28150ac1039b7d8a50e7e2bfde484d1406fde80..1fd7484fee263f3d266d142b8dd9c803d40d0ad6 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
-@@ -1178,6 +1178,7 @@ pub enum RequestType<RT: Runtime> {
+@@ -1185,6 +1185,7 @@ pub enum RequestType<RT: Runtime> {
          fetch_client: Arc<dyn FetchClient>,
          log_line_sender: mpsc::UnboundedSender<LogLine>,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -850,7 +850,7 @@ index 9869a6b3e1b6e6f678de04b9c852bd62d37ec6aa..06b30775e1eaa5f8cea2b6ccaee0831e
      },
      HttpAction {
          request: HttpActionRequest<RT>,
-@@ -1726,6 +1727,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1733,6 +1734,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          environment_data: EnvironmentData<RT>,
          instance_name: String,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -858,7 +858,7 @@ index 9869a6b3e1b6e6f678de04b9c852bd62d37ec6aa..06b30775e1eaa5f8cea2b6ccaee0831e
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
-@@ -1743,6 +1745,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1753,6 +1755,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              fetch_client,
              log_line_sender,
              function_started_sender,
@@ -867,23 +867,22 @@ index 9869a6b3e1b6e6f678de04b9c852bd62d37ec6aa..06b30775e1eaa5f8cea2b6ccaee0831e
          self.send_request(Request::new_with_scheduler_dependency(
              instance_name,
 diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
-index 09d634eda03145d7535aacbfa78476a46aa6d6cc..b3e1d06ca4f226c8aba21220488c552603fa97c8 100644
+index a8d381fabf15651331036eb9865b746f94717afb..904e571c042f77be1c9160f67493699bc980d8b0 100644
 --- a/crates/isolate/src/isolate_worker.rs
 +++ b/crates/isolate/src/isolate_worker.rs
-@@ -1,3 +1,4 @@
+@@ -1,9 +1,11 @@
 +use anyhow::Context;
  use async_trait::async_trait;
  use common::{
      runtime::Runtime,
-@@ -5,6 +6,7 @@ use common::{
+     types::UdfType,
  };
- use futures::FutureExt;
  use sync_types::CanonicalizedUdfPath;
 +use tokio::sync::oneshot;
  use udf::{
      metrics::is_developer_ok,
      HttpActionResult,
-@@ -56,6 +58,20 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
+@@ -55,6 +57,20 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
      }
  }
  
@@ -904,7 +903,7 @@ index 09d634eda03145d7535aacbfa78476a46aa6d6cc..b3e1d06ca4f226c8aba21220488c5526
  #[async_trait(?Send)]
  impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
      async fn handle_request_inner(
-@@ -133,53 +149,63 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -133,66 +149,76 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                  fetch_client,
                  log_line_sender,
                  function_started_sender,
@@ -939,7 +938,7 @@ index 09d634eda03145d7535aacbfa78476a46aa6d6cc..b3e1d06ca4f226c8aba21220488c5526
 -                        permit,
 -                        &mut isolate_clean,
 -                        request.params.clone(),
--                        response.closed().boxed(),
+-                        cancellation,
 -                        function_started_sender,
 -                    )
 -                    .await;
@@ -974,13 +973,13 @@ index 09d634eda03145d7535aacbfa78476a46aa6d6cc..b3e1d06ca4f226c8aba21220488c5526
 +                            permit,
 +                            &mut isolate_clean,
 +                            request.params.clone(),
-+                            response.closed().boxed(),
++                            cancellation,
 +                            function_started_sender,
 +                        )
 +                        .await;
  
 -                let status = match &r {
--                    Ok(outcome) => {
+-                    Ok((outcome, _)) => {
 -                        if outcome.result.is_ok() {
 -                            RequestStatus::Success
 -                        } else {
@@ -990,9 +989,22 @@ index 09d634eda03145d7535aacbfa78476a46aa6d6cc..b3e1d06ca4f226c8aba21220488c5526
 -                    Err(_) => RequestStatus::SystemError,
 -                };
 -                finish_service_request_timer(timer, status);
--                let _ = response.send(r);
+-                match r {
+-                    Ok((outcome, reusable_context)) => {
+-                        if response.send(Ok(outcome)).is_ok()
+-                            && let Some(reusable_context) = reusable_context
+-                        {
+-                            // Publish only after the result is delivered. A
+-                            // dropped caller must not leave a warmed context
+-                            // behind from an unobserved action.
+-                            reusable_context.publish(context_cache);
+-                        }
+-                    },
+-                    Err(error) => {
+-                        let _ = response.send(Err(error));
+-                    },
 +                    let status = match &r {
-+                        Ok(outcome) => {
++                        Ok((outcome, _)) => {
 +                            if outcome.result.is_ok() {
 +                                RequestStatus::Success
 +                            } else {
@@ -1002,12 +1014,25 @@ index 09d634eda03145d7535aacbfa78476a46aa6d6cc..b3e1d06ca4f226c8aba21220488c5526
 +                        Err(_) => RequestStatus::SystemError,
 +                    };
 +                    finish_service_request_timer(timer, status);
-+                    let _ = response.send(r);
-+                }
++                    match r {
++                        Ok((outcome, reusable_context)) => {
++                            if response.send(Ok(outcome)).is_ok()
++                                && let Some(reusable_context) = reusable_context
++                            {
++                                // Publish only after the result is delivered. A
++                                // dropped caller must not leave a warmed context
++                                // behind from an unobserved action.
++                                reusable_context.publish(context_cache);
++                            }
++                        },
++                        Err(error) => {
++                            let _ = response.send(Err(error));
++                        },
++                    }
+                 }
                  log_string
              },
-             RequestType::Analyze {
-@@ -361,3 +387,39 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -389,3 +415,39 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
          &self.rt
      }
  }
@@ -1048,7 +1073,7 @@ index 09d634eda03145d7535aacbfa78476a46aa6d6cc..b3e1d06ca4f226c8aba21220488c5526
 +    }
 +}
 diff --git a/patches/README.md b/patches/README.md
-index d9afcb4c5cd6ddffc317a55eb4c89c9eadbb93f3..2e95d948cf1041bedb2b68445ec9633ce735b035 100644
+index d1f1b6194ba5998b27e5573f1f18d6fdf4c529d8..25da7a2d360cf4d7385ae52bafd083292fb954b7 100644
 --- a/patches/README.md
 +++ b/patches/README.md
 @@ -5,10 +5,11 @@ They are operator adoption units, not one all-or-nothing fork. Read the owning e
@@ -1085,7 +1110,7 @@ index d9afcb4c5cd6ddffc317a55eb4c89c9eadbb93f3..2e95d948cf1041bedb2b68445ec9633c
  ### [Runtime health dashboard semantics](runtime_health_dashboard/README.md)
  
  - Purpose: report observed queueing without unsupported saturation claims and display
-@@ -252,15 +264,17 @@ These files preserve the full earlier analysis without creating additional opera
+@@ -221,15 +233,17 @@ These files preserve the full earlier analysis without creating additional opera
  
  1. Apply standalone import, build, and Node-package reliability fixes as needed.
  2. Deploy dependency capacity before lane-aware queueing or the deployment lane.
@@ -1094,10 +1119,10 @@ index d9afcb4c5cd6ddffc317a55eb4c89c9eadbb93f3..2e95d948cf1041bedb2b68445ec9633c
 +   legacy CoDel and lane-aware queue paths.
 +4. Add shared-base HTTP admission when Node callbacks need outer-service headroom; size it from its
     own wait and occupancy signals.
--4. Establish observability before enabling application context-reuse markers or HTTP reuse.
--5. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
-+5. Establish observability before enabling application context-reuse markers or HTTP reuse.
-+6. Enable reviewed database-UDF context reuse in application-owned stages; consider prewarming only
+-4. Deploy the unified context-reuse patch before enabling reviewed module policy properties.
+-5. Enable reviewed context-reuse properties in application-owned stages; consider prewarming only
++5. Deploy the unified context-reuse patch before enabling reviewed module policy properties.
++6. Enable reviewed context-reuse properties in application-owned stages; consider prewarming only
     after cold-miss evidence.
 -6. Deliver matching backend and client protocol before enabling degradable frontend behavior.
 -7. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a
@@ -1110,7 +1135,7 @@ index d9afcb4c5cd6ddffc317a55eb4c89c9eadbb93f3..2e95d948cf1041bedb2b68445ec9633c
  
  Do not use module, function, route, client, deployment, or tenant names in generic backend logic or
 diff --git a/patches/dependency_capacity/README.md b/patches/dependency_capacity/README.md
-index fd647ffaa0d2bce4b769e6a754174973261584d3..a2d1ddd23b644393ca9b6b51e2163791800a1451 100644
+index ddefbe44d6948e6ae600afa4b869282440adf460..7a1702b2f1c882cf9f30f42146a25809e7da8c20 100644
 --- a/patches/dependency_capacity/README.md
 +++ b/patches/dependency_capacity/README.md
 @@ -245,6 +245,11 @@ can wait at later application and isolate stages while retaining its HTTP permit
@@ -1122,11 +1147,11 @@ index fd647ffaa0d2bce4b769e6a754174973261584d3..a2d1ddd23b644393ca9b6b51e2163791
 +scheduled action before its durable at-most-once claim. Scheduled roots remain independent and
 +never consume dependency overflow.
 +
- HTTP and database context reuse can reduce service time, but neither changes dependency ownership.
- Degradable query admission can reduce independent demand, but a client declaration cannot grant
- dependency status.
+ Context reuse for HTTP actions, database UDFs, and ordinary actions can reduce service time, but
+ none of those features changes dependency ownership. Degradable query admission can reduce
+ independent demand, but a client declaration cannot grant dependency status.
 diff --git a/patches/isolate_queue_control/README.md b/patches/isolate_queue_control/README.md
-index 3eea54bf0867b39ab10359c2e06ae11f7942703b..5f7358ac50cdc9a213aefd770a7737c452eac666 100644
+index d6692aaf50241a5d939cd739ccc6be4910b646bc..de256682fa5a85b8911129aaaae3d0c82b3fcb69 100644
 --- a/patches/isolate_queue_control/README.md
 +++ b/patches/isolate_queue_control/README.md
 @@ -441,10 +441,14 @@ strict configuration, and bounded metrics. Production verification uses an ordin

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Sun, 23 Aug 2026 23:56:18 +0800
-Subject: [PATCH 28/29] node-executor: add per-pool admission policy
+Subject: [PATCH 25/26] node-executor: add per-pool admission policy
 
 Add a strict optional LOCAL_NODE_EXECUTOR_POOL_POLICIES map for independent-action concurrency, queue-warning thresholds, and elapsed event-loop unresponsiveness budgets on the default and named local Node pools.
 
@@ -13,7 +13,7 @@ Document the liveness properties, accepted scheduler head-of-line limitation, ro
 ---
  .../application_function_runner/metrics.rs    |  73 ++++
  .../src/application_function_runner/mod.rs    | 370 +++++++++++++++++-
- crates/common/src/knobs.rs                    | 199 ++++++++++
+ crates/common/src/knobs.rs                    |  60 +++
  crates/node_executor/src/local.rs             | 324 +++++++++++++--
  crates/node_executor/src/metrics.rs           |  19 +
  patches/README.md                             |  13 +
@@ -21,7 +21,7 @@ Document the liveness properties, accepted scheduler head-of-line limitation, ro
  .../design_reference.md                       | 268 +++++++++++++
  .../local_node_executor_resilience/README.md  |  22 +-
  .../README.md                                 |  13 +-
- 10 files changed, 1397 insertions(+), 55 deletions(-)
+ 10 files changed, 1258 insertions(+), 55 deletions(-)
  create mode 100644 patches/local_node_executor_pool_admission/README.md
  create mode 100644 patches/local_node_executor_pool_admission/design_reference.md
 
@@ -589,7 +589,7 @@ index 0ff35f0ddd21f337482b361295c33211f3f606f6..bf48e24e47f029ac3a211d3a85ff37bd
 +    }
  }
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 7bde305bc952b222b92aae07d3f957dcf7148458..dc4cf24886ffc395de5965f011d789678cd90692 100644
+index 877edbf17a11f6fbf2ea2d54c00263ad47a905f4..0d644f9bc1b8b50358ffbfe87be4d0d680562cf5 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -17,6 +17,7 @@ use std::{
@@ -623,153 +623,7 @@ index 7bde305bc952b222b92aae07d3f957dcf7148458..dc4cf24886ffc395de5965f011d78967
  fn parse_usize_strict(name: &str, value: &str) -> anyhow::Result<usize> {
      anyhow::ensure!(
          !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
-@@ -88,6 +101,145 @@ fn env_config_optional_usize_strict(name: &str) -> Option<usize> {
-     value
- }
- 
-+/// Optional admission and watchdog policy for one local Node executor pool.
-+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-+#[serde(rename_all = "camelCase", deny_unknown_fields)]
-+pub struct LocalNodeExecutorPoolPolicy {
-+    /// Maximum independent Node actions admitted concurrently to this pool.
-+    pub max_concurrency: Option<usize>,
-+    /// Maximum failed-health interval tolerated before retiring this pool's
-+    /// event loop.
-+    pub max_event_loop_unresponsive_seconds: Option<u64>,
-+    /// Queue duration after which admission records an operator warning metric.
-+    pub queue_warning_seconds: Option<u64>,
-+}
-+
-+struct UniqueLocalNodeExecutorPoolPolicies(BTreeMap<String, LocalNodeExecutorPoolPolicy>);
-+
-+impl<'de> Deserialize<'de> for UniqueLocalNodeExecutorPoolPolicies {
-+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-+    where
-+        D: Deserializer<'de>,
-+    {
-+        struct PoliciesVisitor;
-+
-+        impl<'de> Visitor<'de> for PoliciesVisitor {
-+            type Value = UniqueLocalNodeExecutorPoolPolicies;
-+
-+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-+                formatter.write_str("a JSON object keyed by Node pool name")
-+            }
-+
-+            fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
-+            where
-+                A: MapAccess<'de>,
-+            {
-+                let mut policies = BTreeMap::new();
-+                while let Some((pool_name, policy)) =
-+                    entries.next_entry::<String, LocalNodeExecutorPoolPolicy>()?
-+                {
-+                    if policies.insert(pool_name.clone(), policy).is_some() {
-+                        return Err(A::Error::custom(format_args!(
-+                            "duplicate Node pool name {pool_name:?}"
-+                        )));
-+                    }
-+                }
-+                Ok(UniqueLocalNodeExecutorPoolPolicies(policies))
-+            }
-+        }
-+
-+        deserializer.deserialize_map(PoliciesVisitor)
-+    }
-+}
-+
-+fn valid_local_node_pool_policy_name(name: &str) -> bool {
-+    // This is the host-policy form of model::config::NodeExecutorPoolName:
-+    // named routes use the same grammar, while the reserved `default` key is
-+    // accepted only here to address the ordinary executor pool.
-+    if name == "default" {
-+        return true;
-+    }
-+    let bytes = name.as_bytes();
-+    !bytes.is_empty()
-+        && bytes.len() <= 32
-+        && bytes[0].is_ascii_lowercase()
-+        && bytes
-+            .iter()
-+            .skip(1)
-+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
-+}
-+
-+fn parse_local_node_executor_pool_policies(
-+    value: &str,
-+) -> anyhow::Result<BTreeMap<String, LocalNodeExecutorPoolPolicy>> {
-+    let UniqueLocalNodeExecutorPoolPolicies(policies) =
-+        serde_json::from_str(value).context("expected a JSON object keyed by Node pool name")?;
-+    anyhow::ensure!(
-+        policies.len() <= MAX_LOCAL_NODE_EXECUTOR_POOL_POLICIES,
-+        "at most {MAX_LOCAL_NODE_EXECUTOR_POOL_POLICIES} local Node pool policies may be \
-+         configured"
-+    );
-+    for (pool_name, policy) in &policies {
-+        anyhow::ensure!(
-+            valid_local_node_pool_policy_name(pool_name),
-+            "invalid Node pool name {pool_name:?}"
-+        );
-+        anyhow::ensure!(
-+            policy.max_concurrency.is_some()
-+                || policy.max_event_loop_unresponsive_seconds.is_some()
-+                || policy.queue_warning_seconds.is_some(),
-+            "Node pool {pool_name:?} has an empty policy"
-+        );
-+        if let Some(max_concurrency) = policy.max_concurrency {
-+            validate_usize_strict_nonzero("maxConcurrency", max_concurrency)?;
-+        }
-+        anyhow::ensure!(
-+            policy.queue_warning_seconds.is_none() || policy.max_concurrency.is_some(),
-+            "Node pool {pool_name:?} queueWarningSeconds requires maxConcurrency"
-+        );
-+        anyhow::ensure!(
-+            policy
-+                .max_event_loop_unresponsive_seconds
-+                .is_none_or(|seconds| seconds > 0),
-+            "Node pool {pool_name:?} maxEventLoopUnresponsiveSeconds must be greater than zero"
-+        );
-+        anyhow::ensure!(
-+            policy
-+                .queue_warning_seconds
-+                .is_none_or(|seconds| seconds > 0),
-+            "Node pool {pool_name:?} queueWarningSeconds must be greater than zero"
-+        );
-+    }
-+    Ok(policies)
-+}
-+
-+/// Per-pool local Node admission and event-loop watchdog overrides.
-+///
-+/// The value is a strict JSON object keyed by the application-declared pool
-+/// name. The reserved `default` key configures the ordinary Node pool. Missing
-+/// pools retain the existing application-wide concurrency and watchdog policy.
-+pub static LOCAL_NODE_EXECUTOR_POOL_POLICIES: LazyLock<
-+    BTreeMap<String, LocalNodeExecutorPoolPolicy>,
-+> = LazyLock::new(
-+    || match std::env::var("LOCAL_NODE_EXECUTOR_POOL_POLICIES") {
-+        Ok(value) => {
-+            let policies =
-+                parse_local_node_executor_pool_policies(&value).unwrap_or_else(|error| {
-+                    panic!("Invalid LOCAL_NODE_EXECUTOR_POOL_POLICIES: {error:#}")
-+                });
-+            tracing::info!(
-+                configured_pool_policies = policies.len(),
-+                "Configured local Node executor pool policies"
-+            );
-+            policies
-+        },
-+        Err(std::env::VarError::NotPresent) => BTreeMap::new(),
-+        Err(std::env::VarError::NotUnicode(..)) => {
-+            panic!("Invalid non-Unicode value for LOCAL_NODE_EXECUTOR_POOL_POLICIES")
-+        },
-+    },
-+);
-+
- fn env_config_duration_millis_strict(name: &str, default: usize) -> Duration {
-     let millis = env_config_usize_strict(name, default)
-         .try_into()
-@@ -2599,4 +2751,51 @@ mod strict_capacity_tests {
+@@ -2731,4 +2744,51 @@ mod strict_capacity_tests {
          assert!(validate_active_javascript_class_minimums(28, 4, 14, None).is_err());
          assert!(validate_active_javascript_class_minimums(28, 4, 14, Some(8)).is_err());
      }
@@ -1310,7 +1164,7 @@ index e2b9769f7cf218f0e7caf960c95a261b0113a1d5..70b4580150424e0c9822433dc00195df
      }
  }
 diff --git a/patches/README.md b/patches/README.md
-index c5b491542b116a614b18aa6f2889f10c799d1df3..30be5eeaf5e7794df6881135436d66733ca15df6 100644
+index 5b7ab35c6e7e99049821686a9b9d627fedf2f2d7..2470106bea011f8f7f5d38e77a0b106013f176a8 100644
 --- a/patches/README.md
 +++ b/patches/README.md
 @@ -199,6 +199,19 @@ adoption contract documented in the backend essay.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Tue, 25 Aug 2026 16:02:20 +0800
-Subject: [PATCH 29/29] isolate: balance class-aware active-JavaScript
+Subject: [PATCH 26/26] isolate: balance class-aware active-JavaScript
  admission
 
 Propagate the backend-owned service class from an admitted degradable query leader into its isolate request and suspended permit. Keep dependency work first, preserve resumptions ahead of new starts within each class, and make protected and degradable floors non-preemptive while allowing unused capacity to be borrowed.
@@ -16,18 +16,18 @@ Keep the phase-only behavior when class-aware floors are disabled, reject invali
  crates/isolate/src/client.rs                  | 406 +++++++++++----
  crates/isolate/src/concurrency_limiter.rs     | 312 +++++++++---
  crates/isolate/src/metrics.rs                 |  18 +-
- patches/README.md                             |  14 +-
- patches/degradable_reactive_queries/README.md |  26 +-
+ patches/README.md                             |  22 +-
+ patches/degradable_reactive_queries/README.md |  31 +-
  .../active_javascript_admission.md            |   5 +-
  patches/dependency_capacity/README.md         |  32 +-
  .../dependency_capacity/design_reference.md   |  68 +--
  patches/deployment_analysis_pacing/README.md  |   8 +-
  patches/isolate_queue_control/README.md       |  37 +-
  .../deployment_lane_design_reference.md       |  37 +-
- .../isolate_delay_queue_design_reference.md   | 481 ++++++++++++++++++
+ .../isolate_delay_queue_design_reference.md   | 480 ++++++++++++++++++
  patches/scheduled_action_admission/README.md  |   2 +-
  self-hosted/advanced/knobs.md                 |  22 +-
- 19 files changed, 1302 insertions(+), 336 deletions(-)
+ 19 files changed, 1308 insertions(+), 342 deletions(-)
  create mode 100644 patches/isolate_queue_control/isolate_delay_queue_design_reference.md
 
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
@@ -160,10 +160,10 @@ index d29b90c9676914f24d57a6e9c57bc9a31370db59..ca62fc79482fea543628715e9ed7b7b6
                              .await?;
                          let FunctionOutcome::Query(mut query_outcome) = outcome else {
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index dc4cf24886ffc395de5965f011d789678cd90692..d9b8ad738e295b53cdbb488c8a7104cd29fcfcde 100644
+index 0d644f9bc1b8b50358ffbfe87be4d0d680562cf5..f988d6208ac6f1bb002cf005b683c29a1ec36d27 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -1654,7 +1654,7 @@ pub fn validate_active_javascript_class_minimums(
+@@ -1647,7 +1647,7 @@ pub fn validate_active_javascript_class_minimums(
      );
      if protected_active_minimum > 0 {
          anyhow::ensure!(
@@ -172,7 +172,7 @@ index dc4cf24886ffc395de5965f011d789678cd90692..d9b8ad738e295b53cdbb488c8a7104cd
              "active-JavaScript class minimums require finite FUNRUN_ISOLATE_ACTIVE_THREADS"
          );
          let combined_minimum = protected_active_minimum
-@@ -2014,20 +2014,21 @@ pub static TICKETMASTER_CLUSTER_NAME: LazyLock<String> =
+@@ -2007,20 +2007,21 @@ pub static TICKETMASTER_CLUSTER_NAME: LazyLock<String> =
  pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("PROBER_PROBE_TIMEOUT", 30)));
  
@@ -202,7 +202,7 @@ index dc4cf24886ffc395de5965f011d789678cd90692..d9b8ad738e295b53cdbb488c8a7104cd
  pub static FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN: LazyLock<usize> =
      LazyLock::new(|| env_config_usize_strict("FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN", 0));
  
-@@ -2747,11 +2748,23 @@ mod strict_capacity_tests {
+@@ -2740,11 +2741,23 @@ mod strict_capacity_tests {
          assert!(validate_active_javascript_class_minimums(28, 0, 0, None).is_ok());
          assert!(validate_active_javascript_class_minimums(28, 0, 14, Some(32)).is_err());
          assert!(validate_active_javascript_class_minimums(0, 4, 14, Some(32)).is_err());
@@ -361,18 +361,18 @@ index 2e91e886786353689a9b2df0400b3e516c69cd52..c65348c7cab1a4ace51a847306d8b86c
                      log_line_sender.context("Missing log line sender for action")?;
                  let function_execution_start =
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a029664513666630 100644
+index 93ad8f182d2ddb7ebe7c01f48cafef43491cd302..93099904949d08982b1ad968eb96f0ea5ba67a34 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
-@@ -313,7 +313,6 @@ impl AnalyzeResponseSender {
+@@ -312,7 +312,6 @@ impl AnalyzeResponseSender {
  
  pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
  pub const PAUSE_REQUEST: &str = "pause_request";
 -pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
  
- /// Caller-drop signal for one database-UDF execution tree.
+ /// Caller-drop signal for one isolate execution tree.
  ///
-@@ -753,9 +752,9 @@ fn pending_active_javascript_class_index(
+@@ -752,9 +751,9 @@ fn pending_active_javascript_class_index(
      class: ActiveJavascriptClass,
      class_aware_admission_enabled: bool,
  ) -> usize {
@@ -385,7 +385,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
      let class = if class_aware_admission_enabled {
          class
      } else {
-@@ -923,20 +922,6 @@ impl SchedulerStateSnapshot {
+@@ -922,20 +921,6 @@ impl SchedulerStateSnapshot {
      }
  }
  
@@ -406,7 +406,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
  #[derive(Clone)]
  pub struct IsolateConfig {
      // Name of isolate pool, used in metrics.
-@@ -1235,6 +1220,7 @@ pub enum RequestType<RT: Runtime> {
+@@ -1242,6 +1227,7 @@ pub enum RequestType<RT: Runtime> {
          is_control_plane: bool,
          reuses_database_context: bool,
          fail_worker: bool,
@@ -414,7 +414,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
          started: mpsc::UnboundedSender<usize>,
          completion: oneshot::Receiver<()>,
          response: oneshot::Sender<anyhow::Result<()>>,
-@@ -2268,8 +2254,10 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -2285,8 +2271,10 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      /// if at least one request is active for that client.
      in_progress_counts_by_client: HashMap<String, ActiveRequestCounts>,
      in_progress_counts: ActiveRequestCounts,
@@ -427,7 +427,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
      pending_permit_counts_by_client: HashMap<String, ActiveRequestCounts>,
      pending_permit_counts: ActiveRequestCounts,
      /// Externally visible active-worker accounting. The worker request owns the
-@@ -2420,6 +2408,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2437,6 +2425,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
  
      fn reserve_pending_permit(&mut self, request: &Request<RT>) {
          let properties = request.scheduling_properties(self.control_plane_lane_enabled);
@@ -439,7 +439,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
          self.pending_permit_counts.increment(properties);
          self.pending_permit_counts_by_client
              .entry(request.client_id.clone())
-@@ -2605,22 +2598,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2622,22 +2615,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          },
                      }
                  },
@@ -466,7 +466,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
                  pending = pending_external_permits.next(), if has_pending_external => {
                      let Some(PendingExternalPermit {
                          request,
-@@ -2665,6 +2646,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2682,6 +2663,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          },
                      }
                  },
@@ -489,7 +489,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
                  output = external_request_stream.next(), if external_request_stream_open => {
                      let Some(IsolateQueueOutput {
                          item: request,
-@@ -2778,24 +2775,23 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2795,24 +2792,23 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              log_scheduler_caller_dropped(self.worker.config().name, scheduling_properties);
              return SchedulerDispatchOutcome::Continue;
          }
@@ -527,7 +527,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
          let (done_sender, done_receiver) = oneshot::channel();
          let client_id = request.client_id.clone();
          let st = ActiveWorkerState {
-@@ -2859,29 +2855,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2876,29 +2872,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      }
  
      /// Find a worker for the request's client.
@@ -563,7 +563,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
          let reusable_context_kind = request.reusable_context_kind();
          // Try to find an existing worker for this client.
          if let Some((client_id, mut workers)) = self.available_workers.remove_entry(client_id) {
-@@ -2908,10 +2892,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2925,10 +2909,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              if !workers.is_empty() {
                  self.available_workers.insert(client_id, workers);
              }
@@ -576,7 +576,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
          }
          // If we've recently started up and haven't yet created `max_workers` threads,
          // create a new worker instead of "stealing" some other client's worker.
-@@ -2933,11 +2917,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2950,11 +2934,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  self.worker.config().name,
                  self.worker_senders.len() - 1
              );
@@ -590,7 +590,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
          }
          // No existing worker for this client and we've already started the max number
          // of workers -- just grab the least recently used worker. This worker is least
-@@ -2952,10 +2936,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2969,10 +2953,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      .last_used_ts
              })
          else {
@@ -602,7 +602,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
          };
          let worker = workers
              .pop_back()
-@@ -2969,10 +2950,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2986,10 +2967,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              let key = key.clone();
              self.available_workers.remove(&key);
          }
@@ -615,15 +615,15 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
      }
  
      fn aggregate_heap_stats(&self) -> IsolateHeapStats {
-@@ -3272,7 +3253,6 @@ mod tests {
+@@ -3289,7 +3270,6 @@ mod tests {
          per_client_worker_capacity,
          validate_control_plane_lane_config,
          wait_for_external_permit,
 -        worker_rejection_reason,
          ActiveRequestCounts,
          AnalyzeResponseSender,
-         CancelUdfOnDrop,
-@@ -3419,6 +3399,7 @@ mod tests {
+         CancelExecutionOnDrop,
+@@ -3436,6 +3416,7 @@ mod tests {
                          is_control_plane: _,
                          reuses_database_context: _,
                          fail_worker,
@@ -631,7 +631,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
                          started,
                          completion,
                          response,
-@@ -3553,6 +3534,19 @@ mod tests {
+@@ -3570,6 +3551,19 @@ mod tests {
          response: oneshot::Receiver<anyhow::Result<()>>,
      }
  
@@ -651,7 +651,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
      struct InFlightTestRequest {
          completion: oneshot::Sender<()>,
          response: oneshot::Receiver<anyhow::Result<()>>,
-@@ -3604,6 +3598,7 @@ mod tests {
+@@ -3621,6 +3615,7 @@ mod tests {
              is_control_plane: matches!(kind, TestRequestKind::ControlPlane),
              reuses_database_context: false,
              fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
@@ -659,7 +659,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
              started,
              completion: completion_receiver,
              response: response_sender,
-@@ -4385,25 +4380,6 @@ mod tests {
+@@ -4402,25 +4397,6 @@ mod tests {
          assert!(!state.can_start_request(properties(true, false, false), "deployment"));
      }
  
@@ -685,7 +685,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
      #[test]
      fn per_client_capacity_handles_large_worker_totals_without_overflow() {
          assert_eq!(
-@@ -4504,10 +4480,7 @@ mod tests {
+@@ -4521,10 +4497,7 @@ mod tests {
          };
          *reuses_database_context = true;
  
@@ -697,7 +697,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
          assert_eq!(selection.worker_id, 0);
          assert_eq!(
              selection.context_affinity,
-@@ -4907,13 +4880,177 @@ mod tests {
+@@ -4924,13 +4897,177 @@ mod tests {
          });
      }
  
@@ -876,7 +876,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
          let PendingTestRequest {
              request: global_pending,
              ..
-@@ -4922,6 +5059,14 @@ mod tests {
+@@ -4939,6 +5076,14 @@ mod tests {
              TestRequestKind::Degradable,
              global_harness.started_sender.clone(),
          );
@@ -891,7 +891,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
          let global_scheduler = &mut global_harness
              .pending_scheduler
              .as_mut()
-@@ -4930,22 +5075,56 @@ mod tests {
+@@ -4947,22 +5092,56 @@ mod tests {
          global_scheduler.reserve_pending_permit(&global_pending);
          let global_state = global_scheduler.state_snapshot();
          let candidate = properties(false, false, false);
@@ -950,7 +950,7 @@ index 8f230e6f806828c0a5a80971f1cb3bc67a1f91d9..6065b1b570129c7f6b162389a0296645
          let client_scheduler = &mut client_harness
              .pending_scheduler
              .as_mut()
-@@ -4956,8 +5135,25 @@ mod tests {
+@@ -4973,8 +5152,25 @@ mod tests {
          let client_eligibility =
              client_state.request_eligibility(candidate, &client_pending.client_id);
          assert!(!client_eligibility.physical_total);
@@ -1465,7 +1465,7 @@ index 1743bd613dcf338859353c02f674017cad372252..b903016ba5e8822c52d7ec0e966be9d2
      async fn cancelling_waiting_requests_preserves_capacity() {
          let limiter = ConcurrencyLimiter::new_with_class_minimums(2, 1, 1);
 diff --git a/crates/isolate/src/metrics.rs b/crates/isolate/src/metrics.rs
-index c45cc2d300cf89256fe6fb146146d5d2d27c5c14..9b2bc577b66a693c7b8396581bedd2ae59293452 100644
+index 76e789ad192e9d82bbfc707195607f20f8d51174..dd6ea7abc25bf640e4adac9084bd0ac9a3fbd54d 100644
 --- a/crates/isolate/src/metrics.rs
 +++ b/crates/isolate/src/metrics.rs
 @@ -45,7 +45,6 @@ use metrics::{
@@ -1476,7 +1476,7 @@ index c45cc2d300cf89256fe6fb146146d5d2d27c5c14..9b2bc577b66a693c7b8396581bedd2ae
      context_cache::{
          ContextCacheClearReason,
          ReusableContextKind,
-@@ -601,8 +600,6 @@ register_convex_counter!(
+@@ -602,8 +601,6 @@ register_convex_counter!(
  #[strum(serialize_all = "snake_case")]
  pub(crate) enum RejectedBeforeExecutionReason {
      ExpiredInQueue,
@@ -1485,7 +1485,7 @@ index c45cc2d300cf89256fe6fb146146d5d2d27c5c14..9b2bc577b66a693c7b8396581bedd2ae
      IsolateNotClean,
      InitialPermitTimeout,
      ExecuteQueueFull,
-@@ -616,9 +613,6 @@ impl RejectedBeforeExecutionReason {
+@@ -617,9 +614,6 @@ impl RejectedBeforeExecutionReason {
                  "Too many concurrent requests in a short period of time. Spread out your requests \
                   out over time or throttle them to avoid errors.",
              ),
@@ -1495,7 +1495,7 @@ index c45cc2d300cf89256fe6fb146146d5d2d27c5c14..9b2bc577b66a693c7b8396581bedd2ae
              Self::IsolateNotClean => ErrorMetadata::rejected_before_execution(
                  "IsolateNotClean",
                  "Selected isolate was not clean",
-@@ -656,13 +650,12 @@ pub fn initialize_capacity_counters(name: &'static str) {
+@@ -657,13 +651,12 @@ pub fn initialize_capacity_counters(name: &'static str) {
          "dependency_descendant_holder",
          "control_plane",
      ];
@@ -1510,7 +1510,7 @@ index c45cc2d300cf89256fe6fb146146d5d2d27c5c14..9b2bc577b66a693c7b8396581bedd2ae
      ];
      const QUEUE_LANES: [&str; 4] = [
          "dependency",
-@@ -1243,8 +1236,7 @@ pub fn create_code_cache_timer() -> StatusTimer {
+@@ -1244,8 +1237,7 @@ pub fn create_code_cache_timer() -> StatusTimer {
  
  register_convex_histogram!(
      CONCURRENCY_PERMIT_ACQUIRE_SECONDS,
@@ -1520,7 +1520,7 @@ index c45cc2d300cf89256fe6fb146146d5d2d27c5c14..9b2bc577b66a693c7b8396581bedd2ae
      &[STATUS_LABEL[0], "active_javascript_class", "phase"]
  );
  
-@@ -1275,17 +1267,17 @@ pub(crate) fn concurrency_permit_acquire_timer(
+@@ -1276,17 +1268,17 @@ pub(crate) fn concurrency_permit_acquire_timer(
  
  register_convex_gauge!(
      ACTIVE_JAVASCRIPT_CAPACITY_INFO,
@@ -1542,10 +1542,25 @@ index c45cc2d300cf89256fe6fb146146d5d2d27c5c14..9b2bc577b66a693c7b8396581bedd2ae
  );
  
 diff --git a/patches/README.md b/patches/README.md
-index 30be5eeaf5e7794df6881135436d66733ca15df6..39ee507cfcb584c7dc6c57557ac2b9e8d6b2c6e2 100644
+index 2470106bea011f8f7f5d38e77a0b106013f176a8..6141236aaa9d8647ad69f8396adaa6e27eea00dc 100644
 --- a/patches/README.md
 +++ b/patches/README.md
-@@ -320,7 +320,8 @@ adoption contract documented in the backend essay.
+@@ -6,9 +6,11 @@ a patch, preserve its prerequisites, and verify the effective configuration and
+ backend replacement.
+ 
+ The maintained backend source chain normally keeps each product patch in its own operator-adoption
+-commit; repository-maintenance commits can remain separate. When lifecycle ownership spans patches,
+-an explicitly ordered corrective integration commit may complete several earlier adoption commits;
+-the owning essays identify those compositions. Lane-aware queueing and its optional deployment
++commit; repository-maintenance commits can remain separate. Patch-history is also used to preserve
++fine-grained bisectability when one adopter-facing feature is developed from several historical
++seams. When lifecycle ownership spans patches, an explicitly ordered corrective integration commit
++may complete several earlier adoption commits; the owning essays identify those compositions.
++Lane-aware queueing and its optional deployment
+ extension are one queue-control patch. The matching degradable-query client half is maintained in
+ `convex-js`; it shares the protocol and adoption essay but is not another commit in this backend
+ chain. Non-committing codegen analysis likewise has a matching CLI commit, with the combined
+@@ -291,7 +293,8 @@ adoption contract documented in the backend essay.
    subscriptions stay mounted.
  - Activation: backend admission is inert while
    `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is unset. Clients must explicitly send the
@@ -1555,7 +1570,7 @@ index 30be5eeaf5e7794df6881135436d66733ca15df6..39ee507cfcb584c7dc6c57557ac2b9e8
    Optional protected and degradable active-JavaScript minimums provide work-conserving execution
    progress when the leader cap exceeds active-JavaScript capacity.
  - Rollback: remove the application opt-in first, then unset the backend cap. The protocol fields can
-@@ -330,11 +331,18 @@ The short HTTP-action note in this essay is future work, not part of the current
+@@ -299,11 +302,18 @@ adoption contract documented in the backend essay.
  
  ## Detailed design references
  
@@ -1577,7 +1592,7 @@ index 30be5eeaf5e7794df6881135436d66733ca15df6..39ee507cfcb584c7dc6c57557ac2b9e8
    the complete classifier, FIFO and reserve proof, deferred worker-reservation design, rejected
    alternatives, and test matrix.
 diff --git a/patches/degradable_reactive_queries/README.md b/patches/degradable_reactive_queries/README.md
-index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..896bd0f36f657543e57dbafe944a254cb1cf47d9 100644
+index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..1a470de2632fa64d227319ecf4dfbc87787d10db 100644
 --- a/patches/degradable_reactive_queries/README.md
 +++ b/patches/degradable_reactive_queries/README.md
 @@ -164,11 +164,12 @@ service protections are deliberately local:
@@ -1627,6 +1642,18 @@ index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..896bd0f36f657543e57dbafe944a254c
  
  If a custom runner does not expose equivalent capacity, it cannot claim the
  same normal-capacity reservation from this cap alone.
+@@ -775,9 +779,8 @@ the cap reserves capacity and the existing query policy remains unchanged. The o
+ admission models without changing Connect parsing, leader admission, cache bypass, client pressure
+ semantics, or isolate queue selection.
+ 
+-[`cancellation_safe_database_context_reuse/README.md`](../cancellation_safe_database_context_reuse/README.md)
+-and [`context_reuse_observability/README.md`](../context_reuse_observability/README.md) are
+-independent service-cost patches. Reuse can change query service time and the
++[`context_reuse/README.md`](../context_reuse/README.md) is an
++independent service-cost patch. Reuse can change query service time and the
+ leader-cap value that is appropriate, but it does not change workload class or
+ pressure semantics. Measure and roll back the features independently.
+ 
 diff --git a/patches/degradable_reactive_queries/active_javascript_admission.md b/patches/degradable_reactive_queries/active_javascript_admission.md
 index d3d5fe3f24d4a19852ac9eed0ee46ce5d1fbf6c8..6c3cc4044df9f6cf283a438af9aaefaf20de7854 100644
 --- a/patches/degradable_reactive_queries/active_javascript_admission.md
@@ -1644,7 +1671,7 @@ index d3d5fe3f24d4a19852ac9eed0ee46ce5d1fbf6c8..6c3cc4044df9f6cf283a438af9aaefaf
  The leader cap remains strictly below the application query shared base and
  the isolate worker shared base. Active admission does not replace lifetime and
 diff --git a/patches/dependency_capacity/README.md b/patches/dependency_capacity/README.md
-index a2d1ddd23b644393ca9b6b51e2163791800a1451..94dc3e41e935b24f5873c500f4436a4b834436b1 100644
+index 7a1702b2f1c882cf9f30f42146a25809e7da8c20..67a966068116393726f24060ee473109f61c5a13 100644
 --- a/patches/dependency_capacity/README.md
 +++ b/patches/dependency_capacity/README.md
 @@ -14,7 +14,7 @@ degradable-query integration gives dependency work the next grant at the already
@@ -1708,7 +1735,7 @@ index a2d1ddd23b644393ca9b6b51e2163791800a1451..94dc3e41e935b24f5873c500f4436a4b
  ## Configuration
  
 diff --git a/patches/dependency_capacity/design_reference.md b/patches/dependency_capacity/design_reference.md
-index 8369327acb61b7b7ee216b5f2ac0f77f60c385d1..50c7ed95a6904b228cc281f04d16cc59ed1d5529 100644
+index 04acc4ebb310db50826d1eae222e57a39de7fca0..9f00252c25d098186dbbb0a3d669b811184f9b3c 100644
 --- a/patches/dependency_capacity/design_reference.md
 +++ b/patches/dependency_capacity/design_reference.md
 @@ -181,8 +181,11 @@ CPU oversubscription control for V8 work.
@@ -1804,7 +1831,7 @@ index 8369327acb61b7b7ee216b5f2ac0f77f60c385d1..50c7ed95a6904b228cc281f04d16cc59
  8. A Node action does not use an isolate worker, but it has its own application
     action permit and executor capacity. Every Node `ctx.run*` callback re-enters
     the main HTTP service and then the corresponding application and isolate
-@@ -569,18 +573,16 @@ Direct internal nested UDF callbacks have no external queue deadline.
+@@ -568,18 +572,16 @@ Direct internal nested UDF callbacks have no external queue deadline.
  Use
  `isolate_scheduler_requests_rejected_total{pool_name, scheduler_class, reason}`
  to distinguish queue-full or lane-full admission rejection, delay-control
@@ -1826,7 +1853,7 @@ index 8369327acb61b7b7ee216b5f2ac0f77f60c385d1..50c7ed95a6904b228cc281f04d16cc59
  five scheduler classes below are closed metric-label contracts.
  
  Use
-@@ -706,7 +708,7 @@ that code pattern.
+@@ -705,7 +707,7 @@ that code pattern.
  | A query calls `ctx.runQuery`, or a mutation calls `ctx.runQuery` or `ctx.runMutation`, with `SUBFUNCTIONS_IN_SAME_ISOLATE=false`                                    | Covered as a finite chain: every separately scheduled child is dependency-marked and may itself be a descendant-holder. Size `R` for expected nesting and fanout; a chain requiring more than `T` simultaneous workers can still fail. `useStaleSnapshot` and `transactionLimits` do not change isolate placement.                           |
  | The application runs many independent V8 or HTTP actions                                                                                                            | `MAX_ISOLATE_ACTION_WORKERS` limits assigned independent action shells without reducing query/mutation worker capacity. A lower value protects mixed traffic; a higher value can improve an action-only route. There is no universal ratio, so document whether the selected value is benchmarked or an informed starting point.             |
  | `HTTP_SERVER_MAX_CONCURRENT_REQUESTS <= HTTP_SERVER_DEPENDENCY_RESERVE`                                                                                             | The standard local backend does not start because the configured overflow would leave no shared base HTTP admission. Set the HTTP total above the HTTP reserve. This matters for `"use node"` chains; V8-only callbacks do not re-enter through HTTP.                                                                    |
@@ -1861,7 +1888,7 @@ index c9bc3f9fdfab1b81ab96bba6b967c1399ab84dc2..eb2bd3df25ee23337ffb9ded0ea8e7e1
  The patch does not add an analysis-specific scheduler reservation. Analysis can still wait after
  gate admission when protected work or dependencies occupy workers, when active-JavaScript permits
 diff --git a/patches/isolate_queue_control/README.md b/patches/isolate_queue_control/README.md
-index 5f7358ac50cdc9a213aefd770a7737c452eac666..f4a61d01bd5a70d8145e439ac55d6fb786da81f6 100644
+index de256682fa5a85b8911129aaaae3d0c82b3fcb69..4695c64c47375e6840d53d88e6e6043c8cdefb9b 100644
 --- a/patches/isolate_queue_control/README.md
 +++ b/patches/isolate_queue_control/README.md
 @@ -11,6 +11,15 @@ evaluation requests into a bounded `control_plane` lane with a longer hard deadl
@@ -1946,7 +1973,7 @@ index 5f7358ac50cdc9a213aefd770a7737c452eac666..f4a61d01bd5a70d8145e439ac55d6fb7
  Query coalescing and application dependency gates run before the isolate queue.
  They must continue propagating dependency role so a child does not wait behind
 diff --git a/patches/isolate_queue_control/deployment_lane_design_reference.md b/patches/isolate_queue_control/deployment_lane_design_reference.md
-index 1f9d6e882eeb19e27baafc62b28cdee6a12762c8..927c27bc8d443d359c96b20018e3f9de610a0db6 100644
+index 0113722fb1931a39583ed988a12e4bc4504e7a8a..9db7965ef950db6b29de0c8deaa0b9f468cfbea9 100644
 --- a/patches/isolate_queue_control/deployment_lane_design_reference.md
 +++ b/patches/isolate_queue_control/deployment_lane_design_reference.md
 @@ -243,7 +243,7 @@ oldest eligible entry across the complete buffer. That selection rule remains:
@@ -2016,10 +2043,10 @@ index 1f9d6e882eeb19e27baafc62b28cdee6a12762c8..927c27bc8d443d359c96b20018e3f9de
  shared-base and dependency-reserve worker and queue model. Control-plane work
 diff --git a/patches/isolate_queue_control/isolate_delay_queue_design_reference.md b/patches/isolate_queue_control/isolate_delay_queue_design_reference.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..c0dbc5ed308b7442850510ca759dca0d86eb41fe
+index 0000000000000000000000000000000000000000..1212d966ba6c71faaaf6cf9b7bcaa62b06c68cfe
 --- /dev/null
 +++ b/patches/isolate_queue_control/isolate_delay_queue_design_reference.md
-@@ -0,0 +1,481 @@
+@@ -0,0 +1,480 @@
 +# Isolate Delay Queue Design Reference
 +
 +> Detailed implementation reference. The operator-facing adoption contract,
@@ -2440,20 +2467,19 @@ index 0000000000000000000000000000000000000000..c0dbc5ed308b7442850510ca759dca0d
 +
 +### Context reuse and memory controls
 +
-+[`reuse_http_action_contexts`](../reuse_http_action_contexts/README.md) and
-+[`cancellation_safe_database_context_reuse`](../cancellation_safe_database_context_reuse/README.md)
-+act after request classification and admission. Reuse can reduce module loading,
++[`context_reuse`](../context_reuse/README.md)
++acts after request classification and admission. Reuse can reduce module loading,
 +V8 context initialization, service time, and resulting queue sojourn. Reuse can
 +also change retained memory per worker. Reuse does not change queue lane,
 +active class, queue capacity, deadline, shedding, or worker eligibility.
 +
-+[`bounded_multi_context_reuse`](../bounded_multi_context_reuse/README.md) owns
++[`context_reuse`](../context_reuse/README.md) owns
 +context-cache sizing and eviction. The cache also consumes the pressure signal
 +owned by
 +[`backend_memory_resilience`](../backend_memory_resilience/README.md).
 +An eviction can reduce later reuse and increase queue sojourn through higher
 +service cost; an eviction does not create a queue class.
-+[`context_reuse_observability`](../context_reuse_observability/README.md), queue
++[`context_reuse`](../context_reuse/README.md), queue
 +metrics, active-permit wait, worker occupancy, CPU, and memory pressure provide
 +separate evidence for those mechanisms.
 +
@@ -2515,10 +2541,10 @@ index 7de1b757a9016ba21e9cf0e61caede4fab37dd98..4d4afdadeeffd0581111033bc83972f4
  
  Dependency capacity can add bounded overflow for work that releases an isolate-holding ancestor.
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 25f356029a4676adcb11d3b12b3983a4cb475fd6..9c16de2fdf9880444f321df9ee543b76903774c0 100644
+index 20aab7a9aa599c8b260427128b971170839c2b15..149c0aa3baac00eb44519fc52b2cf45e26a324cc 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
-@@ -575,7 +575,10 @@ balanced between the two classes; resumptions precede initial starts within a
+@@ -555,7 +555,10 @@ balanced between the two classes; resumptions precede initial starts within a
  selected class.
  
  Both minimums are `0` by default, which preserves the ordinary two-phase
@@ -2530,7 +2556,7 @@ index 25f356029a4676adcb11d3b12b3983a4cb475fd6..9c16de2fdf9880444f321df9ee543b76
  `FUNRUN_ISOLATE_ACTIVE_THREADS`, require
  `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS`, and their sum cannot
  exceed the active-thread total. The degradable minimum cannot exceed the
-@@ -590,3 +593,20 @@ nineteen degradable active executions after non-preemptive convergence. If
+@@ -570,3 +573,20 @@ nineteen degradable active executions after non-preemptive convergence. If
  either class is idle, the other can use all 28 permits. Use the total to
  control CPU oversubscription and select the minimums from measured progress,
  wait time, CPU headroom, and throttling.

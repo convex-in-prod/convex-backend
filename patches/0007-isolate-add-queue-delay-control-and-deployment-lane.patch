@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Mon, 13 Jul 2026 19:30:33 +0800
-Subject: [PATCH 08/29] isolate: add queue delay control and deployment lane
+Subject: [PATCH 07/26] isolate: add queue delay control and deployment lane
 
 Add opt-in bounded independent-action, ordinary, dependency, and control-plane
 queue lanes while preserving improved upstream CoDel as the default. Select the
@@ -58,11 +58,10 @@ rollout, rollback, cancellation, and telemetry contract.
  patches/dependency_capacity/README.md         |    7 +-
  .../dependency_capacity/design_reference.md   |  201 +-
  patches/isolate_queue_control/README.md       |  509 ++++
- .../deployment_lane_design_reference.md       |  779 ++++++
- patches/reuse_http_action_contexts/README.md  |    1 +
+ .../deployment_lane_design_reference.md       |  781 ++++++
  self-hosted/advanced/knobs.md                 |   99 +-
  self-hosted/docker/docker-compose.yml         |    8 +
- 18 files changed, 5807 insertions(+), 664 deletions(-)
+ 17 files changed, 5808 insertions(+), 664 deletions(-)
  delete mode 100644 crates/application/src/application_function_runner/dependency_overflow.rs
  create mode 100644 crates/isolate/src/isolate_queue.rs
  create mode 100644 patches/isolate_queue_control/README.md
@@ -1079,7 +1078,7 @@ index 83106b6e8efa9d9ceada05ba3af13ff4fab65e49..ac93d31370fd607530cc958ccbe453b8
              }
              return Poll::Pending;
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 8588447ab82390854deb3340b89d522a19e718bb..899678b65859aa020b363f61da5997fadd0fe0bd 100644
+index ba00203b70eb5aeb03e7f03d858e4f587e0414fa..779b9d31c6d902030051c8654266d97f8bf84a84 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -68,6 +68,43 @@ fn validate_usize_strict_nonzero(name: &str, value: usize) -> anyhow::Result<usi
@@ -1253,7 +1252,7 @@ index 8588447ab82390854deb3340b89d522a19e718bb..899678b65859aa020b363f61da5997fa
  
  /// The size of the pending commits in the committer queue. This is a FIFO
  /// queue, so if the queue is too large, we run into a risk of all requests
-@@ -1169,9 +1235,10 @@ pub static APPLICATION_MAX_CONCURRENT_UPLOADS: LazyLock<usize> =
+@@ -1162,9 +1228,10 @@ pub static APPLICATION_MAX_CONCURRENT_UPLOADS: LazyLock<usize> =
  
  /// The number of modules to analyze concurrently during a push.
  ///
@@ -1266,7 +1265,7 @@ index 8588447ab82390854deb3340b89d522a19e718bb..899678b65859aa020b363f61da5997fa
  
  /// Set a 64MB limit on the heap size.
  pub static ISOLATE_MAX_USER_HEAP_SIZE: LazyLock<usize> =
-@@ -1448,9 +1515,9 @@ pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
+@@ -1441,9 +1508,9 @@ pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
  
  /// The maximum number of CPU cores that can be used simultaneously by the
  /// isolates. Zero means no limit. For self-hosted tuning guidance, see
@@ -1304,7 +1303,7 @@ index 773b7d4e2a44e2bfebcbcf971e13dacc14f1dd21..2a0f918d466609afdfef311111d79c12
  file_storage = { workspace = true }
  futures = { workspace = true }
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 0d372e3ae0f0fad0bbe47c2d56f7b2d7aa71e30a..c055c07ae6b8b6140cc2566615dfba2215eb8a26 100644
+index 79087d3d1c27243cc429379a97da010367b9dd2b..abf11e78f8589d80a338f7a08380b8e1c6a3267a 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -15,6 +15,7 @@ use std::{
@@ -5880,7 +5879,7 @@ index 1078c08ca20208310de269e4f0297c18c1249fb8..2999de5d86209ca0cde50bb3abcc50a8
      }
  }
 diff --git a/patches/dependency_capacity/README.md b/patches/dependency_capacity/README.md
-index 2f4fc3642fc23adbe70f8399ed9b0d5bc7aaa290..ca579052e58b5b2c56eec094d043b9aaf5ad3d47 100644
+index f35502c5ed47b6ac3bb60c68a702246cebdcf78e..431b34959bf8d71e0a1e0aa94e31c147a17b09a2 100644
 --- a/patches/dependency_capacity/README.md
 +++ b/patches/dependency_capacity/README.md
 @@ -131,7 +131,9 @@ lane hard deadline. Direct separately scheduled nested transactional functions d
@@ -6242,7 +6241,7 @@ index f67e97ccb187471f3c09666c58524c7682424914..ce6a9121da7afa6468b5fd3c1af0c116
  The opt-in isolate queue policy in
 diff --git a/patches/isolate_queue_control/README.md b/patches/isolate_queue_control/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..f1075dacf76b590e07ac2165715be47820ec5b2f
+index 0000000000000000000000000000000000000000..6da2fb50709838ec8cf54654e279bd26d1e6e903
 --- /dev/null
 +++ b/patches/isolate_queue_control/README.md
 @@ -0,0 +1,509 @@
@@ -6714,9 +6713,9 @@ index 0000000000000000000000000000000000000000..f1075dacf76b590e07ac2165715be478
 +request can pass HTTP admission and still wait at an application gate or in the
 +isolate queue. Size each stage from its own occupancy and wait metrics.
 +
-+The HTTP action context-reuse patch reduces repeated V8 context initialization
-+and can therefore change isolate service time, queue sojourn, and memory per
-+worker. It does not alter queue classification or capacity. Evaluate context
++The unified context-reuse patch reduces repeated V8 context initialization for
++eligible modules and can therefore change isolate service time, queue sojourn,
++and memory per worker. It does not alter queue classification or capacity. Evaluate context
 +reuse and lane control as separate opt-ins so a latency or memory regression
 +has an unambiguous rollback. Context reuse can be disabled without changing
 +queue state; queue control can be disabled without changing context semantics.
@@ -6757,10 +6756,10 @@ index 0000000000000000000000000000000000000000..f1075dacf76b590e07ac2165715be478
 +capacity separately; increasing queue depth alone cannot increase throughput.
 diff --git a/patches/isolate_queue_control/deployment_lane_design_reference.md b/patches/isolate_queue_control/deployment_lane_design_reference.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..4abb0fedba2d4adf3bfee3601f51e637cda0c67a
+index 0000000000000000000000000000000000000000..a8eeefb775d1791e95e7ab44ada46a36ca368945
 --- /dev/null
 +++ b/patches/isolate_queue_control/deployment_lane_design_reference.md
-@@ -0,0 +1,779 @@
+@@ -0,0 +1,781 @@
 +# Deployment and Control-Plane Isolate Lane
 +
 +> Detailed design reference. This is not a separate adoption unit. The current operator-facing
@@ -7271,11 +7270,13 @@ index 0000000000000000000000000000000000000000..4abb0fedba2d4adf3bfee3601f51e637
 +worker. Neither patch requires application module names, and either feature can
 +be disabled independently.
 +
-+Database-query context reuse and query-context prewarming can reduce competing
-+runtime service cost and leave more shared capacity available. They do not
-+apply to the five control-plane request variants, which have no reusable-context
-+key in the current isolate client. Recycling or prewarming analysis contexts
-+would be a separate backend design. None of these features changes lane
++Context reuse and query-context prewarming can reduce competing runtime service
++cost and leave more shared capacity available. Context reuse supports the
++eligible database-UDF, ordinary-action, and HTTP-action kinds; query-context
++prewarming remains query-specific. Neither applies to the five control-plane
++request variants, which have no reusable-context key in the current isolate
++client. Recycling or prewarming analysis contexts would be a separate backend
++design. None of these features changes lane
 +classification, queue capacity, deadlines, or reserve access.
 +
 +The outer HTTP service, application function limiters, storage uploads, Node
@@ -7540,18 +7541,6 @@ index 0000000000000000000000000000000000000000..4abb0fedba2d4adf3bfee3601f51e637
 +ownership and cancellation safety. A pre-dispatch closed-sender check, finite
 +lane cap, and finite deadline bound abandoned queue state. More eager removal
 +should be considered only if caller-drop metrics show material waste.
-diff --git a/patches/reuse_http_action_contexts/README.md b/patches/reuse_http_action_contexts/README.md
-index 90167ad1b54b686c12a7afe46fb9df2fadb442ce..f185fd372c26b8ebccb53ab950c6dc25c2023483 100644
---- a/patches/reuse_http_action_contexts/README.md
-+++ b/patches/reuse_http_action_contexts/README.md
-@@ -295,6 +295,7 @@ exercises the read-set invalidation path.
- Application code should still be correct when contexts are not reused. Context
- reuse is a performance optimization with observable state-retention semantics,
- not a durable in-memory cache API.
-+
- ## Interaction with isolate queue delay control
- 
- HTTP action context reuse can reduce action initialization time and therefore
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
 index 89f56f434a5f52afc6f88906e0954bb5dae8281a..0273856b6c9a033f283539e5e35eec061d9d9208 100644
 --- a/self-hosted/advanced/knobs.md
@@ -7674,7 +7663,7 @@ index 89f56f434a5f52afc6f88906e0954bb5dae8281a..0273856b6c9a033f283539e5e35eec06
 +control CPU oversubscription, and raise it only after checking backend CPU
 +headroom and throttling.
 diff --git a/self-hosted/docker/docker-compose.yml b/self-hosted/docker/docker-compose.yml
-index fc6494ae26ad0b7560019fc99a642bd6f1824598..99726cce5b2b0d626525fba6654085c6637bbeb0 100644
+index e89818aa1c7f7cb9665068c92aae3a64f69349a5..d9fa3cae5d84dc75af94a6992ca18c8db2d1771f 100644
 --- a/self-hosted/docker/docker-compose.yml
 +++ b/self-hosted/docker/docker-compose.yml
 @@ -17,7 +17,15 @@ services:
