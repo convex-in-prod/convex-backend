@@ -16,7 +16,7 @@ Remove the startup-time HTTP context-reuse switch and consolidate the adoption c
  .../src/in_process_function_runner.rs         |   46 +-
  crates/isolate/src/client.rs                  |  521 +++++-
  crates/isolate/src/context_cache.rs           | 1560 ++++++++++++++++-
- crates/isolate/src/environment/action/mod.rs  |  394 ++++-
+ crates/isolate/src/environment/action/mod.rs  |  395 ++++-
  .../isolate/src/environment/action/phase.rs   |  193 +-
  crates/isolate/src/environment/analyze.rs     |   37 +-
  crates/isolate/src/environment/udf/mod.rs     |  367 ++--
@@ -32,7 +32,7 @@ Remove the startup-time HTTP context-reuse switch and consolidate the adoption c
  crates/node_executor/src/executor.rs          |    2 +-
  crates/pb/protos/common.proto                 |   15 +
  crates/udf/src/metrics.rs                     |   32 +
- crates/udf/src/validation.rs                  |  319 +++-
+ crates/udf/src/validation.rs                  |  316 +++-
  patches/README.md                             |   54 +-
  patches/backend_memory_resilience/README.md   |   23 +-
  patches/context_reuse/README.md               |   72 +
@@ -40,7 +40,7 @@ Remove the startup-time HTTP context-reuse switch and consolidate the adoption c
  .../dependency_capacity/design_reference.md   |   17 +-
  self-hosted/advanced/knobs.md                 |   44 +-
  self-hosted/docker/docker-compose.yml         |    3 +-
- 29 files changed, 4404 insertions(+), 452 deletions(-)
+ 29 files changed, 4401 insertions(+), 453 deletions(-)
  create mode 100644 patches/context_reuse/README.md
  create mode 100644 patches/context_reuse/design_reference.md
 
@@ -3009,10 +3009,18 @@ index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..69e4e3847eba3068f8c1ecd7ed04417b
 +    }
 +}
 diff --git a/crates/isolate/src/environment/action/mod.rs b/crates/isolate/src/environment/action/mod.rs
-index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d2496472787c 100644
+index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..3b2dc98c0ba3fddf0658e4cb3039a4708e8ce085 100644
 --- a/crates/isolate/src/environment/action/mod.rs
 +++ b/crates/isolate/src/environment/action/mod.rs
-@@ -146,9 +146,16 @@ use super::{
+@@ -21,6 +21,7 @@ use std::{
+ use anyhow::anyhow;
+ use common::{
+     components::{
++        CanonicalizedComponentModulePath,
+         ComponentId,
+         ComponentPath,
+     },
+@@ -146,9 +147,16 @@ use super::{
  use crate::{
      client::{
          ActionRequestParams,
@@ -3030,7 +3038,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
      environment::{
          helpers::{
              module_loader::module_specifier_from_path,
-@@ -177,6 +184,7 @@ use crate::{
+@@ -177,6 +185,7 @@ use crate::{
          log_unawaited_pending_op,
      },
      module_cache::V8ModuleSource,
@@ -3038,7 +3046,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
      ops::OpProvider,
      request_scope::{
          RequestScope,
-@@ -223,6 +231,7 @@ pub struct ActionEnvironment<RT: Runtime> {
+@@ -223,6 +232,7 @@ pub struct ActionEnvironment<RT: Runtime> {
      total_log_lines: usize,
      log_line_sender: mpsc::UnboundedSender<LogLine>,
      http_response_streamer: Option<HttpActionResponseStreamer>,
@@ -3046,7 +3054,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
  
      rt: RT,
  
-@@ -240,12 +249,49 @@ pub struct ActionEnvironment<RT: Runtime> {
+@@ -240,12 +250,49 @@ pub struct ActionEnvironment<RT: Runtime> {
      http_action_route: Arc<OnceLock<HttpActionRoute>>,
  }
  
@@ -3100,7 +3108,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
      }
  }
  
-@@ -305,6 +351,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -305,6 +352,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
              total_log_lines: 0,
              log_line_sender,
              http_response_streamer,
@@ -3108,7 +3116,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
  
              next_task_id: TaskId(0),
              pending_task_sender,
-@@ -344,7 +391,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -344,7 +392,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
          routed_path: RoutedHttpPath,
          request: HttpActionRequest,
          function_started: Option<oneshot::Sender<()>>,
@@ -3117,7 +3125,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
          let start_unix_timestamp = self.rt.unix_timestamp();
  
          // Double check that we correctly initialized `ActionEnvironment` with the right
-@@ -353,17 +400,66 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -353,17 +401,66 @@ impl<RT: Runtime> ActionEnvironment<RT> {
          let component_function_path = http_module_path.path();
          anyhow::ensure!(component_function_path.component == self.phase.component());
          let udf_path = &component_function_path.udf_path;
@@ -3189,7 +3197,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
  
          let request_head = request.head.clone();
  
-@@ -375,15 +471,43 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -375,15 +472,43 @@ impl<RT: Runtime> ActionEnvironment<RT> {
              request,
          )
          .await;
@@ -3236,7 +3244,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
          self = isolate_context.take_environment();
          let execution_time = timeout.into_function_execution_time(UdfType::HttpAction);
          let http_response_streamer = self
-@@ -391,6 +515,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -391,6 +516,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
              .as_ref()
              .ok_or_else(|| anyhow::anyhow!("No HTTP response streamer for HTTP action"))?;
          let total_bytes_sent = http_response_streamer.total_bytes_sent();
@@ -3244,7 +3252,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
          match termination_error {
              Ok(Ok(..)) => (),
              Ok(Err(e)) => {
-@@ -409,6 +534,34 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -409,6 +535,34 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                  result = Err(e);
              },
          }
@@ -3279,7 +3287,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
          let user_execution_time = execution_time.elapsed;
          self.add_warnings_to_log_lines_http_action(execution_time, total_bytes_sent)?;
          let (route, result) = result?;
-@@ -422,7 +575,36 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -422,7 +576,36 @@ impl<RT: Runtime> ActionEnvironment<RT> {
              http_module_path.npm_version().clone(),
              user_execution_time,
          );
@@ -3317,7 +3325,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
      }
  
      #[fastrace::trace]
-@@ -575,7 +757,9 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -575,7 +758,9 @@ impl<RT: Runtime> ActionEnvironment<RT> {
          };
          let sender_closed =
              Box::pin(futures::stream::once(sender_closed_fut).filter_map(|_| async move { None }));
@@ -3328,7 +3336,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
          state
              .environment
              .send_stream(stream_id, Some(sender_closed));
-@@ -631,6 +815,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -631,6 +816,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                      return Ok(());
                  }
                  if streamer.total_bytes_sent() + b.len() > HTTP_ACTION_BODY_LIMIT {
@@ -3336,7 +3344,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
                      let e = JsError::from_message(format!(
                          "HttpResponseTooLarge: HTTP actions support responses up to {}",
                          HTTP_ACTION_BODY_LIMIT.format_size(BINARY)
-@@ -649,13 +834,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -649,13 +835,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                      let _ = streamer.send_part(HttpActionResponsePart::BodyChunk(b))?;
                  }
              },
@@ -3363,7 +3371,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
          };
          Ok(())
      }
-@@ -683,39 +874,88 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -683,39 +875,88 @@ impl<RT: Runtime> ActionEnvironment<RT> {
          permit: ConcurrencyPermit,
          isolate_clean: &mut bool,
          request_params: ActionRequestParams,
@@ -3462,7 +3470,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
              Ok(Ok(..)) => (),
              Ok(Err(e)) => {
                  result = Ok(Err(e));
-@@ -724,7 +964,59 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -724,7 +965,59 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                  result = Err(e);
              },
          }
@@ -3522,7 +3530,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
          let execution_time = timeout.into_function_execution_time(UdfType::Action);
          let user_execution_time = execution_time.elapsed;
          let (path, arguments, udf_server_version) = request_params.path_and_args.consume();
-@@ -747,7 +1039,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -747,7 +1040,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
              udf_server_version,
              user_execution_time: Some(user_execution_time),
          };
@@ -3531,7 +3539,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
      }
  
      #[fastrace::trace]
-@@ -1207,13 +1499,6 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -1207,13 +1500,6 @@ impl<RT: Runtime> ActionEnvironment<RT> {
              timeout.permit = Some(permit);
              handle.check_terminated()?;
          };
@@ -3545,7 +3553,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
          Ok(result)
      }
  
-@@ -1320,6 +1605,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -1320,6 +1606,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
          counts
      }
  
@@ -3565,7 +3573,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
      fn start_task(
          &mut self,
          request: TaskRequestEnum,
-@@ -1329,13 +1627,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -1329,13 +1628,19 @@ impl<RT: Runtime> ActionEnvironment<RT> {
          let task_id = self.next_task_id.increment();
          self.task_promise_resolvers
              .insert(task_id, (resolver, request.to_type()));
@@ -3587,7 +3595,7 @@ index fd92d8b2cfb5a405913592b3aefa1e558d8bda88..88e8cee03e9aa835be3b1f51b7e2d249
          Ok(())
      }
  
-@@ -1409,15 +1713,13 @@ impl<RT: Runtime> SyscallProvider<RT> for ActionEnvironment<RT> {
+@@ -1409,15 +1714,13 @@ impl<RT: Runtime> SyscallProvider<RT> for ActionEnvironment<RT> {
          anyhow::bail!("get_all_table_mappings unsupported in actions")
      }
  
@@ -5785,7 +5793,7 @@ index 8309e206817ade15d508f8df79fc0dc242c4431d..4bbcc9fd9305b84d6aef28883965ae3d
      match &outcome {
          FunctionOutcome::Query(UdfOutcome { result, .. }) => result.is_ok(),
 diff --git a/crates/udf/src/validation.rs b/crates/udf/src/validation.rs
-index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d862381821b9f6 100644
+index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e5cffa87e 100644
 --- a/crates/udf/src/validation.rs
 +++ b/crates/udf/src/validation.rs
 @@ -56,6 +56,7 @@ use model::{
@@ -5796,7 +5804,19 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
              Visibility,
          },
          ModuleModel,
-@@ -83,6 +84,7 @@ use crate::{
+@@ -66,7 +67,10 @@ use model::{
+ use rand::Rng;
+ use roles::RequireDeploymentOp;
+ use serde_json::Value as JsonValue;
+-use sync_types::types::SerializedArgs;
++use sync_types::{
++    types::SerializedArgs,
++    CanonicalizedUdfPath,
++};
+ use value::{
+     heap_size::HeapSize,
+     serialized_args_ext::SerializedArgsExt,
+@@ -83,6 +87,7 @@ use crate::{
          validate_pending_udf_args_size,
          validate_udf_args_size,
      },
@@ -5804,7 +5824,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
      ActionOutcome,
      SyscallTrace,
      UdfOutcome,
-@@ -447,15 +449,17 @@ impl VisibilityInfo {
+@@ -447,15 +452,17 @@ impl VisibilityInfo {
  /// - Checking the args size.
  /// - Checking that the args pass validation.
  ///
@@ -5825,7 +5845,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
  }
  
  impl ValidatedPathAndArgs {
-@@ -538,7 +542,7 @@ impl ValidatedPathAndArgs {
+@@ -538,7 +545,7 @@ impl ValidatedPathAndArgs {
                      path,
                      args,
                      npm_version: None,
@@ -5834,7 +5854,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
                  },
                  ReturnsValidator::Unvalidated,
                  visibility_info,
-@@ -626,7 +630,7 @@ impl ValidatedPathAndArgs {
+@@ -626,7 +633,7 @@ impl ValidatedPathAndArgs {
              pending_args_policy,
              analyzed_function,
              udf_version,
@@ -5843,7 +5863,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
          )? {
              Ok((validated_udf_path_and_args, visibility_info)) => Ok(Ok((
                  validated_udf_path_and_args,
-@@ -646,7 +650,7 @@ impl ValidatedPathAndArgs {
+@@ -646,7 +653,7 @@ impl ValidatedPathAndArgs {
          pending_args_policy: PendingArgsPolicy,
          analyzed_function: AnalyzedFunction,
          version: Version,
@@ -5852,7 +5872,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
      ) -> anyhow::Result<Result<(ValidatedPathAndArgs, VisibilityInfo), JsError>> {
          let visibility_info = VisibilityInfo {
              visibility: analyzed_function.visibility.clone(),
-@@ -718,12 +722,16 @@ impl ValidatedPathAndArgs {
+@@ -718,12 +725,16 @@ impl ValidatedPathAndArgs {
              ))));
          }
  
@@ -5870,7 +5890,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
              },
              visibility_info,
          )))
-@@ -759,6 +767,7 @@ impl ValidatedPathAndArgs {
+@@ -759,6 +770,7 @@ impl ValidatedPathAndArgs {
              component_path,
              component_id,
              reuse_context,
@@ -5878,15 +5898,14 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
          }: pb::common::ValidatedPathAndArgs,
      ) -> anyhow::Result<Self> {
          let args =
-@@ -768,20 +777,213 @@ impl ValidatedPathAndArgs {
+@@ -768,20 +780,212 @@ impl ValidatedPathAndArgs {
              .context("Missing component_path in proto")?
              .try_into()
              .context("Invalid component path in proto")?;
-+        let udf_path = path.context("Missing udf_path")?.parse()?;
++        let udf_path: CanonicalizedUdfPath = path.context("Missing udf_path")?.parse()?;
 +        let is_system_module = udf_path.is_system();
 +        let context_reuse = context_reuse
-+            .map(TryInto::try_into)
-+            .transpose()?
++            .map(context_reuse_policy_from_proto)
 +            .unwrap_or_else(|| {
 +                if reuse_context.unwrap_or(false) {
 +                    ContextReusePolicy::database()
@@ -6096,7 +6115,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
      }
  }
  
-@@ -793,7 +995,7 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
+@@ -793,7 +997,7 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
              path,
              args,
              npm_version,
@@ -6105,41 +6124,35 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
          }: ValidatedPathAndArgs,
      ) -> anyhow::Result<Self> {
          let args = args.get().as_bytes().to_vec();
-@@ -804,20 +1006,45 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
+@@ -804,20 +1008,39 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
              npm_version: npm_version.map(|v| v.to_string()),
              component_path,
              component_id: path.component.serialize_to_string(),
 -            reuse_context: Some(reuse_context),
 +            reuse_context: Some(context_reuse.allows_legacy_database_reuse()),
-+            context_reuse: Some(context_reuse.into()),
-+        })
-+    }
-+}
-+
-+impl From<ContextReusePolicy> for pb::common::ContextReusePolicy {
-+    fn from(policy: ContextReusePolicy) -> Self {
-+        Self {
-+            queries: Some(policy.queries),
-+            mutations: Some(policy.mutations),
-+            actions: Some(policy.actions),
-+            http_actions: Some(policy.http_actions),
-+        }
-+    }
-+}
-+
-+impl TryFrom<pb::common::ContextReusePolicy> for ContextReusePolicy {
-+    type Error = anyhow::Error;
-+
-+    fn try_from(policy: pb::common::ContextReusePolicy) -> anyhow::Result<Self> {
-+        Ok(Self {
-+            queries: policy.queries.unwrap_or(false),
-+            mutations: policy.mutations.unwrap_or(false),
-+            actions: policy.actions.unwrap_or(false),
-+            http_actions: policy.http_actions.unwrap_or(false),
++            context_reuse: Some(context_reuse_policy_to_proto(context_reuse)),
          })
      }
  }
  
++fn context_reuse_policy_to_proto(policy: ContextReusePolicy) -> pb::common::ContextReusePolicy {
++    pb::common::ContextReusePolicy {
++        queries: Some(policy.queries),
++        mutations: Some(policy.mutations),
++        actions: Some(policy.actions),
++        http_actions: Some(policy.http_actions),
++    }
++}
++
++fn context_reuse_policy_from_proto(policy: pb::common::ContextReusePolicy) -> ContextReusePolicy {
++    ContextReusePolicy {
++        queries: policy.queries.unwrap_or(false),
++        mutations: policy.mutations.unwrap_or(false),
++        actions: policy.actions.unwrap_or(false),
++        http_actions: policy.http_actions.unwrap_or(false),
++    }
++}
++
  /// A UDF path that has been validated to be an HTTP route.
  ///
 -/// This should only be constructed via `ValidatedHttpRoute::try_from` to use
@@ -6155,7 +6168,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
  }
  
  impl ValidatedHttpPath {
-@@ -851,14 +1078,32 @@ impl ValidatedHttpPath {
+@@ -851,14 +1074,32 @@ impl ValidatedHttpPath {
              Ok(udf_version) => udf_version,
              Err(e) => return Ok(Err(e)),
          };
@@ -6193,7 +6206,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
          }))
      }
  
-@@ -870,13 +1115,20 @@ impl ValidatedHttpPath {
+@@ -870,13 +1111,20 @@ impl ValidatedHttpPath {
          &self.path
      }
  
@@ -6215,15 +6228,14 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
          }: pb::common::ValidatedHttpPath,
      ) -> anyhow::Result<Self> {
          let component = ComponentId::deserialize_from_string(component_id.as_deref())?;
-@@ -884,14 +1136,26 @@ impl ValidatedHttpPath {
+@@ -884,14 +1132,25 @@ impl ValidatedHttpPath {
              .context("Missing component_path in proto")?
              .try_into()
              .context("Invalid component path in proto")?;
-+        let udf_path = path.context("Missing udf_path")?.parse()?;
++        let udf_path: CanonicalizedUdfPath = path.context("Missing udf_path")?.parse()?;
 +        let is_system_module = udf_path.is_system();
 +        let context_reuse = context_reuse
-+            .map(TryInto::try_into)
-+            .transpose()?
++            .map(context_reuse_policy_from_proto)
 +            .unwrap_or_default();
          Ok(Self {
              path: ResolvedComponentFunctionPath {
@@ -6244,7 +6256,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
          })
      }
  }
-@@ -903,7 +1167,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+@@ -903,7 +1162,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
          ValidatedHttpPath {
              path,
              npm_version,
@@ -6253,7 +6265,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
          }: ValidatedHttpPath,
      ) -> anyhow::Result<Self> {
          let component_path = Some(path.component_path.into());
-@@ -912,7 +1176,10 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+@@ -912,7 +1171,10 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
              npm_version: npm_version.map(|v| v.to_string()),
              component_path,
              component_id: path.component.serialize_to_string(),
@@ -6261,7 +6273,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..796c7f939a1d8923ea583241d3d86238
 +            // Keep this legacy database marker clear. HTTP action reuse is
 +            // carried by the typed policy field.
 +            reuse_context: Some(false),
-+            context_reuse: Some(context_reuse.into()),
++            context_reuse: Some(context_reuse_policy_to_proto(context_reuse)),
          })
      }
  }
