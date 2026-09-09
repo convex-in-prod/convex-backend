@@ -47,7 +47,7 @@ rollout, rollback, cancellation, and telemetry contract.
  Cargo.lock                                    |    1 +
  .../dependency_overflow.rs                    |  302 ---
  .../src/application_function_runner/mod.rs    |   10 +-
- crates/common/src/codel_queue.rs              |  476 +++-
+ crates/common/src/codel_queue.rs              |  488 +++-
  crates/common/src/knobs.rs                    |  151 +-
  crates/common/src/lib.rs                      |    2 +-
  crates/isolate/Cargo.toml                     |    1 +
@@ -61,17 +61,17 @@ rollout, rollback, cancellation, and telemetry contract.
  .../deployment_lane_design_reference.md       |  781 ++++++
  self-hosted/advanced/knobs.md                 |   99 +-
  self-hosted/docker/docker-compose.yml         |    8 +
- 17 files changed, 5808 insertions(+), 664 deletions(-)
+ 17 files changed, 5810 insertions(+), 674 deletions(-)
  delete mode 100644 crates/application/src/application_function_runner/dependency_overflow.rs
  create mode 100644 crates/isolate/src/isolate_queue.rs
  create mode 100644 patches/isolate_queue_control/README.md
  create mode 100644 patches/isolate_queue_control/deployment_lane_design_reference.md
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 88226b37a6539bdbd4507c218aa405965e65a0c3..5553ad15b29f49c7212378bab3fc4b93965f1b0e 100644
+index 06af96efab2fd6a7ee5bd9ce569193a317009f84..9c5ce840dc92d5b13d892c0d49f6ad2a49ef250b 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -5400,6 +5400,7 @@ dependencies = [
+@@ -5419,6 +5419,7 @@ dependencies = [
   "divan",
   "encoding_rs",
   "errors",
@@ -388,7 +388,7 @@ index bbb07d1f496b7132d615a88053c90cf344101898..00000000000000000000000000000000
 -    }
 -}
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 5c5b7382b3bcf8e98b0ba3e667060746c5948cfc..965a65d595352146f34059d3dbfea2b40dff2670 100644
+index 82eaa6071c865c9d3bb92e36a7cf5b6b1e4e77f3..681b4c995ff95276d91dba3e4b0168211d67c0ba 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
 @@ -32,6 +32,10 @@ use common::{
@@ -402,7 +402,7 @@ index 5c5b7382b3bcf8e98b0ba3e667060746c5948cfc..965a65d595352146f34059d3dbfea2b4
      errors::JsError,
      execution_context::{
          ExecutionContext,
-@@ -236,15 +240,9 @@ use crate::{
+@@ -238,15 +242,9 @@ use crate::{
      QueryReturn,
  };
  
@@ -419,7 +419,7 @@ index 5c5b7382b3bcf8e98b0ba3e667060746c5948cfc..965a65d595352146f34059d3dbfea2b4
  
  /// Wrapper for [IsolateClient]s and [FunctionRunner]s that determines where to
 diff --git a/crates/common/src/codel_queue.rs b/crates/common/src/codel_queue.rs
-index 83106b6e8efa9d9ceada05ba3af13ff4fab65e49..ac93d31370fd607530cc958ccbe453b8bcf84a3f 100644
+index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e10cf96a9 100644
 --- a/crates/common/src/codel_queue.rs
 +++ b/crates/common/src/codel_queue.rs
 @@ -40,6 +40,15 @@ use crate::{
@@ -441,14 +441,14 @@ index 83106b6e8efa9d9ceada05ba3af13ff4fab65e49..ac93d31370fd607530cc958ccbe453b8
 @@ -137,8 +146,13 @@ impl<RT: Runtime, T> CoDelQueue<RT, T> {
      }
  
-     fn push_with_limit(&mut self, item: T, capacity: usize) -> Result<(), QueueFull> {
+     fn push_with_limit(&mut self, item: T, capacity: usize) -> Result<(), (QueueFull, T)> {
 +        self.try_push_with_limit(item, capacity)
-+            .map_err(|_item| QueueFull)
++            .map_err(|item| (QueueFull, item))
 +    }
 +
 +    fn try_push_with_limit(&mut self, item: T, capacity: usize) -> Result<(), T> {
          if self.len() >= capacity {
--            return Err(QueueFull);
+-            return Err((QueueFull, item));
 +            return Err(item);
          }
          let now = self.rt.monotonic_now();
@@ -840,29 +840,29 @@ index 83106b6e8efa9d9ceada05ba3af13ff4fab65e49..ac93d31370fd607530cc958ccbe453b8
              inner.event.notify(usize::MAX);
              inner.expired_event.notify(usize::MAX);
          }
-@@ -625,32 +910,55 @@ impl<RT: Runtime, T> Drop for CoDelQueueSender<RT, T> {
+@@ -625,42 +910,57 @@ impl<RT: Runtime, T> Drop for CoDelQueueSender<RT, T> {
  
  impl<RT: Runtime, T> CoDelQueueSender<RT, T> {
      pub fn try_send(&self, item: T) -> Result<(), QueueFull> {
--        let mut inner = self.inner.lock();
--        if inner.receivers == 0 {
--            return Err(QueueFull);
--        }
--        inner.queue.push(item)?;
--        inner.event.notify_additional(1);
--        // All `CoDelQueueExpiredReceiver`s need to be woken since they don't consume
--        // the queue item
--        inner.expired_event.notify(usize::MAX);
--        Ok(())
+-        // N.B.: on error, only drops `item` after releasing the lock
+-        self.try_send_or_recover(item)
+-            .map_err(|(QueueFull, _)| QueueFull)
 +        self.try_send_detailed(item).map_err(|_| QueueFull)
+     }
+ 
+     pub fn try_send_or_recover(&self, item: T) -> Result<(), (QueueFull, T)> {
++        self.try_send_with_limit(item, SendCapacity::Base)
++            .map(|_| ())
++            .map_err(|(_, item)| (QueueFull, item))
 +    }
 +
 +    pub fn try_send_detailed(&self, item: T) -> Result<(), CoDelQueueSendError> {
 +        self.try_send_with_limit(item, SendCapacity::Base)
 +            .map(|_| ())
-     }
- 
-     pub fn try_send_with_reserved_capacity(&self, item: T) -> Result<bool, QueueFull> {
++            .map_err(|(error, _)| error)
++    }
++
++    pub fn try_send_with_reserved_capacity(&self, item: T) -> Result<bool, QueueFull> {
 +        self.try_send_with_reserved_capacity_detailed(item)
 +            .map_err(|_| QueueFull)
 +    }
@@ -872,19 +872,18 @@ index 83106b6e8efa9d9ceada05ba3af13ff4fab65e49..ac93d31370fd607530cc958ccbe453b8
 +        item: T,
 +    ) -> Result<bool, CoDelQueueSendError> {
 +        self.try_send_with_limit(item, SendCapacity::WithReserve)
++            .map_err(|(error, _)| error)
 +    }
 +
 +    fn try_send_with_limit(
 +        &self,
 +        item: T,
 +        send_capacity: SendCapacity,
-+    ) -> Result<bool, CoDelQueueSendError> {
++    ) -> Result<bool, (CoDelQueueSendError, T)> {
          let mut inner = self.inner.lock();
          if inner.receivers == 0 {
--            return Err(QueueFull);
-+            drop(inner);
-+            drop(item);
-+            return Err(CoDelQueueSendError::Closed);
+-            return Err((QueueFull, item));
++            return Err((CoDelQueueSendError::Closed, item));
 +        }
 +        let used_reserved_capacity = inner.queue.len() >= inner.queue.capacity;
 +        let capacity = match send_capacity {
@@ -892,27 +891,40 @@ index 83106b6e8efa9d9ceada05ba3af13ff4fab65e49..ac93d31370fd607530cc958ccbe453b8
 +            SendCapacity::WithReserve => inner.queue.capacity_with_reserve,
 +        };
 +        if let Err(item) = inner.queue.try_push_with_limit(item, capacity) {
-+            drop(inner);
-+            // Rejected queue items can own request resources with arbitrary
-+            // Drop implementations, so never destroy them under this mutex.
-+            drop(item);
-+            return Err(CoDelQueueSendError::Full);
++            // Return ownership so callers recover or drop the item after the lock releases.
++            return Err((CoDelQueueSendError::Full, item));
          }
--        let used_reserved_capacity = inner.queue.push_with_reserved_capacity(item)?;
+-        inner.queue.push(item)?;
          inner.event.notify_additional(1);
-+        // All `CoDelQueueExpiredReceiver`s need to be woken since they don't consume
-+        // the queue item
+         // All `CoDelQueueExpiredReceiver`s need to be woken since they don't consume
+         // the queue item
          inner.expired_event.notify(usize::MAX);
-         Ok(used_reserved_capacity)
-     }
+-        Ok(())
+-    }
+-
+-    pub fn try_send_with_reserved_capacity(&self, item: T) -> Result<bool, QueueFull> {
+-        let result = {
+-            let mut inner = self.inner.lock();
+-            if inner.receivers == 0 {
+-                Err((QueueFull, item))
+-            } else {
+-                inner.queue.push_with_reserved_capacity(item).inspect(|_| {
+-                    inner.event.notify_additional(1);
+-                    inner.expired_event.notify(usize::MAX);
+-                })
+-            }
+-        };
+-        // Rejected items can own queue handles; drop them only after releasing the lock.
+-        result.map_err(|(QueueFull, _)| QueueFull)
+-    }
 -
 -    pub fn is_closed(&self) -> bool {
 -        self.inner.lock().receivers == 0
--    }
++        Ok(used_reserved_capacity)
+     }
  }
  
- impl<RT: Runtime, T> CoDelQueueReceiver<RT, T> {
-@@ -691,26 +999,63 @@ impl<RT: Runtime, T> CoDelQueueReceiver<RT, T> {
+@@ -702,26 +1002,63 @@ impl<RT: Runtime, T> CoDelQueueReceiver<RT, T> {
          poll_fn(|cx| self.poll_next_with_expiration(cx)).await
      }
  
@@ -990,7 +1002,7 @@ index 83106b6e8efa9d9ceada05ba3af13ff4fab65e49..ac93d31370fd607530cc958ccbe453b8
          }
      }
  
-@@ -755,12 +1100,18 @@ impl<RT: Runtime, T> Stream for CoDelQueueExpiredReceiver<RT, T> {
+@@ -766,12 +1103,18 @@ impl<RT: Runtime, T> Stream for CoDelQueueExpiredReceiver<RT, T> {
          loop {
              let mut inner = this.inner.lock();
              if let Some(result) = inner.queue.pop_expired() {
@@ -1014,7 +1026,7 @@ index 83106b6e8efa9d9ceada05ba3af13ff4fab65e49..ac93d31370fd607530cc958ccbe453b8
                  return Poll::Ready(None);
              }
  
-@@ -769,42 +1120,41 @@ impl<RT: Runtime, T> Stream for CoDelQueueExpiredReceiver<RT, T> {
+@@ -780,42 +1123,41 @@ impl<RT: Runtime, T> Stream for CoDelQueueExpiredReceiver<RT, T> {
                  .buffer
                  .front()
                  .map(|(_, expiration)| *expiration);
@@ -1078,7 +1090,7 @@ index 83106b6e8efa9d9ceada05ba3af13ff4fab65e49..ac93d31370fd607530cc958ccbe453b8
              }
              return Poll::Pending;
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 58441382317463576fe2d93f284a025c3c02eeb7..1c68be437a9c010b7a2b283c6f25124e18480f68 100644
+index f6ef26c4da46ef1203d456d9d2cc8ca8b7c251a2..b88dcd4a899805d154ea3028e2b14676a3eac3fe 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -68,6 +68,43 @@ fn validate_usize_strict_nonzero(name: &str, value: usize) -> anyhow::Result<usi
@@ -1291,7 +1303,7 @@ index 6461edb8cb373d8bf804fe6067664b4dfa6e0a9c..a2dd2132f43e484f65dc638cb164a92b
  pub mod document_index_keys;
  pub mod erased_slot;
 diff --git a/crates/isolate/Cargo.toml b/crates/isolate/Cargo.toml
-index 6bb31a24b521cf17a9bea008b3572bae5468be4d..27f3859ce3a354f8ec6b47fbc1d60d2c1ae51cfd 100644
+index c2c1f5858f32cb1b1b3946ea20d984f5b72954fa..b5520a0751308398ea8d6a7c63fc6df3f305ed3f 100644
 --- a/crates/isolate/Cargo.toml
 +++ b/crates/isolate/Cargo.toml
 @@ -73,6 +73,7 @@ deno_core_icudata = { workspace = true }
@@ -5459,7 +5471,7 @@ index 0000000000000000000000000000000000000000..cadc841a8106b38484611060b146acf5
 +    }
 +}
 diff --git a/crates/isolate/src/lib.rs b/crates/isolate/src/lib.rs
-index 41924c1c0a308cf7974fe2e1de6cea18942d32db..0bae8fca1d67ee96473b0c0e1521f928e9033069 100644
+index 4b1b0106c9f887bbcdb8205b5a358e93239dae9d..228b4ae2176e8222862b965962eae7369249c10c 100644
 --- a/crates/isolate/src/lib.rs
 +++ b/crates/isolate/src/lib.rs
 @@ -26,6 +26,7 @@ pub mod helpers;

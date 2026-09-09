@@ -13,19 +13,19 @@ Record bounded attribution for the initiating request kind, phase, sanitized tra
 
 Track cancellation-safe waiting and active requests and export bounded generation, child, request, watchdog, replacement, package, stack, and retirement-diagnostic metrics. Keep the executor single-process and document the direct-child ownership and rollback contract.
 ---
- crates/node_executor/src/executor.rs          |  366 ++-
+ crates/node_executor/src/executor.rs          |  499 +++-
  crates/node_executor/src/lib.rs               |    4 -
- crates/node_executor/src/local.rs             | 2239 ++++++++++++++++-
+ crates/node_executor/src/local.rs             | 2243 ++++++++++++++++-
  crates/node_executor/src/metrics.rs           |  336 +++
  npm-packages/node-executor/src/local.ts       |    4 -
  patches/README.md                             |  209 ++
  .../local_node_executor_resilience/README.md  |  312 +++
- 7 files changed, 3227 insertions(+), 243 deletions(-)
+ 7 files changed, 3350 insertions(+), 257 deletions(-)
  create mode 100644 patches/README.md
  create mode 100644 patches/local_node_executor_resilience/README.md
 
 diff --git a/crates/node_executor/src/executor.rs b/crates/node_executor/src/executor.rs
-index 027fca97925358fa163e96db73ab8397b3a26e45..d6bf735c89baac414ebd91937ca196b9a978841a 100644
+index 02d6381e28d8ff80a6bc0fd4a1d26943f99acc76..ce4b245ef8c0a88ba68704b0d3b38b5267169074 100644
 --- a/crates/node_executor/src/executor.rs
 +++ b/crates/node_executor/src/executor.rs
 @@ -14,6 +14,7 @@ use async_trait::async_trait;
@@ -207,7 +207,7 @@ index 027fca97925358fa163e96db73ab8397b3a26e45..d6bf735c89baac414ebd91937ca196b9
                      .into(),
                  memory_allocated_mb: memory_allocated_mb.unwrap_or(512),
                  egress_bytes: egress_bytes.unwrap_or(0),
-@@ -947,108 +977,108 @@ impl From<VisibilityJson> for Visibility {
+@@ -947,31 +977,70 @@ impl From<VisibilityJson> for Visibility {
      }
  }
  
@@ -263,12 +263,26 @@ index 027fca97925358fa163e96db73ab8397b3a26e45..d6bf735c89baac414ebd91937ca196b9
 +    result_value: &mut Option<JsonValue>,
 +    response_parts: &mut usize,
 +) -> anyhow::Result<()> {
++    let decoded_str = str::from_utf8(line)?;
++    process_streamed_response_part(
++        parse_streamed_response_part(decoded_str)?,
++        log_line_sender,
++        result_value,
++        response_parts,
++    )
++}
++
++fn process_streamed_response_part(
++    part: Option<ResponsePart>,
++    log_line_sender: &mpsc::UnboundedSender<LogLine>,
++    result_value: &mut Option<JsonValue>,
++    response_parts: &mut usize,
++) -> anyhow::Result<()> {
 +    *response_parts = response_parts
 +        .checked_add(1)
 +        .filter(|parts| *parts <= MAX_STREAMED_RESPONSE_PARTS)
 +        .ok_or_else(|| anyhow::anyhow!("Node executor response contained too many parts"))?;
-+    let decoded_str = str::from_utf8(line)?;
-+    let Some(part) = parse_streamed_response_part(decoded_str)? else {
++    let Some(part) = part else {
 +        return Ok(());
 +    };
 +    match part {
@@ -284,14 +298,8 @@ index 027fca97925358fa163e96db73ab8397b3a26e45..d6bf735c89baac414ebd91937ca196b9
 +    Ok(())
  }
  
--pub enum NodeExecutorStreamPart {
-+pub(crate) enum NodeExecutorStreamPart {
-     Chunk(Bytes),
-     InvokeComplete(Result<(), InvokeResponse>),
- }
- 
--pub async fn handle_node_executor_stream(
-+pub(crate) async fn handle_node_executor_stream(
+ pub enum NodeExecutorStreamPart {
+@@ -998,46 +1067,26 @@ pub async fn handle_node_executor_stream(
      log_line_sender: mpsc::UnboundedSender<LogLine>,
      mut stream: impl Stream<Item = anyhow::Result<NodeExecutorStreamPart>> + Unpin,
  ) -> anyhow::Result<Result<JsonValue, InvokeResponse>> {
@@ -354,28 +362,58 @@ index 027fca97925358fa163e96db73ab8397b3a26e45..d6bf735c89baac414ebd91937ca196b9
 +                    )?;
                  }
              },
-             NodeExecutorStreamPart::InvokeComplete(result) => {
-                 if let Err(e) = result {
-                     return Ok(Err(e));
-                 }
--                let decoded_str = String::from_utf8(remaining_chunks.concat())?;
--                let parts = parse_streamed_response(&decoded_str)?;
--                for part in parts {
--                    match part {
--                        ResponsePart::LogLine(log_line) => {
--                            log_line_sender.send(log_line)?;
--                        },
--                        ResponsePart::Result(result) => result_values.push(result),
--                    };
+             NodeExecutorStreamPart::InvokeComplete(completion) => {
+@@ -1046,41 +1095,37 @@ pub async fn handle_node_executor_stream(
+                     InvokeCompletion::ImplicitError(e) => Some(e),
+                     InvokeCompletion::Success => None,
+                 };
+-                let parsed = String::from_utf8(remaining_chunks.concat())
+-                    .map_err(anyhow::Error::from)
+-                    .and_then(|decoded_str| parse_streamed_response(&decoded_str));
+-                match parsed {
+-                    Ok(parts) => {
+-                        for part in parts {
+-                            match part {
+-                                ResponsePart::LogLine(log_line) => {
+-                                    log_line_sender.send(log_line)?;
+-                                },
+-                                ResponsePart::Result(result) => result_values.push(result),
+-                            };
+-                        }
+-                    },
+-                    // A crash can truncate the stream mid-line or mid-character;
+-                    // prefer the inferred failure over the decode error when we
+-                    // have one.
+-                    Err(e) if error_if_no_result.is_none() => return Err(e),
+-                    Err(_) => {},
 +                // A trailing newline was already counted above; do not invent
 +                // an additional empty protocol part at end of stream.
 +                if !remaining_bytes.is_empty() {
-+                    process_streamed_response_line(
-+                        &remaining_bytes,
++                    let parsed = str::from_utf8(&remaining_bytes)
++                        .map_err(anyhow::Error::from)
++                        .and_then(parse_streamed_response_part);
++                    let part = match parsed {
++                        Ok(part) => part,
++                        // A crash can truncate the final line or character.
++                        // Only parsing may defer to the inferred failure;
++                        // protocol limits and duplicate results still fail.
++                        Err(_) if error_if_no_result.is_some() => None,
++                        Err(error) => return Err(error),
++                    };
++                    process_streamed_response_part(
++                        part,
 +                        &log_line_sender,
 +                        &mut result_value,
 +                        &mut response_parts,
 +                    )?;
+                 }
+-                if result_values.is_empty()
+-                    && let Some(e) = error_if_no_result
++                if result_value.is_none()
++                    && let Some(error) = error_if_no_result
+                 {
+-                    return Ok(Err(e));
++                    return Ok(Err(error));
                  }
                  break;
              },
@@ -391,7 +429,7 @@ index 027fca97925358fa163e96db73ab8397b3a26e45..d6bf735c89baac414ebd91937ca196b9
          .ok_or_else(|| anyhow::anyhow!("Received no result from node executor response"))?;
      Ok(Ok(payload))
  }
-@@ -1070,3 +1100,125 @@ fn append_logs_to_error(mut error: JsError, log_lines: LogLines) -> JsError {
+@@ -1102,3 +1147,221 @@ fn append_logs_to_error(mut error: JsError, log_lines: LogLines) -> JsError {
      error.message = format!("{}\n\n{}", error.message, logs_text);
      error
  }
@@ -411,7 +449,9 @@ index 027fca97925358fa163e96db73ab8397b3a26e45..d6bf735c89baac414ebd91937ca196b9
 +                    ])))
 +                })
 +                .collect();
-+        stream_parts.push(Ok(NodeExecutorStreamPart::InvokeComplete(Ok(()))));
++        stream_parts.push(Ok(NodeExecutorStreamPart::InvokeComplete(
++            InvokeCompletion::Success,
++        )));
 +        let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
 +
 +        let response =
@@ -433,7 +473,9 @@ index 027fca97925358fa163e96db73ab8397b3a26e45..d6bf735c89baac414ebd91937ca196b9
 +        response.extend_from_slice(b"{\"type\":\"success\"}\n");
 +        let stream_parts = [
 +            Ok(NodeExecutorStreamPart::Chunk(response.freeze())),
-+            Ok(NodeExecutorStreamPart::InvokeComplete(Ok(()))),
++            Ok(NodeExecutorStreamPart::InvokeComplete(
++                InvokeCompletion::Success,
++            )),
 +        ];
 +        let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
 +
@@ -490,6 +532,98 @@ index 027fca97925358fa163e96db73ab8397b3a26e45..d6bf735c89baac414ebd91937ca196b9
 +        .is_err());
 +    }
 +
++    #[tokio::test]
++    async fn streamed_response_completion_preserves_failure_authority() {
++        for (body, explicit, expected_result) in [
++            (&b"{\"type\":\"success\"}\n"[..], true, false),
++            (&b"{\"type\":\"success\"}"[..], true, false),
++            (&b"{\"type\":\"success\"}"[..], false, true),
++            (&b"{\"type\":\"success\"}\n\xff"[..], false, true),
++            (&b"{\"type\":"[..], false, false),
++            (&b"\xff"[..], false, false),
++            (&b""[..], false, false),
++        ] {
++            let failure = InvokeResponse {
++                response: serde_json::json!({ "type": "error" }),
++                aws_request_id: None,
++            };
++            let completion = if explicit {
++                InvokeCompletion::ExplicitError(failure)
++            } else {
++                InvokeCompletion::ImplicitError(failure)
++            };
++            let stream_parts = [
++                Ok(NodeExecutorStreamPart::Chunk(Bytes::copy_from_slice(body))),
++                Ok(NodeExecutorStreamPart::InvokeComplete(completion)),
++            ];
++            let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
++            let response =
++                handle_node_executor_stream(log_line_sender, futures::stream::iter(stream_parts))
++                    .await
++                    .unwrap();
++            match response {
++                Ok(result) => {
++                    assert!(expected_result);
++                    assert_eq!(result, serde_json::json!({ "type": "success" }));
++                },
++                Err(failure) => {
++                    assert!(!expected_result);
++                    assert_eq!(failure.response, serde_json::json!({ "type": "error" }));
++                },
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn streamed_response_implicit_failure_does_not_hide_protocol_errors() {
++        let mut too_many_parts = vec![b'\n'; MAX_STREAMED_RESPONSE_PARTS];
++        too_many_parts.extend_from_slice(b"{\"type\":\"success\"}");
++        let mut too_many_parts_with_truncation = vec![b'\n'; MAX_STREAMED_RESPONSE_PARTS];
++        too_many_parts_with_truncation.push(0xff);
++        for body in [
++            b"{\"type\":\"success\"}\n{\"type\":\"success\"}".to_vec(),
++            b"{\"type\":\"success\"}\n{\"type\":\"success\"}\n".to_vec(),
++            too_many_parts,
++            too_many_parts_with_truncation,
++        ] {
++            let stream_parts = [
++                Ok(NodeExecutorStreamPart::Chunk(Bytes::from(body))),
++                Ok(NodeExecutorStreamPart::InvokeComplete(
++                    InvokeCompletion::ImplicitError(InvokeResponse {
++                        response: serde_json::json!({ "type": "error" }),
++                        aws_request_id: None,
++                    }),
++                )),
++            ];
++            let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
++            assert!(handle_node_executor_stream(
++                log_line_sender,
++                futures::stream::iter(stream_parts)
++            )
++            .await
++            .is_err());
++        }
++    }
++
++    #[tokio::test]
++    async fn streamed_response_success_rejects_truncated_tail() {
++        for body in [&b"{\"type\":"[..], &b"{\"type\":\"success\"}\n\xff"[..]] {
++            let stream_parts = [
++                Ok(NodeExecutorStreamPart::Chunk(Bytes::copy_from_slice(body))),
++                Ok(NodeExecutorStreamPart::InvokeComplete(
++                    InvokeCompletion::Success,
++                )),
++            ];
++            let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
++            assert!(handle_node_executor_stream(
++                log_line_sender,
++                futures::stream::iter(stream_parts)
++            )
++            .await
++            .is_err());
++        }
++    }
++
 +    #[test]
 +    fn execute_response_rejects_invalid_timing_and_syscall_statistics() {
 +        let response = |download_time_ms: f64, invocations: u32, errors: u32| {
@@ -518,7 +652,7 @@ index 027fca97925358fa163e96db73ab8397b3a26e45..d6bf735c89baac414ebd91937ca196b9
 +    }
 +}
 diff --git a/crates/node_executor/src/lib.rs b/crates/node_executor/src/lib.rs
-index 7f154cddac4bc1a64860d162c922815641c33a40..bfde7653b4f955bbf86e50c3541fe2870d2f5ed1 100644
+index 5ef903d84d230bb0c336a9d6204e1a39950684a8..6926cfe8d1e860444df19ec504d9bca5e87fb1e2 100644
 --- a/crates/node_executor/src/lib.rs
 +++ b/crates/node_executor/src/lib.rs
 @@ -1,6 +1,5 @@
@@ -536,7 +670,7 @@ index 7f154cddac4bc1a64860d162c922815641c33a40..bfde7653b4f955bbf86e50c3541fe287
      AnalyzeRequest,
      AnalyzeResponse,
      BuildDepsRequest,
-@@ -25,9 +23,7 @@ pub use crate::executor::{
+@@ -26,9 +24,7 @@ pub use crate::executor::{
      NodeActionOutcome,
      NodeActions,
      NodeExecutor,
@@ -547,7 +681,7 @@ index 7f154cddac4bc1a64860d162c922815641c33a40..bfde7653b4f955bbf86e50c3541fe287
      ARGS_TOO_LARGE_RESPONSE_MESSAGE,
      EXECUTE_TIMEOUT_RESPONSE_JSON,
 diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
-index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b055a7bca 100644
+index 9847a92bb9077383015c13d8e496fe0257a17732..b2f312ae9a82d8d3569036887e76266a23119435 100644
 --- a/crates/node_executor/src/local.rs
 +++ b/crates/node_executor/src/local.rs
 @@ -1,25 +1,42 @@
@@ -600,7 +734,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
      process::{
          Child,
          Command as TokioCommand,
-@@ -30,27 +47,42 @@ use tokio::{
+@@ -30,28 +47,43 @@ use tokio::{
      },
  };
  
@@ -615,6 +749,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
 +use crate::executor::{
      handle_node_executor_stream,
 +    ExecutorRequest,
+     InvokeCompletion,
 +    InvokeResponse,
 +    NodeExecutor,
      NodeExecutorStreamPart,
@@ -652,7 +787,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
  struct LocalNodeExecutorConfig {
      node_process_timeout: Duration,
      /// Overrides the initial callback retry backoff in the spawned node
-@@ -58,16 +90,472 @@ struct LocalNodeExecutorConfig {
+@@ -59,16 +91,472 @@ struct LocalNodeExecutorConfig {
      /// callbacks retrying against an unreachable backend settle within test
      /// timeouts.
      callback_initial_backoff: Option<Duration>,
@@ -1128,7 +1263,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
          tracing::info!("Initializing inner local node executor");
          // Create a single temp directory for both source files and Node.js temp files
          let source_dir = TempDir::new()?;
-@@ -78,11 +566,6 @@ impl InnerLocalNodeExecutor {
+@@ -79,11 +567,6 @@ impl InnerLocalNodeExecutor {
          let source_map_path = source_dir.path().join("local.cjs.map");
          fs::write(&source_path, source.as_bytes())?;
          fs::write(source_map_path, source_map.as_bytes())?;
@@ -1140,7 +1275,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
          let socket_path = if cfg!(unix) {
              source_dir.path().join(".executor.sock")
          } else if cfg!(windows) {
-@@ -93,8 +576,6 @@ impl InnerLocalNodeExecutor {
+@@ -94,8 +577,6 @@ impl InnerLocalNodeExecutor {
          } else {
              panic!("not supported");
          };
@@ -1149,7 +1284,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
          // Don't keep idle connections in the pool. The Node HTTP server closes
          // idle keep-alive connections after its (default 5s) `keepAliveTimeout`,
          // but hyper's pool would hold one much longer and reuse it right as the
-@@ -103,38 +584,139 @@ impl InnerLocalNodeExecutor {
+@@ -104,38 +585,139 @@ impl InnerLocalNodeExecutor {
          let mut client_builder = Client::builder().pool_max_idle_per_host(0);
          #[cfg(unix)]
          {
@@ -1302,7 +1437,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
          {
              anyhow::bail!(ErrorMetadata::bad_request(
                  "DeploymentNotConfiguredForNodeActions",
-@@ -147,36 +729,123 @@ impl InnerLocalNodeExecutor {
+@@ -148,36 +730,123 @@ impl InnerLocalNodeExecutor {
          Ok(())
      }
  
@@ -1443,7 +1578,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
          Self::check_node_version(&node_path).await?;
  
          let mut cmd = TokioCommand::new(node_path);
-@@ -185,6 +854,11 @@ impl InnerLocalNodeExecutor {
+@@ -186,6 +855,11 @@ impl InnerLocalNodeExecutor {
              .arg(socket_path)
              .arg("--tempdir")
              .arg(temp_dir.path())
@@ -1455,7 +1590,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
              .kill_on_drop(true);
          if let Some(backoff) = config.callback_initial_backoff {
              cmd.env(
-@@ -202,43 +876,163 @@ impl InnerLocalNodeExecutor {
+@@ -203,47 +877,165 @@ impl InnerLocalNodeExecutor {
  impl LocalNodeExecutor {
      pub async fn new(node_process_timeout: Duration) -> anyhow::Result<Self> {
          let executor = Self {
@@ -1611,7 +1746,9 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
 -                                anyhow::Ok(NodeExecutorStreamPart::Chunk(chunk))
 -                            }
 -                            None => {
--                                anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Ok(())))
+-                                anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(
+-                                    InvokeCompletion::Success,
+-                                ))
 -                            }
 -                        }
 +            let part = match tokio::time::timeout_at(deadline, response.chunk()).await {
@@ -1626,24 +1763,27 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
 +                        NodeExecutorStreamPart::Chunk(chunk)
                      },
 -                    _ = timeout_future.fuse() => {
--                        anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Err(InvokeResponse {
--                            response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
--                            aws_request_id: None,
--                        })))
--                    },
--                }
-+                    None => NodeExecutorStreamPart::InvokeComplete(Ok(())),
+-                        anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(
+-                            InvokeCompletion::ExplicitError(InvokeResponse {
+-                                response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
+-                                aws_request_id: None,
+-                            }),
+-                        ))
++                    None => NodeExecutorStreamPart::InvokeComplete(InvokeCompletion::Success),
 +                },
-+                Err(_) => NodeExecutorStreamPart::InvokeComplete(Err(InvokeResponse {
-+                    response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
-+                    aws_request_id: None,
-+                })),
++                Err(_) => NodeExecutorStreamPart::InvokeComplete(InvokeCompletion::ExplicitError(
++                    InvokeResponse {
++                        response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
++                        aws_request_id: None,
+                     },
+-                }
++                )),
              };
 -            let part = process_chunk.await?;
              if let NodeExecutorStreamPart::InvokeComplete(_) = part {
                  yield part;
                  break;
-@@ -248,16 +1042,341 @@ impl LocalNodeExecutor {
+@@ -253,16 +1045,341 @@ impl LocalNodeExecutor {
          }
      }
  
@@ -1790,7 +1930,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
 +                anyhow::bail!("Local Node executor child termination task panicked")
 +            },
 +            Err(_) => anyhow::bail!("Local Node executor child termination task failed"),
-+        }
+         }
 +        Ok(true)
 +    }
 +
@@ -1982,7 +2122,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
 +                operation,
 +                current - previous,
 +            );
-         }
++        }
 +
 +        crate::metrics::log_local_node_stack_format_deltas(
 +            stack.invocations - previous_stack_stats.invocations,
@@ -1994,7 +2134,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
      }
  }
  
-@@ -272,48 +1391,106 @@ impl NodeExecutor for LocalNodeExecutor {
+@@ -277,48 +1394,106 @@ impl NodeExecutor for LocalNodeExecutor {
          request: ExecutorRequest,
          log_line_sender: mpsc::UnboundedSender<LogLine>,
      ) -> anyhow::Result<InvokeResponse> {
@@ -2127,7 +2267,7 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
                  return Err(
                      anyhow::anyhow!(e.without_url()).context(ErrorMetadata::bad_request(
                          "ArgsTooLarge",
-@@ -321,30 +1498,836 @@ impl NodeExecutor for LocalNodeExecutor {
+@@ -326,30 +1501,836 @@ impl NodeExecutor for LocalNodeExecutor {
                      )),
                  );
              }
@@ -2246,13 +2386,14 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
 +                request_guard.set_outcome("response_stream_timeout");
 +                Ok(e)
 +            },
-+        }
-+    }
-+
+         }
+     }
+ 
+-    fn shutdown(&self) {}
 +    fn shutdown(&self) {
 +        if self.shutting_down.swap(true, Ordering::AcqRel) {
 +            return;
-         }
++        }
 +        let state = self.state.clone();
 +        tokio::spawn(async move {
 +            let Some(expected) = state.lock().await.inner.clone() else {
@@ -2420,9 +2561,8 @@ index 0fcf0302d962649a2bf779a808c66601f4419a5b..c9e4fe1222e8e98d334450ac626b9e7b
 +            server_handle: Mutex::new(ManagedChild::new(generation, server_handle, source_dir)),
 +            client,
 +        })
-     }
- 
--    fn shutdown(&self) {}
++    }
++
 +    #[tokio::test(flavor = "current_thread")]
 +    async fn dropped_unpublished_child_retains_tempdir_until_cleanup_finishes() {
 +        let source_dir = TempDir::new().unwrap();
