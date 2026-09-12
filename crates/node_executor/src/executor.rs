@@ -1302,7 +1302,7 @@ impl From<VisibilityJson> for Visibility {
     }
 }
 
-enum ResponsePart {
+pub enum ResponsePart {
     LogLine(LogLine),
     Result(JsonValue),
 }
