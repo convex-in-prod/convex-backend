@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 29 Jul 2026 02:38:40 +0800
-Subject: [PATCH 11/30] runtime: add backend memory resilience
+Subject: [PATCH 11/28] runtime: add backend memory resilience
 
 Expose process, allocator, cgroup, Node, cache, and control-plane memory ownership so operators can account for backend RSS and telemetry coverage. Report glibc arena count separately and preserve the distinction between logical allocator free space and resident memory.
 
@@ -15,25 +15,25 @@ A long-running multithreaded self-hosted backend under a 30 GiB cgroup limit rea
 ---
  Cargo.lock                                    |    1 +
  crates/common/src/http/mod.rs                 |  188 ++
- crates/common/src/knobs.rs                    |  166 +-
+ crates/common/src/knobs.rs                    |  192 +-
  crates/common/src/lib.rs                      |    1 +
  crates/common/src/memory_pressure.rs          |   54 +
  crates/local_backend/Cargo.toml               |    1 +
  crates/local_backend/src/lib.rs               |   12 +-
  crates/local_backend/src/main.rs              |   29 +-
- crates/local_backend/src/memory_metrics.rs    | 1775 +++++++++++++++++
+ crates/local_backend/src/memory_metrics.rs    | 1891 +++++++++++++++++
  crates/local_backend/src/proxy.rs             |    7 +-
- crates/node_executor/src/local.rs             |  807 +++++++-
+ crates/node_executor/src/local.rs             |  807 ++++++-
  crates/node_executor/src/metrics.rs           |  137 ++
  npm-packages/node-executor/src/executor.ts    |   15 +-
  .../node-executor/src/source_package.test.ts  |   46 +
  .../node-executor/src/source_package.ts       |   11 +
  patches/README.md                             |   25 +-
- patches/backend_memory_resilience/README.md   |  125 ++
+ patches/backend_memory_resilience/README.md   |  135 ++
  .../local_node_executor_resilience/README.md  |  163 +-
- self-hosted/advanced/knobs.md                 |  129 ++
- self-hosted/docker/docker-compose.yml         |   12 +
- 20 files changed, 3607 insertions(+), 97 deletions(-)
+ self-hosted/advanced/knobs.md                 |  141 ++
+ self-hosted/docker/docker-compose.yml         |   13 +
+ 20 files changed, 3772 insertions(+), 97 deletions(-)
  create mode 100644 crates/common/src/memory_pressure.rs
  create mode 100644 crates/local_backend/src/memory_metrics.rs
  create mode 100644 patches/backend_memory_resilience/README.md
@@ -51,7 +51,7 @@ index ac76b0e188073792c048df8675dd4a4d4eb05a49..c4c8af687b23efa5fea614f41fe88543
   "metrics",
   "model",
 diff --git a/crates/common/src/http/mod.rs b/crates/common/src/http/mod.rs
-index 228279cb5f3a20904df4d59784c29f0ff850d21e..b0b8adc1741f3a1ce155ed973a04c85134c59203 100644
+index 8904c868ada2cb5c8c35711aff26ecc7a5e3aacd..a48e0eaf2a190be0f4cd5fb68012d14112862114 100644
 --- a/crates/common/src/http/mod.rs
 +++ b/crates/common/src/http/mod.rs
 @@ -12,6 +12,7 @@ use std::{
@@ -106,7 +106,7 @@ index 228279cb5f3a20904df4d59784c29f0ff850d21e..b0b8adc1741f3a1ce155ed973a04c851
      }
  
      #[cfg(test)]
-@@ -598,13 +620,54 @@ pub struct ConvexHttpService {
+@@ -595,13 +617,54 @@ pub struct ConvexHttpService {
      _base_concurrency_gauge: Option<PullingGauge>,
  }
  
@@ -161,7 +161,7 @@ index 228279cb5f3a20904df4d59784c29f0ff850d21e..b0b8adc1741f3a1ce155ed973a04c851
  async fn dependency_aware_concurrency_middleware(
      State(limiter): State<HttpConcurrencyLimiter>,
      request: http::Request<Body>,
-@@ -620,12 +683,32 @@ async fn dependency_aware_concurrency_middleware(
+@@ -617,12 +680,32 @@ async fn dependency_aware_concurrency_middleware(
          && request
              .headers()
              .contains_key(CONVEX_ACTIONS_CALLBACK_TOKEN);
@@ -194,7 +194,7 @@ index 228279cb5f3a20904df4d59784c29f0ff850d21e..b0b8adc1741f3a1ce155ed973a04c851
      let response = next.run(request).await;
      drop(permit);
      response
-@@ -647,6 +730,7 @@ impl ConvexHttpService {
+@@ -644,6 +727,7 @@ impl ConvexHttpService {
              max_concurrency,
              0,
              &[],
@@ -202,7 +202,7 @@ index 228279cb5f3a20904df4d59784c29f0ff850d21e..b0b8adc1741f3a1ce155ed973a04c851
              request_timeout,
              route_metric_mapper,
          )
-@@ -659,6 +743,7 @@ impl ConvexHttpService {
+@@ -656,6 +740,7 @@ impl ConvexHttpService {
          max_concurrency: usize,
          dependency_reserve: usize,
          dependency_path_prefixes: &'static [&'static str],
@@ -210,7 +210,7 @@ index 228279cb5f3a20904df4d59784c29f0ff850d21e..b0b8adc1741f3a1ce155ed973a04c851
          request_timeout: Duration,
          route_metric_mapper: RM,
      ) -> Self {
-@@ -701,6 +786,7 @@ impl ConvexHttpService {
+@@ -699,6 +784,7 @@ impl ConvexHttpService {
          let concurrency_limiter = HttpConcurrencyLimiter {
              gate: concurrency_gate,
              dependency_path_prefixes,
@@ -218,7 +218,7 @@ index 228279cb5f3a20904df4d59784c29f0ff850d21e..b0b8adc1741f3a1ce155ed973a04c851
              service_name,
          };
          let concurrency_gauge = PullingGauge::new(
-@@ -1610,6 +1696,7 @@ mod tests {
+@@ -1612,6 +1698,7 @@ mod tests {
              HttpAdmissionWaitGuard,
          },
          Body,
@@ -226,7 +226,7 @@ index 228279cb5f3a20904df4d59784c29f0ff850d21e..b0b8adc1741f3a1ce155ed973a04c851
          HttpConcurrencyLimiter,
          StatusCode,
      };
-@@ -1633,11 +1720,111 @@ mod tests {
+@@ -1656,11 +1743,111 @@ mod tests {
          StatusCode::OK
      }
  
@@ -338,7 +338,7 @@ index 228279cb5f3a20904df4d59784c29f0ff850d21e..b0b8adc1741f3a1ce155ed973a04c851
              service_name: "test",
          };
          let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-@@ -1725,6 +1912,7 @@ mod tests {
+@@ -1748,6 +1935,7 @@ mod tests {
          let limiter = HttpConcurrencyLimiter {
              gate: DependencyOverflowGate::new(1, 1),
              dependency_path_prefixes: &["/api/actions/"],
@@ -347,10 +347,23 @@ index 228279cb5f3a20904df4d59784c29f0ff850d21e..b0b8adc1741f3a1ce155ed973a04c851
          };
          let (started_tx, mut started_rx) = mpsc::unbounded_channel();
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 29ac814b66e9b92fce8d9ebd2022178d1d0a1a9b..ad6e8cf8d9a3ce3ef73fc8a98b1a029da33daad7 100644
+index 29ac814b66e9b92fce8d9ebd2022178d1d0a1a9b..f79f2225f28b2fdeec8d2076c0070b8210b26fa0 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -286,6 +286,166 @@ pub static NODE_ACTION_USER_TIMEOUT: LazyLock<Duration> =
+@@ -68,6 +68,12 @@ fn validate_usize_strict_nonzero(name: &str, value: usize) -> anyhow::Result<usi
+     Ok(value)
+ }
+ 
++fn validate_percent(name: &str, value: usize) -> anyhow::Result<usize> {
++    anyhow::ensure!(value > 0, "{name} must be greater than zero");
++    anyhow::ensure!(value <= 100, "{name} must not exceed 100");
++    Ok(value)
++}
++
+ fn env_config_optional_usize_strict(name: &str) -> Option<usize> {
+     let value = match std::env::var(name) {
+         Ok(var_s) => Some(parse_usize_strict(name, &var_s).unwrap_or_else(|e| panic!("{e}"))),
+@@ -286,6 +292,178 @@ pub static NODE_ACTION_USER_TIMEOUT: LazyLock<Duration> =
  pub static MAX_ACTION_USER_TIMEOUT: LazyLock<Duration> =
      LazyLock::new(|| max(*V8_ACTION_USER_TIMEOUT, *NODE_ACTION_USER_TIMEOUT));
  
@@ -426,6 +439,18 @@ index 29ac814b66e9b92fce8d9ebd2022178d1d0a1a9b..ad6e8cf8d9a3ce3ef73fc8a98b1a029d
 +            "LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES must be greater than zero"
 +        );
 +        value
++    });
++
++/// Percentage of the aggregate isolate heap and ArrayBuffer ceilings included
++/// in the local backend startup memory feasibility budget. This changes only
++/// planning accounting; runtime limits and the cgroup hard limit are unchanged.
++/// The value must be between 1 and 100 inclusive.
++pub static LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT: LazyLock<usize> =
++    LazyLock::new(|| {
++        let value =
++            env_config_usize_strict("LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT", 100);
++        validate_percent("LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT", value)
++            .unwrap_or_else(|e| panic!("{e}"))
 +    });
 +
 +/// Reclaim optional backend memory before external admission reaches its
@@ -517,7 +542,7 @@ index 29ac814b66e9b92fce8d9ebd2022178d1d0a1a9b..ad6e8cf8d9a3ce3ef73fc8a98b1a029d
  /// Ideally, we should have no timeout here but we are relying on defense in
  /// depth in case somehow the upstream get stuck. Use very high timeout here.
  ///
-@@ -894,7 +1054,7 @@ pub static WRITE_LOG_MIN_RETENTION_SECS: LazyLock<Duration> =
+@@ -894,7 +1072,7 @@ pub static WRITE_LOG_MIN_RETENTION_SECS: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("WRITE_LOG_MIN_RETENTION_SECS", 30)));
  
  /// The maximum time to retain the WriteLog, note that the WriteLog might be
@@ -526,7 +551,7 @@ index 29ac814b66e9b92fce8d9ebd2022178d1d0a1a9b..ad6e8cf8d9a3ce3ef73fc8a98b1a029d
  pub static WRITE_LOG_MAX_RETENTION_SECS: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("WRITE_LOG_MAX_RETENTION_SECS", 300)));
  
-@@ -2050,8 +2210,8 @@ pub static SUBSCRIPTIONS_WORKER_QUEUE_SIZE: LazyLock<usize> =
+@@ -2050,8 +2228,8 @@ pub static SUBSCRIPTIONS_WORKER_QUEUE_SIZE: LazyLock<usize> =
      LazyLock::new(|| env_config("SUBSCRIPTIONS_WORKER_QUEUE_SIZE", 10000));
  
  /// The number of SubscriptionManager instances to run per SubscriptionsWorker.
@@ -537,6 +562,19 @@ index 29ac814b66e9b92fce8d9ebd2022178d1d0a1a9b..ad6e8cf8d9a3ce3ef73fc8a98b1a029d
  pub static NUM_SUBSCRIPTION_MANAGERS: LazyLock<usize> =
      LazyLock::new(|| env_config("NUM_SUBSCRIPTION_MANAGERS", 1));
  
+@@ -2206,4 +2384,12 @@ mod strict_capacity_tests {
+             validate_usize_strict_nonzero("CAP", tokio::sync::Semaphore::MAX_PERMITS + 1).is_err()
+         );
+     }
++
++    #[test]
++    fn percent_rejects_zero_and_values_above_one_hundred() {
++        assert_eq!(validate_percent("PERCENT", 1).unwrap(), 1);
++        assert_eq!(validate_percent("PERCENT", 100).unwrap(), 100);
++        assert!(validate_percent("PERCENT", 0).is_err());
++        assert!(validate_percent("PERCENT", 101).is_err());
++    }
+ }
 diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
 index a2dd2132f43e484f65dc638cb164a92bbbb84378..c3b71876e482c830894c070e5374352076a9a135 100644
 --- a/crates/common/src/lib.rs
@@ -737,10 +775,10 @@ index aad06cfbcf140315c74ff05ae00977ecf48f526a..2543cb0c20516bca2f8e19e9ca642d32
  
 diff --git a/crates/local_backend/src/memory_metrics.rs b/crates/local_backend/src/memory_metrics.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e4113133b5285fd
+index 0000000000000000000000000000000000000000..71171fd907f2d40ba3902a0dae6959bfccb3e7d4
 --- /dev/null
 +++ b/crates/local_backend/src/memory_metrics.rs
-@@ -0,0 +1,1775 @@
+@@ -0,0 +1,1891 @@
 +use std::{
 +    collections::BTreeMap,
 +    fs,
@@ -772,6 +810,7 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +        LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES,
 +        LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES,
 +        LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES,
++        LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT,
 +        LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES,
 +        MAX_ISOLATE_WORKERS,
 +        SOURCE_MAP_CACHE_MAX_SIZE_BYTES,
@@ -883,6 +922,15 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +register_convex_gauge!(
 +    BACKEND_STARTUP_MEMORY_BUDGET_HEADROOM_BYTES,
 +    "Cgroup memory limit remaining after the configured startup memory budget"
++);
++register_convex_gauge!(
++    BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT_INFO,
++    "Percentage of aggregate isolate memory ceilings included in the startup memory budget"
++);
++register_convex_gauge!(
++    BACKEND_STARTUP_ISOLATE_MEMORY_BYTES,
++    "Aggregate isolate memory used for startup planning",
++    &["accounting_kind"]
 +);
 +register_convex_gauge!(
 +    BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED_INFO,
@@ -1040,6 +1088,13 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +    total_bytes: u64,
 +}
 +
++#[derive(Debug, Eq, PartialEq)]
++struct StartupIsolateMemoryAccounting {
++    raw_capacity_bytes: u64,
++    accounted_bytes: u64,
++    commit_percent: usize,
++}
++
 +impl StartupMemoryBudget {
 +    fn new(components: Vec<MemoryBudgetComponent>) -> anyhow::Result<Self> {
 +        let total_bytes = components.iter().try_fold(0u64, |total, component| {
@@ -1052,6 +1107,24 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +            total_bytes,
 +        })
 +    }
++}
++
++fn account_isolate_memory_capacity(raw_bytes: u64, commit_percent: usize) -> anyhow::Result<u64> {
++    anyhow::ensure!(
++        (1..=100).contains(&commit_percent),
++        "startup isolate memory commit percentage must be between 1 and 100"
++    );
++    let commit_percent = u64::try_from(commit_percent)?;
++    let whole = (raw_bytes / 100)
++        .checked_mul(commit_percent)
++        .context("accounted isolate memory capacity overflow")?;
++    let remainder = (raw_bytes % 100)
++        .checked_mul(commit_percent)
++        .context("accounted isolate memory capacity remainder overflow")?
++        .div_ceil(100);
++    whole
++        .checked_add(remainder)
++        .context("accounted isolate memory capacity overflow")
 +}
 +
 +#[derive(Debug)]
@@ -1669,7 +1742,7 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +}
 +
 +pub fn validate_startup_budget() -> anyhow::Result<()> {
-+    let budget = configured_startup_budget()?;
++    let (budget, isolate_memory) = configured_startup_budget()?;
 +    for component in &budget.components {
 +        log_gauge_with_labels(
 +            &BACKEND_STARTUP_MEMORY_BUDGET_BYTES,
@@ -1682,6 +1755,20 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +        budget.total_bytes as f64,
 +        vec![StaticMetricLabel::new("component", "configured_total")],
 +    );
++    log_gauge(
++        &BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT_INFO,
++        isolate_memory.commit_percent as f64,
++    );
++    for (accounting_kind, bytes) in [
++        ("raw_capacity", isolate_memory.raw_capacity_bytes),
++        ("accounted", isolate_memory.accounted_bytes),
++    ] {
++        log_gauge_with_labels(
++            &BACKEND_STARTUP_ISOLATE_MEMORY_BYTES,
++            bytes as f64,
++            vec![StaticMetricLabel::new("accounting_kind", accounting_kind)],
++        );
++    }
 +
 +    match startup_budget_headroom(Path::new(CGROUP_ROOT), &budget)? {
 +        Some(headroom_bytes) => {
@@ -1692,6 +1779,9 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +            );
 +            tracing::info!(
 +                configured_memory_budget_bytes = budget.total_bytes,
++                isolate_memory_raw_capacity_bytes = isolate_memory.raw_capacity_bytes,
++                isolate_memory_accounted_bytes = isolate_memory.accounted_bytes,
++                isolate_memory_commit_percent = isolate_memory.commit_percent,
 +                memory_budget_headroom_bytes = headroom_bytes,
 +                "Validated configured startup memory budget against the cgroup limit"
 +            );
@@ -1700,6 +1790,9 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +            log_gauge(&BACKEND_STARTUP_MEMORY_BUDGET_LIMIT_AVAILABLE_INFO, 0.0);
 +            tracing::info!(
 +                configured_memory_budget_bytes = budget.total_bytes,
++                isolate_memory_raw_capacity_bytes = isolate_memory.raw_capacity_bytes,
++                isolate_memory_accounted_bytes = isolate_memory.accounted_bytes,
++                isolate_memory_commit_percent = isolate_memory.commit_percent,
 +                "Skipped startup memory feasibility because no finite cgroup v2 limit is available"
 +            );
 +        },
@@ -1707,7 +1800,16 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +    Ok(())
 +}
 +
-+fn configured_startup_budget() -> anyhow::Result<StartupMemoryBudget> {
++fn configured_startup_budget(
++) -> anyhow::Result<(StartupMemoryBudget, StartupIsolateMemoryAccounting)> {
++    configured_startup_budget_with_isolate_memory_commit_percent(
++        *LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT,
++    )
++}
++
++fn configured_startup_budget_with_isolate_memory_commit_percent(
++    commit_percent: usize,
++) -> anyhow::Result<(StartupMemoryBudget, StartupIsolateMemoryAccounting)> {
 +    let isolate_workers =
 +        u64::try_from(*MAX_ISOLATE_WORKERS).context("MAX_ISOLATE_WORKERS does not fit in u64")?;
 +    let isolate_heap_per_worker = ISOLATE_MAX_USER_HEAP_SIZE
@@ -1719,14 +1821,27 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +    let isolate_array_buffer_pool = u64::try_from(*ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE)?
 +        .checked_mul(isolate_workers)
 +        .context("configured isolate ArrayBuffer pool overflow")?;
-+    StartupMemoryBudget::new(vec![
++    let accounted_isolate_heap_pool =
++        account_isolate_memory_capacity(isolate_heap_pool, commit_percent)?;
++    let accounted_isolate_array_buffer_pool =
++        account_isolate_memory_capacity(isolate_array_buffer_pool, commit_percent)?;
++    let isolate_memory = StartupIsolateMemoryAccounting {
++        raw_capacity_bytes: isolate_heap_pool
++            .checked_add(isolate_array_buffer_pool)
++            .context("configured raw isolate memory capacity overflow")?,
++        accounted_bytes: accounted_isolate_heap_pool
++            .checked_add(accounted_isolate_array_buffer_pool)
++            .context("configured accounted isolate memory capacity overflow")?,
++        commit_percent,
++    };
++    let budget = StartupMemoryBudget::new(vec![
 +        MemoryBudgetComponent {
 +            name: "isolate_heap_pool",
-+            bytes: isolate_heap_pool,
++            bytes: accounted_isolate_heap_pool,
 +        },
 +        MemoryBudgetComponent {
 +            name: "isolate_array_buffer_pool",
-+            bytes: isolate_array_buffer_pool,
++            bytes: accounted_isolate_array_buffer_pool,
 +        },
 +        MemoryBudgetComponent {
 +            name: "query_cache",
@@ -1763,7 +1878,8 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +            name: "native_kernel_reserve",
 +            bytes: u64::try_from(*LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES)?,
 +        },
-+    ])
++    ])?;
++    Ok((budget, isolate_memory))
 +}
 +
 +fn startup_budget_headroom(
@@ -2280,6 +2396,9 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +    #[cfg(target_env = "gnu")]
 +    use super::allocator_arena_count;
 +    use super::{
++        account_isolate_memory_capacity,
++        configured_startup_budget,
++        configured_startup_budget_with_isolate_memory_commit_percent,
 +        parse_process_status,
 +        pressure_state,
 +        read_cgroup_memory,
@@ -2464,6 +2583,41 @@ index 0000000000000000000000000000000000000000..c32436386d7f69051fd2e5079e411313
 +            .unwrap_err()
 +            .to_string()
 +            .contains("exceeds the finite cgroup memory limit"));
++    }
++
++    #[test]
++    fn startup_budget_accounts_only_the_selected_isolate_capacity_fraction() {
++        let (full_budget, full_isolate_memory) =
++            configured_startup_budget_with_isolate_memory_commit_percent(100).unwrap();
++        let (partial_budget, partial_isolate_memory) =
++            configured_startup_budget_with_isolate_memory_commit_percent(75).unwrap();
++
++        assert_eq!(
++            full_isolate_memory.raw_capacity_bytes,
++            partial_isolate_memory.raw_capacity_bytes
++        );
++        assert_eq!(
++            full_isolate_memory.accounted_bytes,
++            full_isolate_memory.raw_capacity_bytes
++        );
++        assert_eq!(partial_isolate_memory.commit_percent, 75);
++        assert_eq!(
++            partial_isolate_memory.accounted_bytes,
++            account_isolate_memory_capacity(partial_isolate_memory.raw_capacity_bytes, 75).unwrap()
++        );
++        let fixed_budget = full_budget.total_bytes - full_isolate_memory.accounted_bytes;
++        assert_eq!(
++            partial_budget.total_bytes,
++            fixed_budget + partial_isolate_memory.accounted_bytes
++        );
++    }
++
++    #[test]
++    fn isolate_capacity_accounting_rounds_up_and_rejects_invalid_percentages() {
++        assert_eq!(account_isolate_memory_capacity(1, 75).unwrap(), 1);
++        assert_eq!(account_isolate_memory_capacity(101, 75).unwrap(), 76);
++        assert!(account_isolate_memory_capacity(100, 0).is_err());
++        assert!(account_isolate_memory_capacity(100, 101).is_err());
 +    }
 +
 +    #[test]
@@ -4121,10 +4275,10 @@ index 2d41c7326b38ffc99037a128c3d25a3b4968629a..e3e7c782a6d3ad552690b498fd9b583d
  
 diff --git a/patches/backend_memory_resilience/README.md b/patches/backend_memory_resilience/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..f8423c6a1edb883a450eb5cf031763dc91e6b118
+index 0000000000000000000000000000000000000000..775c63926d8cc54a03a65cb231b6b55f06183d4d
 --- /dev/null
 +++ b/patches/backend_memory_resilience/README.md
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,135 @@
 +# Backend Memory Resilience
 +
 +Status: the maintained backend patch accounts for configured and observed memory, reclaims optional
@@ -4146,6 +4300,16 @@ index 0000000000000000000000000000000000000000..f8423c6a1edb883a450eb5cf031763dc
 +reclamation and external HTTP shedding, allocator trim, and the shared pressure signal. It extends
 +the maintained local Node generation-retirement patch with a pressure response and exposes the
 +signal to later owner-specific patches.
++
++Startup feasibility accounts for 100% of the aggregate isolate heap and
++ArrayBuffer ceilings by default. A self-hosted operator may set
++`LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT` from 1 through 100 to
++account for a smaller aggregate fraction while retaining the original runtime
++ceilings. Cache budgets, the complete Node allowance, and the native/kernel
++reserve remain fully counted. Telemetry reports the raw isolate capacity, the
++accounted isolate bytes, the selected percentage, and the resulting adjusted
++total. This planning control does not weaken the finite cgroup limit or the
++runtime memory-pressure response.
 +
 +The maintained commit is applied after
 +[`local_node_executor_resilience`](../local_node_executor_resilience/README.md), whose generation
@@ -4480,10 +4644,10 @@ index 1fa7c63e36c24e19e732b20978fa7354b72bceb9..a7627ed99b651682975e7050c45933de
  The patch does not remove the one-process throughput ceiling or isolate
  synchronous Node work across processes. A process pool remains a separate
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 0273856b6c9a033f283539e5e35eec061d9d9208..aaefb24bd88a14b95dbb6ea42088928c0ff7d58f 100644
+index 0273856b6c9a033f283539e5e35eec061d9d9208..6603724e29cb3f92be2d9a3c11c4c86047870a68 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
-@@ -8,6 +8,135 @@ environment variables by adding them to your `docker-compose.yml` file. Commonly
+@@ -8,6 +8,147 @@ environment variables by adding them to your `docker-compose.yml` file. Commonly
  overriden knobs are listed in the `env` section of the
  [`docker-compose.yml`](../docker/docker-compose.yml)
  
@@ -4493,9 +4657,11 @@ index 0273856b6c9a033f283539e5e35eec061d9d9208..aaefb24bd88a14b95dbb6ea42088928c
 +database caches, isolate pool, or local Node executor. The configured budget is
 +the checked sum of:
 +
-+- `(ISOLATE_MAX_USER_HEAP_SIZE + ISOLATE_MAX_HEAP_EXTRA_SIZE) *
++- `LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT`, default `100`, of
++  `(ISOLATE_MAX_USER_HEAP_SIZE + ISOLATE_MAX_HEAP_EXTRA_SIZE) *
 +  MAX_ISOLATE_WORKERS`;
-+- `ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE * MAX_ISOLATE_WORKERS`;
++- the same percentage of
++  `ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE * MAX_ISOLATE_WORKERS`;
 +- `UDF_CACHE_MAX_SIZE` and `INDEX_CACHE_SIZE`;
 +- `SOURCE_MAP_CACHE_MAX_SIZE_BYTES`, `FUNRUN_INDEX_CACHE_SIZE`,
 +  `FUNRUN_MODULE_CACHE_SIZE`, and `FUNRUN_CODE_CACHE_SIZE`;
@@ -4509,6 +4675,14 @@ index 0273856b6c9a033f283539e5e35eec061d9d9208..aaefb24bd88a14b95dbb6ea42088928c
 +memory controller is absent or unlimited. A malformed present controller file
 +is a startup error.
 +
++`LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT` accepts decimal integers
++from 1 through 100. A value below 100 permits aggregate startup overcommit for
++the isolate heap and ArrayBuffer ceilings. It does not change any per-isolate
++runtime limit, cache or Node allowance, native reserve, memory-pressure
++boundary, or cgroup limit. Operators should reduce it only when workload
++evidence supports the risk that many isolates can approach their independent
++ceilings at the same time.
++
 +This calculation checks configuration feasibility; it is not current
 +allocation and does not prove that every cache's weight exactly matches RSS.
 +The Node budget entry is a planning allowance equal to a sampled Linux
@@ -4516,10 +4690,12 @@ index 0273856b6c9a033f283539e5e35eec061d9d9208..aaefb24bd88a14b95dbb6ea42088928c
 +grow between samples and while active requests drain. Short-lived descendant
 +processes created while building dependencies are not sampled and remain part
 +of the native and kernel reserve.
-+The backend publishes each bounded component, the configured total, finite
-+limit availability, and finite-limit headroom as startup memory-budget metrics.
-+The periodic process, allocator, and cgroup metrics remain the source for
-+actual use.
++The backend publishes each accounted component, the configured total, the
++selected isolate commit percentage, raw and accounted aggregate isolate bytes,
++finite-limit availability, and finite-limit headroom as startup memory-budget
++metrics. `isolate_memory_capacity_bytes` independently retains the raw
++per-worker and aggregate runtime ceilings. The periodic process, allocator, and
++cgroup metrics remain the source for actual use.
 +
 +The local Node executor also has independent lifetime controls:
 +
@@ -4620,10 +4796,10 @@ index 0273856b6c9a033f283539e5e35eec061d9d9208..aaefb24bd88a14b95dbb6ea42088928c
  
  This limits concurrent application requests admitted by the backend HTTP
 diff --git a/self-hosted/docker/docker-compose.yml b/self-hosted/docker/docker-compose.yml
-index d9fa3cae5d84dc75af94a6992ca18c8db2d1771f..45c576f7f2bbeed8aa52d28252a5db2b619c0bb7 100644
+index d9fa3cae5d84dc75af94a6992ca18c8db2d1771f..a15097bd8702e137f213950627f21520661b3be0 100644
 --- a/self-hosted/docker/docker-compose.yml
 +++ b/self-hosted/docker/docker-compose.yml
-@@ -12,11 +12,22 @@ services:
+@@ -12,11 +12,23 @@ services:
      environment:
        - V8_ACTION_USER_TIMEOUT_SECS
        - NODE_ACTION_USER_TIMEOUT_SECS
@@ -4632,6 +4808,7 @@ index d9fa3cae5d84dc75af94a6992ca18c8db2d1771f..45c576f7f2bbeed8aa52d28252a5db2b
 +      - LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS
 +      - LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES
 +      - LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES
++      - LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT
 +      - LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED
 +      - LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES
 +      - LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES
@@ -4646,7 +4823,7 @@ index d9fa3cae5d84dc75af94a6992ca18c8db2d1771f..45c576f7f2bbeed8aa52d28252a5db2b
        - ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS
        - ISOLATE_CONTROL_PLANE_LANE_ENABLED
        - ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY
-@@ -52,6 +63,7 @@ services:
+@@ -52,6 +64,7 @@ services:
        - MYSQL_URL
        - POSTGRES_URL
        - REDACT_LOGS_TO_CLIENT

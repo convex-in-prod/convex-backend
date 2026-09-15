@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 12 Aug 2026 13:29:32 +0800
-Subject: [PATCH 22/30] node-executor: add coordinated local executor pools
+Subject: [PATCH 22/28] node-executor: add coordinated local executor pools
 
 Allow root Node action modules to request bounded named local executor pools and preserve the required assignment through bundling, deployment, durable source metadata, archives, and execution routing. Validate the complete topology and steady-plus-surge RSS budget before commit and during startup.
 
@@ -29,7 +29,7 @@ Document the composed ordering, its package-cache lease limitation, and its deli
  crates/local_backend/src/deploy_config2.rs    |    30 +-
  crates/local_backend/src/lib.rs               |    26 +-
  crates/local_backend/src/main.rs              |    19 +-
- crates/local_backend/src/memory_metrics.rs    |    35 +-
+ crates/local_backend/src/memory_metrics.rs    |    34 +-
  crates/model/src/config/types.rs              |   340 +
  crates/model/src/modules/mod.rs               |     6 +
  crates/model/src/modules/types.rs             |    50 +-
@@ -59,14 +59,14 @@ Document the composed ordering, its package-cache lease limitation, and its deli
  .../node-executor/src/source_package.ts       |    59 +-
  patches/README.md                             |    59 +-
  .../README.md                                 |     7 +
- patches/backend_memory_resilience/README.md   |   122 +-
+ patches/backend_memory_resilience/README.md   |   121 +-
  .../local_node_executor_resilience/README.md  |   413 +-
  .../README.md                                 |   591 +
  .../scheduled_node_action_admission.md        |   557 +
  patches/scheduled_action_admission/README.md  |    67 +-
  self-hosted/advanced/knobs.md                 |    96 +-
  self-hosted/docker/docker-compose.yml         |     1 +
- 49 files changed, 17417 insertions(+), 4461 deletions(-)
+ 49 files changed, 17415 insertions(+), 4461 deletions(-)
  create mode 100644 crates/common/src/execution_start.rs
  create mode 100644 crates/node_executor/src/routed.rs
  create mode 100644 npm-packages/convex/src/bundler/index.test.ts
@@ -1154,10 +1154,10 @@ index 0000000000000000000000000000000000000000..96da864aff1a736cd4af693954a37f9f
 +    }
 +}
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index feefd7a716299668653b4990d7a67e4437e6d639..8f5fe8430231608c4bc55faec943db56f9cbab45 100644
+index 70495c39d776946276dcf4cfe5aad3f0773fb433..e68b65f01762bb033cd49d635d1a5ea7fca91ca3 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -453,6 +453,24 @@ pub static LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES: LazyLock<usize> = LazyLock::new(||
+@@ -459,6 +459,24 @@ pub static LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES: LazyLock<usize> = LazyLock::new(||
      value
  });
  
@@ -1660,19 +1660,19 @@ index c0117f0dc551fd6c928a5cccc13933691ff23334..412dc303530a59cdba76d6fc7ed7e47b
          memory_reclamation.clone(),
      )?;
 diff --git a/crates/local_backend/src/memory_metrics.rs b/crates/local_backend/src/memory_metrics.rs
-index 816df6adce69aa3525f8ff5b865bf61e76785061..b96ef444abca85a0abfcb833917f04b82d676cec 100644
+index 436b863566bdf39f8b35584badf104c5d5e3364b..16e6e75d3851150eccf8c82c28017e2185499307 100644
 --- a/crates/local_backend/src/memory_metrics.rs
 +++ b/crates/local_backend/src/memory_metrics.rs
-@@ -35,7 +35,7 @@ use common::{
-         LOCAL_BACKEND_MEMORY_RECLAMATION_ENTER_HEADROOM_BYTES,
+@@ -36,7 +36,7 @@ use common::{
          LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES,
          LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES,
+         LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT,
 -        LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES,
 +        LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES,
          MAX_ISOLATE_WORKERS,
          SOURCE_MAP_CACHE_MAX_SIZE_BYTES,
          UDF_CACHE_MAX_SIZE,
-@@ -1376,8 +1376,8 @@ fn configured_startup_budget() -> anyhow::Result<StartupMemoryBudget> {
+@@ -1453,8 +1453,8 @@ fn configured_startup_budget_with_isolate_memory_commit_percent(
              // This sampled Linux direct-child retirement trigger is a planning allowance, not a
              // hard RSS maximum. Sampling delay, active-request drain, and descendants can exceed
              // it.
@@ -1683,7 +1683,7 @@ index 816df6adce69aa3525f8ff5b865bf61e76785061..b96ef444abca85a0abfcb833917f04b8
          },
          MemoryBudgetComponent {
              name: "native_kernel_reserve",
-@@ -2338,6 +2338,7 @@ mod tests {
+@@ -2416,6 +2416,7 @@ mod tests {
  
      use common::{
          http::ExternalRequestShedding,
@@ -1691,21 +1691,13 @@ index 816df6adce69aa3525f8ff5b865bf61e76785061..b96ef444abca85a0abfcb833917f04b8
          memory_pressure::MemoryPressureSignal,
      };
      use tempfile::TempDir;
-@@ -2345,6 +2346,7 @@ mod tests {
-     #[cfg(all(target_os = "linux", target_env = "gnu", not(local_backend_jemalloc)))]
-     use super::allocator_arena_count;
-     use super::{
-+        configured_startup_budget,
-         effective_cgroup_root_from,
-         parse_malloc_info_arena_count,
-         parse_process_status,
-@@ -2750,6 +2752,33 @@ VmSwap:\t50 kB
-             .contains("exceeds the finite cgroup memory limit"));
+@@ -2858,6 +2859,20 @@ VmSwap:\t50 kB
+         );
      }
  
 +    #[test]
 +    fn startup_budget_reserves_total_local_node_budget() {
-+        let budget = configured_startup_budget().unwrap();
++        let (budget, _) = configured_startup_budget().unwrap();
 +        let node = budget
 +            .components
 +            .iter()
@@ -1717,9 +1709,16 @@ index 816df6adce69aa3525f8ff5b865bf61e76785061..b96ef444abca85a0abfcb833917f04b8
 +        );
 +    }
 +
+     #[test]
+     fn isolate_capacity_accounting_rounds_up_and_rejects_invalid_percentages() {
+         assert_eq!(account_isolate_memory_capacity(1, 75).unwrap(), 1);
+@@ -2866,6 +2881,19 @@ VmSwap:\t50 kB
+         assert!(account_isolate_memory_capacity(100, 101).is_err());
+     }
+ 
 +    #[test]
 +    fn finite_cgroup_limit_covers_total_local_node_budget() {
-+        let budget = configured_startup_budget().unwrap();
++        let (budget, _) = configured_startup_budget().unwrap();
 +        let root = TempDir::new().unwrap();
 +        fs::write(root.path().join("memory.current"), "0\n").unwrap();
 +        fs::write(
@@ -22761,7 +22760,7 @@ index 507b40b927f11e9fcd101c610758e3c3f76151cd..bea3011d57fa9970be2457494f6465ed
  
  `source_package.test.ts`, `errors.test.ts`, and `build_deps.test.ts` add focused
 diff --git a/patches/backend_memory_resilience/README.md b/patches/backend_memory_resilience/README.md
-index c3f23a6927e7a5e677b7d6df1e07a5db550ab2ee..eb2defb69373fa1961f3161dff0af685928d7cc3 100644
+index 5c30f00a3a9781d359de770f0f84258d5cda37b8..1cc68ca1bde4673588568c9ac3af34b4af181e01 100644
 --- a/patches/backend_memory_resilience/README.md
 +++ b/patches/backend_memory_resilience/README.md
 @@ -1,10 +1,12 @@
@@ -22782,10 +22781,10 @@ index c3f23a6927e7a5e677b7d6df1e07a5db550ab2ee..eb2defb69373fa1961f3161dff0af685
  also requires a readable, finite cgroup v2 memory limit.
  
  ## Problem
-@@ -21,13 +23,27 @@ reclamation and external HTTP shedding, allocator trim, and the shared pressure
- the maintained local Node generation-retirement patch with a pressure response and exposes the
- signal to later owner-specific patches.
- 
+@@ -30,14 +32,27 @@ reserve remain fully counted. Telemetry reports the raw isolate capacity, the
+ accounted isolate bytes, the selected percentage, and the resulting adjusted
+ total. This planning control does not weaken the finite cgroup limit or the
+ runtime memory-pressure response.
 +When application-declared local Node executor pools are available, startup
 +memory feasibility reserves `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`.
 +Deploy and startup validation separately require the default steady slot, every
@@ -22799,7 +22798,7 @@ index c3f23a6927e7a5e677b7d6df1e07a5db550ab2ee..eb2defb69373fa1961f3161dff0af685
 +not started a child. It reserves the complete configured generation allowance,
 +not the normally smaller RSS of a fresh process. Every pool observes the same
 +pressure signal and applies the same grace and RSS floor independently.
-+
+ 
  Backend memory resilience is carried as an ordered adoption composition after
  [`local_node_executor_resilience`](../local_node_executor_resilience/README.md), whose generation
 -fencing and graceful retirement it reuses, and
@@ -22812,7 +22811,7 @@ index c3f23a6927e7a5e677b7d6df1e07a5db550ab2ee..eb2defb69373fa1961f3161dff0af685
  drains. The `runtime: harden backend memory pressure` integration commit supplies effective
  cgroup discovery, concurrent control sampling during trim, strict parser and configuration handling,
  and corrected Node pressure-grace transitions. The later
-@@ -171,17 +187,46 @@ policy in the patch that owns the cache.
+@@ -181,17 +196,46 @@ policy in the patch that owns the cache.
  
  ## Local Node reclamation
  
@@ -22870,7 +22869,7 @@ index c3f23a6927e7a5e677b7d6df1e07a5db550ab2ee..eb2defb69373fa1961f3161dff0af685
  
  ## Observability
  
-@@ -201,7 +246,9 @@ The patch extends the existing bounded memory families with:
+@@ -211,7 +255,9 @@ The patch extends the existing bounded memory families with:
  - `local_node_executor_memory_pressure_active_info`,
    `local_node_executor_memory_pressure_rss_threshold_bytes`, and
    `local_node_executor_memory_pressure_grace_seconds`; and
@@ -22881,7 +22880,7 @@ index c3f23a6927e7a5e677b7d6df1e07a5db550ab2ee..eb2defb69373fa1961f3161dff0af685
  
  Allocator labels form the closed set `jemalloc`, `glibc`, and `system`. The jemalloc configuration
  components are `narenas`, `dirty_decay_ms`, `abort_on_invalid_configuration`,
-@@ -217,6 +264,23 @@ outcome. Signed result gauges retain the latest completed sample, so consumers m
+@@ -227,6 +273,23 @@ outcome. Signed result gauges retain the latest completed sample, so consumers m
  with a counter increment in the observation window. Arena and allocator availability gauges
  distinguish measured zero from unsupported or failed telemetry.
  
@@ -22905,7 +22904,7 @@ index c3f23a6927e7a5e677b7d6df1e07a5db550ab2ee..eb2defb69373fa1961f3161dff0af685
  ## Activation and verification
  
  The reclamation, allocator-trim, and external-shedding switches default to `false`. Enabling any of
-@@ -226,14 +290,18 @@ headroom settings use strict nonnegative decimal parsing. Trim minimum free spac
+@@ -236,14 +299,18 @@ headroom settings use strict nonnegative decimal parsing. Trim minimum free spac
  Node pressure RSS, and Node pressure grace must be positive. Changing the process environment
  requires a backend restart.
  
@@ -24766,10 +24765,10 @@ index a2b9a2325614d1ce55e10f2368aac50e19e39833..7de1b757a9016ba21e9cf0e61caede4f
  scripts/run_cargo.sh check -p application
  ```
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 9dd7c36d6c273b8c38f3e525061ed3331ad4b9c3..5e2e1deb39e9c60b982647130581a2453ed2f0f1 100644
+index 177e13b686361d5a3af3744f60c9cede34d7b7ea..20aab7a9aa599c8b260427128b971170839c2b15 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
-@@ -20,7 +20,7 @@ the checked sum of:
+@@ -22,7 +22,7 @@ the checked sum of:
  - `UDF_CACHE_MAX_SIZE` and `INDEX_CACHE_SIZE`;
  - `SOURCE_MAP_CACHE_MAX_SIZE_BYTES`, `FUNRUN_INDEX_CACHE_SIZE`,
    `FUNRUN_MODULE_CACHE_SIZE`, and `FUNRUN_CODE_CACHE_SIZE`;
@@ -24778,7 +24777,7 @@ index 9dd7c36d6c273b8c38f3e525061ed3331ad4b9c3..5e2e1deb39e9c60b982647130581a245
  - `LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES`, which defaults to 2 GiB.
  
  The reserve covers allocations without a separate configured ceiling,
-@@ -55,17 +55,21 @@ V8 old space excludes Buffers, native modules, executable code, and allocator
+@@ -67,17 +67,21 @@ V8 old space excludes Buffers, native modules, executable code, and allocator
  retention, so the RSS threshold must remain larger and is validated
  independently. The age and lifetime-unique imported source-package thresholds
  bound growth that disk-cache eviction cannot reclaim from Node's ESM module
@@ -24809,7 +24808,7 @@ index 9dd7c36d6c273b8c38f3e525061ed3331ad4b9c3..5e2e1deb39e9c60b982647130581a245
  unsupported and do not use the RSS trigger. A failed Linux sample marks RSS
  telemetry unavailable and skips only that trigger for the iteration; age,
  package, and unhealthy-generation checks continue. The RSS byte gauge retains
-@@ -75,6 +79,66 @@ telemetry-availability gauge.
+@@ -87,6 +91,66 @@ telemetry-availability gauge.
  The stock Compose file passes these controls through without setting
  different defaults. Changing one requires a backend restart.
  
@@ -24876,7 +24875,7 @@ index 9dd7c36d6c273b8c38f3e525061ed3331ad4b9c3..5e2e1deb39e9c60b982647130581a245
  ## Backend process allocator
  
  The standard local backend build enables its default `jemalloc` feature. On supported targets,
-@@ -126,11 +190,15 @@ On entry, the controller first evaluates an optional glibc trim and resamples cg
+@@ -138,11 +202,15 @@ On entry, the controller first evaluates an optional glibc trim and resamples cg
  pressure remains, it publishes one shared signal. When the bounded context-reuse patch is also
  carried, idle isolates drop their fresh context, prune the reusable cache from its normal
  one-probationary-plus-five-protected capacity to the two strongest protected entries, suppress new
@@ -24897,7 +24896,7 @@ index 9dd7c36d6c273b8c38f3e525061ed3331ad4b9c3..5e2e1deb39e9c60b982647130581a245
  A new shared-pressure entry waits behind an in-flight trim only while headroom is above
  `LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES`. At or below that value, owner reclamation
 diff --git a/self-hosted/docker/docker-compose.yml b/self-hosted/docker/docker-compose.yml
-index 06404580775dc60db08bb270cdfb7b6bfa8028d3..334d319d7a1c16e90da86f9fe4c3eeed8b54dfa1 100644
+index f2b5ab59597dfe76d2693651c1027f86dec26fc2..fe572f7e489736227042c97bdcd6fabb8aa1a4f3 100644
 --- a/self-hosted/docker/docker-compose.yml
 +++ b/self-hosted/docker/docker-compose.yml
 @@ -18,6 +18,7 @@ services:
@@ -24906,5 +24905,5 @@ index 06404580775dc60db08bb270cdfb7b6bfa8028d3..334d319d7a1c16e90da86f9fe4c3eeed
        - LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES
 +      - LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES
        - LOCAL_BACKEND_NATIVE_KERNEL_MEMORY_RESERVE_BYTES
+       - LOCAL_BACKEND_STARTUP_ISOLATE_MEMORY_COMMIT_PERCENT
        - LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED
-       - LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES

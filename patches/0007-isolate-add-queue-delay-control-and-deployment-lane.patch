@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Mon, 13 Jul 2026 19:30:33 +0800
-Subject: [PATCH 07/30] isolate: add queue delay control and deployment lane
+Subject: [PATCH 07/28] isolate: add queue delay control and deployment lane
 
 Add opt-in bounded independent-action, ordinary, dependency, and control-plane
 queue lanes while preserving improved upstream CoDel as the default. Select the
@@ -47,7 +47,7 @@ rollout, rollback, cancellation, and telemetry contract.
  Cargo.lock                                    |    1 +
  .../dependency_overflow.rs                    |  302 ---
  .../src/application_function_runner/mod.rs    |   10 +-
- crates/common/src/codel_queue.rs              |  488 +++-
+ crates/common/src/codel_queue.rs              |  518 +++-
  crates/common/src/knobs.rs                    |  151 +-
  crates/common/src/lib.rs                      |    2 +-
  crates/isolate/Cargo.toml                     |    1 +
@@ -61,7 +61,7 @@ rollout, rollback, cancellation, and telemetry contract.
  .../deployment_lane_design_reference.md       |  781 ++++++
  self-hosted/advanced/knobs.md                 |   99 +-
  self-hosted/docker/docker-compose.yml         |    8 +
- 17 files changed, 5810 insertions(+), 674 deletions(-)
+ 17 files changed, 5840 insertions(+), 674 deletions(-)
  delete mode 100644 crates/application/src/application_function_runner/dependency_overflow.rs
  create mode 100644 crates/isolate/src/isolate_queue.rs
  create mode 100644 patches/isolate_queue_control/README.md
@@ -419,7 +419,7 @@ index ace72687bbfe8d9d754a18a510d5ff2750c9a692..73812fbcc0367a601d50813c718f3b61
  
  /// Wrapper for [IsolateClient]s and [FunctionRunner]s that determines where to
 diff --git a/crates/common/src/codel_queue.rs b/crates/common/src/codel_queue.rs
-index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e10cf96a9 100644
+index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..5e09ca5ad6eaaf56ca2cf476d39653fd4c26f4e1 100644
 --- a/crates/common/src/codel_queue.rs
 +++ b/crates/common/src/codel_queue.rs
 @@ -40,6 +40,15 @@ use crate::{
@@ -578,7 +578,7 @@ index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e
      #[test]
      fn pop_selecting_keeps_ineligible_items_queued() {
          let rt = QueueTestRuntime::new();
-@@ -405,13 +477,99 @@ mod tests {
+@@ -405,13 +477,129 @@ mod tests {
          sender.try_send(DropCounter(drops.clone())).unwrap();
  
          drop(receiver);
@@ -648,6 +648,36 @@ index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e
 +    }
 +
 +    #[test]
++    fn recoverable_sender_retains_rejected_items_until_caller_drops_them() {
++        let queue = CoDelQueue::new_with_reserved_capacity(QueueTestRuntime::new(), 1, 1);
++        let (sender, receiver) = queue.into_sender_and_receiver();
++        let inner = Arc::downgrade(&sender.inner);
++        let unlocked_drops = Arc::new(AtomicUsize::new(0));
++        let probe = || LockingDropProbe {
++            inner: inner.clone(),
++            unlocked_drops: unlocked_drops.clone(),
++        };
++
++        assert!(sender.try_send_or_recover(probe()).is_ok());
++        // Recovery uses ordinary admission, even when dependency reserve is free.
++        let Err((super::QueueFull, full_item)) = sender.try_send_or_recover(probe()) else {
++            panic!("Ordinary recovery API consumed dependency reserve");
++        };
++        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 0);
++        drop(receiver);
++        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 1);
++        drop(full_item);
++        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 2);
++
++        let Err((super::QueueFull, closed_item)) = sender.try_send_or_recover(probe()) else {
++            panic!("Recovery API admitted work after receiver closure");
++        };
++        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 2);
++        drop(closed_item);
++        assert_eq!(unlocked_drops.load(Ordering::Relaxed), 3);
++    }
++
++    #[test]
 +    fn detailed_sender_errors_distinguish_full_from_closed() {
 +        let rt = QueueTestRuntime::new();
 +        let queue = CoDelQueue::new_with_reserved_capacity(rt, 1, 1);
@@ -680,7 +710,7 @@ index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e
      #[test]
      fn reserved_capacity_is_unavailable_to_ordinary_senders() {
          let rt = QueueTestRuntime::new();
-@@ -521,6 +679,123 @@ mod tests {
+@@ -521,6 +709,123 @@ mod tests {
              .expect("sender is still open");
          assert_eq!(item, "all_workers_busy");
      }
@@ -804,7 +834,7 @@ index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e
  }
  
  /// Wrapper around CoDelQueue that makes it async.
-@@ -548,9 +823,18 @@ struct Inner<RT: Runtime, T> {
+@@ -548,9 +853,18 @@ struct Inner<RT: Runtime, T> {
      receivers: usize,
  }
  
@@ -823,7 +853,7 @@ index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e
  }
  
  impl<RT: Runtime, T> Clone for CoDelQueueReceiver<RT, T> {
-@@ -559,6 +843,7 @@ impl<RT: Runtime, T> Clone for CoDelQueueReceiver<RT, T> {
+@@ -559,6 +873,7 @@ impl<RT: Runtime, T> Clone for CoDelQueueReceiver<RT, T> {
          Self {
              inner: self.inner.clone(),
              listener: None,
@@ -831,7 +861,7 @@ index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e
          }
      }
  }
-@@ -616,7 +901,7 @@ impl<RT: Runtime, T> Drop for CoDelQueueSender<RT, T> {
+@@ -616,7 +931,7 @@ impl<RT: Runtime, T> Drop for CoDelQueueSender<RT, T> {
          let mut inner = self.inner.lock();
          inner.senders -= 1;
          if inner.senders == 0 {
@@ -840,7 +870,7 @@ index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e
              inner.event.notify(usize::MAX);
              inner.expired_event.notify(usize::MAX);
          }
-@@ -625,42 +910,57 @@ impl<RT: Runtime, T> Drop for CoDelQueueSender<RT, T> {
+@@ -625,42 +940,57 @@ impl<RT: Runtime, T> Drop for CoDelQueueSender<RT, T> {
  
  impl<RT: Runtime, T> CoDelQueueSender<RT, T> {
      pub fn try_send(&self, item: T) -> Result<(), QueueFull> {
@@ -924,7 +954,7 @@ index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e
      }
  }
  
-@@ -702,26 +1002,63 @@ impl<RT: Runtime, T> CoDelQueueReceiver<RT, T> {
+@@ -702,26 +1032,63 @@ impl<RT: Runtime, T> CoDelQueueReceiver<RT, T> {
          poll_fn(|cx| self.poll_next_with_expiration(cx)).await
      }
  
@@ -959,7 +989,7 @@ index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e
 +                drop(inner);
 +                drop(expiration_wait);
 +                return Poll::Ready(None);
-             }
++            }
 +
 +            let next_expiry_time = inner
 +                .queue
@@ -997,12 +1027,12 @@ index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e
 +                let completed = self.expiration_wait.take();
 +                drop(completed);
 +                continue;
-+            }
+             }
 +            return Poll::Pending;
          }
      }
  
-@@ -766,12 +1103,18 @@ impl<RT: Runtime, T> Stream for CoDelQueueExpiredReceiver<RT, T> {
+@@ -766,12 +1133,18 @@ impl<RT: Runtime, T> Stream for CoDelQueueExpiredReceiver<RT, T> {
          loop {
              let mut inner = this.inner.lock();
              if let Some(result) = inner.queue.pop_expired() {
@@ -1026,7 +1056,7 @@ index 8f57ee5c5bb91d2503aaf75a0c4809915dc9ca63..2bbec456ba44ea064cdbd2efcdaebb5e
                  return Poll::Ready(None);
              }
  
-@@ -780,42 +1123,41 @@ impl<RT: Runtime, T> Stream for CoDelQueueExpiredReceiver<RT, T> {
+@@ -780,42 +1153,41 @@ impl<RT: Runtime, T> Stream for CoDelQueueExpiredReceiver<RT, T> {
                  .buffer
                  .front()
                  .map(|(_, expiration)| *expiration);

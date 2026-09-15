@@ -1,0 +1,780 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Tue, 15 Sep 2026 15:04:07 +0800
+Subject: [PATCH 28/28] function runner: expose bounded host-operation mismatch
+ evidence
+
+Retain data-free operation and status count differences when paired query-shadow host traces do not match. Include comparison eligibility and an exact omission count while keeping matching reports allocation-free and preserving the existing order-insensitive multiset semantics. Expose the bounded diagnostic through authenticated operator evidence so a mismatch can be investigated without retaining invocation data.
+---
+ .../query_shadow.rs                           |   1 +
+ crates/application/src/function_log.rs        |  13 +-
+ crates/function_runner/src/lib.rs             |   5 +-
+ crates/function_runner/src/query_shadow.rs    | 253 +++++++++++++++---
+ crates/function_runner/src/server.rs          |   1 +
+ crates/local_backend/src/app_metrics.rs       |  93 ++++++-
+ crates/udf/src/host_operation_trace.rs        |  52 ++++
+ patches/static_hermes_wasm_udfs/operations.md |   7 +-
+ 8 files changed, 377 insertions(+), 48 deletions(-)
+
+diff --git a/crates/application/src/application_function_runner/query_shadow.rs b/crates/application/src/application_function_runner/query_shadow.rs
+index 2593e400286a8a1995ef142cd34390088c4f40f3..7bb69a60b8896b39735e65e0392dc692eb31b40f 100644
+--- a/crates/application/src/application_function_runner/query_shadow.rs
++++ b/crates/application/src/application_function_runner/query_shadow.rs
+@@ -928,6 +928,7 @@ mod tests {
+             audit_log_lines_match: true,
+             write_set_matches: true,
+             inserted_document_identity: QueryShadowInsertedDocumentIdentity::NotApplicable,
++            host_operation_trace_diagnostic: None,
+         }
+     }
+ 
+diff --git a/crates/application/src/function_log.rs b/crates/application/src/function_log.rs
+index 3e5d96dc37e7709bc2227cc8543e35cb33e8700d..e1f2f351966629285c0cec23e21c1098c0ed75d7 100644
+--- a/crates/application/src/function_log.rs
++++ b/crates/application/src/function_log.rs
+@@ -548,7 +548,7 @@ impl QueryShadowMetrics {
+                 ..
+             } => QueryShadowDiagnosticOutcome::Admission(*event),
+             QueryShadowReport::Compared { comparison, .. } if !comparison.matches() => {
+-                QueryShadowDiagnosticOutcome::Mismatch(*comparison)
++                QueryShadowDiagnosticOutcome::Mismatch(comparison.clone())
+             },
+             QueryShadowReport::Terminal { terminal, .. } => {
+                 QueryShadowDiagnosticOutcome::Terminal(*terminal)
+@@ -2812,13 +2812,7 @@ fn record_query_shadow_report_sample(
+                 retention,
+             )?;
+             record_query_shadow_comparison(
+-                metrics,
+-                *udf_type,
+-                route_key,
+-                *direction,
+-                *comparison,
+-                ts,
+-                retention,
++                metrics, *udf_type, route_key, *direction, comparison, ts, retention,
+             )
+         },
+         QueryShadowReport::Terminal {
+@@ -3019,7 +3013,7 @@ fn record_query_shadow_comparison(
+     udf_type: UdfType,
+     route_key: &QueryShadowRouteKey,
+     direction: QueryShadowDirection,
+-    comparison: QueryShadowComparison,
++    comparison: &QueryShadowComparison,
+     ts: SystemTime,
+     retention: QueryShadowReportRetention,
+ ) -> Result<(), UdfMetricsError> {
+@@ -4403,6 +4397,7 @@ mod query_shadow_metrics_tests {
+             audit_log_lines_match: true,
+             write_set_matches: true,
+             inserted_document_identity: QueryShadowInsertedDocumentIdentity::NotApplicable,
++            host_operation_trace_diagnostic: None,
+         }
+     }
+ 
+diff --git a/crates/function_runner/src/lib.rs b/crates/function_runner/src/lib.rs
+index 89782cb0f58b923fd179955753e17585439eab2c..eaf8037a7b1b3a0a28cc4b8fa1497cfb9726a4cb 100644
+--- a/crates/function_runner/src/lib.rs
++++ b/crates/function_runner/src/lib.rs
+@@ -101,6 +101,8 @@ pub use query_shadow::{
+     QueryShadowDirection,
+     QueryShadowFailureReason,
+     QueryShadowFailureStage,
++    QueryShadowHostOperationCountDifference,
++    QueryShadowHostOperationTraceDiagnostic,
+     QueryShadowInsertedDocumentIdentity,
+     QueryShadowReport,
+     QueryShadowReportSink,
+@@ -364,6 +366,7 @@ mod query_shadow_report_tests {
+             audit_log_lines_match: true,
+             write_set_matches: true,
+             inserted_document_identity: QueryShadowInsertedDocumentIdentity::NotApplicable,
++            host_operation_trace_diagnostic: None,
+         }
+     }
+ 
+@@ -390,7 +393,7 @@ mod query_shadow_report_tests {
+         permit.record_comparison(
+             Duration::from_millis(10),
+             Duration::from_millis(20),
+-            comparison,
++            comparison.clone(),
+         );
+ 
+         assert_eq!(
+diff --git a/crates/function_runner/src/query_shadow.rs b/crates/function_runner/src/query_shadow.rs
+index 128f652969bb8f75e5c5364ca88f108e180b4400..4ec11eeaf4950ef3766cee00e7640e0ae336f0aa 100644
+--- a/crates/function_runner/src/query_shadow.rs
++++ b/crates/function_runner/src/query_shadow.rs
+@@ -47,7 +47,6 @@ use udf::{
+     HostOperationTrace,
+     UdfOutcome,
+ };
+-#[cfg(feature = "testing")]
+ use udf::{
+     LogicalHostOperation,
+     LogicalHostOperationStatus,
+@@ -64,6 +63,8 @@ use value::{
+ use crate::FunctionFinalTransaction;
+ 
+ const QUERY_SHADOW_SHA256_LENGTH: usize = 64;
++#[cfg(feature = "static-hermes-wasmtime-gate")]
++const QUERY_SHADOW_HOST_OPERATION_DIAGNOSTIC_LIMIT: usize = 16;
+ 
+ /// An opaque authenticated registry-generation and route key for shadow
+ /// metrics.
+@@ -129,7 +130,7 @@ impl fmt::Debug for QueryShadowRouteKey {
+ #[error("invalid query-shadow registry-generation or route ID")]
+ pub struct QueryShadowRouteKeyError;
+ 
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++#[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct QueryShadowComparison {
+     pub snapshot_matches: bool,
+     pub result_matches: bool,
+@@ -145,6 +146,28 @@ pub struct QueryShadowComparison {
+     pub audit_log_lines_match: bool,
+     pub write_set_matches: bool,
+     pub inserted_document_identity: QueryShadowInsertedDocumentIdentity,
++    pub host_operation_trace_diagnostic: Option<QueryShadowHostOperationTraceDiagnostic>,
++}
++
++/// One data-free host-operation count that differs between the paired lanes.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct QueryShadowHostOperationCountDifference {
++    pub operation: LogicalHostOperation,
++    pub status: LogicalHostOperationStatus,
++    pub primary_count: u64,
++    pub shadow_count: u64,
++}
++
++/// Bounded details for a host-operation trace mismatch.
++///
++/// This diagnostic contains only fixed operation and status enums plus counts.
++/// It never retains syscall arguments, function paths, IDs, values, or errors.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct QueryShadowHostOperationTraceDiagnostic {
++    pub primary_comparison_eligible: bool,
++    pub shadow_comparison_eligible: bool,
++    pub differing_counts: Vec<QueryShadowHostOperationCountDifference>,
++    pub omitted_differing_count: u64,
+ }
+ 
+ /// Whether lane-local document IDs affected mutation comparison.
+@@ -194,7 +217,7 @@ pub fn take_query_shadow_test_trace_diagnostics() -> Vec<QueryShadowTestTraceDia
+ 
+ impl QueryShadowComparison {
+     /// Whether every privacy-safe comparison dimension matched.
+-    pub const fn matches(self) -> bool {
++    pub const fn matches(&self) -> bool {
+         self.snapshot_matches
+             && self.result_matches
+             && self.journal_matches
+@@ -1157,23 +1180,96 @@ fn results_equal(left: &UdfOutcome, right: &UdfOutcome) -> bool {
+ }
+ 
+ #[cfg(feature = "static-hermes-wasmtime-gate")]
+-fn host_operation_traces_equal(left: &HostOperationTrace, right: &HostOperationTrace) -> bool {
+-    if !left.is_comparison_eligible() || !right.is_comparison_eligible() {
+-        return false;
+-    }
+-    let (Some(left), Some(right)) = (left.entries(), right.entries()) else {
+-        return false;
+-    };
++fn host_operation_trace_counts(
++    trace: &HostOperationTrace,
++) -> BTreeMap<(LogicalHostOperation, LogicalHostOperationStatus), u64> {
++    let mut counts = BTreeMap::new();
++    for entry in trace.entries().unwrap_or_default() {
++        let count = counts
++            .entry((entry.operation(), entry.status()))
++            .or_insert(0u64);
++        *count = count
++            .checked_add(1)
++            .expect("host-operation trace count overflow");
++    }
++    counts
++}
++
++#[cfg(feature = "static-hermes-wasmtime-gate")]
++fn compare_host_operation_traces(
++    primary: &HostOperationTrace,
++    shadow: &HostOperationTrace,
++) -> (bool, Option<QueryShadowHostOperationTraceDiagnostic>) {
++    let primary_comparison_eligible = primary.is_comparison_eligible();
++    let shadow_comparison_eligible = shadow.is_comparison_eligible();
++
+     // Promise scheduling can interleave independent host calls differently in
+     // two JavaScript engines. Their raw completion order is not an observable
+     // UDF result; results, reads, query journals, writes, logs, and errors are
+     // compared separately. Preserve operation and status multiplicity while
+     // allowing only this semantically irrelevant reordering.
+-    let mut left = left.to_vec();
+-    let mut right = right.to_vec();
+-    left.sort_unstable();
+-    right.sort_unstable();
+-    left == right
++    let mut primary_entries = primary.entries().unwrap_or_default().to_vec();
++    let mut shadow_entries = shadow.entries().unwrap_or_default().to_vec();
++    primary_entries.sort_unstable();
++    shadow_entries.sort_unstable();
++    let matches = primary_comparison_eligible
++        && shadow_comparison_eligible
++        && primary_entries == shadow_entries;
++    if matches {
++        return (true, None);
++    }
++
++    // Count only mismatches. Matching shadow comparisons stay on the existing
++    // sorted-vector path and do not allocate diagnostic maps.
++    let primary_counts = host_operation_trace_counts(primary);
++    let shadow_counts = host_operation_trace_counts(shadow);
++    let keys = primary_counts
++        .keys()
++        .chain(shadow_counts.keys())
++        .copied()
++        .collect::<BTreeSet<_>>();
++    let differing_count = keys
++        .iter()
++        .filter(|key| primary_counts.get(*key) != shadow_counts.get(*key))
++        .count();
++    let differing_counts = keys
++        .into_iter()
++        .filter_map(|(operation, status)| {
++            let primary_count = primary_counts
++                .get(&(operation, status))
++                .copied()
++                .unwrap_or(0);
++            let shadow_count = shadow_counts
++                .get(&(operation, status))
++                .copied()
++                .unwrap_or(0);
++            (primary_count != shadow_count).then_some(QueryShadowHostOperationCountDifference {
++                operation,
++                status,
++                primary_count,
++                shadow_count,
++            })
++        })
++        .take(QUERY_SHADOW_HOST_OPERATION_DIAGNOSTIC_LIMIT)
++        .collect::<Vec<_>>();
++    let omitted_differing_count = differing_count
++        .saturating_sub(differing_counts.len())
++        .try_into()
++        .expect("host-operation diagnostic difference count exceeds u64");
++    (
++        false,
++        Some(QueryShadowHostOperationTraceDiagnostic {
++            primary_comparison_eligible,
++            shadow_comparison_eligible,
++            differing_counts,
++            omitted_differing_count,
++        }),
++    )
++}
++
++#[cfg(feature = "static-hermes-wasmtime-gate")]
++fn host_operation_traces_equal(left: &HostOperationTrace, right: &HostOperationTrace) -> bool {
++    compare_host_operation_traces(left, right).0
+ }
+ 
+ #[cfg(feature = "static-hermes-wasmtime-gate")]
+@@ -1322,6 +1418,11 @@ pub(crate) fn compare_query(
+                 .collect(),
+             read_dependencies: primary.reads.comparison_diagnostic(&shadow.reads),
+         });
++    let (host_operation_trace_matches, host_operation_trace_diagnostic) =
++        compare_host_operation_traces(
++            &primary.outcome.host_operation_trace,
++            &shadow.outcome.host_operation_trace,
++        );
+     let comparison = QueryShadowComparison {
+         snapshot_matches: primary.begin_timestamp == shadow.begin_timestamp,
+         result_matches: results_equal(&primary.outcome, &shadow.outcome),
+@@ -1333,10 +1434,7 @@ pub(crate) fn compare_query(
+             && primary.outcome.rng_seed == shadow.outcome.rng_seed
+             && primary.outcome.unix_timestamp == shadow.outcome.unix_timestamp
+             && primary.outcome.udf_server_version == shadow.outcome.udf_server_version,
+-        host_operation_trace_matches: host_operation_traces_equal(
+-            &primary.outcome.host_operation_trace,
+-            &shadow.outcome.host_operation_trace,
+-        ),
++        host_operation_trace_matches,
+         host_operation_error_matches: primary.outcome.host_operation_error
+             == shadow.outcome.host_operation_error,
+         observed_identity_matches: primary.outcome.observed_identity
+@@ -1347,8 +1445,9 @@ pub(crate) fn compare_query(
+         audit_log_lines_match: primary.outcome.audit_log_lines == shadow.outcome.audit_log_lines,
+         write_set_matches: true,
+         inserted_document_identity: QueryShadowInsertedDocumentIdentity::NotApplicable,
++        host_operation_trace_diagnostic,
+     };
+-    log_comparison_dimensions(UdfType::Query, comparison);
++    log_comparison_dimensions(UdfType::Query, &comparison);
+     comparison
+ }
+ 
+@@ -1429,6 +1528,11 @@ pub(crate) fn compare_mutation(
+                 )
+             },
+         };
++    let (host_operation_trace_matches, host_operation_trace_diagnostic) =
++        compare_host_operation_traces(
++            &primary.outcome.host_operation_trace,
++            &shadow.outcome.host_operation_trace,
++        );
+     let comparison = QueryShadowComparison {
+         snapshot_matches: primary.begin_timestamp == shadow.begin_timestamp,
+         result_matches,
+@@ -1440,10 +1544,7 @@ pub(crate) fn compare_mutation(
+             && primary.outcome.rng_seed == shadow.outcome.rng_seed
+             && primary.outcome.unix_timestamp == shadow.outcome.unix_timestamp
+             && primary.outcome.udf_server_version == shadow.outcome.udf_server_version,
+-        host_operation_trace_matches: host_operation_traces_equal(
+-            &primary.outcome.host_operation_trace,
+-            &shadow.outcome.host_operation_trace,
+-        ),
++        host_operation_trace_matches,
+         host_operation_error_matches: primary.outcome.host_operation_error
+             == shadow.outcome.host_operation_error,
+         observed_identity_matches: primary.outcome.observed_identity
+@@ -1454,13 +1555,14 @@ pub(crate) fn compare_mutation(
+         audit_log_lines_match: primary.outcome.audit_log_lines == shadow.outcome.audit_log_lines,
+         write_set_matches,
+         inserted_document_identity,
++        host_operation_trace_diagnostic,
+     };
+-    log_comparison_dimensions(UdfType::Mutation, comparison);
++    log_comparison_dimensions(UdfType::Mutation, &comparison);
+     comparison
+ }
+ 
+ #[cfg(feature = "static-hermes-wasmtime-gate")]
+-fn log_comparison_dimensions(udf_type: UdfType, comparison: QueryShadowComparison) {
++fn log_comparison_dimensions(udf_type: UdfType, comparison: &QueryShadowComparison) {
+     for (dimension, matches) in [
+         ("snapshot", comparison.snapshot_matches),
+         ("result", comparison.result_matches),
+@@ -1596,6 +1698,13 @@ mod tests {
+ 
+     #[cfg(feature = "static-hermes-wasmtime-gate")]
+     use super::log_lines_equal;
++    #[cfg(feature = "static-hermes-wasmtime-gate")]
++    use super::{
++        compare_host_operation_traces,
++        host_operation_traces_equal,
++        js_errors_equal,
++        QUERY_SHADOW_HOST_OPERATION_DIAGNOSTIC_LIMIT,
++    };
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+     use super::{
+         compare_mutation,
+@@ -1604,11 +1713,6 @@ mod tests {
+         MutationShadowTestObservation,
+         QueryShadowObservation,
+     };
+-    #[cfg(feature = "static-hermes-wasmtime-gate")]
+-    use super::{
+-        host_operation_traces_equal,
+-        js_errors_equal,
+-    };
+     use super::{
+         QueryShadowComparison,
+         QueryShadowFailureReason,
+@@ -1618,6 +1722,8 @@ mod tests {
+         QueryShadowRouteKey,
+         QueryShadowTerminal,
+     };
++    #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
++    use super::QueryShadowHostOperationCountDifference;
+ 
+     #[cfg(feature = "static-hermes-wasmtime-gate")]
+     fn nested_log_lines(
+@@ -1846,6 +1952,41 @@ mod tests {
+         assert!(!host_operation_traces_equal(&disabled, &disabled));
+         assert!(!host_operation_traces_equal(&left, &pending));
+         assert!(!host_operation_traces_equal(&left, &unknown));
++
++        let (_, diagnostic) = compare_host_operation_traces(&disabled, &disabled);
++        let diagnostic = diagnostic.expect("ineligible traces require a diagnostic");
++        assert!(!diagnostic.primary_comparison_eligible);
++        assert!(!diagnostic.shadow_comparison_eligible);
++        assert!(diagnostic.differing_counts.is_empty());
++        assert_eq!(diagnostic.omitted_differing_count, 0);
++
++        let primary = HostOperationTrace::from(vec![
++            LogicalHostOperation::AuditLog,
++            LogicalHostOperation::CancelJob,
++            LogicalHostOperation::ComponentArgument,
++            LogicalHostOperation::CreateFunctionHandle,
++            LogicalHostOperation::DatabaseCount,
++            LogicalHostOperation::DatabaseDelete,
++            LogicalHostOperation::DatabaseGet,
++            LogicalHostOperation::DatabaseInsert,
++            LogicalHostOperation::DatabaseNormalizeId,
++            LogicalHostOperation::DatabasePatch,
++            LogicalHostOperation::DatabaseQueryCleanup,
++            LogicalHostOperation::DatabaseQueryPage,
++            LogicalHostOperation::DatabaseQueryStream,
++            LogicalHostOperation::DatabaseQueryStreamNext,
++            LogicalHostOperation::DatabaseReplace,
++            LogicalHostOperation::DeploymentMetadata,
++            LogicalHostOperation::FunctionMetadata,
++        ]);
++        let shadow = HostOperationTrace::for_query_shadow();
++        let (_, diagnostic) = compare_host_operation_traces(&primary, &shadow);
++        let diagnostic = diagnostic.expect("different traces require a diagnostic");
++        assert_eq!(
++            diagnostic.differing_counts.len(),
++            QUERY_SHADOW_HOST_OPERATION_DIAGNOSTIC_LIMIT
++        );
++        assert_eq!(diagnostic.omitted_differing_count, 1);
+     }
+ 
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+@@ -2230,7 +2371,7 @@ mod tests {
+     }
+ 
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+-    fn mismatch_dimensions(comparison: QueryShadowComparison) -> Vec<&'static str> {
++    fn mismatch_dimensions(comparison: &QueryShadowComparison) -> Vec<&'static str> {
+         [
+             ("snapshot", comparison.snapshot_matches),
+             ("result", comparison.result_matches),
+@@ -2259,7 +2400,7 @@ mod tests {
+ 
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+     fn assert_only_mismatch(comparison: QueryShadowComparison, expected: &'static str, case: &str) {
+-        assert_eq!(mismatch_dimensions(comparison), vec![expected], "{case}");
++        assert_eq!(mismatch_dimensions(&comparison), vec![expected], "{case}");
+         assert!(!comparison.matches(), "{case}");
+     }
+ 
+@@ -2432,7 +2573,44 @@ mod tests {
+                 },
+                 _ => unreachable!("unknown host-trace negative control"),
+             };
+-            assert_only_mismatch(compare_query(primary, shadow), "host_operation_trace", case);
++            let comparison = compare_query(primary, shadow);
++            let diagnostic = comparison
++                .host_operation_trace_diagnostic
++                .as_ref()
++                .expect("trace mismatch requires bounded details");
++            assert!(diagnostic.primary_comparison_eligible);
++            assert!(diagnostic.shadow_comparison_eligible);
++            assert_eq!(diagnostic.omitted_differing_count, 0);
++            match case {
++                "drop" => assert_eq!(
++                    diagnostic.differing_counts,
++                    vec![QueryShadowHostOperationCountDifference {
++                        operation: LogicalHostOperation::DatabaseQueryPage,
++                        status: LogicalHostOperationStatus::Success,
++                        primary_count: 1,
++                        shadow_count: 0,
++                    }]
++                ),
++                "status" => assert_eq!(
++                    diagnostic.differing_counts,
++                    vec![
++                        QueryShadowHostOperationCountDifference {
++                            operation: LogicalHostOperation::DatabaseGet,
++                            status: LogicalHostOperationStatus::Success,
++                            primary_count: 1,
++                            shadow_count: 0,
++                        },
++                        QueryShadowHostOperationCountDifference {
++                            operation: LogicalHostOperation::DatabaseGet,
++                            status: LogicalHostOperationStatus::Failure,
++                            primary_count: 0,
++                            shadow_count: 1,
++                        },
++                    ]
++                ),
++                _ => unreachable!("unknown host-trace negative control"),
++            }
++            assert_only_mismatch(comparison, "host_operation_trace", case);
+         }
+ 
+         let primary = comparator_query_observation()?;
+@@ -2441,7 +2619,9 @@ mod tests {
+             LogicalHostOperation::DatabaseQueryPage,
+             LogicalHostOperation::DatabaseGet,
+         ]);
+-        assert!(compare_query(primary, reordered).matches());
++        let comparison = compare_query(primary, reordered);
++        assert!(comparison.matches());
++        assert!(comparison.host_operation_trace_diagnostic.is_none());
+         Ok(())
+     }
+ 
+@@ -3179,6 +3359,7 @@ mod tests {
+                 audit_log_lines_match: true,
+                 write_set_matches: true,
+                 inserted_document_identity: QueryShadowInsertedDocumentIdentity::NotApplicable,
++                host_operation_trace_diagnostic: None,
+             },
+         );
+ 
+@@ -3208,6 +3389,7 @@ mod tests {
+             audit_log_lines_match: true,
+             write_set_matches: true,
+             inserted_document_identity: QueryShadowInsertedDocumentIdentity::NotApplicable,
++            host_operation_trace_diagnostic: None,
+         };
+ 
+         assert!(!comparison.matches());
+@@ -3230,6 +3412,7 @@ mod tests {
+             audit_log_lines_match: true,
+             write_set_matches: true,
+             inserted_document_identity: QueryShadowInsertedDocumentIdentity::Inconsistent,
++            host_operation_trace_diagnostic: None,
+         };
+ 
+         assert!(!comparison.matches());
+diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
+index ecdc5dfd0f96c693d7542259d71b876ba5c2a257..694c35021c8d1c85decf9d2b1128e3cea2ff9d06 100644
+--- a/crates/function_runner/src/server.rs
++++ b/crates/function_runner/src/server.rs
+@@ -2584,6 +2584,7 @@ mod query_shadow_lane_contract_tests {
+                 write_set_matches: true,
+                 inserted_document_identity:
+                     crate::QueryShadowInsertedDocumentIdentity::NotApplicable,
++                host_operation_trace_diagnostic: None,
+             }
+         );
+         assert!(!comparison.matches());
+diff --git a/crates/local_backend/src/app_metrics.rs b/crates/local_backend/src/app_metrics.rs
+index 97db36fc1bdacbc05fe115ac080dad7bb25b8946..dd80e04873dce096b258e2ec1649e43964a25774 100644
+--- a/crates/local_backend/src/app_metrics.rs
++++ b/crates/local_backend/src/app_metrics.rs
+@@ -39,6 +39,8 @@ use errors::ErrorMetadata;
+ use function_runner::{
+     QueryShadowComparison,
+     QueryShadowDirection,
++    QueryShadowHostOperationCountDifference,
++    QueryShadowHostOperationTraceDiagnostic,
+     QueryShadowRouteKey,
+ };
+ use serde::Deserialize;
+@@ -784,7 +786,7 @@ mod query_shadow_terminal_response_tests {
+                                     journal_matches: true,
+                                     read_dependencies_match: false,
+                                     invocation_inputs_match: true,
+-                                    host_operation_trace_matches: true,
++                                    host_operation_trace_matches: false,
+                                     host_operation_error_matches: true,
+                                     observed_identity_matches: true,
+                                     observed_time_matches: true,
+@@ -794,6 +796,23 @@ mod query_shadow_terminal_response_tests {
+                                     write_set_matches: false,
+                                     inserted_document_identity:
+                                         QueryShadowInsertedDocumentIdentity::Unresolved,
++                                    host_operation_trace_diagnostic: Some(
++                                        QueryShadowHostOperationTraceDiagnostic {
++                                            primary_comparison_eligible: true,
++                                            shadow_comparison_eligible: true,
++                                            differing_counts: vec![
++                                                QueryShadowHostOperationCountDifference {
++                                                    operation:
++                                                        udf::LogicalHostOperation::UserIdentity,
++                                                    status:
++                                                        udf::LogicalHostOperationStatus::Success,
++                                                    primary_count: 1,
++                                                    shadow_count: 2,
++                                                },
++                                            ],
++                                            omitted_differing_count: 0,
++                                        },
++                                    ),
+                                 },
+                             ),
+                         },
+@@ -838,7 +857,7 @@ mod query_shadow_terminal_response_tests {
+                             "journalMatches": true,
+                             "readDependenciesMatch": false,
+                             "invocationInputsMatch": true,
+-                            "hostOperationTraceMatches": true,
++                            "hostOperationTraceMatches": false,
+                             "hostOperationErrorMatches": true,
+                             "observedIdentityMatches": true,
+                             "observedTimeMatches": true,
+@@ -847,6 +866,19 @@ mod query_shadow_terminal_response_tests {
+                             "auditLogLinesMatch": true,
+                             "writeSetMatches": false,
+                             "insertedDocumentIdentity": "unresolved",
++                            "hostOperationTraceDiagnostic": {
++                                "primaryComparisonEligible": true,
++                                "shadowComparisonEligible": true,
++                                "differingCounts": [
++                                    {
++                                        "operation": "user_identity",
++                                        "status": "success",
++                                        "primaryCount": 1,
++                                        "shadowCount": 2,
++                                    },
++                                ],
++                                "omittedDifferingCount": 0,
++                            },
+                         },
+                     },
+                     {
+@@ -1060,6 +1092,60 @@ struct QueryShadowComparisonResponse {
+     audit_log_lines_match: bool,
+     write_set_matches: bool,
+     inserted_document_identity: &'static str,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    host_operation_trace_diagnostic: Option<QueryShadowHostOperationTraceDiagnosticResponse>,
++}
++
++#[cfg(feature = "static-hermes-wasmtime-gate")]
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++struct QueryShadowHostOperationCountDifferenceResponse {
++    operation: &'static str,
++    status: &'static str,
++    primary_count: u64,
++    shadow_count: u64,
++}
++
++#[cfg(feature = "static-hermes-wasmtime-gate")]
++impl From<QueryShadowHostOperationCountDifference>
++    for QueryShadowHostOperationCountDifferenceResponse
++{
++    fn from(difference: QueryShadowHostOperationCountDifference) -> Self {
++        Self {
++            operation: difference.operation.diagnostic_key(),
++            status: difference.status.diagnostic_key(),
++            primary_count: difference.primary_count,
++            shadow_count: difference.shadow_count,
++        }
++    }
++}
++
++#[cfg(feature = "static-hermes-wasmtime-gate")]
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++struct QueryShadowHostOperationTraceDiagnosticResponse {
++    primary_comparison_eligible: bool,
++    shadow_comparison_eligible: bool,
++    differing_counts: Vec<QueryShadowHostOperationCountDifferenceResponse>,
++    omitted_differing_count: u64,
++}
++
++#[cfg(feature = "static-hermes-wasmtime-gate")]
++impl From<QueryShadowHostOperationTraceDiagnostic>
++    for QueryShadowHostOperationTraceDiagnosticResponse
++{
++    fn from(diagnostic: QueryShadowHostOperationTraceDiagnostic) -> Self {
++        Self {
++            primary_comparison_eligible: diagnostic.primary_comparison_eligible,
++            shadow_comparison_eligible: diagnostic.shadow_comparison_eligible,
++            differing_counts: diagnostic
++                .differing_counts
++                .into_iter()
++                .map(Into::into)
++                .collect(),
++            omitted_differing_count: diagnostic.omitted_differing_count,
++        }
++    }
+ }
+ 
+ #[cfg(feature = "static-hermes-wasmtime-gate")]
+@@ -1080,6 +1166,9 @@ impl From<QueryShadowComparison> for QueryShadowComparisonResponse {
+             audit_log_lines_match: comparison.audit_log_lines_match,
+             write_set_matches: comparison.write_set_matches,
+             inserted_document_identity: comparison.inserted_document_identity.metric_key(),
++            host_operation_trace_diagnostic: comparison
++                .host_operation_trace_diagnostic
++                .map(Into::into),
+         }
+     }
+ }
+diff --git a/crates/udf/src/host_operation_trace.rs b/crates/udf/src/host_operation_trace.rs
+index f4f943aa9c5bd5e107093c6f2d902af5306138cd..c476eb0c3b3b4dba77ad701c3f9c5317b2b23d24 100644
+--- a/crates/udf/src/host_operation_trace.rs
++++ b/crates/udf/src/host_operation_trace.rs
+@@ -45,6 +45,47 @@ pub enum LogicalHostOperation {
+     WriteDeploymentAuditLog,
+ }
+ 
++impl LogicalHostOperation {
++    /// Stable, data-free name used in query-shadow diagnostics.
++    pub const fn diagnostic_key(self) -> &'static str {
++        match self {
++            Self::AuditLog => "audit_log",
++            Self::CancelJob => "cancel_job",
++            Self::ComponentArgument => "component_argument",
++            Self::CreateFunctionHandle => "create_function_handle",
++            Self::DatabaseCount => "database_count",
++            Self::DatabaseDelete => "database_delete",
++            Self::DatabaseGet => "database_get",
++            Self::DatabaseInsert => "database_insert",
++            Self::DatabaseNormalizeId => "database_normalize_id",
++            Self::DatabasePatch => "database_patch",
++            Self::DatabaseQueryPage => "database_query_page",
++            Self::DatabaseQueryCleanup => "database_query_cleanup",
++            Self::DatabaseQueryStream => "database_query_stream",
++            Self::DatabaseQueryStreamNext => "database_query_stream_next",
++            Self::DatabaseReplace => "database_replace",
++            Self::DeploymentMetadata => "deployment_metadata",
++            Self::FunctionMetadata => "function_metadata",
++            Self::RequestMetadata => "request_metadata",
++            Self::RequireOperation => "require_operation",
++            Self::RunUdf => "run_udf",
++            Self::Schedule => "schedule",
++            Self::SnapshotTimestamp => "snapshot_timestamp",
++            Self::StorageDelete => "storage_delete",
++            Self::StorageGenerateUploadUrl => "storage_generate_upload_url",
++            Self::StorageGetMetadata => "storage_get_metadata",
++            Self::StorageGetUrl => "storage_get_url",
++            Self::ThrowOcc => "throw_occ",
++            Self::ThrowOverloaded => "throw_overloaded",
++            Self::TransactionMetrics => "transaction_metrics",
++            Self::UnknownAsyncSyscall => "unknown_async_syscall",
++            Self::UnknownSyncSyscall => "unknown_sync_syscall",
++            Self::UserIdentity => "user_identity",
++            Self::WriteDeploymentAuditLog => "write_deployment_audit_log",
++        }
++    }
++}
++
+ impl HeapSize for LogicalHostOperation {
+     fn heap_size(&self) -> usize {
+         0
+@@ -59,6 +100,17 @@ pub enum LogicalHostOperationStatus {
+     Failure,
+ }
+ 
++impl LogicalHostOperationStatus {
++    /// Stable, data-free name used in query-shadow diagnostics.
++    pub const fn diagnostic_key(self) -> &'static str {
++        match self {
++            Self::Pending => "pending",
++            Self::Success => "success",
++            Self::Failure => "failure",
++        }
++    }
++}
++
+ impl HeapSize for LogicalHostOperationStatus {
+     fn heap_size(&self) -> usize {
+         0
+diff --git a/patches/static_hermes_wasm_udfs/operations.md b/patches/static_hermes_wasm_udfs/operations.md
+index 2a30f3b7ccb9150c40376f7b19386843bf6216cd..5c9b0cc0905036b4529b61f4df922f9dcea7d957 100644
+--- a/patches/static_hermes_wasm_udfs/operations.md
++++ b/patches/static_hermes_wasm_udfs/operations.md
+@@ -361,7 +361,12 @@ Metric labels omit deployment, generation, route, package, module, function,
+ request, user, and tenant identities. The shadow-evidence endpoint is the
+ bounded authenticated route-level surface. It returns opaque generation and
+ route digests, exact completed sample counts, bounded terminal and mismatch
+-counts, and retained latency distributions.
++counts, and retained latency distributions. A retained host-operation trace
++mismatch includes comparison-eligibility flags and at most 16 differing
++operation/status counts for the primary and shadow lanes. The operation and
++status names are fixed enums; syscall arguments, paths, IDs, values, and error
++text are not retained. `omittedDifferingCount` reports any additional count
++categories beyond that bound.
+ 
+ Timing percentiles without completed sample counts are not evidence. Route
+ sampling is traffic- and query-cache-biased. Use deterministic route coverage

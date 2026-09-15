@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Sun, 12 Jul 2026 14:33:15 +0800
-Subject: [PATCH 06/30] self-hosted: expose shared-base HTTP admission
+Subject: [PATCH 06/28] self-hosted: expose shared-base HTTP admission
 
 Use HTTP_SERVER_MAX_CONCURRENT_REQUESTS for both local-backend HTTP entry points, reject malformed, zero, or unsupported values before runtime and database initialization, and pass the setting through self-hosted Compose. Remove the fixed 128-request backend cap and fixed four-request HTTP action proxy cap.
 
@@ -12,7 +12,7 @@ Track actual permit waits with dependency-class waiter gauges and a duration his
 Place admission outside request instrumentation and timeout, bound direct constructor values, cover cancellation and waiter-guard handoff, and centralize the callback-token header contract. Document pre-permit waiting, response-stream permit lifetime, finite callback depth, reverse-proxy requirements, and the independent relationship with isolate-scheduler overflow.
 ---
  crates/common/src/dependency_overflow.rs      | 465 ++++++++++++++++++
- crates/common/src/http/mod.rs                 | 409 ++++++++++++++-
+ crates/common/src/http/mod.rs                 | 444 ++++++++++++++++-
  crates/common/src/knobs.rs                    |  23 +-
  crates/common/src/lib.rs                      |   1 +
  crates/local_backend/src/lib.rs               |   2 -
@@ -22,7 +22,7 @@ Place admission outside request instrumentation and timeout, bound direct constr
  patches/shared_base_http_admission/README.md  | 171 +++++++
  self-hosted/advanced/knobs.md                 |  74 +++
  self-hosted/docker/docker-compose.yml         |   2 +
- 11 files changed, 1198 insertions(+), 32 deletions(-)
+ 11 files changed, 1227 insertions(+), 38 deletions(-)
  create mode 100644 crates/common/src/dependency_overflow.rs
  create mode 100644 patches/shared_base_http_admission/README.md
 
@@ -498,7 +498,7 @@ index 0000000000000000000000000000000000000000..493d27f92adfa2dd503d97287a923f9a
 +    }
 +}
 diff --git a/crates/common/src/http/mod.rs b/crates/common/src/http/mod.rs
-index 5456c4bbd633a5cc3656f3fc1e1a3afa383e1cda..228279cb5f3a20904df4d59784c29f0ff850d21e 100644
+index 5456c4bbd633a5cc3656f3fc1e1a3afa383e1cda..8904c868ada2cb5c8c35711aff26ecc7a5e3aacd 100644
 --- a/crates/common/src/http/mod.rs
 +++ b/crates/common/src/http/mod.rs
 @@ -90,7 +90,6 @@ use serde::{
@@ -635,7 +635,21 @@ index 5456c4bbd633a5cc3656f3fc1e1a3afa383e1cda..228279cb5f3a20904df4d59784c29f0f
  impl HeapSize for HttpRequest {
      fn heap_size(&self) -> usize {
          // Assume heap size is dominated by body (because the rest is annoying
-@@ -504,6 +595,40 @@ pub struct ConvexHttpService {
+@@ -486,11 +577,8 @@ impl RouteMapper for NoopRouteMapper {
+     }
+ }
+ 
+-fn concurrency_metric_name(service_name: &str, namespace: &str) -> String {
+-    let name = format!(
+-        "{}_http_service_concurrent_requests",
+-        service_name.replace('-', "_")
+-    );
++fn service_metric_name(service_name: &str, namespace: &str, metric_name: &str) -> String {
++    let name = format!("{}_{metric_name}", service_name.replace('-', "_"));
+     // The registry already prefixes metrics with the executable name.
+     name.strip_prefix(&format!("{namespace}_"))
+         .unwrap_or(&name)
+@@ -504,6 +592,40 @@ pub struct ConvexHttpService {
      version: String,
      service_name: &'static str,
      _concurrency_gauge: Option<PullingGauge>,
@@ -676,7 +690,7 @@ index 5456c4bbd633a5cc3656f3fc1e1a3afa383e1cda..228279cb5f3a20904df4d59784c29f0f
  }
  
  impl ConvexHttpService {
-@@ -515,16 +640,73 @@ impl ConvexHttpService {
+@@ -515,16 +637,78 @@ impl ConvexHttpService {
          request_timeout: Duration,
          route_metric_mapper: RM,
      ) -> Self {
@@ -723,9 +737,10 @@ index 5456c4bbd633a5cc3656f3fc1e1a3afa383e1cda..228279cb5f3a20904df4d59784c29f0f
 +        let concurrency_gate_for_base_gauge = concurrency_gate.clone();
 +        let base_concurrency_gauge = (dependency_reserve > 0).then(|| {
 +            PullingGauge::new(
-+                format!(
-+                    "{}_http_service_base_concurrent_requests",
-+                    service_name.replace('-', "_")
++                service_metric_name(
++                    service_name,
++                    &SERVICE_NAME,
++                    "http_service_base_concurrent_requests",
 +                ),
 +                "The amount of shared base HTTP admission capacity in use",
 +                Box::new(move || concurrency_gate_for_base_gauge.base_in_use() as f64),
@@ -746,14 +761,19 @@ index 5456c4bbd633a5cc3656f3fc1e1a3afa383e1cda..228279cb5f3a20904df4d59784c29f0f
 +            service_name,
 +        };
          let concurrency_gauge = PullingGauge::new(
-             concurrency_metric_name(service_name, &SERVICE_NAME),
+-            concurrency_metric_name(service_name, &SERVICE_NAME),
++            service_metric_name(
++                service_name,
++                &SERVICE_NAME,
++                "http_service_concurrent_requests",
++            ),
              "The number of currently outstanding requests on the ConvexHttpService",
 -            Box::new(move || (max_concurrency - semaphore_.available_permits()) as f64),
 +            Box::new(move || concurrency_gate_for_total_gauge.active() as f64),
          )
          .expect("Invalid gauge initialization");
          if let Err(e) = CONVEX_METRICS_REGISTRY.register(Box::new(concurrency_gauge.clone())) {
-@@ -534,6 +716,12 @@ impl ConvexHttpService {
+@@ -534,6 +718,12 @@ impl ConvexHttpService {
          let router = router
              .layer(
                  ServiceBuilder::new()
@@ -766,7 +786,7 @@ index 5456c4bbd633a5cc3656f3fc1e1a3afa383e1cda..228279cb5f3a20904df4d59784c29f0f
                      // Order important. Log/stats first because they are infallible.
                      .layer(axum::middleware::from_fn(tokio_instrumentation_middleware))
                      .layer(axum::middleware::from_fn(log_middleware))
-@@ -542,7 +730,6 @@ impl ConvexHttpService {
+@@ -542,7 +732,6 @@ impl ConvexHttpService {
                          stats_middleware::<RM>,
                      ))
                      .layer(axum::middleware::from_fn(client_version_state_middleware))
@@ -774,7 +794,7 @@ index 5456c4bbd633a5cc3656f3fc1e1a3afa383e1cda..228279cb5f3a20904df4d59784c29f0f
                      .layer(tower_cookies::CookieManagerLayer::new())
                      .layer(HandleErrorLayer::new(|_: BoxError| async {
                          StatusCode::REQUEST_TIMEOUT
-@@ -555,6 +742,7 @@ impl ConvexHttpService {
+@@ -555,6 +744,7 @@ impl ConvexHttpService {
              router,
              version,
              _concurrency_gauge: Some(concurrency_gauge),
@@ -782,7 +802,7 @@ index 5456c4bbd633a5cc3656f3fc1e1a3afa383e1cda..228279cb5f3a20904df4d59784c29f0f
              service_name,
              meta_routes_enabled: true,
          }
-@@ -634,7 +822,6 @@ impl ConvexHttpService {
+@@ -634,7 +824,6 @@ impl ConvexHttpService {
              .await
          }
      }
@@ -790,7 +810,7 @@ index 5456c4bbd633a5cc3656f3fc1e1a3afa383e1cda..228279cb5f3a20904df4d59784c29f0f
  }
  
  /// Serves an HTTP server using the given service.
-@@ -1394,3 +1581,207 @@ where
+@@ -1394,3 +1583,228 @@ where
          (key, value)
      })
  }
@@ -827,6 +847,27 @@ index 5456c4bbd633a5cc3656f3fc1e1a3afa383e1cda..228279cb5f3a20904df4d59784c29f0f
 +        StatusCode,
 +    };
 +    use crate::dependency_overflow::DependencyOverflowGate;
++
++    #[test]
++    fn concurrency_gauges_strip_only_the_matching_executable_prefix() {
++        for metric_name in [
++            "http_service_concurrent_requests",
++            "http_service_base_concurrent_requests",
++        ] {
++            for (service_name, namespace, expected_prefix) in [
++                ("local-backend", "local_backend", ""),
++                ("local-backend-site", "local_backend", "site_"),
++                ("function-runner", "local_backend", "function_runner_"),
++                ("local-backend", "local", "backend_"),
++                ("local-backend", "local_back", "local_backend_"),
++            ] {
++                assert_eq!(
++                    super::service_metric_name(service_name, namespace, metric_name),
++                    format!("{expected_prefix}{metric_name}"),
++                );
++            }
++        }
++    }
 +
 +    #[derive(Clone)]
 +    struct BlockingHandlerState {
