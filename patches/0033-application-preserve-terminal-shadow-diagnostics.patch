@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 16 Sep 2026 11:45:00 +0800
+Subject: [PATCH 33/35] application: preserve terminal shadow diagnostics
+
+Prefer evicting admission-pressure diagnostics when the per-route evidence bound is exceeded. Retain terminal and semantic-mismatch outcomes so a busy route does not lose the only evidence that identifies a runtime or comparison failure. Keep the existing fixed memory bound and fall back to oldest-outcome eviction when no admission record remains.
+---
+ crates/application/src/function_log.rs | 88 +++++++++++++++++++++++++-
+ 1 file changed, 85 insertions(+), 3 deletions(-)
+
+diff --git a/crates/application/src/function_log.rs b/crates/application/src/function_log.rs
+index 0e14ad62586b4b1160419cca286cf712f81df7bd..4b056b1b9d8a31cd803f3aa152a69054dd17bf91 100644
+--- a/crates/application/src/function_log.rs
++++ b/crates/application/src/function_log.rs
+@@ -582,14 +582,27 @@ impl QueryShadowMetrics {
+             })
+             .count();
+         if route_diagnostic_count > QUERY_SHADOW_DIAGNOSTICS_PER_ROUTE {
++            let same_route = |diagnostic: &RetainedQueryShadowDiagnostic| {
++                diagnostic.udf_type == report.udf_type()
++                    && diagnostic.route_key == *report.route_key()
++                    && diagnostic.direction == report.direction()
++            };
++            // Admission pressure is useful context, but it must not evict the
++            // only retained terminal or semantic-mismatch explanation for a
++            // route. Keep the fixed bound by evicting the oldest admission
++            // first; if the route contains only semantic outcomes, evict its
++            // oldest outcome as usual.
+             let position = self
+                 .diagnostics
+                 .iter()
+                 .position(|diagnostic| {
+-                    diagnostic.udf_type == report.udf_type()
+-                        && diagnostic.route_key == *report.route_key()
+-                        && diagnostic.direction == report.direction()
++                    same_route(diagnostic)
++                        && matches!(
++                            diagnostic.outcome,
++                            QueryShadowDiagnosticOutcome::Admission(_)
++                        )
+                 })
++                .or_else(|| self.diagnostics.iter().position(same_route))
+                 .expect("query-shadow route diagnostic disappeared");
+             self.diagnostics.remove(position);
+         }
+@@ -4331,6 +4344,7 @@ mod query_shadow_metrics_tests {
+ 
+     use function_runner::{
+         QueryShadowAdmissionEvent,
++        QueryShadowGeneratedExportDiagnostic,
+         QueryShadowTerminal,
+     };
+ 
+@@ -4482,6 +4496,74 @@ mod query_shadow_metrics_tests {
+         );
+     }
+ 
++    #[test]
++    fn query_shadow_diagnostics_preserve_terminal_outcome_under_admission_pressure() {
++        let base_ts = SystemTime::UNIX_EPOCH + Duration::from_secs(20_050);
++        let route = query_shadow_route_key('d', '1');
++        let mut metrics = QueryShadowMetrics::new(base_ts, query_shadow_metrics_config(), 1);
++        metrics.activate_generation(route.generation_sha256(), base_ts);
++
++        record_query_shadow_report_with_capacity(
++            &mut metrics,
++            &QueryShadowReport::Terminal {
++                udf_type: UdfType::Query,
++                route_key: route.clone(),
++                direction: QueryShadowDirection::V8PrimaryWasmShadow,
++                terminal: QueryShadowTerminal::ShadowFailure {
++                    stage: QueryShadowFailureStage::WasmExecution,
++                    reason: QueryShadowFailureReason::GeneratedExportDispatch,
++                    generated_export_diagnostic: Some(
++                        QueryShadowGeneratedExportDiagnostic::SelectedEntryPreparationRejected {
++                            status: 65,
++                        },
++                    ),
++                },
++            },
++            base_ts,
++        )
++        .unwrap();
++        for _ in 0..(QUERY_SHADOW_DIAGNOSTICS_PER_ROUTE + 4) {
++            record_query_shadow_report_with_capacity(
++                &mut metrics,
++                &QueryShadowReport::Admission {
++                    udf_type: UdfType::Query,
++                    route_key: route.clone(),
++                    direction: QueryShadowDirection::V8PrimaryWasmShadow,
++                    event: QueryShadowAdmissionEvent::CapacityDrop,
++                },
++                base_ts,
++            )
++            .unwrap();
++        }
++
++        let route_sha256s = vec![route.route_sha256().to_owned()];
++        let page = query_shadow_evidence_page(
++            &mut metrics,
++            base_ts,
++            UdfType::Query,
++            Some((UdfType::Query, route.generation_sha256(), &route_sha256s)),
++            None,
++            1,
++        )
++        .unwrap();
++        let diagnostics = &page.routes[0].diagnostics;
++        assert_eq!(diagnostics.len(), QUERY_SHADOW_DIAGNOSTICS_PER_ROUTE);
++        assert!(diagnostics.iter().any(|diagnostic| {
++            matches!(
++                diagnostic.outcome,
++                QueryShadowDiagnosticOutcome::Terminal(QueryShadowTerminal::ShadowFailure {
++                    reason: QueryShadowFailureReason::GeneratedExportDispatch,
++                    generated_export_diagnostic: Some(
++                        QueryShadowGeneratedExportDiagnostic::SelectedEntryPreparationRejected {
++                            status: 65
++                        }
++                    ),
++                    ..
++                })
++            )
++        }));
++    }
++
+     #[test]
+     fn query_shadow_diagnostics_retain_admission_rejections() {
+         let base_ts = SystemTime::UNIX_EPOCH + Duration::from_secs(20_100);

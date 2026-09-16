@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 16 Sep 2026 15:30:25 +0800
+Subject: [PATCH 35/35] function runner: prune inconsistent partial insert
+ mappings
+
+Paired mutations allocate independent document IDs. Batches of scheduled jobs can have identical metadata shapes while their distinct argument records determine the only valid identity relation. Waiting until a complete assignment to check those references explores irrelevant permutations and exhausts the bounded search even for eight equivalent jobs.
+
+Check every assigned insert against the partial relation before descending. Keep unassigned identities as placeholders, retain the existing search bound, and require the complete write, read and result comparison before accepting a relation. This changes search pruning, not semantic equivalence.
+
+Add a reversed-allocation scheduler-batch regression that reproduced unresolved identity and read/write mismatches before the fix. Verify that changed arguments are still rejected. Make the test read-set builder retain all inserted-ID dependencies within each table instead of overwriting earlier ones.
+
+Validation: all 41 query-shadow comparator tests pass, including cyclic scheduled-operation references, symmetric inserts, partial-search bounds and negative semantic comparisons.
+---
+ crates/function_runner/src/query_shadow.rs | 164 ++++++++++++++++++---
+ 1 file changed, 140 insertions(+), 24 deletions(-)
+
+diff --git a/crates/function_runner/src/query_shadow.rs b/crates/function_runner/src/query_shadow.rs
+index 662ab803f7d8f6e3f19652bbbc77c7a485fa63c5..0f83fde04c8ba72565ea3952d0be4f363edf7f2b 100644
+--- a/crates/function_runner/src/query_shadow.rs
++++ b/crates/function_runner/src/query_shadow.rs
+@@ -1029,10 +1029,47 @@ fn mutation_write_sets_equal(
+ #[cfg(feature = "static-hermes-wasmtime-gate")]
+ struct MutationInsertIdMappingSearch {
+     examined_candidates: usize,
++    primary_insert_ids: BTreeSet<String>,
++    shadow_insert_ids: BTreeSet<String>,
+ }
+ 
+ #[cfg(feature = "static-hermes-wasmtime-gate")]
+ impl MutationInsertIdMappingSearch {
++    fn partial_mapping_matches(
++        &self,
++        primary_writes: &NormalizedMutationWriteSet,
++        shadow_writes: &NormalizedMutationWriteSet,
++        document_ids: &BTreeMap<ResolvedDocumentId, ResolvedDocumentId>,
++    ) -> anyhow::Result<bool> {
++        let mapping = MutationInsertIdMapping::new(document_ids.clone())?;
++        let mut unmapped_primary = self.primary_insert_ids.clone();
++        let mut unmapped_shadow = self.shadow_insert_ids.clone();
++        for (primary_id, shadow_id) in &mapping.encoded_ids {
++            unmapped_primary.remove(primary_id);
++            unmapped_shadow.remove(shadow_id);
++        }
++        for (primary_id, shadow_id) in document_ids {
++            let primary = erase_insert_identities(
++                &normalize_inserted_scheduler_readiness(
++                    &primary_writes.inserts[primary_id],
++                    primary_writes.scheduled_job_inserts.contains(primary_id),
++                ),
++                &unmapped_primary,
++            );
++            let shadow = erase_insert_identities(
++                &normalize_inserted_scheduler_readiness(
++                    &shadow_writes.inserts[shadow_id],
++                    shadow_writes.scheduled_job_inserts.contains(shadow_id),
++                ),
++                &unmapped_shadow,
++            );
++            if mapping.replace_primary_ids(&primary) != shadow {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++
+     // One complete mapping that satisfies the caller's exact predicate proves
+     // the cross-lane relation, so it can stop the factorial search early.
+     fn visit<F>(
+@@ -1071,15 +1108,24 @@ impl MutationInsertIdMappingSearch {
+             );
+             let previous = document_ids.insert(*primary_id, *shadow_id);
+             debug_assert!(previous.is_none());
+-            let result = self.visit(
+-                candidate_sets,
+-                primary_writes,
+-                shadow_writes,
+-                next_primary + 1,
+-                document_ids,
+-                used_shadow_ids,
+-                on_mapping,
+-            );
++            // Use already assigned references before exploring permutations of
++            // otherwise identical parents, such as jobs with distinct args.
++            // Unknown references remain placeholders; acceptance still requires
++            // the complete write, read, and result comparison at a leaf.
++            let result =
++                match self.partial_mapping_matches(primary_writes, shadow_writes, document_ids) {
++                    Ok(true) => self.visit(
++                        candidate_sets,
++                        primary_writes,
++                        shadow_writes,
++                        next_primary + 1,
++                        document_ids,
++                        used_shadow_ids,
++                        on_mapping,
++                    ),
++                    Ok(false) => Ok(std::ops::ControlFlow::Continue(())),
++                    Err(error) => Err(error),
++                };
+             let removed = document_ids.remove(primary_id);
+             debug_assert_eq!(removed, Some(*shadow_id));
+             used_shadow_ids.remove(shadow_id);
+@@ -1150,6 +1196,8 @@ where
+ 
+     let mut search = MutationInsertIdMappingSearch {
+         examined_candidates: 0,
++        primary_insert_ids,
++        shadow_insert_ids,
+     };
+     let mut found_solution = false;
+     let _ = search.visit(
+@@ -2223,23 +2271,20 @@ mod tests {
+ 
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+     fn insert_id_read_set(ids: &[ResolvedDocumentId]) -> ReadSet {
+-        let indexed = ids
+-            .iter()
+-            .map(|id| {
+-                let mut intervals = IntervalSet::new();
+-                intervals.add(Interval::prefix(
++        let mut indexed = BTreeMap::new();
++        for id in ids {
++            indexed
++                .entry(TabletIndexName::by_id(id.tablet_id))
++                .or_insert_with(|| IndexReads {
++                    fields: IndexedFields::by_id(),
++                    intervals: IntervalSet::new(),
++                    stack_traces: None,
++                })
++                .intervals
++                .add(Interval::prefix(
+                     IndexKey::new(vec![], (*id).into()).to_bytes().into(),
+                 ));
+-                (
+-                    TabletIndexName::by_id(id.tablet_id),
+-                    IndexReads {
+-                        fields: IndexedFields::by_id(),
+-                        intervals,
+-                        stack_traces: None,
+-                    },
+-                )
+-            })
+-            .collect();
++        }
+         ReadSet::new(indexed, BTreeMap::new())
+     }
+ 
+@@ -3295,6 +3340,77 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
++    #[test]
++    fn mutation_shadow_matches_scheduled_batch_with_reversed_allocated_ids() -> anyhow::Result<()> {
++        let operation = test_document_id_in_table(11, 101, 1);
++        let args_sample = test_document_id_in_table(12, 102, 1);
++        let job_sample = test_document_id_in_table(13, 103, 1);
++        let mut table_mapping = TableMapping::new();
++        for (id, table_name) in [
++            (
++                args_sample,
++                model::scheduled_jobs::args::SCHEDULED_JOBS_ARGS_TABLE.clone(),
++            ),
++            (
++                job_sample,
++                model::scheduled_jobs::SCHEDULED_JOBS_TABLE.clone(),
++            ),
++        ] {
++            table_mapping.insert(
++                id.tablet_id,
++                TableNamespace::Global,
++                id.developer_id.table(),
++                table_name,
++            );
++        }
++        let observation = |shadow: bool, changed_argument: bool| -> anyhow::Result<_> {
++            let mut writes = Vec::new();
++            let mut ids = Vec::new();
++            for index in 0..8u8 {
++                let args_id =
++                    test_document_id_in_table(12, 102, if shadow { 20 + index } else { index + 1 });
++                let job_id =
++                    test_document_id_in_table(13, 103, if shadow { 40 - index } else { index + 1 });
++                let creation_time = if shadow { 2.0 } else { 1.0 };
++                let argument = if changed_argument && index == 0 {
++                    "changed".to_owned()
++                } else {
++                    format!("argument-{index}")
++                };
++                writes.push(scheduled_args_insert(
++                    args_id,
++                    operation,
++                    &argument,
++                    creation_time,
++                )?);
++                writes.push(scheduled_job_insert_with_creation_time(
++                    job_id,
++                    args_id,
++                    if shadow { 1_002 } else { 1_001 },
++                    1_000,
++                    creation_time,
++                )?);
++                ids.extend([args_id, job_id]);
++            }
++            mutation_observation_with_table_mapping_and_reads(
++                writes,
++                mutation_outcome()?,
++                Timestamp::MIN,
++                table_mapping.clone(),
++                insert_id_read_set(&ids),
++            )
++        };
++
++        // Job metadata has the same shape, but distinct argument documents
++        // determine the relation. Allocation order is not execution identity.
++        let comparison = compare_mutation(observation(false, false)?, observation(true, false)?);
++        assert!(comparison.matches(), "{comparison:?}");
++        let changed = compare_mutation(observation(false, false)?, observation(true, true)?);
++        assert!(!changed.write_set_matches);
++        Ok(())
++    }
++
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+     #[test]
+     fn mutation_shadow_preserves_user_bytes_that_encode_insert_ids() -> anyhow::Result<()> {
