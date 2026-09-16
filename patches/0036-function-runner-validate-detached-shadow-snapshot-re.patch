@@ -1,0 +1,485 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 16 Sep 2026 15:40:25 +0800
+Subject: [PATCH 36/36] function runner: validate detached shadow snapshot
+ retention
+
+A shared timestamped index reader does not pin persistence history. The authoritative result passes retention validation, but a detached verifier may continue reading after that check. Retain the admitted timestamp and validator independently of the primary publication sender, then validate after each shadow completes before accepting comparison evidence.
+
+An unavailable snapshot produces the existing invalid-shadow terminal, never agreement or semantic divergence. Validation remains inside the bounded background deadline and does not delay, retract, or replace the primary response. Keeping validation ownership separate preserves prompt channel closure when the caller is cancelled.
+
+Document the snapshot/read-set distinction and retention behavior. Add delayed-verifier tests for both execution directions, valid and expired snapshots, and keep the caller-cancellation regression. The new test fails without the final checks; all 69 function-runner tests pass with them.
+---
+ .../src/in_process_function_runner.rs         |   2 +-
+ crates/function_runner/src/server.rs          | 251 +++++++++++++++---
+ patches/static_hermes_wasm_udfs/operations.md |  12 +
+ 3 files changed, 234 insertions(+), 31 deletions(-)
+
+diff --git a/crates/function_runner/src/in_process_function_runner.rs b/crates/function_runner/src/in_process_function_runner.rs
+index e4f68f7113d49eb21e682ce3dec445a3d5a1e1eb..d7a272cd3fae6e2265bfbbbbb101439ed96fed6a 100644
+--- a/crates/function_runner/src/in_process_function_runner.rs
++++ b/crates/function_runner/src/in_process_function_runner.rs
+@@ -346,7 +346,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
+             FunctionExecutionMode::V8WithStaticHermesWasmShadow(_)
+                 | FunctionExecutionMode::StaticHermesWasmWithV8Shadow(_)
+         )
+-        .then(QueryShadowPrimaryPublication::new);
++        .then(|| QueryShadowPrimaryPublication::new(*ts, self.database.retention_validator()));
+         let request_metadata = RunRequestArgs {
+             execution_mode,
+             #[cfg(feature = "static-hermes-wasmtime-gate")]
+diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
+index 453b62242bfb3ac982cddadf74b26266a26616f1..0f118b53ef5b9d05fa3f7c449253773e200655f8 100644
+--- a/crates/function_runner/src/server.rs
++++ b/crates/function_runner/src/server.rs
+@@ -390,6 +390,26 @@ pub struct QueryShadowPrimaryPublication(Arc<QueryShadowPrimaryPublicationState>
+ #[cfg(feature = "static-hermes-wasmtime-gate")]
+ struct QueryShadowPrimaryPublicationState {
+     pending: Mutex<Option<PendingQueryShadowPrimaryPublication>>,
++    snapshot_validation: ShadowSnapshotValidation,
++}
++
++#[cfg(feature = "static-hermes-wasmtime-gate")]
++#[derive(Clone)]
++struct ShadowSnapshotValidation {
++    timestamp: Timestamp,
++    retention_validator: Arc<dyn RetentionValidator>,
++}
++
++#[cfg(feature = "static-hermes-wasmtime-gate")]
++impl ShadowSnapshotValidation {
++    async fn validate(&self) -> Result<(), QueryShadowTerminal> {
++        // A detached verifier may finish after the primary's retention check.
++        // An unavailable historical snapshot cannot support a comparison.
++        self.retention_validator
++            .validate_snapshot(self.timestamp)
++            .await
++            .map_err(|_| QueryShadowTerminal::InvalidShadow)
++    }
+ }
+ 
+ #[cfg(feature = "static-hermes-wasmtime-gate")]
+@@ -400,9 +420,16 @@ struct PendingQueryShadowPrimaryPublication {
+ 
+ #[cfg(feature = "static-hermes-wasmtime-gate")]
+ impl QueryShadowPrimaryPublication {
+-    pub(crate) fn new() -> Self {
++    pub(crate) fn new(
++        timestamp: Timestamp,
++        retention_validator: Arc<dyn RetentionValidator>,
++    ) -> Self {
+         Self(Arc::new(QueryShadowPrimaryPublicationState {
+             pending: Mutex::new(None),
++            snapshot_validation: ShadowSnapshotValidation {
++                timestamp,
++                retention_validator,
++            },
+         }))
+     }
+ 
+@@ -510,6 +537,7 @@ impl PrimaryShadowObservation {
+ async fn await_shadow_lanes<Shadow>(
+     primary_receiver: &mut oneshot::Receiver<PrimaryShadowObservation>,
+     shadow: impl Future<Output = Shadow>,
++    snapshot_validation: &ShadowSnapshotValidation,
+ ) -> Result<Option<((ShadowObservation, Duration), Shadow)>, QueryShadowTerminal> {
+     tokio::pin!(shadow);
+     let first = tokio::select! {
+@@ -532,6 +560,7 @@ async fn await_shadow_lanes<Shadow>(
+             Err(_) => return Ok(None),
+         },
+     };
++    snapshot_validation.validate().await?;
+     Ok(Some((primary, shadow)))
+ }
+ 
+@@ -566,6 +595,7 @@ enum V8VerifierOutcome {
+ async fn await_v8_verifier_and_primary<Verifier>(
+     primary_receiver: &mut oneshot::Receiver<PrimaryShadowObservation>,
+     verifier: Verifier,
++    snapshot_validation: &ShadowSnapshotValidation,
+ ) -> Result<((ShadowObservation, Duration), (ShadowObservation, Duration)), QueryShadowTerminal>
+ where
+     Verifier: Future<Output = V8VerifierOutcome>,
+@@ -585,6 +615,7 @@ where
+         } => (observation, duration),
+         V8VerifierOutcome::Terminal(terminal) => return Err(terminal),
+     };
++    snapshot_validation.validate().await?;
+     Ok((primary, verifier))
+ }
+ 
+@@ -609,17 +640,25 @@ where
+ {
+     let (primary_sender, mut primary_receiver) = oneshot::channel::<PrimaryShadowObservation>();
+     primary_publication.arm(primary_sender);
++    // Retain validation without retaining the primary sender. Caller
++    // cancellation must still close the observation channel promptly.
++    let snapshot_validation = primary_publication.0.snapshot_validation.clone();
+     let background_rt = rt.clone();
+     rt.spawn_background("static_hermes_v8_shadow", async move {
+         let result = run_admitted_shadow_lane(&background_rt, shadow_timeout, async {
+-            let (primary, (shadow, verifier_duration)) =
+-                match await_v8_verifier_and_primary(&mut primary_receiver, verifier).await {
+-                    Ok(observations) => observations,
+-                    Err(terminal) => {
+-                        shadow_permit.record_terminal(terminal);
+-                        return Ok(());
+-                    },
+-                };
++            let (primary, (shadow, verifier_duration)) = match await_v8_verifier_and_primary(
++                &mut primary_receiver,
++                verifier,
++                &snapshot_validation,
++            )
++            .await
++            {
++                Ok(observations) => observations,
++                Err(terminal) => {
++                    shadow_permit.record_terminal(terminal);
++                    return Ok(());
++                },
++            };
+             let comparison = match (primary.0, shadow) {
+                 (ShadowObservation::Query(primary), ShadowObservation::Query(shadow)) => {
+                     compare_query_shadow(primary, shadow)
+@@ -1351,6 +1390,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                         let (primary_sender, mut primary_receiver) =
+                             oneshot::channel::<PrimaryShadowObservation>();
+                         query_shadow_primary_publication.arm(primary_sender);
++                        let snapshot_validation = query_shadow_primary_publication
++                            .0
++                            .snapshot_validation
++                            .clone();
+                         let shadow_runner = self.clone();
+                         self.rt
+                             .spawn_background("static_hermes_shadow", async move {
+@@ -1378,8 +1421,12 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                                             (result, duration)
+                                         };
+                                         let ((primary, primary_duration), (shadow, wasm_duration)) =
+-                                            match await_shadow_lanes(&mut primary_receiver, shadow)
+-                                                .await
++                                            match await_shadow_lanes(
++                                                &mut primary_receiver,
++                                                shadow,
++                                                &snapshot_validation,
++                                            )
++                                            .await
+                                             {
+                                                 Ok(Some(paired)) => paired,
+                                                 Ok(None) => {
+@@ -2377,6 +2424,7 @@ mod query_shadow_lane_contract_tests {
+         sync::{
+             atomic::{
+                 AtomicBool,
++                AtomicUsize,
+                 Ordering,
+             },
+             Arc,
+@@ -2399,13 +2447,20 @@ mod query_shadow_lane_contract_tests {
+         },
+         identity::InertIdentity,
+         pause::PauseClient,
++        persistence::{
++            NoopRetentionValidator,
++            RetentionValidator,
++        },
+         query_journal::QueryJournal,
+         runtime::{
+             Runtime,
+             SpawnHandle,
+             UnixTimestamp,
+         },
+-        types::UdfType,
++        types::{
++            RepeatableTimestamp,
++            UdfType,
++        },
+     };
+     use database::{
+         ReadSet,
+@@ -2450,6 +2505,7 @@ mod query_shadow_lane_contract_tests {
+         QueryShadowObservation,
+         QueryShadowPrimaryPublication,
+         ShadowObservation,
++        ShadowSnapshotValidation,
+         StaticHermesGeneratedExportDiagnostic,
+         StaticHermesWasmExecutionFailure,
+         StaticHermesWasmModuleLoadingFailure,
+@@ -2467,6 +2523,44 @@ mod query_shadow_lane_contract_tests {
+     #[derive(Clone)]
+     struct ImmediateDeadlineRuntime;
+ 
++    fn valid_test_snapshot() -> ShadowSnapshotValidation {
++        ShadowSnapshotValidation {
++            timestamp: Timestamp::MIN,
++            retention_validator: Arc::new(NoopRetentionValidator),
++        }
++    }
++
++    struct ExpiringTestSnapshot {
++        valid: AtomicBool,
++        validations: AtomicUsize,
++    }
++
++    #[async_trait::async_trait]
++    impl RetentionValidator for ExpiringTestSnapshot {
++        fn optimistic_validate_snapshot(&self, _ts: Timestamp) -> anyhow::Result<()> {
++            anyhow::bail!("test expects validation after execution")
++        }
++
++        async fn validate_snapshot(&self, ts: Timestamp) -> anyhow::Result<()> {
++            assert_eq!(ts, Timestamp::MIN);
++            self.validations.fetch_add(1, Ordering::SeqCst);
++            anyhow::ensure!(self.valid.load(Ordering::SeqCst), "test snapshot expired");
++            Ok(())
++        }
++
++        async fn validate_document_snapshot(&self, _ts: Timestamp) -> anyhow::Result<()> {
++            anyhow::bail!("test does not read the documents log")
++        }
++
++        async fn min_snapshot_ts(&self) -> anyhow::Result<RepeatableTimestamp> {
++            anyhow::bail!("test expects validation of the admitted timestamp")
++        }
++
++        async fn min_document_snapshot_ts(&self) -> anyhow::Result<RepeatableTimestamp> {
++            anyhow::bail!("test does not read the documents log")
++        }
++    }
++
+     impl Runtime for ImmediateDeadlineRuntime {
+         fn wait(
+             &self,
+@@ -2665,7 +2759,8 @@ mod query_shadow_lane_contract_tests {
+ 
+     #[test]
+     fn primary_shadow_publication_waits_for_retention_validation() {
+-        let publication = QueryShadowPrimaryPublication::new();
++        let publication =
++            QueryShadowPrimaryPublication::new(Timestamp::MIN, Arc::new(NoopRetentionValidator));
+         let (sender, mut receiver) = oneshot::channel();
+         publication.arm(sender);
+         publication.record_primary(PrimaryShadowObservation::Terminal(
+@@ -2688,7 +2783,8 @@ mod query_shadow_lane_contract_tests {
+ 
+     #[test]
+     fn primary_shadow_publication_rejects_failed_retention_validation() {
+-        let publication = QueryShadowPrimaryPublication::new();
++        let publication =
++            QueryShadowPrimaryPublication::new(Timestamp::MIN, Arc::new(NoopRetentionValidator));
+         let (sender, mut receiver) = oneshot::channel();
+         publication.arm(sender);
+         publication.record_primary(PrimaryShadowObservation::Terminal(
+@@ -2874,15 +2970,19 @@ mod query_shadow_lane_contract_tests {
+         let (shadow_started_sender, shadow_started_receiver) = oneshot::channel();
+         let (shadow_release_sender, shadow_release_receiver) = oneshot::channel();
+         let paired_lanes = tokio::spawn(async move {
+-            await_shadow_lanes(&mut primary_receiver, async move {
+-                shadow_started_sender
+-                    .send(())
+-                    .expect("shadow start receiver was dropped");
+-                shadow_release_receiver
+-                    .await
+-                    .expect("shadow release sender was dropped");
+-                "wasm"
+-            })
++            await_shadow_lanes(
++                &mut primary_receiver,
++                async move {
++                    shadow_started_sender
++                        .send(())
++                        .expect("shadow start receiver was dropped");
++                    shadow_release_receiver
++                        .await
++                        .expect("shadow release sender was dropped");
++                    "wasm"
++                },
++                &valid_test_snapshot(),
++            )
+             .await
+         });
+ 
+@@ -2914,6 +3014,7 @@ mod query_shadow_lane_contract_tests {
+                     started: Some(shadow_started_sender),
+                     cancelled: Some(shadow_cancelled_sender),
+                 },
++                &valid_test_snapshot(),
+             )
+             .await
+         });
+@@ -2924,7 +3025,12 @@ mod query_shadow_lane_contract_tests {
+ 
+         let (primary_sender, mut primary_receiver) = oneshot::channel();
+         let shadow_failure = tokio::spawn(async move {
+-            await_shadow_lanes(&mut primary_receiver, async { Err::<(), _>("failed") }).await
++            await_shadow_lanes(
++                &mut primary_receiver,
++                async { Err::<(), _>("failed") },
++                &valid_test_snapshot(),
++            )
++            .await
+         });
+         tokio::task::yield_now().await;
+         assert!(!shadow_failure.is_finished());
+@@ -2948,6 +3054,7 @@ mod query_shadow_lane_contract_tests {
+                     started: Some(shadow_started_sender),
+                     cancelled: Some(shadow_cancelled_sender),
+                 },
++                &valid_test_snapshot(),
+             )
+             .await
+         });
+@@ -2963,7 +3070,9 @@ mod query_shadow_lane_contract_tests {
+         ));
+         shadow_cancelled_receiver.await?;
+ 
+-        let publication = QueryShadowPrimaryPublication::new();
++        let publication =
++            QueryShadowPrimaryPublication::new(Timestamp::MIN, Arc::new(NoopRetentionValidator));
++        let snapshot_validation = publication.0.snapshot_validation.clone();
+         let (primary_sender, mut primary_receiver) = oneshot::channel();
+         publication.arm(primary_sender);
+         let (shadow_started_sender, shadow_started_receiver) = oneshot::channel();
+@@ -2975,6 +3084,7 @@ mod query_shadow_lane_contract_tests {
+                     started: Some(shadow_started_sender),
+                     cancelled: Some(shadow_cancelled_sender),
+                 },
++                &snapshot_validation,
+             )
+             .await
+         });
+@@ -2986,15 +3096,94 @@ mod query_shadow_lane_contract_tests {
+         Ok(())
+     }
+ 
++    #[tokio::test]
++    async fn detached_shadows_validate_retention_after_execution() -> anyhow::Result<()> {
++        for wasm_primary in [false, true] {
++            for expire_during_shadow in [false, true] {
++                let validator = Arc::new(ExpiringTestSnapshot {
++                    valid: AtomicBool::new(true),
++                    validations: AtomicUsize::new(0),
++                });
++                let publication =
++                    QueryShadowPrimaryPublication::new(Timestamp::MIN, validator.clone());
++                let snapshot_validation = publication.0.snapshot_validation.clone();
++                let (primary_sender, mut primary_receiver) = oneshot::channel();
++                publication.arm(primary_sender);
++                publication.record_primary(query_primary_observation()?);
++                let (started_sender, started_receiver) = oneshot::channel();
++                let (release_sender, release_receiver) = oneshot::channel();
++                let PrimaryShadowObservation::Observation {
++                    observation,
++                    duration,
++                } = query_primary_observation()?
++                else {
++                    anyhow::bail!("test fixture did not produce an observation")
++                };
++                let pairing = tokio::spawn(async move {
++                    let shadow = async move {
++                        started_sender
++                            .send(())
++                            .expect("shadow start receiver dropped");
++                        release_receiver
++                            .await
++                            .expect("shadow release sender dropped");
++                        V8VerifierOutcome::Observation {
++                            observation,
++                            duration,
++                        }
++                    };
++                    if wasm_primary {
++                        await_v8_verifier_and_primary(
++                            &mut primary_receiver,
++                            shadow,
++                            &snapshot_validation,
++                        )
++                        .await
++                        .map(|_| ())
++                    } else {
++                        await_shadow_lanes(&mut primary_receiver, shadow, &snapshot_validation)
++                            .await
++                            .map(|_| ())
++                    }
++                });
++
++                validator.validate_snapshot(Timestamp::MIN).await?;
++                publication.publish_after_retention_validation();
++                drop(publication);
++                started_receiver.await?;
++                assert_eq!(validator.validations.load(Ordering::SeqCst), 1);
++                assert!(!pairing.is_finished());
++                validator
++                    .valid
++                    .store(!expire_during_shadow, Ordering::SeqCst);
++                release_sender
++                    .send(())
++                    .expect("shadow release receiver dropped");
++                let result = pairing.await?;
++                if expire_during_shadow {
++                    assert!(matches!(result, Err(QueryShadowTerminal::InvalidShadow)));
++                } else {
++                    assert!(result.is_ok());
++                }
++                assert_eq!(validator.validations.load(Ordering::SeqCst), 2);
++            }
++        }
++        Ok(())
++    }
++
+     #[tokio::test]
+     async fn wasm_primary_terminal_does_not_start_v8_verifier() -> anyhow::Result<()> {
+         let (primary_sender, mut primary_receiver) = oneshot::channel();
+         let (verifier_started_sender, mut verifier_started_receiver) = oneshot::channel();
+         let pairing = tokio::spawn(async move {
+-            await_v8_verifier_and_primary(&mut primary_receiver, async move {
+-                let _ = verifier_started_sender.send(());
+-                unreachable!("pending V8 verifier completed")
+-            })
++            await_v8_verifier_and_primary(
++                &mut primary_receiver,
++                async move {
++                    let _ = verifier_started_sender.send(());
++                    unreachable!("pending V8 verifier completed")
++                },
++                &valid_test_snapshot(),
++            )
+             .await
+         });
+ 
+@@ -3055,7 +3244,9 @@ mod query_shadow_lane_contract_tests {
+             &ImmediateDeadlineRuntime,
+             Duration::from_secs(1),
+             async move {
+-                let _ = await_shadow_lanes(&mut primary_receiver, async { () }).await;
++                let _ =
++                    await_shadow_lanes(&mut primary_receiver, async { () }, &valid_test_snapshot())
++                        .await;
+                 comparison_attempted_for_lane.store(true, Ordering::Relaxed);
+                 Ok(())
+             },
+diff --git a/patches/static_hermes_wasm_udfs/operations.md b/patches/static_hermes_wasm_udfs/operations.md
+index 5c9b0cc0905036b4529b61f4df922f9dcea7d957..6a5f8dc4c96fe3f057654eac503a6595c7ef3cf8 100644
+--- a/patches/static_hermes_wasm_udfs/operations.md
++++ b/patches/static_hermes_wasm_udfs/operations.md
+@@ -337,6 +337,18 @@ reuse policy.
+ 
+ ## Observability
+ 
++Primary and verifier executions use the same timestamped database inputs, but
++record their own read dependencies; verification does not replay the primary's
++reads. Newly inserted IDs are allocated independently and compared through one
++consistent identity relation across results, reads, and writes.
++
++Holding the shared reader does not pin historical data indefinitely. The
++primary receives its normal post-execution retention check, and a detached
++verifier receives a separate check after its reads finish. If that final check
++fails, the attempt is recorded as `invalid_shadow`, not agreement or semantic
++divergence. The check runs within the bounded background deadline and cannot
++delay or retract the already returned primary result.
++
+ Execution and registry metrics include:
+ 
+ - `convex_local_backend_static_hermes_wasmtime_gate_phase_seconds`;
