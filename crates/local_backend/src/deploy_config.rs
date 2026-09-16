@@ -256,7 +256,7 @@ pub async fn get_config_hashes(
     let config: JsonValue = config.to_internal_json();
 
     let node_version = SourcePackageModel::new(&mut tx, TableNamespace::Global)
-        .get_latest()
+        .get_latest_record()
         .await?
         .and_then(|v| v.node_version.map(|v| v.into()));
 

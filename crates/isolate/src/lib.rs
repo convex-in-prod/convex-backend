@@ -12,6 +12,42 @@
 #![feature(exit_status_error)]
 #![feature(vec_deque_extract_if)]
 
+#[cfg(all(
+    feature = "static-hermes-wasmtime-gate",
+    not(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))
+))]
+compile_error!(
+    "static-hermes-wasmtime-gate requires target x86_64-unknown-linux-gnu because its \
+     authenticated AOT contract is target-specific"
+);
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use crate::environment::udf::wasm_udf_package::{
+    MODULE_GRAPH_RUNTIME_SURFACE_INVENTORY_SHA256,
+    MODULE_GRAPH_RUNTIME_SURFACE_POLICY_IDENTITY_KIND,
+    MODULE_GRAPH_RUNTIME_SURFACE_POLICY_SHA256,
+};
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+mod static_hermes_wasmtime_quarantine;
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticHermesWasmtimeGateRuntimeSurfacePolicyIdentity {
+    pub inventory_sha256: &'static str,
+    pub kind: &'static str,
+    pub runtime_surface_policy_sha256: &'static str,
+}
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub const STATIC_HERMES_WASMTIME_GATE_RUNTIME_SURFACE_POLICY_IDENTITY:
+    StaticHermesWasmtimeGateRuntimeSurfacePolicyIdentity =
+    StaticHermesWasmtimeGateRuntimeSurfacePolicyIdentity {
+        inventory_sha256: MODULE_GRAPH_RUNTIME_SURFACE_INVENTORY_SHA256,
+        kind: MODULE_GRAPH_RUNTIME_SURFACE_POLICY_IDENTITY_KIND,
+        runtime_surface_policy_sha256: MODULE_GRAPH_RUNTIME_SURFACE_POLICY_SHA256,
+    };
+
 mod array_buffer_allocator;
 pub mod bundled_js;
 pub mod client;
@@ -38,6 +74,59 @@ mod termination;
 pub mod timeout;
 mod udf_runtime;
 
+#[cfg(all(
+    feature = "static-hermes-wasmtime-gate",
+    any(test, feature = "testing")
+))]
+pub use self::environment::udf::static_hermes_wasmtime_gate::{
+    cleanup_static_hermes_test_instances,
+    install_test_hooks as install_static_hermes_gate_test_hooks,
+    StaticHermesGateTestHooks,
+    StaticHermesGateTestHooksGuard,
+    StaticHermesGeneratedExecutionPhaseObservation,
+    StaticHermesGeneratedInvocationObservation,
+    StaticHermesGeneratedMemorySnapshot,
+    StaticHermesGeneratedRoutePreflightStage,
+};
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub use self::environment::udf::static_hermes_wasmtime_gate::{
+    source_keyed_paired_deployment_guard_enabled,
+    source_keyed_runtime_generation_identity,
+    source_keyed_runtime_readiness,
+    SourceKeyedRuntimeGenerationIdentity,
+    SourceKeyedRuntimeReadiness,
+    StaticHermesGeneratedMemoryRouteStatistics,
+    StaticHermesGeneratedMemoryStatistics,
+};
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub use self::environment::udf::static_hermes_wasmtime_gate::{
+    PreparedStaticHermesWasmtimeInvocation,
+    StaticHermesGeneratedExportDiagnostic,
+    StaticHermesQueryShadowCapacityUnavailable,
+    StaticHermesQueryShadowRegistry,
+    StaticHermesWasmExecutionFailure,
+    StaticHermesWasmModuleLoadingFailure,
+    StaticHermesWasmTrapCode,
+    StaticHermesWasmTrapDiagnostic,
+    StaticHermesWasmTrapStderrClassification,
+    StaticHermesWasmtimePreparationMode,
+    StaticHermesWasmtimeRouteHandle,
+};
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub use self::static_hermes_wasmtime_quarantine::{
+    initialize_static_hermes_wasmtime_quarantine,
+    static_hermes_wasmtime_quarantine,
+    static_hermes_wasmtime_quarantine_path_for_database_spec,
+    StaticHermesWasmtimeQuarantine,
+    StaticHermesWasmtimeQuarantineAction,
+    StaticHermesWasmtimeQuarantineEntry,
+    StaticHermesWasmtimeQuarantineMutationError,
+    StaticHermesWasmtimeQuarantineSelector,
+    StaticHermesWasmtimeQuarantineSnapshot,
+    StaticHermesWasmtimeQuarantineUpdate,
+    StaticHermesWasmtimeRouteDecision,
+    StaticHermesWasmtimeSourceIdentity,
+};
 pub use self::{
     client::{
         ActionRequest,

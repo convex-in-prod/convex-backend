@@ -48,6 +48,7 @@ use common::{
         IndexName,
         ModuleEnvironment,
         NodeDependency,
+        ObjectKey,
         RepeatableTimestamp,
         Timestamp,
     },
@@ -76,6 +77,13 @@ use fastrace::{
     Span,
 };
 use futures::FutureExt;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use isolate::{
+    source_keyed_paired_deployment_guard_enabled,
+    source_keyed_runtime_readiness,
+    SourceKeyedRuntimeGenerationIdentity,
+    SourceKeyedRuntimeReadiness,
+};
 use keybroker::Identity;
 use maplit::btreeset;
 use model::{
@@ -123,20 +131,28 @@ use model::{
         },
     },
     environment_variables::EnvironmentVariablesModel,
-    external_packages::types::ExternalDepsPackageId,
+    external_packages::{
+        types::{
+            ExternalDepsPackage,
+            ExternalDepsPackageId,
+        },
+        ExternalPackagesModel,
+    },
     modules::module_versions::{
         AnalyzedModule,
         ModuleSource,
         SourceMap,
     },
     source_packages::{
+        runtime_content::runtime_content_sha256,
         types::{
             NodeExecutorPoolTopology,
             NodeVersion,
             NodeVersionDiff,
             SourcePackage,
+            SourcePackageRuntimeGeneration,
         },
-        upload_download::download_package,
+        upload_download::download_package_with_metadata,
         SourcePackageModel,
     },
     udf_config::types::UdfConfig,
@@ -187,6 +203,20 @@ pub struct PushMetrics {
     pub occ_stats: OccRetryStats,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceKeyedRuntimeExpectedPrior {
+    pub source_package_id: DeveloperDocumentId,
+    pub source_package_sha256: Sha256Digest,
+    pub source_package_runtime_content_sha256: Option<Sha256Digest>,
+    pub runtime_generation: Option<SourcePackageRuntimeGeneration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceKeyedRuntimeActivation {
+    pub expected_prior: SourceKeyedRuntimeExpectedPrior,
+    pub target_generation: SourcePackageRuntimeGeneration,
+}
+
 struct EvaluatedPushContents {
     app: CheckedComponent,
     auth_info: Vec<AuthInfo>,
@@ -197,7 +227,198 @@ struct EvaluatedPushContents {
     app_functions: Vec<ModuleConfig>,
 }
 
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+fn validate_source_keyed_runtime_readiness(
+    paired_primary_enabled: bool,
+    runtime_content_sha256: Option<&Sha256Digest>,
+    runtime_generation: Option<&SourcePackageRuntimeGeneration>,
+    readiness: Option<SourceKeyedRuntimeReadiness>,
+) -> anyhow::Result<()> {
+    if !paired_primary_enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        runtime_content_sha256.is_some(),
+        ErrorMetadata::bad_request(
+            "StaticHermesWasmGenerationNotReady",
+            "The source package has no load-verified Wasm generation staged for paired deployment",
+        )
+    );
+    anyhow::ensure!(
+        runtime_generation.is_some(),
+        ErrorMetadata::bad_request(
+            "StaticHermesWasmGenerationNotReady",
+            "The paired deployment request has no exact Wasm generation selector",
+        )
+    );
+    anyhow::ensure!(
+        readiness == Some(SourceKeyedRuntimeReadiness::Ready),
+        ErrorMetadata::bad_request(
+            "StaticHermesWasmGenerationNotReady",
+            "The source package has no load-verified Wasm generation staged for paired deployment",
+        )
+    );
+    Ok(())
+}
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+async fn prepare_source_keyed_runtime_activation(
+    source_package: &mut SourcePackage,
+    activation: Option<SourceKeyedRuntimeActivation>,
+) -> anyhow::Result<Option<SourceKeyedRuntimeExpectedPrior>> {
+    // Paired activation is opt-in per publication, not mandatory for every client
+    // of a Wasm-capable backend. Ordinary clients publish V8 source and clear the
+    // selected generation; retained artifacts cannot authorize that new source.
+    let Some(activation) = activation else {
+        source_package.runtime_generation = None;
+        return Ok(None);
+    };
+    let paired_deployment_enabled = source_keyed_paired_deployment_guard_enabled()?;
+    anyhow::ensure!(
+        paired_deployment_enabled,
+        ErrorMetadata::bad_request(
+            "SourceKeyedRuntimeActivationUnsupported",
+            "This backend is not configured for paired source-keyed activation",
+        )
+    );
+    let runtime_content_sha256 = source_package.runtime_content_sha256.as_ref();
+    let generation_identity = SourceKeyedRuntimeGenerationIdentity {
+        deployment_sha256: activation.target_generation.deployment_sha256.as_hex(),
+        generation_manifest_sha256: activation
+            .target_generation
+            .generation_manifest_sha256
+            .as_hex(),
+        generation_sha256: activation.target_generation.generation_sha256.as_hex(),
+    };
+    let readiness = match runtime_content_sha256.map(Sha256Digest::as_hex) {
+        Some(sha256) => Some(source_keyed_runtime_readiness(&sha256, &generation_identity).await?),
+        None => None,
+    };
+    validate_source_keyed_runtime_readiness(
+        paired_deployment_enabled,
+        runtime_content_sha256,
+        Some(&activation.target_generation),
+        readiness,
+    )?;
+    source_package.runtime_generation = Some(activation.target_generation);
+    Ok(Some(activation.expected_prior))
+}
+
+#[cfg(not(feature = "static-hermes-wasmtime-gate"))]
+async fn prepare_source_keyed_runtime_activation(
+    _source_package: &mut SourcePackage,
+    activation: Option<SourceKeyedRuntimeActivation>,
+) -> anyhow::Result<Option<SourceKeyedRuntimeExpectedPrior>> {
+    anyhow::ensure!(
+        activation.is_none(),
+        ErrorMetadata::bad_request(
+            "SourceKeyedRuntimeActivationUnsupported",
+            "This backend does not support paired source-keyed activation",
+        )
+    );
+    Ok(None)
+}
+
+fn validate_source_keyed_runtime_expected_prior(
+    expected: &SourceKeyedRuntimeExpectedPrior,
+    actual_id: DeveloperDocumentId,
+    actual: &SourcePackage,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        actual_id == expected.source_package_id
+            && actual.sha256 == expected.source_package_sha256
+            && actual.runtime_content_sha256 == expected.source_package_runtime_content_sha256
+            && actual.runtime_generation == expected.runtime_generation,
+        ErrorMetadata::bad_request(
+            "SourceKeyedRuntimeExpectedPriorMismatch",
+            "The committed source/runtime state changed before paired activation",
+        )
+    );
+    Ok(())
+}
+
+async fn validate_source_keyed_runtime_expected_prior_in_tx<RT: Runtime>(
+    tx: &mut database::Transaction<RT>,
+    expected: &SourceKeyedRuntimeExpectedPrior,
+) -> anyhow::Result<()> {
+    let actual = SourcePackageModel::new(tx, TableNamespace::Global)
+        .get_latest_record()
+        .await?
+        .context(ErrorMetadata::bad_request(
+            "SourceKeyedRuntimeExpectedPriorMismatch",
+            "The committed source package disappeared before paired activation",
+        ))?;
+    validate_source_keyed_runtime_expected_prior(expected, actual.developer_id(), &actual)
+}
+
+fn restore_source_package_runtime_content_sha256(
+    source_package: &mut SourcePackage,
+    verified_runtime_content_sha256: Sha256Digest,
+) -> anyhow::Result<()> {
+    if let Some(returned_runtime_content_sha256) = &source_package.runtime_content_sha256 {
+        anyhow::ensure!(
+            returned_runtime_content_sha256 == &verified_runtime_content_sha256,
+            ErrorMetadata::bad_request(
+                "SourcePackageRuntimeContentMismatch",
+                "The source package runtime-content identity does not match its downloaded \
+                 contents",
+            )
+        );
+    }
+    source_package.runtime_content_sha256 = Some(verified_runtime_content_sha256);
+    Ok(())
+}
+
+fn validate_source_package_external_deps_identity(
+    archive_external_deps_storage_key: Option<&ObjectKey>,
+    external_deps_package: Option<&ExternalDepsPackage>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        archive_external_deps_storage_key
+            == external_deps_package.map(|package| &package.storage_key),
+        ErrorMetadata::bad_request(
+            "SourcePackageExternalDepsMismatch",
+            "The source package dependencies do not match its downloaded contents",
+        )
+    );
+    Ok(())
+}
+
 impl<RT: Runtime> Application<RT> {
+    async fn restore_downloaded_source_package_runtime_content_identity(
+        &self,
+        source_package: &mut SourcePackage,
+        downloaded_package: &BTreeMap<CanonicalizedModulePath, ModuleConfig>,
+        archive_external_deps_storage_key: Option<&ObjectKey>,
+    ) -> anyhow::Result<()> {
+        let external_deps_package = match &source_package.external_deps_package_id {
+            Some(external_deps_package_id) => {
+                let mut tx = self.begin(Identity::system()).await?;
+                let external_deps_package = ExternalPackagesModel::new(&mut tx)
+                    .get(external_deps_package_id.clone())
+                    .await?
+                    .into_value();
+                tx.into_token()?;
+                Some(external_deps_package)
+            },
+            None => None,
+        };
+        validate_source_package_external_deps_identity(
+            archive_external_deps_storage_key,
+            external_deps_package.as_ref(),
+        )?;
+        let modules = downloaded_package.values().cloned().collect::<Vec<_>>();
+        let verified_runtime_content_sha256 = runtime_content_sha256(
+            &modules,
+            external_deps_package.as_ref(),
+            source_package.node_version,
+        )?;
+        restore_source_package_runtime_content_sha256(
+            source_package,
+            verified_runtime_content_sha256,
+        )
+    }
+
     async fn complete_node_executor_pool_cutover_after_commit(
         &self,
         topology: &NodeExecutorPoolTopology,
@@ -917,13 +1138,25 @@ impl<RT: Runtime> Application<RT> {
         request_metadata: RequestMetadata,
         mut start_push: StartPushResponse,
         message: Option<PushMessage>,
+        source_keyed_runtime_activation: Option<SourceKeyedRuntimeActivation>,
         force_node_cutover: bool,
     ) -> anyhow::Result<(FinishPushDiff, Timestamp)> {
         // Download all source packages. We can remove this once we don't store source
         // in the database.
         let mut downloaded_source_packages = BTreeMap::new();
+        let mut root_archive_external_deps_storage_key = None;
         for (definition_path, source_package) in &mut start_push.component_definition_packages {
-            let package = download_package(self.modules_storage().clone(), source_package).await?;
+            // `StartPushResponse` crosses a client round trip. A client cannot
+            // provide durable runtime-generation authority for any component.
+            source_package.runtime_generation = None;
+            let downloaded_package =
+                download_package_with_metadata(self.modules_storage().clone(), source_package)
+                    .await?;
+            if definition_path.is_root() {
+                root_archive_external_deps_storage_key =
+                    downloaded_package.external_deps_storage_key.clone();
+            }
+            let package = downloaded_package.modules;
             if !definition_path.is_root() {
                 anyhow::ensure!(
                     package.values().all(|module| {
@@ -943,9 +1176,26 @@ impl<RT: Runtime> Application<RT> {
                 node_executor_pool_topology(package.values())?;
             downloaded_source_packages.insert(definition_path.clone(), package);
         }
+        let root_definition_path = ComponentDefinitionPath::root();
+        let downloaded_root_package = downloaded_source_packages
+            .get(&root_definition_path)
+            .context("No downloaded source package for the root component")?;
+        let root_source_package = start_push
+            .component_definition_packages
+            .get_mut(&root_definition_path)
+            .context("No source package for the root component")?;
+        // The source-package response crosses a client round trip. Restore the
+        // runtime identity from the downloaded contents before it becomes
+        // deployment authority.
+        self.restore_downloaded_source_package_runtime_content_identity(
+            root_source_package,
+            downloaded_root_package,
+            root_archive_external_deps_storage_key.as_ref(),
+        )
+        .await?;
         let committed_pool_topology = start_push
             .component_definition_packages
-            .get(&ComponentDefinitionPath::root())
+            .get(&root_definition_path)
             .context("No source package for the root component")?
             .node_executor_pool_topology
             .clone();
@@ -955,6 +1205,16 @@ impl<RT: Runtime> Application<RT> {
         // configured process budget.
         self.runner()
             .validate_node_executor_pool_topology(&committed_pool_topology)?;
+
+        let source_keyed_runtime_expected_prior = {
+            let source_package = start_push
+                .component_definition_packages
+                .get_mut(&root_definition_path)
+                .context("No source package for the root component")?;
+            prepare_source_keyed_runtime_activation(source_package, source_keyed_runtime_activation)
+                .await?
+        };
+
         let cutover_reservation = self
             .runner()
             .reserve_node_executor_pool_cutover(&committed_pool_topology, force_node_cutover)
@@ -979,7 +1239,12 @@ impl<RT: Runtime> Application<RT> {
                     let start_push = &start_push;
                     let downloaded_source_packages = &downloaded_source_packages;
                     let message = &message;
+                    let source_keyed_runtime_expected_prior = &source_keyed_runtime_expected_prior;
                     async move {
+                        if let Some(expected_prior) = source_keyed_runtime_expected_prior {
+                            validate_source_keyed_runtime_expected_prior_in_tx(tx, expected_prior)
+                                .await?;
+                        }
                         // Validate that environment variables haven't changed since `start_push`.
                         let environment_variables =
                             EnvironmentVariablesModel::new(tx).get_all().await?;
@@ -1029,7 +1294,7 @@ impl<RT: Runtime> Application<RT> {
                             .await?;
 
                         let prev_node_version = SourcePackageModel::new(tx, TableNamespace::Global)
-                            .get_latest()
+                            .get_latest_record()
                             .await?
                             .and_then(|p| p.node_version);
 
@@ -1054,7 +1319,7 @@ impl<RT: Runtime> Application<RT> {
                             .await?;
 
                         let next_node_version = SourcePackageModel::new(tx, TableNamespace::Global)
-                            .get_latest()
+                            .get_latest_record()
                             .await?
                             .and_then(|p| p.node_version);
 
@@ -1139,9 +1404,10 @@ impl<RT: Runtime> Application<RT> {
             .map(|(_, pkg)| pkg.package_size)
             .unwrap_or_default();
 
-        let source_package = self
+        let mut source_package = self
             .upload_package(&modules, external_deps_id_and_pkg, node_version)
             .await?;
+        prepare_source_keyed_runtime_activation(&mut source_package, None).await?;
         let committed_pool_topology = source_package.node_executor_pool_topology.clone();
         let end_upload_source_package = Instant::now();
         // Verify that we have not exceeded the max zipped or unzipped file size
@@ -1323,6 +1589,14 @@ pub struct StartPushRequest {
 
     pub node_dependencies: Vec<NodeDependencyJson>,
 
+    /// Omitted by ordinary clients; provided when staging selected exact
+    /// dependency material.
+    #[serde(
+        default,
+        deserialize_with = "SerializedExternalDepsPackageSelection::deserialize_present"
+    )]
+    pub external_deps_package: Option<SerializedExternalDepsPackageSelection>,
+
     pub node_version: Option<String>,
 
     #[serde(default)]
@@ -1371,10 +1645,52 @@ impl StartPushRequest {
                 .into_iter()
                 .map(NodeDependency::from)
                 .collect(),
+            external_deps_package: self
+                .external_deps_package
+                .map(TryInto::try_into)
+                .transpose()?,
             node_version,
             dry_run: self.dry_run,
             for_codegen: self.for_codegen,
             include_analysis: self.include_analysis,
+        })
+    }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SerializedExternalDepsPackageSelection {
+    pub id: String,
+    pub sha256: String,
+}
+
+impl SerializedExternalDepsPackageSelection {
+    fn deserialize_present<'de, D>(deserializer: D) -> Result<Option<Self>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // A present null selector must not silently select the ordinary build path.
+        Self::deserialize(deserializer).map(Some)
+    }
+}
+
+impl TryFrom<SerializedExternalDepsPackageSelection>
+    for model::external_packages::types::ExternalDepsPackageSelection
+{
+    type Error = anyhow::Error;
+
+    fn try_from(value: SerializedExternalDepsPackageSelection) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            value.sha256.len() == 64
+                && value
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "External dependency package SHA-256 must be lowercase hex"
+        );
+        Ok(Self {
+            id: value.id.try_into()?,
+            sha256: const_hex::decode(value.sha256)?.try_into()?,
         })
     }
 }
@@ -1983,6 +2299,484 @@ mod node_pool_tests {
             udf_server_version: "1.0.0".to_owned(),
         };
         assert!(ComponentDefinitionConfig::try_from(component).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "static-hermes-wasmtime-gate"))]
+mod source_keyed_deployment_readiness_tests {
+    use std::sync::Arc;
+
+    use anyhow::Context;
+    use common::{
+        persistence::Persistence,
+        runtime::new_unlimited_rate_limiter,
+        shutdown::ShutdownSignal,
+    };
+    use database::Database;
+    use indexing::index_cache::IndexCache;
+    use model::{
+        initialize_application_system_tables,
+        virtual_system_mapping,
+    };
+    use runtime::prod::ProdRuntime;
+    use search::searcher::SearcherStub;
+    use sqlite::SqlitePersistence;
+
+    use super::*;
+
+    #[test]
+    fn selected_external_deps_survive_cache_replacement_and_eviction() -> anyhow::Result<()> {
+        use model::external_packages::types::ExternalDepsPackageSelection;
+
+        let tokio = ProdRuntime::init_tokio()?;
+        let runtime = ProdRuntime::new(&tokio);
+        let block_runtime = runtime.clone();
+        block_runtime.block_on("selected_external_deps", async move {
+            let database = new_test_database(runtime).await?;
+            initialize_application_system_tables(&database).await?;
+            let dependencies = vec![NodeDependency {
+                package: "example-package".to_owned(),
+                version: "1.0.0".to_owned(),
+            }];
+            let mut original = external_deps_package("original-dependencies");
+            original.deps = dependencies.clone();
+            let mut tx = database.begin_system().await?;
+            let id = ExternalPackagesModel::new(&mut tx)
+                .put(original.clone())
+                .await?;
+            database
+                .commit_with_write_source(tx, "test_original_dependencies")
+                .await?;
+            let selection = ExternalDepsPackageSelection {
+                id,
+                sha256: original.sha256.clone(),
+            };
+
+            let mut replacement = original.clone();
+            replacement.sha256 = Sha256Digest::from([8; 32]);
+            replacement.storage_key = "replacement-dependencies".try_into()?;
+            let mut tx = database.begin_system().await?;
+            let replacement_id = ExternalPackagesModel::new(&mut tx)
+                .put(replacement.clone())
+                .await?;
+            database
+                .commit_with_write_source(tx, "test_replacement_dependencies")
+                .await?;
+            let mut tx = database.begin_system().await?;
+            let mut model = ExternalPackagesModel::new(&mut tx);
+            assert_eq!(
+                model
+                    .get_cached_package_match(dependencies.clone())
+                    .await?
+                    .unwrap()
+                    .0,
+                replacement_id
+            );
+            assert_eq!(model.get_selected(&selection).await?, original);
+
+            for index in 0..11 {
+                let mut other = replacement.clone();
+                other.deps[0].package = format!("other-package-{index}");
+                let mut tx = database.begin_system().await?;
+                ExternalPackagesModel::new(&mut tx).put(other).await?;
+                database
+                    .commit_with_write_source(tx, "test_dependency_cache_churn")
+                    .await?;
+            }
+            let mut tx = database.begin_system().await?;
+            let mut model = ExternalPackagesModel::new(&mut tx);
+            assert!(model
+                .get_cached_package_match(dependencies.clone())
+                .await?
+                .is_none());
+            let selected = model.get_selected(&selection).await?;
+            selected.validate_dependencies(&dependencies)?;
+            assert_eq!(selected, original);
+            assert_eq!(
+                runtime_content_sha256(&[], Some(&selected), None)?,
+                runtime_content_sha256(&[], Some(&original), None)?
+            );
+            assert_ne!(
+                runtime_content_sha256(&[], Some(&selected), None)?,
+                runtime_content_sha256(&[], Some(&replacement), None)?
+            );
+            assert!(model
+                .get_selected(&ExternalDepsPackageSelection {
+                    sha256: replacement.sha256,
+                    ..selection.clone()
+                })
+                .await
+                .is_err());
+            assert!(model
+                .get_selected(&ExternalDepsPackageSelection {
+                    id: DeveloperDocumentId::MAX.into(),
+                    ..selection
+                })
+                .await
+                .is_err());
+            Ok(())
+        })
+    }
+
+    fn source_package(runtime_content_sha256: Option<Sha256Digest>) -> SourcePackage {
+        SourcePackage {
+            storage_key: "runtime-content-identity-test".try_into().unwrap(),
+            sha256: Sha256Digest::from([0; 32]),
+            runtime_content_sha256,
+            runtime_generation: None,
+            external_deps_package_id: None,
+            package_size: Default::default(),
+            node_version: None,
+            node_executor_pool_topology: Default::default(),
+        }
+    }
+
+    fn runtime_generation() -> SourcePackageRuntimeGeneration {
+        SourcePackageRuntimeGeneration {
+            deployment_sha256: Sha256Digest::from([2; 32]),
+            generation_manifest_sha256: Sha256Digest::from([3; 32]),
+            generation_sha256: Sha256Digest::from([4; 32]),
+        }
+    }
+
+    fn external_deps_package(storage_key: &str) -> ExternalDepsPackage {
+        ExternalDepsPackage {
+            storage_key: storage_key.try_into().unwrap(),
+            sha256: Sha256Digest::from([9; 32]),
+            deps: vec![],
+            package_size: Default::default(),
+        }
+    }
+
+    async fn new_test_database(runtime: ProdRuntime) -> anyhow::Result<Database<ProdRuntime>> {
+        let persistence: Arc<dyn Persistence> = Arc::new(SqlitePersistence::new(":memory:")?);
+        let (deleted_tablet_sender, _deleted_tablet_receiver) = tokio::sync::mpsc::channel(16);
+        Database::load(
+            persistence,
+            runtime.clone(),
+            Arc::new(SearcherStub),
+            ShutdownSignal::panic(),
+            virtual_system_mapping().clone(),
+            IndexCache::new(1 << 20).new_handle(),
+            Arc::new(new_unlimited_rate_limiter(runtime)),
+            deleted_tablet_sender,
+            "source_keyed_finish_push_tests".to_owned(),
+        )
+        .await
+    }
+
+    fn source_package_with_generation(
+        sha256_byte: u8,
+        runtime_generation: Option<SourcePackageRuntimeGeneration>,
+    ) -> SourcePackage {
+        SourcePackage {
+            storage_key: format!("source-keyed-finish-push-{sha256_byte}")
+                .try_into()
+                .unwrap(),
+            sha256: Sha256Digest::from([sha256_byte; 32]),
+            runtime_content_sha256: Some(Sha256Digest::from([sha256_byte.wrapping_add(1); 32])),
+            runtime_generation,
+            external_deps_package_id: None,
+            package_size: Default::default(),
+            node_version: None,
+            node_executor_pool_topology: Default::default(),
+        }
+    }
+
+    async fn commit_source_package(
+        database: &Database<ProdRuntime>,
+        source_package: SourcePackage,
+        write_source: &'static str,
+    ) -> anyhow::Result<()> {
+        let mut tx = database.begin_system().await?;
+        SourcePackageModel::new(&mut tx, TableNamespace::Global)
+            .put(source_package)
+            .await?;
+        database.commit_with_write_source(tx, write_source).await?;
+        Ok(())
+    }
+
+    async fn latest_source_package(
+        database: &Database<ProdRuntime>,
+    ) -> anyhow::Result<(DeveloperDocumentId, SourcePackage)> {
+        let mut tx = database.begin_system().await?;
+        let source_package = SourcePackageModel::new(&mut tx, TableNamespace::Global)
+            .get_latest_record()
+            .await?
+            .context("source-keyed finish-push test has no source package")?;
+        let source_package_id = source_package.developer_id();
+        let source_package = source_package.as_ref().clone().into_value();
+        tx.into_token()?;
+        Ok((source_package_id, source_package))
+    }
+
+    fn expected_prior(
+        source_package_id: DeveloperDocumentId,
+        source_package: &SourcePackage,
+    ) -> SourceKeyedRuntimeExpectedPrior {
+        SourceKeyedRuntimeExpectedPrior {
+            source_package_id,
+            source_package_sha256: source_package.sha256.clone(),
+            source_package_runtime_content_sha256: source_package.runtime_content_sha256.clone(),
+            runtime_generation: source_package.runtime_generation.clone(),
+        }
+    }
+
+    async fn commit_paired_source_package(
+        database: &Database<ProdRuntime>,
+        expected_prior: &SourceKeyedRuntimeExpectedPrior,
+        source_package: SourcePackage,
+    ) -> anyhow::Result<()> {
+        let mut tx = database.begin_system().await?;
+        validate_source_keyed_runtime_expected_prior_in_tx(&mut tx, expected_prior).await?;
+        SourcePackageModel::new(&mut tx, TableNamespace::Global)
+            .put(source_package)
+            .await?;
+        database
+            .commit_with_write_source(tx, "source_keyed_paired_finish_push")
+            .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn downloaded_runtime_content_identity_is_restored_but_cannot_be_replaced() {
+        let verified = Sha256Digest::from([1; 32]);
+        let mut omitted = source_package(None);
+        restore_source_package_runtime_content_sha256(&mut omitted, verified.clone()).unwrap();
+        assert_eq!(omitted.runtime_content_sha256, Some(verified.clone()));
+
+        let mut matching = source_package(Some(verified.clone()));
+        restore_source_package_runtime_content_sha256(&mut matching, verified.clone()).unwrap();
+        assert_eq!(matching.runtime_content_sha256, Some(verified));
+
+        let mut replaced = source_package(Some(Sha256Digest::from([2; 32])));
+        assert!(restore_source_package_runtime_content_sha256(
+            &mut replaced,
+            Sha256Digest::from([1; 32]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn downloaded_external_deps_identity_must_match_the_source_package_record() {
+        let external_deps = external_deps_package("source-keyed-external-deps");
+        assert!(validate_source_package_external_deps_identity(
+            Some(&external_deps.storage_key),
+            Some(&external_deps),
+        )
+        .is_ok());
+        assert!(validate_source_package_external_deps_identity(None, None).is_ok());
+
+        let different_external_deps = external_deps_package("source-keyed-other-external-deps");
+        assert!(validate_source_package_external_deps_identity(
+            Some(&different_external_deps.storage_key),
+            Some(&external_deps),
+        )
+        .is_err());
+        assert!(
+            validate_source_package_external_deps_identity(None, Some(&external_deps)).is_err()
+        );
+        assert!(validate_source_package_external_deps_identity(
+            Some(&external_deps.storage_key),
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ordinary_publication_clears_wasm_selection_without_requiring_runtime_configuration(
+    ) -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let runtime = ProdRuntime::new(&tokio);
+        runtime.block_on("ordinary_v8_publication", async {
+            for digest in [None, Some(Sha256Digest::from([1; 32]))] {
+                let mut package = source_package(digest.clone());
+                package.runtime_generation = Some(runtime_generation());
+                assert!(prepare_source_keyed_runtime_activation(&mut package, None)
+                    .await?
+                    .is_none());
+                assert!(package.runtime_generation.is_none());
+                assert_eq!(package.runtime_content_sha256, digest);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn paired_source_package_requires_the_exact_ready_runtime_content() {
+        let runtime_content_sha256 = Sha256Digest::from([1; 32]);
+        let runtime_generation = runtime_generation();
+        assert!(validate_source_keyed_runtime_readiness(
+            true,
+            Some(&runtime_content_sha256),
+            Some(&runtime_generation),
+            Some(SourceKeyedRuntimeReadiness::Ready),
+        )
+        .is_ok());
+        assert!(validate_source_keyed_runtime_readiness(
+            true,
+            Some(&runtime_content_sha256),
+            Some(&runtime_generation),
+            Some(SourceKeyedRuntimeReadiness::NotStaged),
+        )
+        .is_err());
+        assert!(validate_source_keyed_runtime_readiness(
+            true,
+            Some(&runtime_content_sha256),
+            Some(&runtime_generation),
+            None,
+        )
+        .is_err());
+        assert!(validate_source_keyed_runtime_readiness(
+            true,
+            None,
+            Some(&runtime_generation),
+            Some(SourceKeyedRuntimeReadiness::Ready),
+        )
+        .is_err());
+        assert!(validate_source_keyed_runtime_readiness(
+            true,
+            Some(&runtime_content_sha256),
+            None,
+            Some(SourceKeyedRuntimeReadiness::Ready),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn disabled_paired_deployment_ignores_catalog_readiness() {
+        assert!(validate_source_keyed_runtime_readiness(false, None, None, None).is_ok());
+        assert!(validate_source_keyed_runtime_readiness(
+            false,
+            None,
+            None,
+            Some(SourceKeyedRuntimeReadiness::NotStaged),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn expected_prior_requires_the_exact_transaction_visible_source_and_generation() {
+        let mut actual = source_package(Some(Sha256Digest::from([1; 32])));
+        actual.sha256 = Sha256Digest::from([5; 32]);
+        actual.runtime_generation = Some(runtime_generation());
+        let expected = SourceKeyedRuntimeExpectedPrior {
+            source_package_id: DeveloperDocumentId::MIN,
+            source_package_sha256: actual.sha256.clone(),
+            source_package_runtime_content_sha256: actual.runtime_content_sha256.clone(),
+            runtime_generation: actual.runtime_generation.clone(),
+        };
+        validate_source_keyed_runtime_expected_prior(&expected, DeveloperDocumentId::MIN, &actual)
+            .unwrap();
+
+        assert!(validate_source_keyed_runtime_expected_prior(
+            &expected,
+            DeveloperDocumentId::MAX,
+            &actual,
+        )
+        .is_err());
+        actual.runtime_generation = None;
+        assert!(validate_source_keyed_runtime_expected_prior(
+            &expected,
+            DeveloperDocumentId::MIN,
+            &actual,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn source_keyed_finish_push_persists_exact_generation_and_fences_both_commit_orders(
+    ) -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let runtime = ProdRuntime::new(&tokio);
+        let block_runtime = runtime.clone();
+        block_runtime.block_on("source_keyed_finish_push_fencing", async move {
+            let foreign_first_database = new_test_database(runtime.clone()).await?;
+            initialize_application_system_tables(&foreign_first_database).await?;
+            let initial = source_package_with_generation(10, None);
+            commit_source_package(
+                &foreign_first_database,
+                initial,
+                "source_keyed_finish_push_initial",
+            )
+            .await?;
+            let (initial_id, initial) = latest_source_package(&foreign_first_database).await?;
+            let initial_expected_prior = expected_prior(initial_id, &initial);
+            let mut stale_paired_tx = foreign_first_database.begin_system().await?;
+            validate_source_keyed_runtime_expected_prior_in_tx(
+                &mut stale_paired_tx,
+                &initial_expected_prior,
+            )
+            .await?;
+            SourcePackageModel::new(&mut stale_paired_tx, TableNamespace::Global)
+                .put(source_package_with_generation(
+                    30,
+                    Some(runtime_generation()),
+                ))
+                .await?;
+            let foreign = source_package_with_generation(20, None);
+            commit_source_package(
+                &foreign_first_database,
+                foreign.clone(),
+                "source_keyed_finish_push_competing",
+            )
+            .await?;
+            let stale_commit_error = foreign_first_database
+                .commit_with_write_source(stale_paired_tx, "source_keyed_paired_finish_push")
+                .await
+                .err()
+                .context("the transaction-visible expected-prior read did not fence its commit")?;
+            assert!(stale_commit_error.occ_info().is_some());
+            // An OCC retry starts a fresh transaction and observes the competing
+            // source package, so the exact expected-prior check must then reject it.
+            assert!(commit_paired_source_package(
+                &foreign_first_database,
+                &initial_expected_prior,
+                source_package_with_generation(30, Some(runtime_generation())),
+            )
+            .await
+            .is_err());
+            let (_, active_after_foreign_first) =
+                latest_source_package(&foreign_first_database).await?;
+            assert_eq!(active_after_foreign_first, foreign);
+
+            let paired_first_database = new_test_database(runtime.clone()).await?;
+            initialize_application_system_tables(&paired_first_database).await?;
+            let initial = source_package_with_generation(40, None);
+            commit_source_package(
+                &paired_first_database,
+                initial,
+                "source_keyed_finish_push_initial",
+            )
+            .await?;
+            let (initial_id, initial) = latest_source_package(&paired_first_database).await?;
+            let initial_expected_prior = expected_prior(initial_id, &initial);
+            let paired = source_package_with_generation(50, Some(runtime_generation()));
+            commit_paired_source_package(
+                &paired_first_database,
+                &initial_expected_prior,
+                paired.clone(),
+            )
+            .await?;
+            let (_, active_after_paired_first) =
+                latest_source_package(&paired_first_database).await?;
+            assert_eq!(active_after_paired_first, paired);
+
+            let stale_foreign = source_package_with_generation(60, Some(runtime_generation()));
+            assert!(commit_paired_source_package(
+                &paired_first_database,
+                &initial_expected_prior,
+                stale_foreign,
+            )
+            .await
+            .is_err());
+            let (_, active_after_foreign_second) =
+                latest_source_package(&paired_first_database).await?;
+            assert_eq!(active_after_foreign_second, paired);
+            foreign_first_database.shutdown().await?;
+            paired_first_database.shutdown().await?;
+            Ok(())
+        })
     }
 }
 

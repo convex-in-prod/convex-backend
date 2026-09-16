@@ -36,8 +36,6 @@ use common::{
     try_anyhow,
     types::{
         AllowedVisibility,
-        DeploymentClass,
-        RegionName,
         UdfType,
         WriteTimestamp,
     },
@@ -93,6 +91,7 @@ use serde::{
     Serialize,
 };
 use serde_json::{
+    json,
     value::RawValue,
     Value as JsonValue,
 };
@@ -107,6 +106,10 @@ use udf::{
         PendingArgsPolicy,
         ValidatedPathAndArgs,
     },
+    HostOperation,
+    HostOperationErrorV1,
+    LogicalHostOperation,
+    LogicalHostOperationStatus,
     NestedUdfOutcome,
 };
 use value::{
@@ -245,6 +248,100 @@ pub enum AsyncRead {
     QueryStreamNext(JsonValue),
 }
 
+impl AsyncRead {
+    fn logical_host_operation(&self) -> LogicalHostOperation {
+        match self {
+            Self::Get(_) => LogicalHostOperation::DatabaseGet,
+            Self::QueryStreamNext(_) => LogicalHostOperation::DatabaseQueryStreamNext,
+        }
+    }
+}
+
+pub struct AsyncSyscallResult {
+    pub(super) result: anyhow::Result<String>,
+    pub(super) host_operation_error: Option<HostOperationErrorV1>,
+}
+
+struct NestedUdfExecutionResult {
+    result: anyhow::Result<PendingValue>,
+    host_operation_error: Option<HostOperationErrorV1>,
+}
+
+fn nested_udf_async_syscall_result(
+    nested_udf_result: anyhow::Result<NestedUdfExecutionResult>,
+) -> AsyncSyscallResult {
+    let NestedUdfExecutionResult {
+        result,
+        host_operation_error,
+    } = match nested_udf_result {
+        Ok(result) => result,
+        Err(error) => return AsyncSyscallResult::with_host_operation_error(Err(error), None),
+    };
+    match result {
+        Ok(value) => {
+            assert!(
+                host_operation_error.is_none(),
+                "successful nested UDF carried a terminal host operation error"
+            );
+            AsyncSyscallResult::with_host_operation_error(
+                serde_json::value::to_raw_value(&value.to_uncommitted_json_serializable())
+                    .map_err(Into::into),
+                None,
+            )
+        },
+        Err(error) => {
+            AsyncSyscallResult::with_host_operation_error(Err(error), host_operation_error)
+        },
+    }
+}
+
+impl AsyncSyscallResult {
+    fn from_json(result: anyhow::Result<Box<RawValue>>) -> Self {
+        Self {
+            result: result.map(|value| value.get().to_owned()),
+            host_operation_error: None,
+        }
+    }
+
+    fn with_host_operation_error(
+        result: anyhow::Result<Box<RawValue>>,
+        host_operation_error: Option<HostOperationErrorV1>,
+    ) -> Self {
+        Self {
+            result: result.map(|value| value.get().to_owned()),
+            host_operation_error,
+        }
+    }
+
+    pub(super) fn is_ok(&self) -> bool {
+        self.result.is_ok()
+    }
+}
+
+fn missing_document_host_operation_error<T>(
+    args: &JsonValue,
+    operation: HostOperation,
+    result: &anyhow::Result<T>,
+) -> Option<HostOperationErrorV1> {
+    let error = result.as_ref().err()?;
+    let ErrorMetadata {
+        code: ErrorCode::BadRequest,
+        short_msg,
+        ..
+    } = error.downcast_ref::<ErrorMetadata>()?
+    else {
+        return None;
+    };
+    if short_msg != "NonexistentDocument" {
+        return None;
+    }
+    let document_id = DeveloperDocumentId::decode(args.get("id")?.as_str()?).ok()?;
+    Some(HostOperationErrorV1::NonexistentDocument {
+        operation,
+        document_id,
+    })
+}
+
 impl AsyncSyscallBatch {
     pub fn new(name: String, args: JsonValue) -> Self {
         match &*name {
@@ -292,6 +389,19 @@ impl AsyncSyscallBatch {
         }
     }
 
+    pub(crate) fn logical_host_operations(&self) -> Vec<LogicalHostOperation> {
+        match self {
+            Self::Reads(reads) => reads
+                .iter()
+                .map(AsyncRead::logical_host_operation)
+                .collect(),
+            Self::StorageGetUrls(args) => {
+                vec![LogicalHostOperation::StorageGetUrl; args.len()]
+            },
+            Self::Unbatched { name, .. } => vec![logical_async_syscall_operation(name)],
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::Reads(args) => args.len(),
@@ -302,6 +412,32 @@ impl AsyncSyscallBatch {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+fn logical_async_syscall_operation(name: &str) -> LogicalHostOperation {
+    match name {
+        "1.0/count" => LogicalHostOperation::DatabaseCount,
+        "1.0/insert" => LogicalHostOperation::DatabaseInsert,
+        "1.0/shallowMerge" => LogicalHostOperation::DatabasePatch,
+        "1.0/replace" => LogicalHostOperation::DatabaseReplace,
+        "1.0/remove" => LogicalHostOperation::DatabaseDelete,
+        "1.0/queryPage" => LogicalHostOperation::DatabaseQueryPage,
+        "1.0/getTransactionMetrics" => LogicalHostOperation::TransactionMetrics,
+        "1.0/getFunctionMetadata" => LogicalHostOperation::FunctionMetadata,
+        "1.0/getDeploymentMetadata" => LogicalHostOperation::DeploymentMetadata,
+        "1.0/getRequestMetadata" => LogicalHostOperation::RequestMetadata,
+        "1.0/getUserIdentity" => LogicalHostOperation::UserIdentity,
+        "1.0/storageDelete" => LogicalHostOperation::StorageDelete,
+        "1.0/storageGetMetadata" => LogicalHostOperation::StorageGetMetadata,
+        "1.0/storageGenerateUploadUrl" => LogicalHostOperation::StorageGenerateUploadUrl,
+        "1.0/schedule" => LogicalHostOperation::Schedule,
+        "1.0/cancel_job" => LogicalHostOperation::CancelJob,
+        "1.0/auditLog" => LogicalHostOperation::AuditLog,
+        "1.0/writeDeploymentAuditLog" => LogicalHostOperation::WriteDeploymentAuditLog,
+        "1.0/runUdf" => LogicalHostOperation::RunUdf,
+        "1.0/createFunctionHandle" => LogicalHostOperation::CreateFunctionHandle,
+        _ => LogicalHostOperation::UnknownAsyncSyscall,
     }
 }
 
@@ -335,6 +471,14 @@ impl<RT: Runtime> QueryManager<RT> {
 
     pub fn cleanup_developer(&mut self, id: u32) -> bool {
         self.developer_queries.remove(&id).is_some()
+    }
+
+    pub fn clear_developer_queries(&mut self) {
+        self.developer_queries.clear();
+    }
+
+    pub fn has_developer_queries(&self) -> bool {
+        !self.developer_queries.is_empty()
     }
 }
 
@@ -377,7 +521,7 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
         .await
     }
 
-    async fn file_storage_generate_upload_url(&mut self) -> anyhow::Result<String> {
+    pub(super) async fn file_storage_generate_upload_url(&mut self) -> anyhow::Result<String> {
         let issued_ts = self.phase.unix_timestamp()?;
         let component = self.phase.component()?;
         let post_url = self
@@ -387,7 +531,7 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
         Ok(post_url)
     }
 
-    async fn file_storage_get_url_batch(
+    pub(super) async fn file_storage_get_url_batch(
         &mut self,
         storage_ids: BTreeMap<BatchKey, FileStorageId>,
     ) -> BTreeMap<BatchKey, anyhow::Result<Option<String>>> {
@@ -414,14 +558,17 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
             .await
     }
 
-    async fn file_storage_delete(&mut self, storage_id: FileStorageId) -> anyhow::Result<()> {
+    pub(super) async fn file_storage_delete(
+        &mut self,
+        storage_id: FileStorageId,
+    ) -> anyhow::Result<()> {
         let component = self.phase.component()?;
         self.file_storage
             .delete(self.phase.tx()?, component.into(), storage_id)
             .await
     }
 
-    async fn file_storage_get_entry(
+    pub(super) async fn file_storage_get_entry(
         &mut self,
         storage_id: FileStorageId,
     ) -> anyhow::Result<Option<FileStorageEntry>> {
@@ -439,7 +586,7 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
         args: PendingValue,
         transaction_limits: Option<TransactionLimits>,
         udf_callback: impl UdfCallback<RT>,
-    ) -> anyhow::Result<PendingValue> {
+    ) -> anyhow::Result<NestedUdfExecutionResult> {
         match (self.udf_type, nested_udf_type) {
             // Queries can call other queries, but not snapshot queries.
             (UdfType::Query, NestedUdfType::Query) => (),
@@ -532,7 +679,15 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
                         file_storage: self.file_storage.clone(),
                         module_loader: self.phase.module_loader().clone(),
                         deployment: self.deployment.clone(),
+                        #[cfg(feature = "static-hermes-wasmtime-gate")]
+                        // Nested UDFs execute through the existing V8 recursion path. Keep this
+                        // boundary explicit so a future nested Wasm route fails before guest startup.
+                        host_secret_values: None,
                     },
+                    trace_host_operations: self.host_operation_trace.is_enabled(),
+                    capture_handler_reads: self.phase.handler_read_capture_enabled(),
+                    #[cfg(feature = "static-hermes-wasmtime-gate")]
+                    shadow_work_guard: self.shadow_work_guard.clone(),
                 },
                 rng_seed,
                 new_reactor_depth,
@@ -574,6 +729,8 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
             observed_identity,
             observed_rng,
             observed_time,
+            host_operation_error,
+            host_operation_trace,
             syscall_trace,
             audit_log_lines,
             log_lines,
@@ -600,6 +757,7 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
         }
 
         self.syscall_trace.merge(&syscall_trace);
+        self.host_operation_trace.extend(host_operation_trace);
 
         if self.is_system() && nested_udf_type == NestedUdfType::Query && result.is_ok() {
             self.next_journal = journal;
@@ -614,7 +772,15 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
         }
 
         // TODO: How do we want to propagate stack traces between component calls?
-        let result = result?;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(NestedUdfExecutionResult {
+                    result: Err(error.into()),
+                    host_operation_error,
+                });
+            },
+        };
         let tx = self.phase.tx()?;
         let table_mapping = tx.table_mapping().namespace(called_component_id.into());
         if let Some(e) = returns_validator.check_pending_output(
@@ -624,7 +790,10 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
         )? {
             anyhow::bail!(ErrorMetadata::bad_request("InvalidReturnValue", e.message));
         }
-        Ok(result)
+        Ok(NestedUdfExecutionResult {
+            result: Ok(result),
+            host_operation_error: None,
+        })
     }
 
     async fn create_function_handle(
@@ -663,7 +832,19 @@ pub(super) async fn run_async_syscall_batch<RT: Runtime>(
     provider: &mut DatabaseUdfSyscallProvider<RT>,
     batch: AsyncSyscallBatch,
     udf_callback: impl UdfCallback<RT>,
-) -> Vec<anyhow::Result<String>> {
+) -> Vec<AsyncSyscallResult> {
+    let trace_entries = provider.host_operation_trace.is_enabled().then(|| {
+        batch
+            .logical_host_operations()
+            .into_iter()
+            .map(|operation| {
+                provider
+                    .host_operation_trace
+                    .start(operation)
+                    .expect("enabled host-operation trace did not start an entry")
+            })
+            .collect::<Vec<_>>()
+    });
     let start = provider.phase.rt.monotonic_now();
     let batch_name = batch.name().to_string();
     let timer = async_syscall_timer(&batch_name);
@@ -671,68 +852,141 @@ pub(super) async fn run_async_syscall_batch<RT: Runtime>(
     // inner errors are for individual batch items that may be system or developer
     // errors.
     let results = match batch {
-        AsyncSyscallBatch::Reads(batch_args) => query_batch(provider, batch_args).await,
+        AsyncSyscallBatch::Reads(batch_args) => query_batch(provider, batch_args)
+            .await
+            .into_iter()
+            .map(AsyncSyscallResult::from_json)
+            .collect(),
         AsyncSyscallBatch::StorageGetUrls(batch_args) => {
-            storage_get_url_batch(provider, batch_args).await
+            storage_get_url_batch(provider, batch_args)
+                .await
+                .into_iter()
+                .map(AsyncSyscallResult::from_json)
+                .collect()
         },
         AsyncSyscallBatch::Unbatched { name, args } => {
             let result = match &name[..] {
                 // Database
-                "1.0/count" => Box::pin(count(provider, args)).await,
-                "1.0/insert" => Box::pin(insert(provider, args)).await,
-                "1.0/shallowMerge" => Box::pin(shallow_merge(provider, args)).await,
-                "1.0/replace" => Box::pin(replace(provider, args)).await,
-                "1.0/remove" => Box::pin(remove(provider, args)).await,
-                "1.0/queryPage" => Box::pin(query_page(provider, args)).await,
-                "1.0/getTransactionMetrics" => tx_metrics(provider),
-                "1.0/getFunctionMetadata" => function_metadata(provider),
-                "1.0/getDeploymentMetadata" => deployment_metadata(provider),
-                "1.0/getRequestMetadata" => request_metadata(provider),
-                // Auth
-                "1.0/getUserIdentity" => Box::pin(get_user_identity(provider, args)).await,
-                // Storage
-                "1.0/storageDelete" => Box::pin(storage_delete(provider, args)).await,
-                "1.0/storageGetMetadata" => Box::pin(storage_get_metadata(provider, args)).await,
-                "1.0/storageGenerateUploadUrl" => {
-                    Box::pin(storage_generate_upload_url(provider, args)).await
+                "1.0/count" => AsyncSyscallResult::from_json(Box::pin(count(provider, args)).await),
+                "1.0/insert" => {
+                    AsyncSyscallResult::from_json(Box::pin(insert(provider, args)).await)
                 },
-                "1.0/storageStore" => Box::pin(storage_store(provider, args)).await,
+                "1.0/shallowMerge" => {
+                    let host_operation_error_args = args.clone();
+                    let result = Box::pin(shallow_merge(provider, args)).await;
+                    let host_operation_error = missing_document_host_operation_error(
+                        &host_operation_error_args,
+                        HostOperation::Patch,
+                        &result,
+                    );
+                    AsyncSyscallResult::with_host_operation_error(result, host_operation_error)
+                },
+                "1.0/replace" => {
+                    let host_operation_error_args = args.clone();
+                    let result = Box::pin(replace(provider, args)).await;
+                    let host_operation_error = missing_document_host_operation_error(
+                        &host_operation_error_args,
+                        HostOperation::Replace,
+                        &result,
+                    );
+                    AsyncSyscallResult::with_host_operation_error(result, host_operation_error)
+                },
+                "1.0/remove" => {
+                    let host_operation_error_args = args.clone();
+                    let result = Box::pin(remove(provider, args)).await;
+                    let host_operation_error = missing_document_host_operation_error(
+                        &host_operation_error_args,
+                        HostOperation::Delete,
+                        &result,
+                    );
+                    AsyncSyscallResult::with_host_operation_error(result, host_operation_error)
+                },
+                "1.0/queryPage" => {
+                    AsyncSyscallResult::from_json(Box::pin(query_page(provider, args)).await)
+                },
+                "1.0/getTransactionMetrics" => AsyncSyscallResult::from_json(tx_metrics(provider)),
+                "1.0/getFunctionMetadata" => {
+                    AsyncSyscallResult::from_json(function_metadata(provider))
+                },
+                "1.0/getDeploymentMetadata" => {
+                    AsyncSyscallResult::from_json(deployment_metadata(provider))
+                },
+                "1.0/getRequestMetadata" => {
+                    AsyncSyscallResult::from_json(request_metadata(provider))
+                },
+                // Auth
+                "1.0/getUserIdentity" => {
+                    AsyncSyscallResult::from_json(Box::pin(get_user_identity(provider, args)).await)
+                },
+                // Storage
+                "1.0/storageDelete" => {
+                    AsyncSyscallResult::from_json(Box::pin(storage_delete(provider, args)).await)
+                },
+                "1.0/storageGetMetadata" => AsyncSyscallResult::from_json(
+                    Box::pin(storage_get_metadata(provider, args)).await,
+                ),
+                "1.0/storageGenerateUploadUrl" => AsyncSyscallResult::from_json(
+                    Box::pin(storage_generate_upload_url(provider, args)).await,
+                ),
+                "1.0/storageStore" => {
+                    AsyncSyscallResult::from_json(Box::pin(storage_store(provider, args)).await)
+                },
                 // Scheduling
-                "1.0/schedule" => Box::pin(schedule(provider, args)).await,
-                "1.0/cancel_job" => Box::pin(cancel_job(provider, args)).await,
+                "1.0/schedule" => {
+                    AsyncSyscallResult::from_json(Box::pin(schedule(provider, args)).await)
+                },
+                "1.0/cancel_job" => {
+                    AsyncSyscallResult::from_json(Box::pin(cancel_job(provider, args)).await)
+                },
 
                 // Audit logging
-                "1.0/auditLog" => Box::pin(audit_log(provider, args)).await,
-                // Audit logging (system UDFs only)
-                "1.0/writeDeploymentAuditLog" => {
-                    Box::pin(write_deployment_audit_log(provider, args)).await
+                "1.0/auditLog" => {
+                    AsyncSyscallResult::from_json(Box::pin(audit_log(provider, args)).await)
                 },
+                // Audit logging (system UDFs only)
+                "1.0/writeDeploymentAuditLog" => AsyncSyscallResult::from_json(
+                    Box::pin(write_deployment_audit_log(provider, args)).await,
+                ),
 
                 // Components
                 "1.0/runUdf" => Box::pin(run_udf(provider, args, udf_callback)).await,
-                "1.0/createFunctionHandle" => {
-                    Box::pin(create_function_handle(provider, args)).await
-                },
+                "1.0/createFunctionHandle" => AsyncSyscallResult::from_json(
+                    Box::pin(create_function_handle(provider, args)).await,
+                ),
 
-                _ => Err(ErrorMetadata::bad_request(
+                _ => AsyncSyscallResult::from_json(Err(ErrorMetadata::bad_request(
                     "UnknownAsyncOperation",
                     format!("Unknown async operation {name}"),
                 )
-                .into()),
+                .into())),
             };
             vec![result]
         },
     };
+    if let Some(trace_entries) = trace_entries {
+        assert_eq!(
+            trace_entries.len(),
+            results.len(),
+            "logical host-operation trace and async syscall result count diverged"
+        );
+        for (trace_entry, result) in trace_entries.into_iter().zip(&results) {
+            provider.host_operation_trace.complete(
+                Some(trace_entry),
+                if result.is_ok() {
+                    LogicalHostOperationStatus::Success
+                } else {
+                    LogicalHostOperationStatus::Failure
+                },
+            );
+        }
+    }
     provider.syscall_trace.log_async_syscall(
         batch_name,
         start.elapsed(),
-        results.iter().all(|result| result.is_ok()),
+        results.iter().all(AsyncSyscallResult::is_ok),
     );
     timer.finish();
     results
-        .into_iter()
-        .map(|r| r.map(|json| <Box<str>>::from(json).into_string()))
-        .collect()
 }
 
 /// Returns the remaining headroom for this transaction before hitting
@@ -789,37 +1043,21 @@ fn tx_metrics<RT: Runtime>(
 fn function_metadata<RT: Runtime>(
     provider: &mut DatabaseUdfSyscallProvider<RT>,
 ) -> anyhow::Result<Box<RawValue>> {
-    let udf_path = &provider.path.udf_path;
-    let component_path = &provider.path.component_path;
-    #[allow(non_snake_case)]
-    #[derive(Serialize)]
-    struct FunctionMetadataJson {
-        name: String,
-        componentPath: String,
-    }
-    Ok(serde_json::value::to_raw_value(&FunctionMetadataJson {
-        name: udf_path.clone().strip().to_string(),
-        componentPath: component_path.to_string(),
-    })?)
+    Ok(serde_json::value::to_raw_value(&json!({
+        "name": provider.path.udf_path.clone().strip().to_string(),
+        "componentPath": provider.path.component_path.to_string(),
+    }))?)
 }
 
 /// Returns metadata about the deployment this function is running on.
 fn deployment_metadata<RT: Runtime>(
     provider: &mut DatabaseUdfSyscallProvider<RT>,
 ) -> anyhow::Result<Box<RawValue>> {
-    let deployment = &provider.deployment;
-    #[allow(non_snake_case)]
-    #[derive(Serialize)]
-    struct DeploymentMetadataJson<'a> {
-        name: &'a String,
-        region: &'a Option<RegionName>,
-        class: &'a DeploymentClass,
-    }
-    Ok(serde_json::value::to_raw_value(&DeploymentMetadataJson {
-        name: &deployment.name,
-        region: &deployment.region,
-        class: &deployment.class,
-    })?)
+    Ok(serde_json::value::to_raw_value(&json!({
+        "name": provider.deployment.name,
+        "region": provider.deployment.region,
+        "class": provider.deployment.class,
+    }))?)
 }
 
 /// Returns metadata about the originating HTTP request.
@@ -1433,14 +1671,14 @@ async fn query_batch<RT: Runtime>(
                         let args: QueryStreamNextArgs = serde_json::from_value(args)?;
                         Ok(args.query_id)
                     })?;
-                    let managed_query = ManagedQuery::Active(
-                        provider.query_manager.take_developer(query_id).context(
-                            ErrorMetadata::bad_request(
-                                "QueryNotFound",
-                                "in-progress query not found",
-                            ),
-                        )?,
-                    );
+                    let managed_query = provider
+                        .query_manager
+                        .take_developer(query_id)
+                        .map(ManagedQuery::Active)
+                        .context(ErrorMetadata::bad_request(
+                            "QueryNotFound",
+                            "in-progress query not found",
+                        ))?;
                     let local_query = match managed_query {
                         ManagedQuery::Pending { query, version } => {
                             let component = provider.phase.component()?;
@@ -1557,10 +1795,13 @@ async fn query_batch<RT: Runtime>(
             let done = maybe_next.is_none();
             let component = provider.phase.component()?;
             let tx = provider.phase.tx()?;
-            let value = match maybe_next {
-                Some((doc, ts)) => developer_document_to_json(tx, component.into(), &doc, ts)?,
-                None => RawValue::NULL.to_owned(),
-            };
+            let value =
+                match maybe_next {
+                    Some((doc, ts)) => serde_json::value::to_raw_value(
+                        &developer_document_to_json(tx, component.into(), &doc, ts)?,
+                    )?,
+                    None => RawValue::NULL.to_owned(),
+                };
 
             if let Some(query_id) = query_id {
                 if done {
@@ -1619,7 +1860,7 @@ async fn run_udf<RT: Runtime>(
     provider: &mut DatabaseUdfSyscallProvider<RT>,
     args: JsonValue,
     udf_callback: impl UdfCallback<RT>,
-) -> anyhow::Result<Box<RawValue>> {
+) -> AsyncSyscallResult {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct RunUdfArgs {
@@ -1630,80 +1871,85 @@ async fn run_udf<RT: Runtime>(
         args: JsonValue,
         transaction_limits: Option<TransactionLimits>,
     }
-    let RunUdfArgs {
-        udf_type,
-        name,
-        reference,
-        function_handle,
-        args,
-        transaction_limits,
-    } = with_argument_error("runUdf", || Ok(serde_json::from_value(args)?))?;
-    let caller_udf_type = provider.udf_type;
-    let (udf_type, args) = with_argument_error("runUdf", || {
-        let udf_type: NestedUdfType = udf_type.parse().context(ArgName("udfType"))?;
-        // Only a mutation can hold an unresolved commit timestamp to pass
-        // along; queries keep rejecting the `$commitTs` token.
-        let args = match caller_udf_type {
-            UdfType::Mutation => {
-                let args = PendingValue::from_uncommitted_json(args).context(ArgName("args"))?;
-                if !args.is_object() {
-                    return Err(anyhow::anyhow!("Value must be an Object").context(ArgName("args")));
+    let result = async {
+        let RunUdfArgs {
+            udf_type,
+            name,
+            reference,
+            function_handle,
+            args,
+            transaction_limits,
+        } = with_argument_error("runUdf", || Ok(serde_json::from_value(args)?))?;
+        let caller_udf_type = provider.udf_type;
+        let (udf_type, args) = with_argument_error("runUdf", || {
+            let udf_type: NestedUdfType = udf_type.parse().context(ArgName("udfType"))?;
+            // Only a mutation can hold an unresolved commit timestamp to pass
+            // along; queries keep rejecting the `$commitTs` token.
+            let args = match caller_udf_type {
+                UdfType::Mutation => {
+                    let args =
+                        PendingValue::from_uncommitted_json(args).context(ArgName("args"))?;
+                    if !args.is_object() {
+                        return Err(
+                            anyhow::anyhow!("Value must be an Object").context(ArgName("args"))
+                        );
+                    }
+                    args
+                },
+                UdfType::Query | UdfType::Action | UdfType::HttpAction => {
+                    let args: ConvexObject = ConvexValue::try_from(args)
+                        .context(ArgName("args"))?
+                        .try_into()
+                        .context(ArgName("args"))?;
+                    args.into()
+                },
+            };
+            Ok((udf_type, args))
+        })?;
+        let path = match function_handle {
+            Some(function_handle) => {
+                let handle: FunctionHandle =
+                    with_argument_error("runUdf", || function_handle.parse())?;
+                let path = provider.lookup_function_handle(handle).await?;
+                let tx = provider.phase.tx()?;
+                let (_, component) = BootstrapComponentsModel::new(tx)
+                    .must_component_path_to_ids(&path.component)?;
+                ResolvedComponentFunctionPath {
+                    component,
+                    udf_path: path.udf_path,
+                    component_path: path.component,
                 }
-                args
             },
-            UdfType::Query | UdfType::Action | UdfType::HttpAction => {
-                let args: ConvexObject = ConvexValue::try_from(args)
-                    .context(ArgName("args"))?
-                    .try_into()
-                    .context(ArgName("args"))?;
-                args.into()
+            None => {
+                let reference = parse_name_or_reference("runUdf", name, reference)?;
+                let resource = provider.resolve(reference).await?;
+                match resource {
+                    Resource::ResolvedSystemUdf(path) => path,
+                    Resource::Value(_) => {
+                        anyhow::bail!(ErrorMetadata::bad_request(
+                            "InvalidResource",
+                            "Cannot execute a value resource"
+                        ));
+                    },
+                    Resource::Function(path) => {
+                        let tx = provider.phase.tx()?;
+                        let (_, component) = BootstrapComponentsModel::new(tx)
+                            .must_component_path_to_ids(&path.component)?;
+                        ResolvedComponentFunctionPath {
+                            component,
+                            udf_path: path.udf_path,
+                            component_path: path.component,
+                        }
+                    },
+                }
             },
         };
-        Ok((udf_type, args))
-    })?;
-    let path = match function_handle {
-        Some(function_handle) => {
-            let handle: FunctionHandle = with_argument_error("runUdf", || function_handle.parse())?;
-            let path = provider.lookup_function_handle(handle).await?;
-            let tx = provider.phase.tx()?;
-            let (_, component) =
-                BootstrapComponentsModel::new(tx).must_component_path_to_ids(&path.component)?;
-            ResolvedComponentFunctionPath {
-                component,
-                udf_path: path.udf_path,
-                component_path: path.component,
-            }
-        },
-        None => {
-            let reference = parse_name_or_reference("runUdf", name, reference)?;
-            let resource = provider.resolve(reference).await?;
-            match resource {
-                Resource::ResolvedSystemUdf(path) => path,
-                Resource::Value(_) => {
-                    anyhow::bail!(ErrorMetadata::bad_request(
-                        "InvalidResource",
-                        "Cannot execute a value resource"
-                    ));
-                },
-                Resource::Function(path) => {
-                    let tx = provider.phase.tx()?;
-                    let (_, component) = BootstrapComponentsModel::new(tx)
-                        .must_component_path_to_ids(&path.component)?;
-                    ResolvedComponentFunctionPath {
-                        component,
-                        udf_path: path.udf_path,
-                        component_path: path.component,
-                    }
-                },
-            }
-        },
-    };
-    let value = provider
-        .run_udf(udf_type, path, args, transaction_limits, udf_callback)
-        .await?;
-    Ok(serde_json::value::to_raw_value(
-        &value.to_uncommitted_json_serializable(),
-    )?)
+        provider
+            .run_udf(udf_type, path, args, transaction_limits, udf_callback)
+            .await
+    }
+    .await;
+    nested_udf_async_syscall_result(result)
 }
 
 async fn create_function_handle<RT: Runtime>(
@@ -1775,12 +2021,12 @@ struct QueryPageMetadata {
 /// Serialize a queried document for JS, emitting `{"$commitTs": null}` at each
 /// unresolved commit timestamp when the document is one of this transaction's
 /// own staged writes.
-fn developer_document_to_json<RT: Runtime>(
+pub(super) fn developer_document_to_json<RT: Runtime>(
     tx: &mut Transaction<RT>,
     namespace: TableNamespace,
     document: &DeveloperDocument,
     ts: WriteTimestamp,
-) -> anyhow::Result<Box<RawValue>> {
+) -> anyhow::Result<JsonValue> {
     if ts == WriteTimestamp::Pending {
         let id = document.id();
         // Virtual-table reads are also tagged pending when they hit a staged
@@ -1796,17 +2042,14 @@ fn developer_document_to_json<RT: Runtime>(
             if let Some(update) = tx.pending_write(&id)
                 && !update.is_resolved()
             {
-                return Ok(serde_json::value::to_raw_value(
-                    &update
-                        .new_document_internal_json()
-                        .context("Staged write for a returned document has no new document")?,
-                )?);
+                let document = update
+                    .new_document_internal_json()
+                    .context("Staged write for a returned document has no new document")?;
+                return Ok(serde_json::to_value(document)?);
             }
         }
     }
-    Ok(serde_json::value::to_raw_value(
-        &document.to_internal_json_serializable(),
-    )?)
+    Ok(document.to_internal_json())
 }
 
 async fn read_page_from_query<RT: Runtime>(
@@ -1961,7 +2204,15 @@ async fn query_page<RT: Runtime>(
         let (page, metadata) = read_page_from_query(query, tx, page_size).await?;
         let page = page
             .into_iter()
-            .map(|(doc, ts)| developer_document_to_json(tx, component.into(), &doc, ts))
+            .map(|(doc, ts)| {
+                serde_json::value::to_raw_value(&developer_document_to_json(
+                    tx,
+                    component.into(),
+                    &doc,
+                    ts,
+                )?)
+                .map_err(Into::into)
+            })
             .collect::<anyhow::Result<_>>()?;
         (page, metadata)
     };
@@ -2008,4 +2259,92 @@ async fn query_page<RT: Runtime>(
         page_status,
     };
     Ok(serde_json::value::to_raw_value(&result)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nonexistent_document_error(message: &str) -> anyhow::Result<JsonValue> {
+        Err(ErrorMetadata::bad_request("NonexistentDocument", message.to_owned()).into())
+    }
+
+    #[test]
+    fn missing_document_host_operation_error_uses_typed_metadata() {
+        let document_id = DeveloperDocumentId::MIN;
+        let args = json!({ "id": document_id.encode() });
+
+        for (operation, expected) in [
+            (HostOperation::Patch, HostOperation::Patch),
+            (HostOperation::Replace, HostOperation::Replace),
+            (HostOperation::Delete, HostOperation::Delete),
+        ] {
+            assert_eq!(
+                missing_document_host_operation_error(
+                    &args,
+                    operation,
+                    &nonexistent_document_error("arbitrary human copy"),
+                ),
+                Some(HostOperationErrorV1::NonexistentDocument {
+                    operation: expected,
+                    document_id,
+                }),
+            );
+        }
+
+        let unrelated_error: anyhow::Result<JsonValue> = Err(ErrorMetadata::bad_request(
+            "OtherBadRequest",
+            "nonexistent document in free-form copy",
+        )
+        .into());
+        assert_eq!(
+            missing_document_host_operation_error(&args, HostOperation::Patch, &unrelated_error),
+            None,
+        );
+    }
+
+    #[test]
+    fn nested_udf_terminal_error_reaches_only_the_parent_run_udf_rejection() {
+        let host_operation_error = HostOperationErrorV1::NonexistentDocument {
+            operation: HostOperation::Patch,
+            document_id: DeveloperDocumentId::MIN,
+        };
+
+        let child_terminal_error = nested_udf_async_syscall_result(Ok(NestedUdfExecutionResult {
+            result: Err(anyhow::anyhow!("child terminal developer error")),
+            host_operation_error: Some(host_operation_error),
+        }));
+        assert!(child_terminal_error.result.is_err());
+        assert_eq!(
+            child_terminal_error.host_operation_error,
+            Some(host_operation_error)
+        );
+
+        let successful_child = nested_udf_async_syscall_result(Ok(NestedUdfExecutionResult {
+            result: Ok(PendingValue::from_uncommitted_json(json!(true)).unwrap()),
+            host_operation_error: None,
+        }));
+        assert!(successful_child.result.is_ok());
+        assert_eq!(successful_child.host_operation_error, None);
+
+        let outer_provider_error =
+            nested_udf_async_syscall_result(Err(anyhow::anyhow!("outer provider error")));
+        assert!(outer_provider_error.result.is_err());
+        assert_eq!(outer_provider_error.host_operation_error, None);
+    }
+
+    #[test]
+    fn logical_host_operations_preserve_each_batched_read_in_order() -> anyhow::Result<()> {
+        let mut batch = AsyncSyscallBatch::new("1.0/get".to_owned(), json!({}));
+        batch.push("1.0/queryStreamNext".to_owned(), json!({}))?;
+
+        assert_eq!(
+            batch.logical_host_operations(),
+            vec![
+                LogicalHostOperation::DatabaseGet,
+                LogicalHostOperation::DatabaseQueryStreamNext,
+            ]
+        );
+        Ok(())
+    }
 }

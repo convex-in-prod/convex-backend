@@ -3671,7 +3671,7 @@ mod tests {
         send_response_sender.send(()).unwrap();
         server.await.unwrap();
         let later = later.await.unwrap().unwrap();
-        assert_eq!(later.kind, NodeSystemOperationKind::Analyze);
+        assert_eq!(later.kind(), NodeSystemOperationKind::Analyze);
         drop(later);
         wait_for_no_active_system_operation(&executor.system_admission).await;
     }
@@ -3774,12 +3774,12 @@ mod tests {
         .await;
         assert!(invocation.await.unwrap().is_err());
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !executor.system.test_has_failed_retirement().await {
+            while !executor.system.test_termination_failures_exhausted().await {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("Initial system-operation cleanup attempts did not fail");
+        .expect("Initial system-operation cleanup attempts did not consume failures");
 
         let waiting_admission = executor.system_admission.clone();
         let later = tokio::spawn(async move {
@@ -4034,7 +4034,7 @@ mod tests {
         assert_eq!(
             calculate_local_node_rss_budget(100, 200, std::iter::empty()).unwrap(),
             LocalNodeExecutorRssBudget {
-                required_bytes: 500,
+                required_bytes: 400,
                 surge_bytes: 100,
             }
         );
@@ -4046,8 +4046,8 @@ mod tests {
         assert!(calculate_local_node_rss_budget(1, 1, [usize::MAX]).is_err());
 
         let budget = calculate_local_node_rss_budget(100, 200, [300]).unwrap();
-        assert!(validate_rss_budget(&budget, 999).is_err());
-        validate_rss_budget(&budget, 1_000).unwrap();
+        assert!(validate_rss_budget(&budget, 899).is_err());
+        validate_rss_budget(&budget, 900).unwrap();
     }
 
     #[test]

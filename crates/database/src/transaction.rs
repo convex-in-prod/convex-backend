@@ -166,6 +166,15 @@ use crate::{
 pub const DEFAULT_PAGE_SIZE: usize = 512;
 
 pub const MAX_PAGE_SIZE: usize = 1024;
+
+/// Allocation inputs captured before an invocation for its non-committing
+/// verifier. Equal snapshots alone do not give inserts equal IDs or times.
+pub struct TransactionDocumentCreationState {
+    timestamp: RepeatableTimestamp,
+    id_generator: TransactionIdGenerator,
+    next_creation_time: CreationTime,
+}
+
 pub struct Transaction<RT: Runtime> {
     pub(crate) identity: Identity,
     pub(crate) id_generator: TransactionIdGenerator,
@@ -182,6 +191,10 @@ pub struct Transaction<RT: Runtime> {
     pub(crate) limits: TransactionLimits,
 
     pub(crate) reads: TransactionReadSet,
+    // Reads made while executing the user handler. This is kept separately
+    // from the full transaction read set so query-shadow comparisons do not
+    // include engine initialization or authentication reads.
+    handler_read_set: Option<TransactionReadSet>,
     pub(crate) writes: NestedWrites<Writes>,
 
     pub(crate) index: NestedWrites<TransactionIndex>,
@@ -200,7 +213,6 @@ pub struct Transaction<RT: Runtime> {
 
     pub usage_tracker: FunctionUsageTracker,
     pub(crate) virtual_system_mapping: VirtualSystemMapping,
-
 }
 
 #[async_trait]
@@ -238,6 +250,7 @@ impl<RT: Runtime> Transaction<RT> {
         Self {
             identity,
             reads: TransactionReadSet::new(),
+            handler_read_set: None,
             writes: NestedWrites::new(Writes::new()),
             id_generator,
             next_creation_time: creation_time,
@@ -395,6 +408,30 @@ impl<RT: Runtime> Transaction<RT> {
         self.next_creation_time
     }
 
+    pub fn document_creation_state(&self) -> TransactionDocumentCreationState {
+        TransactionDocumentCreationState {
+            timestamp: self.begin_timestamp(),
+            id_generator: self.id_generator.clone_for_replay(),
+            next_creation_time: self.next_creation_time,
+        }
+    }
+
+    /// Apply only to a non-committing verifier before it executes the handler.
+    /// Keeping allocation inputs equal also aligns index cursor boundaries
+    /// produced when a handler queries documents it has just inserted.
+    pub fn apply_document_creation_state(
+        &mut self,
+        state: &TransactionDocumentCreationState,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.begin_timestamp() == state.timestamp,
+            "document creation replay requires the same database snapshot"
+        );
+        self.id_generator = state.id_generator.clone_for_replay();
+        self.next_creation_time = state.next_creation_time;
+        Ok(())
+    }
+
     pub fn index_registry(&self) -> &indexing::index_registry::IndexRegistry {
         self.index.index_registry()
     }
@@ -452,6 +489,13 @@ impl<RT: Runtime> Transaction<RT> {
 
     pub fn into_reads_and_writes(self) -> (TransactionReadSet, NestedWrites<Writes>) {
         (self.reads, self.writes)
+    }
+
+    pub fn into_reads_writes_and_table_mapping(
+        self,
+    ) -> (TransactionReadSet, NestedWrites<Writes>, TableMapping) {
+        let table_mapping = self.metadata.table_mapping().clone();
+        (self.reads, self.writes, table_mapping)
     }
 
     pub fn biggest_document_writes(&self) -> Option<BiggestDocumentWrites> {
@@ -1099,6 +1143,19 @@ impl<RT: Runtime> Transaction<RT> {
         );
     }
 
+    /// Records a read segment collected while a user handler was active.
+    pub fn record_handler_read_set(&mut self, reads: TransactionReadSet) {
+        let Some(handler_read_set) = self.handler_read_set.as_mut() else {
+            self.handler_read_set = Some(reads);
+            return;
+        };
+        handler_read_set.merge_handler_segment(reads);
+    }
+
+    pub fn take_handler_read_set(&mut self) -> Option<TransactionReadSet> {
+        self.handler_read_set.take()
+    }
+
     pub fn has_pending_write(&self, tablet_id: TabletId) -> bool {
         self.index
             .pending_writes_for_by_id_index(tablet_id)
@@ -1376,6 +1433,12 @@ impl<RT: Runtime> Transaction<RT> {
         SnoopedTransaction::new(self)
     }
 
+    /// Starts recording a handler's reads while retaining the read accounting
+    /// needed to enforce cumulative transaction limits.
+    pub fn snoop_handler_reads(self) -> SnoopedTransaction<RT> {
+        SnoopedTransaction::new_handler(self)
+    }
+
     pub fn finalize(self) -> anyhow::Result<FinalTransaction> {
         FinalTransaction::new(self)
     }
@@ -1384,7 +1447,7 @@ impl<RT: Runtime> Transaction<RT> {
     pub fn clone_for_snapshot_query(&self) -> Transaction<RT> {
         Transaction {
             identity: self.identity.clone(),
-            id_generator: self.id_generator.clone_for_snapshot_query(),
+            id_generator: self.id_generator.clone_for_replay(),
             next_creation_time: self.next_creation_time,
             scheduled_size: self.scheduled_size.clone(),
             file_storage_size: self.file_storage_size.clone(),
@@ -1392,6 +1455,7 @@ impl<RT: Runtime> Transaction<RT> {
             // Don't clone the read set because it is expensive and doesn't matter in a snapshot
             // query
             reads: TransactionReadSet::new(),
+            handler_read_set: None,
             // Reset the write set because the query should observe a snapshot of the database from
             // the start of the transaction
             writes: NestedWrites::new(Writes::new()),
@@ -1412,16 +1476,15 @@ impl<RT: Runtime> Transaction<RT> {
             runtime: self.runtime.clone(),
             usage_tracker: self.usage_tracker.clone(),
             virtual_system_mapping: self.virtual_system_mapping.clone(),
-
         }
     }
-
 }
 
 #[must_use]
 #[derive(Deref, DerefMut)]
 pub struct SnoopedTransaction<RT: Runtime> {
     saved_read_set: TransactionReadSet,
+    handler_capture: bool,
     #[deref]
     #[deref_mut]
     tx: Transaction<RT>,
@@ -1431,12 +1494,30 @@ impl<RT: Runtime> SnoopedTransaction<RT> {
     fn new(mut tx: Transaction<RT>) -> Self {
         Self {
             saved_read_set: mem::replace(&mut tx.reads, TransactionReadSet::new()),
+            handler_capture: false,
+            tx,
+        }
+    }
+
+    fn new_handler(mut tx: Transaction<RT>) -> Self {
+        let saved_read_set = mem::replace(&mut tx.reads, TransactionReadSet::new());
+        tx.reads = saved_read_set.empty_with_accounting();
+        Self {
+            saved_read_set,
+            handler_capture: true,
             tx,
         }
     }
 
     pub fn finish_snoop(mut self) -> (Transaction<RT>, TransactionReadSet) {
-        let snooped_reads = mem::replace(&mut self.tx.reads, self.saved_read_set);
+        let snooped_reads = mem::replace(&mut self.tx.reads, TransactionReadSet::new());
+        let saved_read_set = mem::replace(&mut self.saved_read_set, TransactionReadSet::new());
+        if self.handler_capture {
+            let (handler_reads, full_reads) = snooped_reads.split_handler_capture(&saved_read_set);
+            self.tx.reads = full_reads;
+            return (self.tx, handler_reads);
+        }
+        self.tx.reads = saved_read_set;
         self.tx.apply_reads(snooped_reads.clone());
         (self.tx, snooped_reads)
     }
@@ -1463,7 +1544,6 @@ pub struct FinalTransaction {
     pub(crate) writes: Writes,
 
     pub(crate) usage_tracker: FunctionUsageTracker,
-
 }
 
 impl FinalTransaction {
@@ -1483,7 +1563,6 @@ impl FinalTransaction {
             reads: transaction.reads,
             writes: transaction.writes.into_flat()?,
             usage_tracker: transaction.usage_tracker,
-
         })
     }
 

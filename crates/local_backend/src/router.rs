@@ -58,6 +58,11 @@ use utoipa::{
 };
 use utoipa_axum::router::OpenApiRouter;
 
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use crate::app_metrics::{
+    generated_wasm_memory_statistics,
+    query_shadow_evidence,
+};
 use crate::{
     app_metrics::{
         cache_hit_percentage,
@@ -324,6 +329,14 @@ pub fn router(st: LocalAppState) -> Router {
         .route("/prepare_schema", post(prepare_schema))
         .route("/deploy2/start_push", post(deploy_config2::start_push))
         .route(
+            "/deploy2/prepare_external_deps",
+            post(deploy_config2::prepare_external_deps),
+        )
+        .route(
+            "/deploy2/download_external_deps",
+            post(deploy_config2::download_external_deps),
+        )
+        .route(
             "/deploy2/evaluate_push",
             post(deploy_config2::evaluate_push),
         )
@@ -508,7 +521,7 @@ where
     LocalAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
-    Router::new()
+    let routes = Router::new()
         .route("/stream_udf_execution", get(stream_udf_execution))
         .route("/stream_function_logs", get(stream_function_logs))
         .route("/udf_rate", get(udf_rate))
@@ -526,7 +539,15 @@ where
         .route("/table_rate", get(table_rate))
         .route("/latency_percentiles", get(latency_percentiles))
         .route("/scheduled_job_lag", get(scheduled_job_lag))
-        .route("/function_concurrency", get(function_concurrency))
+        .route("/function_concurrency", get(function_concurrency));
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    let routes = routes
+        .route("/query_shadow_evidence", get(query_shadow_evidence))
+        .route(
+            "/generated_wasm_memory_statistics",
+            get(generated_wasm_memory_statistics),
+        );
+    routes
 }
 
 // Routes with the same handlers for the local backend + closed source backend

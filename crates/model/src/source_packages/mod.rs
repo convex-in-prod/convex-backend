@@ -30,6 +30,7 @@ use crate::{
     SystemTable,
 };
 
+pub mod runtime_content;
 pub mod types;
 pub mod upload_download;
 
@@ -111,8 +112,8 @@ impl<'a, RT: Runtime> SourcePackageModel<'a, RT> {
         Ok(latest_source_pkg)
     }
 
-    /// Returns the newest committed package record, including an empty package
-    /// that no module metadata references.
+    /// Returns the newest package record visible to this transaction, including
+    /// an empty package that no module metadata references.
     pub async fn get_latest_record(
         &mut self,
     ) -> anyhow::Result<Option<Arc<ParsedDocument<SourcePackage>>>> {

@@ -61,6 +61,7 @@ struct ConcurrencyLimiterInner {
     max_permits: usize,
     protected_minimum: usize,
     degradable_minimum: usize,
+    publish_javascript_metrics: bool,
 }
 
 #[derive(Debug)]
@@ -165,6 +166,22 @@ impl ConcurrencyLimiter {
         protected_minimum: usize,
         degradable_minimum: usize,
     ) -> Self {
+        Self::new_inner(max_concurrency, protected_minimum, degradable_minimum, true)
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub(crate) fn new_for_wasm(max_concurrency: usize) -> Self {
+        // Wasm shares permit scheduling, not the V8 capacity or occupancy budget.
+        // Its routing layer already records separate CPU capacity and admission.
+        Self::new_inner(max_concurrency, 0, 0, false)
+    }
+
+    fn new_inner(
+        max_concurrency: usize,
+        protected_minimum: usize,
+        degradable_minimum: usize,
+        publish_javascript_metrics: bool,
+    ) -> Self {
         assert!(
             max_concurrency > 0,
             "max_concurrency must be greater than zero"
@@ -197,17 +214,20 @@ impl ConcurrencyLimiter {
                 max_permits: max_concurrency,
                 protected_minimum,
                 degradable_minimum,
+                publish_javascript_metrics,
             }),
         };
-        initialize_active_javascript_metrics(
-            if max_concurrency == usize::MAX {
-                0
-            } else {
-                max_concurrency
-            },
-            protected_minimum,
-            degradable_minimum,
-        );
+        if publish_javascript_metrics {
+            initialize_active_javascript_metrics(
+                if max_concurrency == usize::MAX {
+                    0
+                } else {
+                    max_concurrency
+                },
+                protected_minimum,
+                degradable_minimum,
+            );
+        }
         limiter
     }
 
@@ -241,6 +261,33 @@ impl ConcurrencyLimiter {
         self.inner.protected_minimum > 0
     }
 
+    /// Attempt a low-priority admission without queueing.
+    ///
+    /// This preserves the normal priority rule: a new caller cannot take a
+    /// permit that is reserved for an already-running caller to regain after
+    /// an asynchronous wait.
+    pub fn try_acquire(&self, client_id: Arc<String>) -> Option<ConcurrencyPermit> {
+        let class = ActiveJavascriptClass::Protected;
+        let mut tracker = self.inner.tracker.lock();
+        // Dispatch accounts for granted permits before releasing this lock, so
+        // queued resumptions and dependencies already own otherwise free
+        // capacity in `total_occupancy`.
+        if tracker.total_occupancy() >= self.inner.max_permits {
+            return None;
+        }
+        let permit_id = tracker.register(client_id.clone(), class);
+        if self.inner.publish_javascript_metrics {
+            increment_active_javascript_occupancy(class);
+        }
+        drop(tracker);
+        Some(ConcurrencyPermit {
+            permit_id,
+            limiter: self.clone(),
+            client_id,
+            class,
+        })
+    }
+
     // If a client uses a thread for too long. We still want to log periodically.
     pub fn go_log<RT: Runtime>(
         &self,
@@ -258,7 +305,9 @@ impl ConcurrencyLimiter {
                             "{client_id} held concurrency semaphore for more than {frequency:?}"
                         );
                     }
-                    log_concurrency_permit_used(client_id, start_time.elapsed());
+                    if inner.publish_javascript_metrics {
+                        log_concurrency_permit_used(client_id, start_time.elapsed());
+                    }
                 }
             }
         }
@@ -293,7 +342,10 @@ impl ConcurrencyLimiter {
             class
         };
         let queue = WaiterQueue::new(class, phase);
-        let timer = concurrency_permit_acquire_timer(class, queue.phase());
+        let timer = self
+            .inner
+            .publish_javascript_metrics
+            .then(|| concurrency_permit_acquire_timer(class, queue.phase()));
         let immediate_permit_id = {
             let mut tracker = self.inner.tracker.lock();
             // Avoid waiter machinery on the uncontended path, but never let a
@@ -301,14 +353,18 @@ impl ConcurrencyLimiter {
             if tracker.total_occupancy() < self.inner.max_permits
                 && tracker.queues.iter().all(VecDeque::is_empty)
             {
-                increment_active_javascript_occupancy(class);
+                if self.inner.publish_javascript_metrics {
+                    increment_active_javascript_occupancy(class);
+                }
                 Some(tracker.register(client_id.clone(), class))
             } else {
                 None
             }
         };
         if let Some(permit_id) = immediate_permit_id {
-            timer.finish(true);
+            if let Some(timer) = timer {
+                timer.finish(true);
+            }
             return ConcurrencyPermit {
                 permit_id,
                 limiter: self.clone(),
@@ -325,7 +381,9 @@ impl ConcurrencyLimiter {
                 state: WaiterState::Waiting(sender),
             });
             tracker.queues[queue.index()].push_back(waiter_id);
-            increment_active_javascript_waiters(class, queue.phase());
+            if self.inner.publish_javascript_metrics {
+                increment_active_javascript_waiters(class, queue.phase());
+            }
             tracker.dispatch(&self.inner);
             waiter_id
         };
@@ -358,7 +416,9 @@ impl ConcurrencyLimiter {
                 .expect("active-JavaScript granted count underflow");
             tracker.register(client_id.clone(), class)
         };
-        timer.finish(true);
+        if let Some(timer) = timer {
+            timer.finish(true);
+        }
         ConcurrencyPermit {
             permit_id,
             limiter: self.clone(),
@@ -395,14 +455,18 @@ impl ConcurrencyLimiter {
                     .position(|queued_id| *queued_id == waiter_id)
                     .expect("waiting active-JavaScript waiter missing from its queue");
                 queue.remove(position);
-                decrement_active_javascript_waiters(waiter.queue.class(), waiter.queue.phase());
+                if self.inner.publish_javascript_metrics {
+                    decrement_active_javascript_waiters(waiter.queue.class(), waiter.queue.phase());
+                }
             },
             WaiterState::Granted => {
                 let class_index = class_index(waiter.queue.class());
                 tracker.granted_by_class[class_index] = tracker.granted_by_class[class_index]
                     .checked_sub(1)
                     .expect("active-JavaScript granted count underflow");
-                decrement_active_javascript_occupancy(waiter.queue.class());
+                if self.inner.publish_javascript_metrics {
+                    decrement_active_javascript_occupancy(waiter.queue.class());
+                }
             },
         }
         tracker.dispatch(&self.inner);
@@ -452,7 +516,6 @@ impl ActivePermitsTracker {
         self.active_by_class[class_index] = self.active_by_class[class_index]
             .checked_sub(1)
             .expect("active-JavaScript class count underflow");
-        decrement_active_javascript_occupancy(permit.class);
         (permit.started.elapsed(), permit.class)
     }
 
@@ -604,8 +667,10 @@ impl ActivePermitsTracker {
                 },
             };
             self.granted_by_class[class_index(class)] += 1;
-            decrement_active_javascript_waiters(class, waiter.queue.phase());
-            increment_active_javascript_occupancy(class);
+            if inner.publish_javascript_metrics {
+                decrement_active_javascript_waiters(class, waiter.queue.phase());
+                increment_active_javascript_occupancy(class);
+            }
             sender
                 .send(())
                 .expect("active-JavaScript receiver closed before waiter cancellation");
@@ -669,9 +734,14 @@ impl Drop for ConcurrencyPermit {
         let mut tracker = self.limiter.inner.tracker.lock();
         let (duration, class) = tracker.deregister(self.permit_id);
         assert_eq!(class, self.class, "active-JavaScript permit class drifted");
+        if self.limiter.inner.publish_javascript_metrics {
+            decrement_active_javascript_occupancy(class);
+        }
         tracker.dispatch(&self.limiter.inner);
         drop(tracker);
-        log_concurrency_permit_used(self.client_id.clone(), duration);
+        if self.limiter.inner.publish_javascript_metrics {
+            log_concurrency_permit_used(self.client_id.clone(), duration);
+        }
     }
 }
 
@@ -717,6 +787,78 @@ mod tests {
     ) -> impl Future<Output = ConcurrencyPermit> + 'a {
         let name = name.into();
         limiter.acquire_with_class(Arc::new(name), class, phase)
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    #[tokio::test]
+    async fn wasm_limiter_does_not_publish_javascript_metrics() {
+        const CHILD_ENV: &str = "CONCURRENCY_METRICS_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // The registry is process-global. Isolate this assertion from other
+            // tests creating V8 limiters instead of serializing the whole suite.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "concurrency_limiter::tests::wasm_limiter_does_not_publish_javascript_metrics",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "metric isolation test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let javascript = ConcurrencyLimiter::new_with_class_minimums(28, 7, 7);
+        let _javascript_permit = javascript.acquire(Arc::new("v8".to_owned()), false).await;
+        let snapshot = || {
+            metrics::CONVEX_METRICS_REGISTRY
+                .gather()
+                .into_iter()
+                .filter(|family| {
+                    family.name().contains("active_javascript")
+                        || family.name().contains("concurrency_permit")
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        assert!(!before.is_empty());
+        let wasm = ConcurrencyLimiter::new_for_wasm(1);
+        assert_eq!(wasm.max_permits(), Some(1));
+        assert_eq!(javascript.max_permits(), Some(28));
+        assert_eq!(snapshot(), before);
+
+        let held = wasm.try_acquire(Arc::new("wasm".to_owned())).unwrap();
+        assert!(wasm.try_acquire(Arc::new("full".to_owned())).is_none());
+        let mut cancelled = Box::pin(wasm.acquire(Arc::new("cancelled".to_owned()), false));
+        assert!(matches!(poll!(cancelled.as_mut()), Poll::Pending));
+        assert_eq!(snapshot(), before);
+        drop(cancelled);
+        assert_eq!(snapshot(), before);
+
+        let mut granted = Box::pin(wasm.acquire(Arc::new("granted".to_owned()), false));
+        assert!(matches!(poll!(granted.as_mut()), Poll::Pending));
+        drop(held);
+        assert_eq!(snapshot(), before);
+        // Cancellation after dispatch must not decrement V8's occupancy either.
+        drop(granted);
+        assert_eq!(snapshot(), before);
+
+        let held = wasm.acquire(Arc::new("resume".to_owned()), false).await;
+        let suspended = held.suspend();
+        assert_eq!(wasm.active_permits(), 0);
+        let held = suspended.acquire().await;
+        assert_eq!(wasm.active_permits(), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        drop(held);
+        assert_eq!(wasm.active_permits(), 0);
+        assert_eq!(javascript.active_permits(), 1);
+        assert_eq!(snapshot(), before);
     }
 
     #[tokio::test]
@@ -850,6 +992,24 @@ mod tests {
         assert!(degradable.as_mut().now_or_never().is_none());
         drop(dependency_permit);
         drop(second_held);
+    }
+
+    #[tokio::test]
+    async fn immediate_low_priority_admission_respects_high_priority_waiters() {
+        let limiter = ConcurrencyLimiter::new(1);
+        let initial_permit = limiter.acquire(Arc::new("initial".to_owned()), false).await;
+        let mut high_priority = Box::pin(limiter.acquire(Arc::new("high".to_owned()), true));
+        assert!(matches!(poll!(high_priority.as_mut()), Poll::Pending));
+
+        drop(initial_permit);
+        assert!(limiter
+            .try_acquire(Arc::new("immediate".to_owned()))
+            .is_none());
+
+        let Poll::Ready(high_priority_permit) = poll!(high_priority.as_mut()) else {
+            panic!("high-priority waiter did not receive the released permit");
+        };
+        drop(high_priority_permit);
     }
 
     #[tokio::test]

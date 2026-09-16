@@ -10,6 +10,7 @@ import { extractErrorMessage, getPrepareStackTraceStats } from "./errors";
 import { startMainThreadProfiler } from "./main_thread_profiler";
 import { getPackageCacheStats } from "./source_package";
 import { prepareSourcePackage } from "./prepare";
+import { nodePoolRetirement } from "./retirement";
 
 const DEFAULT_PORT = 3002;
 
@@ -46,6 +47,7 @@ async function startServer(
     });
   }
   const app = express();
+  if (role === "application") nodePoolRetirement.enable();
   const systemOperationState = new SystemOperationState();
   app.use(express.json({ limit: "6MB" })); // 5 MiB for args (https://docs.convex.dev/production/state/limits#functions) + extra space
 
@@ -79,6 +81,25 @@ async function startServer(
       res.json({
         type: "error",
         message: "Package preparation failed",
+      });
+    }
+  });
+
+  app.post("/retire", async (req: Request, res: Response) => {
+    if (role !== "application") {
+      res.status(400).json({
+        type: "error",
+        message: "System Node executor has no residents",
+      });
+      return;
+    }
+    try {
+      const result = await nodePoolRetirement.retire(req.body);
+      res.json(result);
+    } catch (_error: unknown) {
+      res.status(400).json({
+        type: "error",
+        message: "Invalid Node pool retirement request",
       });
     }
   });

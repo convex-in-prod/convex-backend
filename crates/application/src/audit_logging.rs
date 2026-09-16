@@ -23,8 +23,15 @@ const FIREHOSE_ROUND_INCREMENTS_BYTES: u64 = 5000;
 /// AuditLogClient implementation that forwards audit logs to log streams.
 #[derive(Clone)]
 pub struct AuditLogClient {
-    log_stream_client: LogManagerClient,
+    destination: AuditLogDestination,
     firehose_client: Option<Arc<AuditLogFirehoseClient>>,
+}
+
+#[derive(Clone)]
+enum AuditLogDestination {
+    LogManager(LogManagerClient),
+    #[cfg(all(test, feature = "static-hermes-wasmtime-gate"))]
+    StaticHermesGateTest,
 }
 
 impl AuditLogClient {
@@ -40,9 +47,17 @@ impl AuditLogClient {
             None
         };
         Ok(Self {
-            log_stream_client,
+            destination: AuditLogDestination::LogManager(log_stream_client),
             firehose_client,
         })
+    }
+
+    #[cfg(all(test, feature = "static-hermes-wasmtime-gate"))]
+    pub(crate) fn for_static_hermes_gate_test() -> Self {
+        Self {
+            destination: AuditLogDestination::StaticHermesGateTest,
+            firehose_client: None,
+        }
     }
 
     fn send_to_log_streams(
@@ -58,7 +73,15 @@ impl AuditLogClient {
                 },
             })
             .collect();
-        self.log_stream_client.send_logs(events);
+        match &self.destination {
+            AuditLogDestination::LogManager(log_stream_client) => {
+                log_stream_client.send_logs(events);
+            },
+            #[cfg(all(test, feature = "static-hermes-wasmtime-gate"))]
+            AuditLogDestination::StaticHermesGateTest => {
+                assert!(events.is_empty());
+            },
+        }
     }
 
     #[fastrace::trace]

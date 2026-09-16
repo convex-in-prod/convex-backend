@@ -126,6 +126,7 @@ use value::{
 
 use crate::{
     application_function_runner::{
+        query_shadow::QueryShadowCoordinator,
         DatabaseFunctionKind,
         FunctionRouter,
     },
@@ -278,6 +279,7 @@ pub struct CacheManager<RT: Runtime> {
     tenant_id: QueryCacheTenantId,
     cache: QueryCache,
     degradable_query_leader_admission: Option<DegradableQueryLeaderAdmission>,
+    query_shadow: QueryShadowCoordinator,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -471,6 +473,7 @@ impl<RT: Runtime> CacheManager<RT> {
         // each `CacheManager` (for a different deployment) gets its own tenant
         // ID within `Cache`, which has a _global_ size-limit
         let tenant_id = QueryCacheTenantId::allocate();
+        let query_shadow = QueryShadowCoordinator::new(Arc::new(udf_execution.clone()));
         Self {
             rt,
             database,
@@ -481,6 +484,7 @@ impl<RT: Runtime> CacheManager<RT> {
             cache,
             degradable_query_leader_admission: query_analysis_admission
                 .map(DegradableQueryLeaderAdmission::from_shared),
+            query_shadow,
         }
     }
 
@@ -750,6 +754,7 @@ impl<RT: Runtime> CacheManager<RT> {
                 log_lines: cache_result.outcome.log_lines.clone(),
                 token: cache_result.token,
                 journal: cache_result.outcome.journal.clone(),
+                host_operation_error: cache_result.outcome.host_operation_error,
             };
             return Ok((result, is_cache_hit));
         }
@@ -911,15 +916,18 @@ impl<RT: Runtime> CacheManager<RT> {
                     },
                     Ok((path_and_args, returns_validator, visibility_info)) => {
                         let component = path_and_args.path().component;
+                        let execution_mode =
+                            self.query_shadow.execution_mode(&self.rt, UdfType::Query);
                         let (mut tx, outcome) = self
                             .function_router
-                            .execute_query_or_mutation(
+                            .execute_query_or_mutation_with_mode(
                                 tx,
                                 path_and_args,
                                 DatabaseFunctionKind::Query(active_javascript_class),
                                 journal.clone(),
                                 context,
                                 scheduler_dependency,
+                                execution_mode,
                             )
                             .await?;
                         let FunctionOutcome::Query(mut query_outcome) = outcome else {
@@ -1433,12 +1441,16 @@ impl CacheOp<'_> {
 #[cfg(test)]
 mod tests {
     use common::{
-        components::ExportPath,
+        components::{
+            ComponentId,
+            ExportPath,
+        },
         identity::InertIdentity,
         runtime::UnixTimestamp,
         types::FunctionCaller,
         RequestId,
     };
+    use model::modules::module_versions::Visibility;
     use value::{
         JsonPackedValue,
         PendingValue,
@@ -1526,6 +1538,8 @@ mod tests {
             result: Ok(JsonPackedValue::pack(PendingValue::Concrete(
                 ConvexValue::Null,
             ))),
+            host_operation_error: None,
+            host_operation_trace: udf::HostOperationTrace::default(),
             syscall_trace: udf::SyscallTrace::new(),
             udf_server_version: None,
             memory_in_mb: 0,
@@ -1535,7 +1549,11 @@ mod tests {
             outcome: Arc::new(outcome),
             original_ts,
             token: Token::empty(original_ts),
-            visibility_info: None,
+            visibility_info: Some(VisibilityInfo::new(
+                Some(Visibility::Public),
+                ComponentId::Root,
+                false,
+            )),
         }
     }
 

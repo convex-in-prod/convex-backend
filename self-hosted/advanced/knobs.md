@@ -121,6 +121,13 @@ global setting. The reserved internal `_system` pool always uses all global
 values. Each effective old-space and pressure setting must remain below that
 pool's effective `maxRssBytes`; this permits a small pool to use a smaller V8
 heap and pressure boundary rather than inheriting the global 2 GiB values.
+The same policy accepts `maxGenerationAgeSeconds`: omission inherits
+`LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS`, while explicit `null` disables
+only age retirement for that application pool. `backgroundDrainTimeoutSeconds`
+defaults to 30 seconds and bounds a registered resident cleanup callback before
+healthy age, RSS, package, source, or topology replacement reaps the process.
+Watchdog, process-failure, cgroup-pressure, and forced replacement retain
+immediate termination authority.
 `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` is the host resource policy for
 these processes. With `Rdefault` as the effective default-pool threshold,
 `Rsystem` as the global threshold, and `Rpool` as each effective named-pool

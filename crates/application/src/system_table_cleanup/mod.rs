@@ -69,6 +69,7 @@ use model::{
     session_requests::SESSION_REQUESTS_TABLE,
     source_packages::{
         types::SourcePackageId,
+        SourcePackageModel,
         SourcePackagesTable,
     },
     SystemIndex,
@@ -515,6 +516,13 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
             .table_mapping()
             .namespaces_for_name(&SourcePackagesTable::TABLE_NAME)
         {
+            // A deployment with no modules has no module metadata pointing at
+            // its source package. Keep its newest record so the active runtime
+            // content is not discarded by cleanup.
+            let latest_source_package_id = SourcePackageModel::new(&mut tx, namespace)
+                .get_latest_record()
+                .await?
+                .map(|source_package| SourcePackageId::from(source_package.id().developer_id));
             let mut source_package_ids: BTreeSet<SourcePackageId> = BTreeSet::new();
             for module in ModuleModel::new(&mut tx)
                 .get_all_metadata(namespace.into())
@@ -528,7 +536,7 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
                 .await?
             {
                 let id = SourcePackageId::from(source_package.id().developer_id);
-                if !source_package_ids.contains(&id) {
+                if Some(id) != latest_source_package_id && !source_package_ids.contains(&id) {
                     SystemMetadataModel::new(&mut tx, namespace)
                         .delete(source_package.id())
                         .await?;
@@ -555,4 +563,169 @@ enum CreationTimeInterval {
     All,
     None,
     Before(CreationTime),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common::{
+        persistence::Persistence,
+        runtime::new_unlimited_rate_limiter,
+        shutdown::ShutdownSignal,
+        types::ObjectKey,
+    };
+    use database::Database;
+    use indexing::index_cache::IndexCache;
+    use model::{
+        initialize_application_system_tables,
+        source_packages::{
+            runtime_content::runtime_content_sha256,
+            types::{
+                PackageSize,
+                SourcePackage,
+                SourcePackageId,
+            },
+            SourcePackageModel,
+        },
+        virtual_system_mapping,
+    };
+    use runtime::prod::ProdRuntime;
+    use search::searcher::SearcherStub;
+    use sqlite::SqlitePersistence;
+    use storage::{
+        LocalDirStorage,
+        Storage,
+    };
+    use value::{
+        sha256::Sha256Digest,
+        TableNamespace,
+    };
+
+    use super::SystemTableCleanupWorker;
+
+    async fn new_test_database(runtime: ProdRuntime) -> anyhow::Result<Database<ProdRuntime>> {
+        let persistence: Arc<dyn Persistence> = Arc::new(SqlitePersistence::new(":memory:")?);
+        let (deleted_tablet_sender, _deleted_tablet_receiver) = tokio::sync::mpsc::channel(16);
+        Database::load(
+            persistence,
+            runtime.clone(),
+            Arc::new(SearcherStub),
+            ShutdownSignal::panic(),
+            virtual_system_mapping().clone(),
+            IndexCache::new(1 << 20).new_handle(),
+            Arc::new(new_unlimited_rate_limiter(runtime)),
+            deleted_tablet_sender,
+            "system_table_cleanup_tests".to_owned(),
+        )
+        .await
+    }
+
+    async fn insert_source_package(
+        database: &Database<ProdRuntime>,
+        storage_key: &str,
+        sha256_byte: u8,
+        runtime_content_sha256: Sha256Digest,
+    ) -> anyhow::Result<SourcePackageId> {
+        let mut tx = database.begin_system().await?;
+        let source_package_id = SourcePackageModel::new(&mut tx, TableNamespace::root_component())
+            .put(SourcePackage {
+                storage_key: ObjectKey::try_from(storage_key)?,
+                sha256: Sha256Digest::from([sha256_byte; 32]),
+                runtime_content_sha256: Some(runtime_content_sha256),
+                runtime_generation: None,
+                external_deps_package_id: None,
+                package_size: PackageSize::default(),
+                node_version: None,
+                node_executor_pool_topology: Default::default(),
+            })
+            .await?;
+        database
+            .commit_with_write_source(tx, "source_package_cleanup_test_setup")
+            .await?;
+        Ok(source_package_id)
+    }
+
+    #[test]
+    fn cleanup_keeps_the_newest_empty_source_package_runtime_identity() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let runtime = ProdRuntime::new(&tokio);
+        let block_runtime = runtime.clone();
+        block_runtime.block_on("source_package_cleanup_empty_deployment", async move {
+            let database = new_test_database(runtime.clone()).await?;
+            initialize_application_system_tables(&database).await?;
+
+            let old_source_package_id = insert_source_package(
+                &database,
+                "source-package-cleanup-old",
+                1,
+                Sha256Digest::from([1; 32]),
+            )
+            .await?;
+            let empty_runtime_content_sha256 = runtime_content_sha256(&[], None, None)?;
+            let empty_source_package_id = insert_source_package(
+                &database,
+                "source-package-cleanup-empty",
+                2,
+                empty_runtime_content_sha256.clone(),
+            )
+            .await?;
+
+            let mut before_cleanup = database.begin_system().await?;
+            assert!(
+                SourcePackageModel::new(&mut before_cleanup, TableNamespace::root_component())
+                    .get_latest()
+                    .await?
+                    .is_none()
+            );
+            let latest_before_cleanup =
+                SourcePackageModel::new(&mut before_cleanup, TableNamespace::root_component())
+                    .get_latest_record()
+                    .await?
+                    .expect("empty deployment source package was not recorded");
+            assert_eq!(
+                SourcePackageId::from(latest_before_cleanup.id().developer_id),
+                empty_source_package_id
+            );
+            drop(before_cleanup);
+
+            let exports_storage: Arc<dyn Storage> =
+                Arc::new(LocalDirStorage::new(runtime.clone())?);
+            let worker = SystemTableCleanupWorker {
+                database: database.clone(),
+                runtime: runtime.clone(),
+                exports_storage,
+            };
+            worker.cleanup_unused_source_packages().await?;
+
+            let mut after_cleanup = database.begin_system().await?;
+            assert!(
+                SourcePackageModel::new(&mut after_cleanup, TableNamespace::root_component())
+                    .get(old_source_package_id)
+                    .await
+                    .is_err()
+            );
+            let retained_source_package =
+                SourcePackageModel::new(&mut after_cleanup, TableNamespace::root_component())
+                    .get(empty_source_package_id)
+                    .await?;
+            assert_eq!(
+                retained_source_package.runtime_content_sha256,
+                Some(empty_runtime_content_sha256)
+            );
+            let latest_after_cleanup =
+                SourcePackageModel::new(&mut after_cleanup, TableNamespace::root_component())
+                    .get_latest_record()
+                    .await?
+                    .expect("cleanup removed the empty deployment source package");
+            assert_eq!(
+                SourcePackageId::from(latest_after_cleanup.id().developer_id),
+                empty_source_package_id
+            );
+            drop(after_cleanup);
+
+            database.shutdown().await?;
+            Ok(())
+        })
+    }
 }

@@ -229,6 +229,12 @@ pub mod scheduling;
 pub mod schema;
 pub mod snapshot_export;
 pub mod snapshot_import;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub mod source_keyed_runtime_active_pair;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub mod source_keyed_runtime_readiness;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub mod static_hermes_wasmtime_quarantine;
 pub mod storage;
 pub mod streaming_export;
 pub mod streaming_import;
@@ -303,7 +309,7 @@ pub async fn make_app(
     let (committed_pool_topology, committed_pool_topology_version) = {
         let mut tx = database.begin_system().await?;
         let topology = SourcePackageModel::new(&mut tx, TableNamespace::Global)
-            .get_latest()
+            .get_latest_record()
             .await?
             .map(|package| package.node_executor_pool_topology.clone())
             .unwrap_or_default();

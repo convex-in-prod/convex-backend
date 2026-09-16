@@ -95,6 +95,7 @@ pub struct UdfPhase<RT: Runtime> {
     module_loader: Arc<dyn ModuleCache<RT>>,
     preloaded: UdfPreloaded,
     component: ComponentId,
+    capture_handler_reads: bool,
 }
 
 enum UdfPreloaded {
@@ -147,6 +148,7 @@ impl<RT: Runtime> UdfPhase<RT> {
         module_loader: Arc<dyn ModuleCache<RT>>,
         default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
         component: ComponentId,
+        capture_handler_reads: bool,
     ) -> Self {
         Self {
             phase: Phase::Importing,
@@ -157,6 +159,7 @@ impl<RT: Runtime> UdfPhase<RT> {
                 default_system_env_vars,
             },
             component,
+            capture_handler_reads,
         }
     }
 
@@ -235,6 +238,52 @@ impl<RT: Runtime> UdfPhase<RT> {
             })
             .await?;
 
+        Ok(())
+    }
+
+    /// Prepare the canonical database-UDF provider for a runtime that owns
+    /// module initialization itself. Static Hermes still needs the normal
+    /// environment-variable view and execution accounting, but must not load
+    /// JavaScript modules through the V8 import phase.
+    pub async fn initialize_static_hermes(
+        &mut self,
+        timeout: &mut Timeout<RT>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.phase == Phase::Importing);
+        if matches!(&self.preloaded, UdfPreloaded::Ready { .. }) {
+            return Ok(());
+        }
+        let UdfPreloaded::Created {
+            default_system_env_vars,
+        } = &self.preloaded
+        else {
+            anyhow::bail!("UdfPhase initialized twice");
+        };
+        let default_system_env_vars = default_system_env_vars.clone();
+        let component = self.component;
+        self.preloaded = timeout
+            .with_release_permit(PauseReason::UdfInitialize, async {
+                let env_vars = PreloadedEnvVars::load(
+                    self.tx_mut()?,
+                    component,
+                    default_system_env_vars.clone(),
+                )
+                .await?;
+                Ok(UdfPreloaded::Ready {
+                    rng: None,
+                    observed_rng_during_execution: false,
+                    unix_timestamp: None,
+                    observed_time_during_execution: false,
+                    performance_api: None,
+                    observed_identity_during_execution: false,
+                    default_system_env_vars,
+                    env_vars,
+                    component,
+                    component_arguments: None,
+                    source_package: None,
+                })
+            })
+            .await?;
         Ok(())
     }
 
@@ -361,9 +410,16 @@ impl<RT: Runtime> UdfPhase<RT> {
             .tx
             .take()
             .context("Transaction missing due to concurrent component call")?;
-        let MaybeSnooped::Tx(tx) = tx else {
-            // snooping is only used during initialization
-            anyhow::bail!("Transaction is still snooped during start_nested_udf?");
+        let tx = match tx {
+            MaybeSnooped::Tx(tx) => tx,
+            MaybeSnooped::SnoopedTx(tx) if self.capture_handler_reads => {
+                let (mut tx, reads) = tx.finish_snoop();
+                tx.record_handler_read_set(reads);
+                tx
+            },
+            MaybeSnooped::SnoopedTx(_) => {
+                anyhow::bail!("Transaction is still snooped during start_nested_udf?")
+            },
         };
         let UdfPreloaded::Ready {
             ref mut rng,
@@ -386,7 +442,13 @@ impl<RT: Runtime> UdfPhase<RT> {
 
     pub fn put_tx(&mut self, tx: Transaction<RT>) -> anyhow::Result<()> {
         anyhow::ensure!(self.tx.is_none());
-        self.tx = Some(MaybeSnooped::Tx(tx));
+        self.tx = Some(
+            if self.capture_handler_reads && self.phase == Phase::Executing {
+                MaybeSnooped::SnoopedTx(tx.snoop_handler_reads())
+            } else {
+                MaybeSnooped::Tx(tx)
+            },
+        );
         Ok(())
     }
 
@@ -421,6 +483,32 @@ impl<RT: Runtime> UdfPhase<RT> {
             },
             None => anyhow::bail!("Transaction missing due to concurrent component call"),
         }
+    }
+
+    pub fn start_handler_read_capture(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.capture_handler_reads);
+        anyhow::ensure!(self.phase == Phase::Executing);
+        match self.tx.take() {
+            Some(MaybeSnooped::Tx(tx)) => {
+                self.tx = Some(MaybeSnooped::SnoopedTx(tx.snoop_handler_reads()));
+                Ok(())
+            },
+            Some(MaybeSnooped::SnoopedTx(_)) => {
+                anyhow::bail!("Called start_handler_read_capture while already capturing")
+            },
+            None => anyhow::bail!("Transaction missing due to concurrent component call"),
+        }
+    }
+
+    pub fn finish_handler_read_capture(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.capture_handler_reads);
+        let reads = self.finish_snoop()?;
+        self.tx_mut()?.record_handler_read_set(reads);
+        Ok(())
+    }
+
+    pub fn handler_read_capture_enabled(&self) -> bool {
+        self.capture_handler_reads
     }
 
     fn tx_ref(&self) -> anyhow::Result<&Transaction<RT>> {
@@ -528,6 +616,13 @@ impl<RT: Runtime> UdfPhase<RT> {
             ));
         };
         Ok(unix_timestamp)
+    }
+
+    pub fn execution_unix_timestamp(&self) -> anyhow::Result<UnixTimestamp> {
+        let UdfPreloaded::Ready { unix_timestamp, .. } = &self.preloaded else {
+            anyhow::bail!("Phase not initialized");
+        };
+        unix_timestamp.context("Execution timestamp missing")
     }
 
     pub fn performance_now_incrementing(&mut self) -> anyhow::Result<Duration> {

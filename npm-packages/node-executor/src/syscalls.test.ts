@@ -22,6 +22,7 @@ function makeSyscalls(hasIsolateWorkerAncestor: boolean): SyscallsImpl {
     hasIsolateWorkerAncestor,
     null,
     { name: "local-test", region: null, class: "s16" },
+    60_000,
   );
 }
 

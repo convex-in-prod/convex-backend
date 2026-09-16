@@ -1,9 +1,24 @@
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use std::path::{
+    Path,
+    PathBuf,
+};
 use std::time::Duration;
 
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use anyhow::Context as _;
 use clap::Parser;
 use cmd_util::env::{
     config_service,
     config_tool,
+};
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use common::knobs::{
+    static_hermes_wasm_primary_directions,
+    APPLICATION_STATIC_HERMES_MUTATION_SHADOW_BPS,
+    APPLICATION_STATIC_HERMES_MUTATION_WASM_PRIMARY_V8_SHADOW_BPS,
+    APPLICATION_STATIC_HERMES_QUERY_SHADOW_BPS,
+    APPLICATION_STATIC_HERMES_QUERY_WASM_PRIMARY_V8_SHADOW_BPS,
 };
 #[cfg(not(target_os = "linux"))]
 use common::knobs::{
@@ -137,9 +152,126 @@ fn main() -> Result<(), MainError> {
 
 fn run_subcommand(command: &Subcommand) -> Result<(), MainError> {
     match command {
+        Subcommand::Capabilities => {
+            println!("{}", backend_capabilities());
+            Ok(())
+        },
         Subcommand::Keygen {
             kind: KeygenCommand::AdminKey(args),
         } => generate_admin_key(args),
+    }
+}
+
+fn backend_capabilities() -> serde_json::Value {
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    {
+        let identity = isolate::STATIC_HERMES_WASMTIME_GATE_RUNTIME_SURFACE_POLICY_IDENTITY;
+        return serde_json::json!({
+            "kind": "convex-local-backend-capabilities-v2",
+            "staticHermesRuntimeSurfacePolicy": {
+                "inventorySha256": identity.inventory_sha256,
+                "kind": identity.kind,
+                "runtimeSurfacePolicySha256": identity.runtime_surface_policy_sha256,
+            },
+            "staticHermesWasmtimeGate": true,
+        });
+    }
+
+    #[cfg(not(feature = "static-hermes-wasmtime-gate"))]
+    serde_json::json!({
+        "kind": "convex-local-backend-capabilities-v2",
+        "staticHermesRuntimeSurfacePolicy": null,
+        "staticHermesWasmtimeGate": false,
+    })
+}
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+const STATIC_HERMES_WASM_GATE_ENABLED_ENV: &str = "CONVEX_STATIC_HERMES_WASM_GATE_ENABLED";
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+const STATIC_HERMES_WASM_GATE_PACKAGE_DIRECTORY_ENV: &str =
+    "CONVEX_STATIC_HERMES_WASM_GATE_PACKAGE_DIRECTORY";
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+const STATIC_HERMES_WASM_GATE_UDF_PATH_ENV: &str = "CONVEX_STATIC_HERMES_WASM_GATE_UDF_PATH";
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+const STATIC_HERMES_WASM_GATE_RUNTIME_REGISTRY_ROOT_ENV: &str =
+    "CONVEX_STATIC_HERMES_WASM_GATE_RUNTIME_REGISTRY_ROOT";
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+const STATIC_HERMES_WASM_GATE_DEPLOYMENT_MANIFEST_ENV: &str =
+    "CONVEX_STATIC_HERMES_WASM_GATE_DEPLOYMENT_MANIFEST";
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+const STATIC_HERMES_WASM_GATE_ARTIFACT_CACHE_ROOT_ENV: &str =
+    "CONVEX_STATIC_HERMES_WASM_GATE_ARTIFACT_CACHE_ROOT";
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticHermesWasmtimeRuntimeAdmissionConfiguration {
+    normal_routing_enabled: bool,
+    shadow_routing_enabled: bool,
+    generated_package_configured: bool,
+    deployment_registry_configured: bool,
+}
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+impl StaticHermesWasmtimeRuntimeAdmissionConfiguration {
+    fn from_process_environment() -> anyhow::Result<Self> {
+        let gate_enabled = match std::env::var(STATIC_HERMES_WASM_GATE_ENABLED_ENV) {
+            Ok(value) if value == "0" => false,
+            Ok(value) if value == "1" => true,
+            Ok(_) => anyhow::bail!("{STATIC_HERMES_WASM_GATE_ENABLED_ENV} must be 0 or 1"),
+            Err(std::env::VarError::NotPresent) => false,
+            Err(error) => {
+                return Err(error).context(format!(
+                    "failed to read {STATIC_HERMES_WASM_GATE_ENABLED_ENV}"
+                ));
+            },
+        };
+        let (query_wasm_primary_enabled, mutation_wasm_primary_enabled) =
+            static_hermes_wasm_primary_directions(gate_enabled)?;
+        let normal_routing_enabled = query_wasm_primary_enabled || mutation_wasm_primary_enabled;
+        let shadow_routing_enabled = *APPLICATION_STATIC_HERMES_QUERY_SHADOW_BPS > 0
+            || *APPLICATION_STATIC_HERMES_MUTATION_SHADOW_BPS > 0
+            || *APPLICATION_STATIC_HERMES_QUERY_WASM_PRIMARY_V8_SHADOW_BPS > 0
+            || *APPLICATION_STATIC_HERMES_MUTATION_WASM_PRIMARY_V8_SHADOW_BPS > 0;
+        let package_directory_configured =
+            std::env::var_os(STATIC_HERMES_WASM_GATE_PACKAGE_DIRECTORY_ENV).is_some();
+        let udf_path_configured = std::env::var_os(STATIC_HERMES_WASM_GATE_UDF_PATH_ENV).is_some();
+        let generated_package_configured = package_directory_configured && udf_path_configured;
+        let runtime_registry_root_configured =
+            std::env::var_os(STATIC_HERMES_WASM_GATE_RUNTIME_REGISTRY_ROOT_ENV).is_some();
+        let deployment_manifest_configured =
+            std::env::var_os(STATIC_HERMES_WASM_GATE_DEPLOYMENT_MANIFEST_ENV).is_some();
+        let artifact_cache_root_configured =
+            std::env::var_os(STATIC_HERMES_WASM_GATE_ARTIFACT_CACHE_ROOT_ENV).is_some();
+        let deployment_registry_configured = (runtime_registry_root_configured
+            && !deployment_manifest_configured
+            && !artifact_cache_root_configured)
+            || (!runtime_registry_root_configured
+                && deployment_manifest_configured
+                && artifact_cache_root_configured);
+        Ok(Self {
+            normal_routing_enabled,
+            shadow_routing_enabled,
+            generated_package_configured,
+            deployment_registry_configured,
+        })
+    }
+
+    fn can_admit_wasm(self) -> bool {
+        (self.normal_routing_enabled
+            && (self.generated_package_configured || self.deployment_registry_configured))
+            || (self.shadow_routing_enabled && self.deployment_registry_configured)
+    }
+
+    fn quarantine_policy_path(
+        self,
+        db_spec: &str,
+        data_dir: Option<&Path>,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        if !self.can_admit_wasm() {
+            return Ok(None);
+        }
+        isolate::static_hermes_wasmtime_quarantine_path_for_database_spec(db_spec, data_dir)
+            .map(Some)
     }
 }
 
@@ -219,6 +351,19 @@ async fn run_server_inner(
 
     // Use to signal to the http service to stop.
     let (shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    {
+        let runtime_admission =
+            StaticHermesWasmtimeRuntimeAdmissionConfiguration::from_process_environment()?;
+        let data_dir = std::env::var_os("DATA_DIR").map(std::path::PathBuf::from);
+        if let Some(quarantine_path) =
+            runtime_admission.quarantine_policy_path(&config.db_spec, data_dir.as_deref())?
+        {
+            // Initialize the process-global policy before constructing a
+            // function runner that can admit Wasm work.
+            isolate::initialize_static_hermes_wasmtime_quarantine(quarantine_path)?;
+        }
+    }
     let persistence = connect_persistence(
         config.db,
         &config.db_spec,
@@ -339,4 +484,38 @@ async fn run_server_inner(
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "static-hermes-wasmtime-gate"))]
+mod static_hermes_wasmtime_quarantine_startup_tests {
+    use super::*;
+
+    #[test]
+    fn url_backed_zero_wasm_configuration_preserves_ordinary_v8_without_data_dir() {
+        let configuration = StaticHermesWasmtimeRuntimeAdmissionConfiguration {
+            normal_routing_enabled: false,
+            shadow_routing_enabled: false,
+            generated_package_configured: false,
+            deployment_registry_configured: false,
+        };
+        assert_eq!(
+            configuration
+                .quarantine_policy_path("postgres://example.invalid/backend", None)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn url_backed_wasm_configuration_requires_durable_quarantine_storage() {
+        let configuration = StaticHermesWasmtimeRuntimeAdmissionConfiguration {
+            normal_routing_enabled: true,
+            shadow_routing_enabled: false,
+            generated_package_configured: true,
+            deployment_registry_configured: false,
+        };
+        assert!(configuration
+            .quarantine_policy_path("postgres://example.invalid/backend", None)
+            .is_err());
+    }
 }

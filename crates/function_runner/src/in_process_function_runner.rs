@@ -105,6 +105,8 @@ use usage_tracking::FunctionUsageStats;
 use value::identifier::Identifier;
 
 use super::FunctionRunner;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use crate::server::QueryShadowPrimaryPublication;
 use crate::{
     server::{
         validate_run_function_result,
@@ -115,6 +117,8 @@ use crate::{
         HttpActionMetadata,
         RunRequestArgs,
     },
+    FunctionExecutionMode,
+    FunctionExecutionResult,
     FunctionFinalTransaction,
     FunctionWrites,
 };
@@ -254,7 +258,16 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
                             anyhow::bail!(ErrorMetadata::client_disconnect());
                         }
                     }
-                    return result;
+                    return match result? {
+                        FunctionExecutionResult::Completed {
+                            transaction,
+                            outcome,
+                            usage_stats,
+                        } => Ok((transaction, outcome, usage_stats)),
+                        FunctionExecutionResult::StaticHermesWasmUnavailable => {
+                            anyhow::bail!("HTTP action unexpectedly selected Static Hermes Wasm")
+                        },
+                    };
                 },
                 _ = outer_response_streamer.sender.closed().fuse() => {
                     // The streamer above us has disconnected, so stop running
@@ -288,6 +301,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
     #[fastrace::trace]
     async fn run_function(
         &self,
+        execution_mode: FunctionExecutionMode,
         udf_type: UdfType,
         identity: Identity,
         ts: RepeatableTimestamp,
@@ -300,11 +314,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
         context: ExecutionContext,
         function_execution_start: Option<FunctionExecutionStartGate>,
         scheduler_dependency: SchedulerDependencyClass,
-    ) -> anyhow::Result<(
-        Option<FunctionFinalTransaction>,
-        FunctionOutcome,
-        FunctionUsageStats,
-    )> {
+    ) -> anyhow::Result<FunctionExecutionResult> {
         let pause_client = self.database.runtime().pause_client();
         pause_client.wait("run_function").await;
 
@@ -330,7 +340,17 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
             self.database.retention_validator(),
         );
         let index_reader = Arc::new(repeatable_persistence.read_snapshot(ts)?);
+        #[cfg(feature = "static-hermes-wasmtime-gate")]
+        let query_shadow_primary_publication = matches!(
+            &execution_mode,
+            FunctionExecutionMode::V8WithStaticHermesWasmShadow(_)
+                | FunctionExecutionMode::StaticHermesWasmWithV8Shadow(_)
+        )
+        .then(|| QueryShadowPrimaryPublication::new(*ts, self.database.retention_validator()));
         let request_metadata = RunRequestArgs {
+            execution_mode,
+            #[cfg(feature = "static-hermes-wasmtime-gate")]
+            query_shadow_primary_publication: query_shadow_primary_publication.clone(),
             key_broker: self.key_broker.clone(),
             index_reader,
             convex_origin: self.convex_origin.clone(),
@@ -362,16 +382,46 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
                     .run_function_no_retention_check(request_metadata, function_metadata, None)
                     .await
             },
-            UdfType::HttpAction => {
-                self.run_http_action(
+            UdfType::HttpAction => self
+                .run_http_action(
                     request_metadata,
                     http_action_metadata.context("Http action metadata not set")?,
                 )
                 .await
-            },
+                .map(
+                    |(transaction, outcome, usage_stats)| FunctionExecutionResult::Completed {
+                        transaction,
+                        outcome,
+                        usage_stats,
+                    },
+                ),
         };
-        validate_run_function_result(udf_type, *ts, self.database.retention_validator()).await?;
-        result
+        let retention_result =
+            validate_run_function_result(udf_type, *ts, self.database.retention_validator()).await;
+        #[cfg(feature = "static-hermes-wasmtime-gate")]
+        match retention_result {
+            Ok(()) => {
+                if let Some(query_shadow_primary_publication) = &query_shadow_primary_publication {
+                    if result.is_ok() {
+                        query_shadow_primary_publication.publish_after_retention_validation();
+                    } else {
+                        query_shadow_primary_publication.primary_failed();
+                    }
+                }
+                result
+            },
+            Err(error) => {
+                if let Some(query_shadow_primary_publication) = &query_shadow_primary_publication {
+                    query_shadow_primary_publication.reject_after_retention_validation();
+                }
+                Err(error)
+            },
+        }
+        #[cfg(not(feature = "static-hermes-wasmtime-gate"))]
+        {
+            retention_result?;
+            result
+        }
     }
 
     #[fastrace::trace]

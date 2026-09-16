@@ -162,6 +162,8 @@ use model::{
 use parking_lot::Mutex;
 use prometheus::VMHistogram;
 use sync_types::CanonicalizedModulePath;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{
     mpsc,
     oneshot,
@@ -183,6 +185,11 @@ use udf::{
 };
 use value::identifier::Identifier;
 
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use crate::environment::udf::static_hermes_wasmtime_gate::{
+    PreparedStaticHermesWasmtimeInvocation,
+    StaticHermesWasmtimeRouteHandle,
+};
 use crate::{
     concurrency_limiter::{
         ConcurrencyLimiter,
@@ -340,6 +347,16 @@ impl CancellationSignal {
     fn cancel(&self) {
         self.inner.cancelled.store(true, Ordering::Release);
         self.inner.waker.wake();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_for_test(&self) {
+        self.cancel();
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -967,6 +984,15 @@ pub struct UdfRequest<RT: Runtime> {
     pub journal: QueryJournal,
     pub context: ExecutionContext,
     pub environment_data: EnvironmentData<RT>,
+    /// Query-shadow collection is opt-in because normal UDF execution has no
+    /// consumer for this process-local evidence.
+    pub trace_host_operations: bool,
+    /// Capture only reads made while the user handler is executing.
+    pub capture_handler_reads: bool,
+    /// Keep shadow admission held while separately scheduled nested V8 work
+    /// drains after the parent Wasm request is cancelled.
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub shadow_work_guard: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 pub struct HttpActionRequest<RT: Runtime> {
@@ -999,6 +1025,23 @@ pub struct EnvironmentData<RT: Runtime> {
     pub file_storage: TransactionalFileStorage<RT>,
     pub module_loader: Arc<dyn ModuleCache<RT>>,
     pub deployment: DeploymentMetadata,
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub host_secret_values: Option<BTreeMap<String, HostSecretValue>>,
+}
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+#[derive(Clone, Eq, PartialEq)]
+pub struct HostSecretValue(Arc<Vec<u8>>);
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+impl HostSecretValue {
+    pub fn new(value: impl Into<Vec<u8>>) -> Self {
+        Self(Arc::new(value.into()))
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
 }
 
 pub struct Request<RT: Runtime> {
@@ -1503,6 +1546,10 @@ impl<RT: Runtime> IsolateClient<RT> {
         max_isolate_workers: usize,
         isolate_worker: W,
     ) -> anyhow::Result<Self> {
+        #[cfg(feature = "static-hermes-wasmtime-gate")]
+        {
+            crate::environment::udf::static_hermes_wasmtime_gate::initialize_route_configuration()?;
+        }
         let configured_context_cache_capacity =
             Self::preflight_context_cache_capacity(max_isolate_workers)?;
         anyhow::ensure!(
@@ -1599,6 +1646,10 @@ impl<RT: Runtime> IsolateClient<RT> {
         let active_workers = Arc::new(AtomicUsize::new(0));
         let _active_workers = active_workers.clone();
         let rt_clone = rt.clone();
+        #[cfg(feature = "static-hermes-wasmtime-gate")]
+        crate::environment::udf::static_hermes_wasmtime_gate::initialize_memory_pressure_sampler(
+            rt.clone(),
+        )?;
         let scheduler = rt.spawn("shared_isolate_scheduler", async move {
             // The scheduler thread selects a queued request and an available
             // worker, then sends the request to that worker.
@@ -1649,6 +1700,130 @@ impl<RT: Runtime> IsolateClient<RT> {
     }
 
     #[fastrace::trace]
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub fn resolve_static_hermes_wasmtime_route(
+        udf_type: UdfType,
+        path_and_args: &ValidatedPathAndArgs,
+    ) -> anyhow::Result<Option<StaticHermesWasmtimeRouteHandle>> {
+        crate::environment::udf::static_hermes_wasmtime_gate::resolve_route(udf_type, path_and_args)
+    }
+
+    #[fastrace::trace]
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub async fn select_static_hermes_wasmtime_route_for_invocation(
+        route: StaticHermesWasmtimeRouteHandle,
+        udf_type: UdfType,
+        path_and_args: &ValidatedPathAndArgs,
+        transaction: &mut Transaction<RT>,
+    ) -> anyhow::Result<Option<StaticHermesWasmtimeRouteHandle>> {
+        crate::environment::udf::static_hermes_wasmtime_gate::select_route_for_invocation(
+            route,
+            udf_type,
+            path_and_args,
+            transaction,
+        )
+        .await
+    }
+
+    #[fastrace::trace]
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub fn resolve_static_hermes_wasmtime_shadow_route(
+        udf_type: UdfType,
+        path_and_args: &ValidatedPathAndArgs,
+    ) -> anyhow::Result<Option<StaticHermesWasmtimeRouteHandle>> {
+        crate::environment::udf::static_hermes_wasmtime_gate::resolve_shadow_route(
+            udf_type,
+            path_and_args,
+        )
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub fn active_static_hermes_query_shadow_registry(
+    ) -> anyhow::Result<Option<crate::StaticHermesQueryShadowRegistry>> {
+        crate::environment::udf::static_hermes_wasmtime_gate::active_query_shadow_registry()
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub fn static_hermes_generated_memory_statistics(
+        udf_type: UdfType,
+    ) -> anyhow::Result<Option<crate::StaticHermesGeneratedMemoryStatistics>> {
+        crate::environment::udf::static_hermes_wasmtime_gate::generated_memory_statistics(udf_type)
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub async fn prepare_static_hermes_wasmtime_invocation(
+        route: StaticHermesWasmtimeRouteHandle,
+        udf_type: UdfType,
+        path_and_args: ValidatedPathAndArgs,
+        transaction: Transaction<RT>,
+        mode: crate::StaticHermesWasmtimePreparationMode,
+    ) -> anyhow::Result<PreparedStaticHermesWasmtimeInvocation<RT>> {
+        crate::environment::udf::static_hermes_wasmtime_gate::prepare_routed_invocation(
+            route,
+            udf_type,
+            path_and_args,
+            transaction,
+            mode,
+        )
+        .await
+    }
+
+    #[fastrace::trace]
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub async fn execute_static_hermes_wasmtime_gate(
+        &self,
+        prepared: PreparedStaticHermesWasmtimeInvocation<RT>,
+        client_id: String,
+        udf_type: UdfType,
+        journal: QueryJournal,
+        context: ExecutionContext,
+        environment_data: EnvironmentData<RT>,
+        rng_seed: [u8; 32],
+        unix_timestamp: UnixTimestamp,
+        function_started_sender: Option<oneshot::Sender<()>>,
+        capture_handler_reads: bool,
+        shadow_work_guard: Option<Arc<OwnedSemaphorePermit>>,
+        trace_host_operations: bool,
+    ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
+        let (tx, rx) = oneshot::channel();
+        let cancellation = CancellationSignal::new();
+        let caller_cancellation = cancellation.clone();
+        let rt = self.rt.clone();
+        let nested_udf_callback = self.clone();
+        self.rt
+            .spawn_background("static_hermes_wasmtime_gate", async move {
+                let result =
+                    crate::environment::udf::static_hermes_wasmtime_gate::run_prepared_routed(
+                        rt,
+                        prepared,
+                        nested_udf_callback,
+                        client_id,
+                        0,
+                        udf_type,
+                        journal,
+                        context,
+                        environment_data,
+                        rng_seed,
+                        unix_timestamp,
+                        cancellation,
+                        function_started_sender,
+                        capture_handler_reads,
+                        shadow_work_guard,
+                        trace_host_operations,
+                    )
+                    .await;
+                let _ = tx.send(result);
+            });
+
+        let response = pin!(Self::receive_response(rx));
+        // Match execute_udf's publication-before-receiver-drop ordering.
+        let cancel_on_drop = CancelExecutionOnDrop(Some(caller_cancellation));
+        let response = response.await;
+        cancel_on_drop.disarm();
+        response?
+    }
+
+    #[fastrace::trace]
     pub async fn execute_udf(
         &self,
         udf_type: UdfType,
@@ -1663,6 +1838,10 @@ impl<RT: Runtime> IsolateClient<RT> {
         instance_name: String,
         function_started_sender: Option<oneshot::Sender<()>>,
         subfunctions_in_same_isolate: bool,
+        trace_host_operations: bool,
+        #[cfg(feature = "static-hermes-wasmtime-gate")] shadow_work_guard: Option<
+            Arc<OwnedSemaphorePermit>,
+        >,
         scheduler_dependency: SchedulerDependencyClass,
         active_javascript_class: ActiveJavascriptClass,
     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
@@ -1678,6 +1857,10 @@ impl<RT: Runtime> IsolateClient<RT> {
                 journal,
                 context,
                 environment_data,
+                trace_host_operations,
+                capture_handler_reads: trace_host_operations,
+                #[cfg(feature = "static-hermes-wasmtime-gate")]
+                shadow_work_guard,
             },
             cancellation,
             response: tx,
@@ -2241,6 +2424,8 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
                         })?),
                         Err(e) => Err(e),
                     },
+                    host_operation_error: outcome.host_operation_error,
+                    host_operation_trace: outcome.host_operation_trace,
                     syscall_trace: outcome.syscall_trace,
                 }
             },

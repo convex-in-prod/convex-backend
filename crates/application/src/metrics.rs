@@ -1,3 +1,5 @@
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use metrics::log_counter;
 use metrics::{
     log_counter_with_labels,
     log_distribution_with_labels,
@@ -14,6 +16,17 @@ register_convex_counter!(
     "Total pushes with external dependency packages",
     &["cache_status"],
 );
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+register_convex_counter!(
+    QUERY_SHADOW_ROUTE_DETAIL_CAPACITY_DROPS_TOTAL,
+    "Query shadow reports recorded only in aggregate because the active-route metric cap was full",
+);
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub(crate) fn log_query_shadow_route_detail_capacity_drop() {
+    log_counter(&QUERY_SHADOW_ROUTE_DETAIL_CAPACITY_DROPS_TOTAL, 1);
+}
 pub fn log_external_deps_package(is_cache_hit: bool) {
     let cache_label = if is_cache_hit { "hit" } else { "miss" };
 

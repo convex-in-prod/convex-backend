@@ -998,13 +998,13 @@ impl<RT: Runtime> SyncWorker<RT> {
                                 ts: Some(udf_return.ts),
                                 log_lines: udf_return.log_lines.into(),
                             },
-                            Err(RedactedMutationError { error, log_lines }) => {
-                                ServerMessage::MutationResponse {
-                                    request_id,
-                                    result: Err(error.into_error_payload()),
-                                    ts: None,
-                                    log_lines: log_lines.into(),
-                                }
+                            Err(RedactedMutationError {
+                                error, log_lines, ..
+                            }) => ServerMessage::MutationResponse {
+                                request_id,
+                                result: Err(error.into_error_payload()),
+                                ts: None,
+                                log_lines: log_lines.into(),
                             },
                         };
                         Ok(response)

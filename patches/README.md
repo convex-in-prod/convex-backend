@@ -54,6 +54,18 @@ adoption contract documented in the backend essay.
 
 ## Deployment and code generation
 
+Named local Node executor pools accept `maxGenerationAgeSeconds` and
+`backgroundDrainTimeoutSeconds` in `LOCAL_NODE_EXECUTOR_POOL_POLICIES`.
+Omitting the age setting inherits the positive global generation-age limit;
+explicit `null` disables age-only retirement for that pool while RSS,
+package, pressure, watchdog, and deployment retirement remain active. The
+background drain timeout defaults to 30 seconds and applies only when a
+process generation registers a resident retirement callback, so pools without
+resident work retain their existing retirement behavior. The timeout is one
+fixed monotonic deadline; callback errors and expiry are recorded before the
+generation is reaped. Forced replacement and emergency pressure or watchdog
+paths retain immediate termination authority.
+
 ### [Non-committing codegen analysis](non_committing_codegen_analysis/README.md)
 
 - Purpose: let standalone codegen obtain authoritative evaluated component analysis without
@@ -120,6 +132,29 @@ adoption contract documented in the backend essay.
   requires build args or Cargo profile settings.
 - Rollback: return to the normal release profile and default strip behavior, or restore the previous
   dependency-fetch and JavaScript-install layers. Runtime behavior and data are unchanged.
+
+### [Static Hermes Wasm UDF execution](static_hermes_wasm_udfs/README.md)
+
+- Purpose: route digest-bound deployment-selected root queries and mutations through generated
+  Static Hermes Wasm on one shared Wasmtime engine while preserving explicit V8 routing and bounded
+  module, native-code, Store, and runtime ownership.
+- Prerequisites: a feature-enabled backend image; the separate cancellation-safe MySQL patch so an
+  interrupted connection cannot return to reuse; and an external compiler, precompiler, source-
+  authority, package, and deployment pipeline that produces the exact digest-bound schemas and
+  engine identity. Numeric MySQL cancellation remains disabled unless the operator separately
+  proves the trusted-single-namespace topology contract.
+- Activation: experimental and disabled by default. Read the linked compiler/artifact and
+  operations documents. A downstream integration must bind the active V8 source, publish and mount
+  a complete immutable shadow-only registry, start with normal Wasm routing and both shadow rates
+  disabled, and verify unchanged V8 behavior. Query shadows sample admitted cache-miss leaders and
+  direct no-cache admin/system queries; mutation shadow sampling is independent. V8 remains the
+  only response and commit authority. Wasm-primary
+  routing requires a separately proved primary-admitted generation and explicit promotion review.
+  Route-aware reuse avoids destroy-and-recreate churn when matching runtimes return at the instance
+  ceiling, but does not establish performance or memory parity between the generated path and a
+  manually authored Wasm baseline.
+- Rollback: set both shadow rates to zero, keep normal Wasm routing disabled, and restart before
+  restoring the previous image. No data or schema migration rollback is required.
 
 ### [Atomic Node executor source packages](atomic_node_executor_source_packages/README.md)
 
@@ -322,7 +357,10 @@ operator adoption units:
 8. Deliver matching backend and client protocol before enabling degradable frontend behavior.
 9. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a
    controlled multi-module push before changing analysis concurrency or queue deadlines.
-10. Change one independent capacity or semantic opt-in at a time unless the documented policy
+10. Apply and verify cancellation-safe MySQL connections before experimenting with Static Hermes
+   Wasm UDF execution. Treat its feature image, active source, immutable registry, memory policy,
+   and metrics as one reviewed compatibility set, with the routing gate disabled first.
+11. Change one independent capacity or semantic opt-in at a time unless the documented policy
    explicitly requires a coupled rollout and rollback order.
 
 Do not use module, function, route, client, deployment, or tenant names in generic backend logic or

@@ -1,3 +1,7 @@
+#![cfg_attr(
+    all(test, feature = "static-hermes-wasmtime-gate"),
+    recursion_limit = "256"
+)]
 #![feature(try_blocks)]
 #![feature(try_blocks_heterogeneous)]
 #![feature(stmt_expr_attributes)]
@@ -279,6 +283,7 @@ use model::{
         types::{
             ExternalDepsPackage,
             ExternalDepsPackageId,
+            ExternalDepsPackageSelection,
         },
         ExternalPackagesModel,
     },
@@ -309,6 +314,7 @@ use model::{
         ImportRequestor,
     },
     source_packages::{
+        runtime_content::runtime_content_sha256,
         types::{
             NodeVersion,
             PackageSize,
@@ -440,6 +446,7 @@ pub mod deploy_config;
 pub mod deployment_state;
 mod execute_query_timestamp;
 mod exports;
+mod external_deps;
 pub mod function_log;
 pub mod log_streaming;
 pub mod log_visibility;
@@ -489,6 +496,7 @@ pub struct QueryReturn {
     pub log_lines: LogLines,
     pub token: Token,
     pub journal: QueryJournal,
+    pub(crate) host_operation_error: Option<udf::HostOperationErrorV1>,
 }
 
 #[derive(Debug)]
@@ -497,6 +505,7 @@ pub struct RedactedQueryReturn {
     pub log_lines: RedactedLogLines,
     pub token: Token,
     pub journal: SerializedQueryJournal,
+    pub(crate) host_operation_error: Option<udf::HostOperationErrorV1>,
 }
 
 #[derive(Debug)]
@@ -518,6 +527,7 @@ pub struct RedactedMutationReturn {
 pub struct MutationError {
     pub error: JsError,
     pub log_lines: LogLines,
+    pub(crate) host_operation_error: Option<udf::HostOperationErrorV1>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -525,6 +535,7 @@ pub struct MutationError {
 pub struct RedactedMutationError {
     pub error: RedactedJsError,
     pub log_lines: RedactedLogLines,
+    pub(crate) host_operation_error: Option<udf::HostOperationErrorV1>,
 }
 
 #[derive(Debug)]
@@ -753,6 +764,23 @@ impl<RT: Runtime> Application<RT> {
 
         let deployment_name = deployment.name.clone();
         let deployment_region = deployment.region.clone();
+        #[cfg(feature = "static-hermes-wasmtime-gate")]
+        let disable_background_function_executors =
+            match std::env::var("CONVEX_STATIC_HERMES_WASM_GATE_DISABLE_BACKGROUND_EXECUTORS")
+                .as_deref()
+            {
+                Ok("1") => true,
+                Ok("0") | Err(std::env::VarError::NotPresent) => false,
+                Ok(_) => panic!(
+                    "CONVEX_STATIC_HERMES_WASM_GATE_DISABLE_BACKGROUND_EXECUTORS must be 0 or 1"
+                ),
+                Err(error) => panic!(
+                    "failed to read CONVEX_STATIC_HERMES_WASM_GATE_DISABLE_BACKGROUND_EXECUTORS: \
+                     {error}"
+                ),
+            };
+        #[cfg(not(feature = "static-hermes-wasmtime-gate"))]
+        let disable_background_function_executors = false;
         let default_system_env_vars = btreemap! {
             CONVEX_ORIGIN.clone() => convex_origin.parse()?,
             CONVEX_SITE.clone() => convex_site.parse()?
@@ -894,21 +922,40 @@ impl<RT: Runtime> Application<RT> {
         ));
         function_runner.set_action_callbacks(runner.clone());
 
-        let scheduled_job_runner = ScheduledJobRunner::start(
-            runtime.clone(),
-            deployment_name.clone(),
-            database.clone(),
-            runner.clone(),
-            function_log.clone(),
-        );
+        let scheduled_job_runner = if disable_background_function_executors {
+            #[cfg(not(feature = "static-hermes-wasmtime-gate"))]
+            unreachable!("background function executors can only be disabled in the gate build");
+            #[cfg(feature = "static-hermes-wasmtime-gate")]
+            ScheduledJobRunner::disabled(runtime.clone())
+        } else {
+            ScheduledJobRunner::start(
+                runtime.clone(),
+                deployment_name.clone(),
+                database.clone(),
+                runner.clone(),
+                function_log.clone(),
+            )
+        };
 
-        let cron_job_executor_fut = CronJobExecutor::run(
-            runtime.clone(),
-            deployment_name.clone(),
-            database.clone(),
-            runner.clone(),
-            function_log.clone(),
-        );
+        let cron_runtime = runtime.clone();
+        let cron_deployment_name = deployment_name.clone();
+        let cron_database = database.clone();
+        let cron_runner = runner.clone();
+        let cron_function_log = function_log.clone();
+        let cron_job_executor_fut = async move {
+            if disable_background_function_executors {
+                std::future::pending().await
+            } else {
+                CronJobExecutor::run(
+                    cron_runtime,
+                    cron_deployment_name,
+                    cron_database,
+                    cron_runner,
+                    cron_function_log,
+                )
+                .await
+            }
+        };
         let cron_job_executor = Arc::new(Mutex::new(
             runtime.spawn("cron_job_executor", cron_job_executor_fut),
         ));
@@ -1415,6 +1462,7 @@ impl<RT: Runtime> Application<RT> {
                 journal: self
                     .key_broker
                     .encrypt_query_journal(&query_return.journal, persistence_version),
+                host_operation_error: query_return.host_operation_error,
             },
             Err(e) if e.is_deterministic_user_error() => RedactedQueryReturn {
                 result: Err(RedactedJsError::from_js_error(
@@ -1429,6 +1477,7 @@ impl<RT: Runtime> Application<RT> {
                 journal: self
                     .key_broker
                     .encrypt_query_journal(&QueryJournal::new(), persistence_version),
+                host_operation_error: None,
             },
             Err(e) => anyhow::bail!(e),
         };
@@ -1512,6 +1561,7 @@ impl<RT: Runtime> Application<RT> {
                     mutation_error.log_lines,
                     block_logging,
                 ),
+                host_operation_error: mutation_error.host_operation_error,
             }),
             Err(e) if e.is_deterministic_user_error() => Err(RedactedMutationError {
                 error: RedactedJsError::from_js_error(
@@ -1520,6 +1570,7 @@ impl<RT: Runtime> Application<RT> {
                     request_id,
                 ),
                 log_lines: RedactedLogLines::empty(),
+                host_operation_error: None,
             }),
             Err(e) => anyhow::bail!(e),
         };
@@ -2493,13 +2544,23 @@ impl<RT: Runtime> Application<RT> {
         BTreeMap<ComponentDefinitionPath, SourcePackage>,
         Vec<ModuleConfig>,
     )> {
+        let selected_external_deps = match &config.external_deps_package {
+            Some(selection) => {
+                let package = self.get_external_node_deps(selection).await?;
+                package.validate_dependencies(&config.node_dependencies)?;
+                Some((selection.id.clone(), package))
+            },
+            None => None,
+        };
         let upload_limit = Arc::new(Semaphore::new(*APPLICATION_MAX_CONCURRENT_UPLOADS));
 
         let mut app_functions: Vec<ModuleConfig> =
             config.app_definition.changed_runtime_modules.clone();
         let root_future = async {
             let permit = upload_limit.acquire().await?;
-            let external_deps_id_and_pkg = if !config.node_dependencies.is_empty() {
+            let external_deps_id_and_pkg = if let Some(selected) = selected_external_deps {
+                Some(selected)
+            } else if !config.node_dependencies.is_empty() {
                 let deps = self
                     .build_external_node_deps(config.node_dependencies.clone())
                     .await?;
@@ -2834,6 +2895,8 @@ impl<RT: Runtime> Application<RT> {
             Some((id, pkg)) => (Some(id), Some(pkg)),
             _ => (None, None),
         };
+        let runtime_content_sha256 =
+            runtime_content_sha256(modules, external_deps_pkg.as_ref(), node_version)?;
         let (storage_key, sha256, package_size) = upload_package(
             package,
             self.application_storage.modules_storage.clone(),
@@ -2848,6 +2911,8 @@ impl<RT: Runtime> Application<RT> {
         Ok(SourcePackage {
             storage_key,
             sha256,
+            runtime_content_sha256: Some(runtime_content_sha256),
+            runtime_generation: None,
             external_deps_package_id,
             package_size,
             node_version,
@@ -3090,6 +3155,34 @@ impl<RT: Runtime> Application<RT> {
         // Write package to system table
         let id = self._upload_external_deps_package(pkg.clone()).await?;
         Ok((id, pkg))
+    }
+
+    pub async fn get_external_node_deps(
+        &self,
+        selection: &ExternalDepsPackageSelection,
+    ) -> anyhow::Result<ExternalDepsPackage> {
+        let mut tx = self.begin(Identity::system()).await?;
+        ExternalPackagesModel::new(&mut tx)
+            .get_selected(selection)
+            .await
+    }
+
+    pub async fn download_external_node_deps(
+        &self,
+        selection: &ExternalDepsPackageSelection,
+    ) -> anyhow::Result<StorageGetStream> {
+        let package = self.get_external_node_deps(selection).await?;
+        package.package_size.verify_size()?;
+        let result = self
+            .modules_storage()
+            .get(&package.storage_key)
+            .await?
+            .context("Selected external dependency archive is missing")?;
+        anyhow::ensure!(
+            usize::try_from(result.content_length)? == package.package_size.zipped_size_bytes,
+            "Selected external dependency archive size does not match its package"
+        );
+        Ok(result)
     }
 
     #[fastrace::trace]

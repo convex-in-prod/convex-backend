@@ -102,6 +102,7 @@ pub use transaction::{
     SnoopedTransaction,
     TableCountSnapshot,
     Transaction,
+    TransactionDocumentCreationState,
 };
 pub use transaction_index::{
     SearchNotEnabled,

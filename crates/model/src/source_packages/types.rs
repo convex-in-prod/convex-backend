@@ -166,6 +166,13 @@ impl TryFrom<SerializedNodeVersionDiff> for NodeVersionDiff {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourcePackageRuntimeGeneration {
+    pub deployment_sha256: Sha256Digest,
+    pub generation_manifest_sha256: Sha256Digest,
+    pub generation_sha256: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 /// Contains the metadata for a source package. Multiple [`SourcePackage`]
 /// documents may be referenced in the modules table. [`ModuleMetadata`] that
 /// reference old versions of [`SourcePackage`] are able to be read at all
@@ -173,6 +180,10 @@ impl TryFrom<SerializedNodeVersionDiff> for NodeVersionDiff {
 pub struct SourcePackage {
     pub storage_key: ObjectKey,
     pub sha256: Sha256Digest,
+    pub runtime_content_sha256: Option<Sha256Digest>,
+    /// Exact preloaded runtime generation selected with this source package.
+    /// This is written only by the paired finish-push boundary.
+    pub runtime_generation: Option<SourcePackageRuntimeGeneration>,
     pub external_deps_package_id: Option<ExternalDepsPackageId>,
     pub package_size: PackageSize,
     pub node_version: Option<NodeVersion>,
@@ -187,6 +198,7 @@ impl SourcePackage {
         self.node_version == other.node_version
             && self.external_deps_package_id == other.external_deps_package_id
             && self.node_executor_pool_topology == other.node_executor_pool_topology
+            && self.runtime_generation == other.runtime_generation
     }
 }
 
@@ -326,6 +338,8 @@ impl From<SourcePackageId> for DeveloperDocumentId {
 pub struct SerializedSourcePackage {
     storage_key: String,
     sha256: ByteBuf,
+    runtime_content_sha256: Option<ByteBuf>,
+    runtime_generation: Option<SerializedSourcePackageRuntimeGeneration>,
     external_package_id: Option<String>,
     package_size: Option<SerializedPackageSize>,
     node_version: Option<String>,
@@ -333,6 +347,14 @@ pub struct SerializedSourcePackage {
     node_pool_names: Option<Vec<String>>,
     node_pool_default_route_count: Option<i64>,
     node_pool_default_module_paths: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SerializedSourcePackageRuntimeGeneration {
+    deployment_sha256: ByteBuf,
+    generation_manifest_sha256: ByteBuf,
+    generation_sha256: ByteBuf,
 }
 
 impl TryFrom<SourcePackage> for SerializedSourcePackage {
@@ -357,6 +379,18 @@ impl TryFrom<SourcePackage> for SerializedSourcePackage {
         Ok(SerializedSourcePackage {
             storage_key: value.storage_key.into(),
             sha256: ByteBuf::from(value.sha256.to_vec()),
+            runtime_content_sha256: value
+                .runtime_content_sha256
+                .map(|sha256| ByteBuf::from(sha256.to_vec())),
+            runtime_generation: value.runtime_generation.map(|generation| {
+                SerializedSourcePackageRuntimeGeneration {
+                    deployment_sha256: ByteBuf::from(generation.deployment_sha256.to_vec()),
+                    generation_manifest_sha256: ByteBuf::from(
+                        generation.generation_manifest_sha256.to_vec(),
+                    ),
+                    generation_sha256: ByteBuf::from(generation.generation_sha256.to_vec()),
+                }
+            }),
             external_package_id: value
                 .external_deps_package_id
                 .map(|id| DeveloperDocumentId::from(id).encode()),
@@ -375,6 +409,23 @@ impl TryFrom<SerializedSourcePackage> for SourcePackage {
     fn try_from(value: SerializedSourcePackage) -> Result<Self, Self::Error> {
         let storage_key = value.storage_key.try_into()?;
         let sha256 = value.sha256.into_vec().try_into()?;
+        let runtime_content_sha256 = value
+            .runtime_content_sha256
+            .map(|sha256| sha256.into_vec().try_into())
+            .transpose()?;
+        let runtime_generation = value
+            .runtime_generation
+            .map(|generation| {
+                anyhow::Ok(SourcePackageRuntimeGeneration {
+                    deployment_sha256: generation.deployment_sha256.into_vec().try_into()?,
+                    generation_manifest_sha256: generation
+                        .generation_manifest_sha256
+                        .into_vec()
+                        .try_into()?,
+                    generation_sha256: generation.generation_sha256.into_vec().try_into()?,
+                })
+            })
+            .transpose()?;
         let external_package_id = match value.external_package_id {
             None => None,
             Some(s) => Some(DeveloperDocumentId::decode(&s)?.into()),
@@ -445,6 +496,8 @@ impl TryFrom<SerializedSourcePackage> for SourcePackage {
         Ok(Self {
             storage_key,
             sha256,
+            runtime_content_sha256,
+            runtime_generation,
             external_deps_package_id: external_package_id,
             package_size,
             node_version,
@@ -463,6 +516,8 @@ mod tests {
         SerializedSourcePackage {
             storage_key: "package.zip".to_owned(),
             sha256: ByteBuf::from(vec![0; 32]),
+            runtime_content_sha256: None,
+            runtime_generation: None,
             external_package_id: None,
             package_size: None,
             node_version: None,
@@ -502,6 +557,12 @@ mod tests {
         let package = SourcePackage {
             storage_key: "package.zip".try_into().unwrap(),
             sha256: Sha256Digest::from([0; 32]),
+            runtime_content_sha256: Some(Sha256Digest::from([1; 32])),
+            runtime_generation: Some(SourcePackageRuntimeGeneration {
+                deployment_sha256: Sha256Digest::from([2; 32]),
+                generation_manifest_sha256: Sha256Digest::from([3; 32]),
+                generation_sha256: Sha256Digest::from([4; 32]),
+            }),
             external_deps_package_id: None,
             package_size: PackageSize::default(),
             node_version: None,
@@ -510,6 +571,18 @@ mod tests {
         let serialized = SerializedSourcePackage::try_from(package).unwrap();
         let round_tripped = SourcePackage::try_from(serialized).unwrap();
         assert_eq!(round_tripped.node_executor_pool_topology, topology);
+        assert_eq!(
+            round_tripped.runtime_content_sha256,
+            Some(Sha256Digest::from([1; 32]))
+        );
+        assert_eq!(
+            round_tripped.runtime_generation,
+            Some(SourcePackageRuntimeGeneration {
+                deployment_sha256: Sha256Digest::from([2; 32]),
+                generation_manifest_sha256: Sha256Digest::from([3; 32]),
+                generation_sha256: Sha256Digest::from([4; 32]),
+            })
+        );
 
         let mut invalid = serialized_source_package();
         invalid.node_pool_module_paths = Some(vec![]);

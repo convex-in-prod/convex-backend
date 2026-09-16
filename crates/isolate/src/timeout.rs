@@ -50,6 +50,7 @@ pub const SYSTEM_TIMEOUT_ERROR_MESSAGE: &str =
 pub enum PauseReason {
     DatabaseSyscall { name: String },
     ConcurrencyPermitReacquire,
+    GeneratedLifecycleBarrier,
     UdfInitialize,
     LoadModule,
 }
@@ -59,6 +60,7 @@ impl PauseReason {
         match self {
             Self::DatabaseSyscall { name } => format!("database_syscall({name})"),
             Self::ConcurrencyPermitReacquire => "concurrency_permit_reacquire".to_string(),
+            Self::GeneratedLifecycleBarrier => "generated_lifecycle_barrier".to_string(),
             Self::UdfInitialize => "udf_initialize".to_string(),
             Self::LoadModule => "load_module".to_string(),
         }
@@ -76,6 +78,7 @@ pub struct Timeout<RT: Runtime> {
     handle: Box<dyn SpawnHandle>,
     inner: Arc<Mutex<TimeoutInner<RT>>>,
     done_rx: async_broadcast::Receiver<()>,
+    deadline_changed: async_broadcast::Sender<()>,
     pub permit: Option<ConcurrencyPermit>,
 }
 
@@ -87,6 +90,9 @@ struct TimeoutInner<RT: Runtime> {
 
     // How long has the timeout been in the paused state?
     pause_elapsed: Duration,
+    // A Static Hermes prepared entry starts a fresh active deadline without
+    // erasing the outer system-time accounting accumulated before activation.
+    active_pause_elapsed_base: Duration,
     max_time_paused: Option<Duration>,
 
     state: TimeoutState,
@@ -102,7 +108,10 @@ impl<RT: Runtime> TimeoutInner<RT> {
         match self.state {
             TimeoutState::Running => {
                 // Extend the deadline by the time spent paused.
-                let deadline = initial_deadline + self.pause_elapsed;
+                let deadline = initial_deadline
+                    + self
+                        .pause_elapsed
+                        .saturating_sub(self.active_pause_elapsed_base);
                 let now = self.rt.monotonic_now();
                 if now >= deadline {
                     metrics::log_user_timeout();
@@ -177,6 +186,57 @@ impl<RT: Runtime> Drop for Timeout<RT> {
 // We default to counting everything as user time but we exempt async syscalls
 // from the user timeout and count them as system time instead.
 impl<RT: Runtime> Timeout<RT> {
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub(crate) fn for_static_hermes_gate(rt: RT, permit: ConcurrencyPermit) -> Self {
+        let (done_tx, done_rx) = broadcast(1);
+        let (deadline_changed, _deadline_changed_rx) = broadcast(1);
+        let handle = rt.spawn("static_hermes_gate_timeout", async move {
+            let _done_tx = done_tx;
+            future::pending::<()>().await;
+        });
+        Self {
+            handle,
+            inner: Arc::new(Mutex::new(TimeoutInner {
+                rt: rt.clone(),
+                start: rt.monotonic_now(),
+                timeout: None,
+                pause_elapsed: Duration::ZERO,
+                active_pause_elapsed_base: Duration::ZERO,
+                max_time_paused: None,
+                state: TimeoutState::Running,
+                pause_breakdown: HashMap::new(),
+            })),
+            done_rx,
+            deadline_changed,
+            permit: Some(permit),
+        }
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub(crate) fn rearm_static_hermes_user_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        {
+            let mut inner = self.inner.lock();
+            anyhow::ensure!(
+                matches!(inner.state, TimeoutState::Running),
+                "cannot rearm a paused Static Hermes timeout"
+            );
+            anyhow::ensure!(
+                inner.timeout.is_some(),
+                "cannot rearm an unarmed Static Hermes timeout"
+            );
+            inner.start = inner.rt.monotonic_now();
+            inner.timeout = Some(timeout);
+            inner.active_pause_elapsed_base = inner.pause_elapsed;
+        }
+        // Keep the system-time accounting in the existing Timeout while waking
+        // its background task to observe the new active deadline.
+        let _ = self.deadline_changed.try_broadcast(());
+        Ok(())
+    }
+
     pub fn new(
         rt: RT,
         handle: ExecutionHandle,
@@ -184,23 +244,41 @@ impl<RT: Runtime> Timeout<RT> {
         max_time_paused: Option<Duration>,
         permit: ConcurrencyPermit,
     ) -> Self {
+        Self::new_with_termination(rt, timeout, max_time_paused, permit, move |reason| {
+            handle.terminate(reason)
+        })
+    }
+
+    pub(crate) fn new_with_termination(
+        rt: RT,
+        timeout: Option<Duration>,
+        max_time_paused: Option<Duration>,
+        permit: ConcurrencyPermit,
+        terminate: impl FnOnce(TerminationReason) + Send + 'static,
+    ) -> Self {
         let start = rt.monotonic_now();
         let inner = TimeoutInner {
             rt: rt.clone(),
             start,
             timeout,
             pause_elapsed: Duration::ZERO,
+            active_pause_elapsed_base: Duration::ZERO,
             max_time_paused,
             state: TimeoutState::Running,
             pause_breakdown: HashMap::new(),
         };
         let inner = Arc::new(Mutex::new(inner));
         let (done_tx, done_rx) = broadcast(1);
-        let handle = rt.spawn("isolate_timeout", Self::go(handle, inner.clone(), done_tx));
+        let (deadline_changed, deadline_changed_rx) = broadcast(1);
+        let handle = rt.spawn(
+            "isolate_timeout",
+            Self::go(terminate, inner.clone(), done_tx, deadline_changed_rx),
+        );
         Self {
             handle,
             inner,
             done_rx,
+            deadline_changed,
             permit: Some(permit),
         }
     }
@@ -294,15 +372,18 @@ impl<RT: Runtime> Timeout<RT> {
             .context(ErrorMetadata::bad_request(
                 "SystemTimeoutError",
                 SYSTEM_TIMEOUT_ERROR_MESSAGE,
-            ))?;
+            ));
         let suspended_permit = pause_guard
             .suspended_permit
             .take()
             .context("lost the suspended permit")?;
         drop(pause_guard);
 
-        // Time the permit reacquire separately.
-        let timeout = self.with_timeout();
+        // Reacquire before reporting the suspended operation's result. If the
+        // system timeout fired while the operation was suspended, returning
+        // first would let a Wasmtime host import trap and finalize without its
+        // active CPU admission. The reacquire itself cannot be bounded by this
+        // request timeout for the same reason.
         let (pause_start, tx) = self.pause_start(PauseReason::ConcurrencyPermitReacquire);
         let pause_guard = PauseGuard {
             timeout: self,
@@ -311,16 +392,10 @@ impl<RT: Runtime> Timeout<RT> {
             reason: PauseReason::ConcurrencyPermitReacquire,
             suspended_permit: None,
         };
-        let permit =
-            timeout(suspended_permit.acquire())
-                .await
-                .context(ErrorMetadata::bad_request(
-                    "SystemTimeoutError",
-                    SYSTEM_TIMEOUT_ERROR_MESSAGE,
-                ))?;
+        let permit = suspended_permit.acquire().await;
         drop(pause_guard);
         self.permit = Some(permit);
-        result
+        result?
     }
 
     pub async fn with_release_permit<T>(
@@ -339,30 +414,52 @@ impl<RT: Runtime> Timeout<RT> {
     }
 
     async fn go(
-        handle: ExecutionHandle,
+        terminate: impl FnOnce(TerminationReason),
         inner: Arc<Mutex<TimeoutInner<RT>>>,
         done_tx: async_broadcast::Sender<()>,
+        mut deadline_changed: async_broadcast::Receiver<()>,
     ) {
-        let timeout = match inner.lock().timeout {
-            None => return,
-            Some(timeout) => timeout,
-        };
         let termination_reason = loop {
-            let future = match inner.lock().termination_reason_or_wait(timeout) {
-                Ok(termination_reason) => break termination_reason,
-                Err(future) => future,
+            let timeout = match inner.lock().timeout {
+                None => return,
+                Some(timeout) => timeout,
             };
-            future.await;
+            let wait = match inner.lock().termination_reason_or_wait(timeout) {
+                Ok(termination_reason) => break termination_reason,
+                Err(wait) => wait,
+            };
+            let deadline_change = deadline_changed.recv();
+            pin_mut!(wait);
+            pin_mut!(deadline_change);
+            let _ = future::select(wait, deadline_change).await;
         };
         if let Some(reason) = termination_reason {
-            handle.terminate(reason);
+            terminate(reason);
         }
         let _ = done_tx.try_broadcast(());
     }
 
     pub fn into_function_execution_time(self, udf_type: UdfType) -> FunctionExecutionTime {
+        self.function_execution_time(udf_type)
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub(crate) fn into_function_execution_time_with_permit(
+        mut self,
+        udf_type: UdfType,
+    ) -> anyhow::Result<(FunctionExecutionTime, ConcurrencyPermit)> {
+        let execution_time = self.function_execution_time(udf_type);
+        let permit = self.permit.take().context("lost the permit")?;
+        Ok((execution_time, permit))
+    }
+
+    fn function_execution_time(&self, udf_type: UdfType) -> FunctionExecutionTime {
         let inner = self.inner.lock();
-        let elapsed = inner.rt.monotonic_now() - inner.start - inner.pause_elapsed;
+        let elapsed = inner.rt.monotonic_now()
+            - inner.start
+            - inner
+                .pause_elapsed
+                .saturating_sub(inner.active_pause_elapsed_base);
         let limit = inner.timeout.unwrap_or(Duration::ZERO);
         metrics::log_user_function_execution_time(udf_type, elapsed);
         FunctionExecutionTime { elapsed, limit }
@@ -502,7 +599,13 @@ impl<RT: Runtime> Drop for PauseGuard<'_, RT> {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::Arc,
+        sync::{
+            atomic::{
+                AtomicBool,
+                Ordering,
+            },
+            Arc,
+        },
         task::Poll,
     };
 
@@ -517,6 +620,7 @@ mod tests {
 
     fn timeout_for_test(rt: &ProdRuntime, permit: ConcurrencyPermit) -> Timeout<ProdRuntime> {
         let (done_tx, done_rx) = broadcast(1);
+        let (deadline_changed, _deadline_changed_rx) = broadcast(1);
         let handle = rt.spawn("timeout_test", async move {
             let _done_tx = done_tx;
             future::pending::<()>().await;
@@ -528,11 +632,13 @@ mod tests {
                 start: rt.monotonic_now(),
                 timeout: None,
                 pause_elapsed: Duration::ZERO,
+                active_pause_elapsed_base: Duration::ZERO,
                 max_time_paused: None,
                 state: TimeoutState::Running,
                 pause_breakdown: HashMap::new(),
             })),
             done_rx,
+            deadline_changed,
             permit: Some(permit),
         }
     }
@@ -645,6 +751,62 @@ mod tests {
                 );
             }
             drop(timeout);
+            assert_eq!(limiter.active_permits(), 0);
+        });
+    }
+
+    #[test]
+    fn system_timeout_regains_the_permit_before_returning() {
+        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
+        let rt = ProdRuntime::new(&tokio);
+        let block_rt = rt.clone();
+        block_rt.block_on("system_timeout_permit_regain_test", async move {
+            let limiter = ConcurrencyLimiter::new(1);
+            let permit = limiter
+                .acquire(Arc::new("timeout test".to_owned()), false)
+                .await;
+            let terminated_by_system_timeout = Arc::new(AtomicBool::new(false));
+            let termination_observer = Arc::clone(&terminated_by_system_timeout);
+            let mut timeout = Timeout::new_with_termination(
+                rt,
+                // A paused timeout is reevaluated when the active deadline
+                // wakes the watchdog. Keep this short so this test exercises
+                // the system-timeout completion path without waiting seconds.
+                Some(Duration::from_millis(20)),
+                Some(Duration::from_millis(5)),
+                permit,
+                move |reason| {
+                    termination_observer.store(
+                        matches!(
+                            reason,
+                            TerminationReason::Isolate(IsolateTerminationReason::SystemTimeout(_))
+                        ),
+                        Ordering::Release,
+                    );
+                },
+            );
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                timeout.with_release_permit(
+                    PauseReason::DatabaseSyscall {
+                        name: "timeout test".to_owned(),
+                    },
+                    future::pending::<anyhow::Result<()>>(),
+                ),
+            )
+            .await
+            .expect("system timeout did not complete");
+            assert!(result.is_err());
+            assert!(terminated_by_system_timeout.load(Ordering::Acquire));
+            assert!(timeout.permit.is_some());
+            assert_eq!(limiter.active_permits(), 1);
+
+            drop(
+                timeout
+                    .finish_with_permit()
+                    .expect("system timeout lost reacquired permit"),
+            );
             assert_eq!(limiter.active_permits(), 0);
         });
     }

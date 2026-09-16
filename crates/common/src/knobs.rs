@@ -136,6 +136,25 @@ pub struct LocalNodeExecutorPoolPolicy {
     pub max_event_loop_unresponsive_seconds: Option<u64>,
     /// Queue duration after which admission records an operator warning metric.
     pub queue_warning_seconds: Option<u64>,
+    /// Maximum generation age in seconds. Omitted inherits the global age;
+    /// `null` disables age-only retirement for this pool.
+    #[serde(default, deserialize_with = "deserialize_generation_age")]
+    pub max_generation_age_seconds: Option<Option<u64>>,
+    /// Bounded time allowed for a registered resident retirement callback.
+    #[serde(default, deserialize_with = "deserialize_background_drain_timeout")]
+    pub background_drain_timeout_seconds: Option<u64>,
+}
+
+fn deserialize_generation_age<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<u64>>, D::Error> {
+    Option::<u64>::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_background_drain_timeout<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
 }
 
 struct UniqueLocalNodeExecutorPoolPolicies(BTreeMap<String, LocalNodeExecutorPoolPolicy>);
@@ -214,8 +233,23 @@ fn parse_local_node_executor_pool_policies(
                 || policy.max_old_space_size_mib.is_some()
                 || policy.memory_pressure_min_rss_bytes.is_some()
                 || policy.max_event_loop_unresponsive_seconds.is_some()
-                || policy.queue_warning_seconds.is_some(),
+                || policy.queue_warning_seconds.is_some()
+                || policy.max_generation_age_seconds.is_some()
+                || policy.background_drain_timeout_seconds.is_some(),
             "Node pool {pool_name:?} has an empty policy"
+        );
+        anyhow::ensure!(
+            policy
+                .max_generation_age_seconds
+                .flatten()
+                .is_none_or(|seconds| seconds > 0),
+            "Node pool {pool_name:?} maxGenerationAgeSeconds must be null or greater than zero"
+        );
+        anyhow::ensure!(
+            policy
+                .background_drain_timeout_seconds
+                .is_none_or(|seconds| seconds > 0 && seconds <= 2_147_483),
+            "Node pool {pool_name:?} backgroundDrainTimeoutSeconds must be between 1 and 2147483"
         );
         if let Some(max_concurrency) = policy.max_concurrency {
             validate_usize_strict_nonzero("maxConcurrency", max_concurrency)?;
@@ -347,11 +381,60 @@ pub fn local_node_executor_pool_memory_pressure_min_rss_bytes(pool_name: &str) -
     )
 }
 
+/// Returns the effective generation-age setting. `None` disables age-only
+/// retirement.
+pub fn local_node_executor_pool_generation_age(pool_name: &str) -> Option<Duration> {
+    effective_local_node_executor_pool_generation_age(
+        &LOCAL_NODE_EXECUTOR_POOL_POLICIES,
+        *LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE,
+        pool_name,
+    )
+}
+
+fn effective_local_node_executor_pool_generation_age(
+    policies: &BTreeMap<String, LocalNodeExecutorPoolPolicy>,
+    global_age: Duration,
+    pool_name: &str,
+) -> Option<Duration> {
+    match policies
+        .get(pool_name)
+        .and_then(|policy| policy.max_generation_age_seconds.as_ref())
+    {
+        Some(Some(seconds)) => Some(Duration::from_secs(*seconds)),
+        Some(None) => None,
+        None => Some(global_age),
+    }
+}
+
+/// Returns the bounded resident cleanup timeout for an application pool. The
+/// default keeps pools without registered resident work behaviorally unchanged.
+pub fn local_node_executor_pool_background_drain_timeout(pool_name: &str) -> Duration {
+    Duration::from_secs(
+        LOCAL_NODE_EXECUTOR_POOL_POLICIES
+            .get(pool_name)
+            .and_then(|policy| policy.background_drain_timeout_seconds)
+            .unwrap_or(30),
+    )
+}
+
 fn env_config_duration_millis_strict(name: &str, default: usize) -> Duration {
     let millis = env_config_usize_strict(name, default)
         .try_into()
         .unwrap_or_else(|_| panic!("Invalid value for {name}: milliseconds do not fit in u64"));
     Duration::from_millis(millis)
+}
+
+fn env_config_duration_millis_strict_nonzero(name: &str, default: usize) -> Duration {
+    let milliseconds = env_config_usize_strict(name, default)
+        .try_into()
+        .unwrap_or_else(|_| panic!("Invalid value for {name}: milliseconds do not fit in u64"));
+    validate_duration_millis_strict_nonzero(name, milliseconds)
+}
+
+fn validate_duration_millis_strict_nonzero(name: &str, milliseconds: u64) -> Duration {
+    let duration = Duration::from_millis(milliseconds);
+    assert!(!duration.is_zero(), "{name} must be greater than zero");
+    duration
 }
 
 fn env_config_bool_strict(name: &str, default: bool) -> bool {
@@ -1874,6 +1957,172 @@ pub static APPLICATION_MAX_CONCURRENT_MUTATIONS: LazyLock<usize> = LazyLock::new
     )
 });
 
+/// Basis-point sampling rate for V8-primary Static Hermes Wasm query shadows.
+///
+/// Zero disables the production shadow path. A five-percent rollout uses 500.
+pub static APPLICATION_STATIC_HERMES_QUERY_SHADOW_BPS: LazyLock<u16> = LazyLock::new(|| {
+    let value = env_config("APPLICATION_STATIC_HERMES_QUERY_SHADOW_BPS", 0);
+    assert!(
+        value <= 10_000,
+        "query shadow sampling must not exceed 10000 bps"
+    );
+    value
+});
+
+/// Basis-point sampling rate for V8-primary Static Hermes Wasm mutation
+/// shadows.
+///
+/// Zero disables the production shadow path. Query and mutation lanes are
+/// sampled independently, but share one immediate-admission concurrency budget.
+pub static APPLICATION_STATIC_HERMES_MUTATION_SHADOW_BPS: LazyLock<u16> = LazyLock::new(|| {
+    let value = env_config("APPLICATION_STATIC_HERMES_MUTATION_SHADOW_BPS", 0);
+    assert!(
+        value <= 10_000,
+        "mutation shadow sampling must not exceed 10000 bps"
+    );
+    value
+});
+
+/// Optional query-specific Wasm-primary routing switch.
+///
+/// When unset, query routing follows the process-wide Static Hermes gate for
+/// compatibility. Set this to `0` or `1` to roll query authority separately
+/// from mutation authority.
+pub static APPLICATION_STATIC_HERMES_QUERY_WASM_PRIMARY_ENABLED: LazyLock<Option<bool>> =
+    LazyLock::new(|| {
+        env_config_optional_bool_strict("APPLICATION_STATIC_HERMES_QUERY_WASM_PRIMARY_ENABLED")
+    });
+
+/// Optional mutation-specific Wasm-primary routing switch.
+///
+/// When unset, mutation routing follows the process-wide Static Hermes gate
+/// for compatibility. The process-wide gate must be enabled before either
+/// per-UDF switch can enable Wasm authority.
+pub static APPLICATION_STATIC_HERMES_MUTATION_WASM_PRIMARY_ENABLED: LazyLock<Option<bool>> =
+    LazyLock::new(|| {
+        env_config_optional_bool_strict("APPLICATION_STATIC_HERMES_MUTATION_WASM_PRIMARY_ENABLED")
+    });
+
+/// Resolve query and mutation Wasm-primary routing from the process-wide gate
+/// and the optional per-UDF overrides.
+pub fn static_hermes_wasm_primary_directions(gate_enabled: bool) -> anyhow::Result<(bool, bool)> {
+    let query_wasm_primary_enabled =
+        (*APPLICATION_STATIC_HERMES_QUERY_WASM_PRIMARY_ENABLED).unwrap_or(gate_enabled);
+    let mutation_wasm_primary_enabled =
+        (*APPLICATION_STATIC_HERMES_MUTATION_WASM_PRIMARY_ENABLED).unwrap_or(gate_enabled);
+    anyhow::ensure!(
+        gate_enabled || !(query_wasm_primary_enabled || mutation_wasm_primary_enabled),
+        "per-UDF Wasm-primary routing requires CONVEX_STATIC_HERMES_WASM_GATE_ENABLED=1"
+    );
+    Ok((query_wasm_primary_enabled, mutation_wasm_primary_enabled))
+}
+
+/// Validate that each Static Hermes verifier rate matches its configured
+/// primary runtime.
+pub fn validate_static_hermes_verifier_directions(
+    query_shadow_bps: u16,
+    mutation_shadow_bps: u16,
+    query_wasm_primary_v8_shadow_bps: u16,
+    mutation_wasm_primary_v8_shadow_bps: u16,
+    query_wasm_primary_enabled: bool,
+    mutation_wasm_primary_enabled: bool,
+) -> anyhow::Result<()> {
+    if query_wasm_primary_enabled {
+        anyhow::ensure!(
+            query_shadow_bps == 0,
+            "query V8-primary Static Hermes shadow sampling must be zero when query Wasm-primary \
+             routing is enabled"
+        );
+    } else {
+        anyhow::ensure!(
+            query_wasm_primary_v8_shadow_bps == 0,
+            "query Wasm-primary V8 verifier sampling must be zero when query Wasm-primary routing \
+             is disabled"
+        );
+    }
+    if mutation_wasm_primary_enabled {
+        anyhow::ensure!(
+            mutation_shadow_bps == 0,
+            "mutation V8-primary Static Hermes shadow sampling must be zero when mutation \
+             Wasm-primary routing is enabled"
+        );
+    } else {
+        anyhow::ensure!(
+            mutation_wasm_primary_v8_shadow_bps == 0,
+            "mutation Wasm-primary V8 verifier sampling must be zero when mutation Wasm-primary \
+             routing is disabled"
+        );
+    }
+    Ok(())
+}
+
+/// Basis-point sampling rate for V8 verification behind Wasm-primary queries.
+///
+/// Zero disables the verifier. The verifier is background work and never
+/// affects the Wasm response or its state transition.
+pub static APPLICATION_STATIC_HERMES_QUERY_WASM_PRIMARY_V8_SHADOW_BPS: LazyLock<u16> =
+    LazyLock::new(|| {
+        let value = env_config(
+            "APPLICATION_STATIC_HERMES_QUERY_WASM_PRIMARY_V8_SHADOW_BPS",
+            0,
+        );
+        assert!(
+            value <= 10_000,
+            "Wasm-primary query V8 shadow sampling must not exceed 10000 bps"
+        );
+        value
+    });
+
+/// Basis-point sampling rate for V8 verification behind Wasm-primary
+/// mutations.
+pub static APPLICATION_STATIC_HERMES_MUTATION_WASM_PRIMARY_V8_SHADOW_BPS: LazyLock<u16> =
+    LazyLock::new(|| {
+        let value = env_config(
+            "APPLICATION_STATIC_HERMES_MUTATION_WASM_PRIMARY_V8_SHADOW_BPS",
+            0,
+        );
+        assert!(
+            value <= 10_000,
+            "Wasm-primary mutation V8 shadow sampling must not exceed 10000 bps"
+        );
+        value
+    });
+
+/// Maximum number of Static Hermes verifier lanes running concurrently.
+///
+/// Admission is immediate and has no queue. This limit does not include the
+/// authoritative primary invocation and is shared by both directions and UDF
+/// types.
+pub static APPLICATION_STATIC_HERMES_SHADOW_CONCURRENCY: LazyLock<usize> =
+    LazyLock::new(|| env_config("APPLICATION_STATIC_HERMES_SHADOW_CONCURRENCY", 8));
+
+/// Maximum wall-clock duration for one admitted Static Hermes verifier.
+///
+/// This bounds verifier-only setup, execution, and comparison without affecting
+/// the authoritative invocation. Thirty seconds leaves room for cold artifact
+/// and retained-runtime work while preventing an admitted verifier from
+/// occupying its concurrency slot indefinitely.
+pub static APPLICATION_STATIC_HERMES_SHADOW_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    env_config_duration_millis_strict_nonzero(
+        "APPLICATION_STATIC_HERMES_SHADOW_TIMEOUT_MILLISECONDS",
+        30_000,
+    )
+});
+
+/// Maximum number of authenticated routes retained in shadow metrics for each
+/// runtime direction.
+///
+/// Aggregate metrics continue when this cap is full. The default covers the
+/// initial campaign while bounding memory used by route-keyed HDR histograms.
+/// V8-primary/Wasm-shadow and Wasm-primary/V8-verifier routes apply this cap
+/// independently.
+pub static APPLICATION_STATIC_HERMES_SHADOW_MAX_ACTIVE_ROUTES: LazyLock<usize> =
+    LazyLock::new(|| {
+        let value = env_config("APPLICATION_STATIC_HERMES_SHADOW_MAX_ACTIVE_ROUTES", 2_048);
+        assert!(value > 0, "shadow active-route cap must be positive");
+        value
+    });
+
 /// The maximum number of v8 actions that can be run concurrently by an
 /// application.
 ///
@@ -2913,6 +3162,33 @@ mod strict_capacity_tests {
         assert!(validate_percent("PERCENT", 101).is_err());
     }
 
+    fn positive_duration_millis_parser_accepts_valid_values_and_rejects_zero() {
+        assert_eq!(
+            validate_duration_millis_strict_nonzero(
+                "APPLICATION_STATIC_HERMES_SHADOW_TIMEOUT_MILLISECONDS",
+                30_000,
+            ),
+            Duration::from_secs(30)
+        );
+
+        let zero = std::panic::catch_unwind(|| {
+            validate_duration_millis_strict_nonzero(
+                "APPLICATION_STATIC_HERMES_SHADOW_TIMEOUT_MILLISECONDS",
+                0,
+            )
+        });
+        assert!(zero.is_err());
+    }
+
+    #[test]
+    fn positive_duration_millis_parser_rejects_malformed_values() {
+        assert!(parse_usize_strict(
+            "APPLICATION_STATIC_HERMES_SHADOW_TIMEOUT_MILLISECONDS",
+            "thirty-seconds"
+        )
+        .is_err());
+    }
+
     #[test]
     fn degradable_query_capacity_leaves_each_finite_shared_base() {
         assert!(validate_degradable_query_leader_capacity(4, 16, 300, 1, 8, 0, 0).is_ok());
@@ -2975,7 +3251,12 @@ mod strict_capacity_tests {
                     "maxEventLoopUnresponsiveSeconds": 30
                 },
                 "watchdog": {
-                    "maxEventLoopUnresponsiveSeconds": 10
+                    "maxEventLoopUnresponsiveSeconds": 10,
+                    "maxGenerationAgeSeconds": null,
+                    "backgroundDrainTimeoutSeconds": 45
+                },
+                "aged": {
+                    "maxGenerationAgeSeconds": 90
                 }
             }"#,
         )
@@ -2991,6 +3272,12 @@ mod strict_capacity_tests {
             Some(1024 * 1024 * 1024)
         );
         assert_eq!(policies["default"].queue_warning_seconds, Some(5));
+        assert_eq!(policies["watchdog"].max_generation_age_seconds, Some(None));
+        assert_eq!(
+            policies["watchdog"].background_drain_timeout_seconds,
+            Some(45)
+        );
+        assert_eq!(policies["aged"].max_generation_age_seconds, Some(Some(90)));
 
         assert_eq!(
             effective_local_node_executor_pool_rss_bytes(
@@ -3074,6 +3361,9 @@ mod strict_capacity_tests {
             r#"{"planning": {"unknown": 1}}"#,
             r#"{"planning": {"queueWarningSeconds": 5}}"#,
             r#"{"planning": {"maxEventLoopUnresponsiveSeconds": 0}}"#,
+            r#"{"planning": {"maxGenerationAgeSeconds": 0}}"#,
+            r#"{"planning": {"maxGenerationAgeSeconds": "90"}}"#,
+            r#"{"planning": {"backgroundDrainTimeoutSeconds": 0}}"#,
             r#"{"planning": {"queueWarningSeconds": 0}}"#,
             r#"{
                 "planning": {"maxConcurrency": 1},

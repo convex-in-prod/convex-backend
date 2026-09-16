@@ -14,6 +14,7 @@ use database::{
     SystemMetadataModel,
     Transaction,
 };
+use errors::ErrorMetadata;
 use value::{
     id_v6::DeveloperDocumentId,
     TableName,
@@ -23,6 +24,7 @@ use value::{
 use self::types::{
     ExternalDepsPackage,
     ExternalDepsPackageId,
+    ExternalDepsPackageSelection,
 };
 use crate::{
     SystemIndex,
@@ -78,6 +80,31 @@ impl<'a, RT: Runtime> ExternalPackagesModel<'a, RT> {
             .await?;
         let doc_id: DeveloperDocumentId = id.into();
         Ok(doc_id.into())
+    }
+
+    pub async fn get_selected(
+        &mut self,
+        selection: &ExternalDepsPackageSelection,
+    ) -> anyhow::Result<ExternalDepsPackage> {
+        // An admitted package remains selected even after newer builds enter the name
+        // cache.
+        let id: DeveloperDocumentId = selection.id.clone().into();
+        let package = self
+            .tx
+            .get_system::<ExternalPackagesTable>(TableNamespace::Global, id)
+            .await?
+            .context(ErrorMetadata::bad_request(
+                "ExternalDepsPackageNotFound",
+                "Selected external dependency package does not exist",
+            ))?;
+        anyhow::ensure!(
+            package.sha256 == selection.sha256,
+            ErrorMetadata::bad_request(
+                "ExternalDepsPackageMismatch",
+                "Selected external dependency package SHA-256 does not match",
+            )
+        );
+        Ok((**package).clone())
     }
 
     #[fastrace::trace]

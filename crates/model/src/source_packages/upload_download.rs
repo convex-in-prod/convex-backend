@@ -1,6 +1,10 @@
 use std::{
     collections::BTreeMap,
     sync::Arc,
+    time::{
+        Duration,
+        SystemTime,
+    },
 };
 
 use anyhow::Context as AnyhowContext;
@@ -64,6 +68,11 @@ pub struct PackagedFile {
     pub source_map_checksum: Option<Sha256Digest>,
 }
 
+pub struct DownloadedSourcePackage {
+    pub external_deps_storage_key: Option<ObjectKey>,
+    pub modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
+}
+
 #[derive(Serialize, Deserialize, Eq, PartialEq, Debug)]
 #[serde(rename_all = "camelCase")]
 struct MetadataJson {
@@ -74,11 +83,15 @@ struct MetadataJson {
 }
 
 #[fastrace::trace]
-async fn write_package(
+/// Write the canonical source-package archive consumed by the backend.
+pub async fn write_package(
     package: BTreeMap<CanonicalizedModulePath, &ModuleConfig>,
     mut out: impl AsyncWrite + Send + Unpin,
     external_deps_storage_key: Option<ObjectKey>,
 ) -> anyhow::Result<(usize, BTreeMap<CanonicalizedModulePath, PackagedFile>)> {
+    // ZIP's timestamp range starts at 1980, so use that epoch instead of a pre-1980
+    // time that the archive format would wrap.
+    let archive_timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(315_532_800);
     let mut writer = ZipFileWriter::new(&mut out);
     let mut files = BTreeMap::new();
     let mut module_paths = vec![];
@@ -92,8 +105,9 @@ async fn write_package(
         // easily change this later.
         let source_path = format!("modules/{}", String::from(path.clone()));
         // 0o644 => read-write for owner, read for everyone else.
-        let builder =
-            ZipEntryBuilder::new(source_path.clone(), Compression::Deflate).unix_permissions(0o644);
+        let builder = ZipEntryBuilder::new(source_path.clone(), Compression::Deflate)
+            .unix_permissions(0o644)
+            .last_modification_date(archive_timestamp.into());
         module_paths.push(String::from(path.clone()));
         module_environments.push((
             String::from(path.clone()),
@@ -113,7 +127,8 @@ async fn write_package(
             // suffix this with ".map".
             let source_map_path = format!("modules/{}.map", String::from(path.clone()));
             let builder = ZipEntryBuilder::new(source_map_path.clone(), Compression::Deflate)
-                .unix_permissions(0o644);
+                .unix_permissions(0o644)
+                .last_modification_date(archive_timestamp.into());
             module_paths.push(String::from(path.clone()) + ".map");
             unzipped_size_bytes += source_map.len();
             writer.write_entry_whole(builder, source_map).await?;
@@ -128,7 +143,8 @@ async fn write_package(
         anyhow::ensure!(files.insert(path, packaged_file).is_none());
     }
 
-    let metadata_entry = ZipEntryBuilder::new("metadata.json".to_string(), Compression::Deflate);
+    let metadata_entry = ZipEntryBuilder::new("metadata.json".to_string(), Compression::Deflate)
+        .last_modification_date(archive_timestamp.into());
     let metadata_contents = MetadataJson {
         module_paths,
         module_environments: Some(module_environments),
@@ -176,6 +192,18 @@ pub async fn download_package(
     storage: Arc<dyn Storage>,
     package: &SourcePackage,
 ) -> anyhow::Result<BTreeMap<CanonicalizedModulePath, ModuleConfig>> {
+    Ok(download_package_with_metadata(storage, package)
+        .await?
+        .modules)
+}
+
+/// Download a source package together with the dependency identity recorded in
+/// its archive metadata.
+#[fastrace::trace]
+pub async fn download_package_with_metadata(
+    storage: Arc<dyn Storage>,
+    package: &SourcePackage,
+) -> anyhow::Result<DownloadedSourcePackage> {
     let object_key = storage.fully_qualified_key(&package.storage_key);
     let object_size = package.package_size.zipped_size_bytes as u64;
     let stream = if object_size > 0 {
@@ -241,6 +269,11 @@ pub async fn download_package(
 
     // Make sure metadata.json looks right
     let metadata_json = metadata_json.context("metadata.json not found")?;
+    let external_deps_storage_key = metadata_json
+        .external_deps_storage_key
+        .as_deref()
+        .map(ObjectKey::try_from)
+        .transpose()?;
 
     let mut found_paths: Vec<_> = source
         .keys()
@@ -327,11 +360,20 @@ pub async fn download_package(
             .matches_archive(&node_executor_pool_topology(out.values())?),
         "Source package archive Node pool topology does not match durable metadata"
     );
-    Ok(out)
+    Ok(DownloadedSourcePackage {
+        external_deps_storage_key,
+        modules: out,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::Cursor,
+        time::SystemTime,
+    };
+
+    use async_zip_0_0_9::read::seek::ZipFileReader as SeekZipFileReader;
     use common::types::ModuleEnvironment;
 
     use super::*;
@@ -360,5 +402,41 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&metadata).unwrap();
         assert!(serde_json::from_slice::<LegacyMetadataJson>(&encoded).is_err());
+    }
+
+    #[tokio::test]
+    async fn write_package_produces_a_deterministic_archive() {
+        let module = ModuleConfig {
+            path: "functions/example.js".parse().unwrap(),
+            source: ModuleSource::new("export const example = 1;"),
+            source_map: Some("example-source-map".to_owned()),
+            environment: ModuleEnvironment::Isolate,
+            node_pool: None,
+        };
+        let package = || BTreeMap::from([(module.path.clone().canonicalize(), &module)]);
+        let mut first_archive = Cursor::new(Vec::new());
+        write_package(package(), &mut first_archive, None)
+            .await
+            .unwrap();
+        let mut second_archive = Cursor::new(Vec::new());
+        write_package(package(), &mut second_archive, None)
+            .await
+            .unwrap();
+
+        assert_eq!(first_archive.get_ref(), second_archive.get_ref());
+
+        first_archive.set_position(0);
+        let archive = SeekZipFileReader::new(&mut first_archive).await.unwrap();
+        let expected_timestamp: chrono::DateTime<chrono::Utc> =
+            (SystemTime::UNIX_EPOCH + Duration::from_secs(315_532_800)).into();
+        assert_eq!(archive.entries().len(), 3);
+        for entry in archive.entries() {
+            assert_eq!(
+                entry.last_modification_date(),
+                &expected_timestamp,
+                "{} must have the fixed source-package timestamp",
+                entry.filename(),
+            );
+        }
     }
 }

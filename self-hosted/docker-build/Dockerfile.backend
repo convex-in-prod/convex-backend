@@ -8,7 +8,9 @@ ARG VERGEN_GIT_COMMIT_TIMESTAMP
 # cargo-chef is used to cache Rust dependencies and build artifacts
 # It creates a recipe of our dependencies first, then builds them in a separate stage
 # This helps avoid rebuilding dependencies when only first-party source code changes
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+# Pin the multi-platform index so retries cannot silently replace the build environment.
+FROM lukemathwalker/cargo-chef:latest-rust-1@sha256:b8cfeff0a392bc4bf5066210875728562b5b6ba66fe3b67aae0c6b7d56df1043 AS chef
+ARG TARGETARCH
 WORKDIR /tmp
 COPY rust-toolchain .
 # Dummy command to just fetch the toolchain that'll get installed by running `cargo chef`
@@ -22,15 +24,15 @@ COPY third_party/mysql_async ./third_party/mysql_async
 COPY .cargo ./.cargo
 # Exclusive cache mounts make it safe to remove Git locks left by a canceled
 # BuildKit step before Cargo accesses the persistent repositories.
-RUN --mount=type=cache,id=convex-backend-cargo-git-db,target=/usr/local/cargo/git/db,sharing=locked \
-    --mount=type=cache,id=convex-backend-cargo-git-checkouts,target=/usr/local/cargo/git/checkouts,sharing=locked \
-    --mount=type=cache,id=convex-backend-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+RUN --mount=type=cache,id=convex-backend-cargo-git-db-${TARGETARCH},target=/usr/local/cargo/git/db,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-git-checkouts-${TARGETARCH},target=/usr/local/cargo/git/checkouts,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
     find /usr/local/cargo/git -type f -name '*.lock' -delete && \
     cargo chef prepare --recipe-path recipe.json --bin convex-local-backend
 
 # Build stage: Compiles the Rust backend with all dependencies
 # Uses cargo-chef's recipe from the previous stage for optimal caching
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS build
+FROM lukemathwalker/cargo-chef:latest-rust-1@sha256:b8cfeff0a392bc4bf5066210875728562b5b6ba66fe3b67aae0c6b7d56df1043 AS build-dependencies
 SHELL ["/bin/bash", "-e", "-o", "pipefail", "-c"]
 
 # Update APT configuration for Docker builds
@@ -42,10 +44,10 @@ printf 'APT::Get::Assume-Yes \"true\";\n' > /etc/apt/apt.conf.d/90forceyes
 printf 'DPkg::Lock::Timeout \"30\";\n' > /etc/apt/apt.conf.d/85timeout
 echo 'DEBIAN_FRONTEND=noninteractive' > /etc/environment
 apt-get update
-apt-get install -y --no-install-recommends cmake libclang-dev libstdc++6 libc6
+apt-get install -y --no-install-recommends cmake libclang-dev libstdc++6 libc6 sccache
 EOF
 
-# Install Just (for build scripts)
+# Install Just for the JavaScript workspace setup below.
 RUN cargo install just
 
 WORKDIR /
@@ -99,24 +101,22 @@ COPY .cargo ./.cargo
 COPY third_party/mysql_async ./third_party/mysql_async
 COPY --from=chef /tmp/recipe.json recipe.json
 ARG CARGO_BUILD_PROFILE=release
+ARG CARGO_BUILD_JOBS=8
 ARG CARGO_PROFILE_RELEASE_DEBUG=
 ARG CARGO_PROFILE_RELEASE_STRIP=
 ARG TARGETARCH
-# Keep cargo-chef and the final build on the mounted target cache. This also
-# makes the artifact paths below independent of Cargo config target-dir changes.
 ENV CARGO_TARGET_DIR=/convex/target
-# cargo-chef removes dummy workspace artifacts after Cargo releases its own
-# target lock. Lock all partially mounted Cargo caches across concurrent builds;
-# TARGETARCH also keeps native artifacts from different platforms separate.
-# Use cargo-chef to build dependencies from the recipe created in the first stage
-# This step will be cached unless dependencies change
 RUN --mount=type=cache,id=convex-backend-target-${TARGETARCH},target=/convex/target,sharing=locked \
-    --mount=type=cache,id=convex-backend-cargo-git-db,target=/usr/local/cargo/git/db,sharing=locked \
-    --mount=type=cache,id=convex-backend-cargo-git-checkouts,target=/usr/local/cargo/git/checkouts,sharing=locked \
-    --mount=type=cache,id=convex-backend-cargo-registry,target=/usr/local/cargo/registry,sharing=locked <<EOF
+    --mount=type=cache,id=convex-backend-cargo-git-db-${TARGETARCH},target=/usr/local/cargo/git/db,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-git-checkouts-${TARGETARCH},target=/usr/local/cargo/git/checkouts,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked <<EOF
 set -euo pipefail
 find /usr/local/cargo/git -type f -name '*.lock' -delete
 : "${CARGO_BUILD_PROFILE:?CARGO_BUILD_PROFILE must not be empty}"
+if [[ ! "$CARGO_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CARGO_BUILD_JOBS must be a positive integer" >&2
+  exit 1
+fi
 if [[ -n "$CARGO_PROFILE_RELEASE_DEBUG" ]]; then
   export CARGO_PROFILE_RELEASE_DEBUG
 else
@@ -127,16 +127,47 @@ if [[ -n "$CARGO_PROFILE_RELEASE_STRIP" ]]; then
 else
   unset CARGO_PROFILE_RELEASE_STRIP
 fi
-PROTOC="$(mise which protoc)" cargo chef cook --profile "$CARGO_BUILD_PROFILE" --recipe-path recipe.json
+PROTOC="$(mise which protoc)" cargo chef cook \
+  --jobs "$CARGO_BUILD_JOBS" \
+  --profile "$CARGO_BUILD_PROFILE" \
+  --recipe-path recipe.json
 EOF
-# Copy first-party Rust and JavaScript sources only after dependency cooking.
-# isolate's build script installs the frozen JavaScript workspace with lifecycle
-# scripts disabled and builds the packages embedded in the backend. A separate
-# `just install-js` here duplicates that install and downloads unrelated browser
-# artifacts whenever package source changes.
+
+FROM build-dependencies AS build
+ARG CARGO_BUILD_PROFILE=release
+ARG CARGO_BUILD_JOBS=8
+ARG CARGO_PROFILE_RELEASE_PACKAGE_LOCAL_BACKEND_CODEGEN_UNITS=
+ARG CARGO_PROFILE_RELEASE_DEBUG=
+ARG CARGO_PROFILE_RELEASE_STRIP=
+ARG LOCAL_BACKEND_FEATURES=
+ARG NATIVE_PREBUILD_JOBS=1
+ARG NATIVE_PREBUILD_PACKAGES=
+ARG RUSTC_PARALLEL_FRONTEND_THREADS=
+ARG SCCACHE_CACHE_SIZE=
+ARG SERIALIZE_LOCAL_BACKEND_CODEGEN=false
+ARG BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY=false
+ARG TARGETARCH
+# Keep the final Cargo graph concurrency independent from an optional native
+# dependency prebuild. The prebuild uses Cargo's own job count so build scripts
+# and cc-rs inherit the requested jobserver width. Cache both Rust and native
+# compiler output on the same persistent sccache mount.
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
+    CARGO_TARGET_DIR=/convex/target \
+    CMAKE_BUILD_PARALLEL_LEVEL=${NATIVE_PREBUILD_JOBS} \
+    CMAKE_C_COMPILER_LAUNCHER=sccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=sccache \
+    MAKEFLAGS="-j${NATIVE_PREBUILD_JOBS}" \
+    RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/sccache
+# Lock all compiler-related caches across concurrent builds. Keep every cache
+# architecture-scoped: Cargo's registry and Git sources may include native
+# build inputs, and target plus sccache always contain architecture-specific
+# compiler output.
+# Copy the Rust sources only after the independently cached system, Node, and
+# JavaScript dependency layers.
 COPY . .
 
-# Build the convex-local-backend binary
+# Build both runtime binaries in one feature-unified Cargo graph by default.
 # Must redeclare these as environment variables so that they are available
 ARG VERGEN_GIT_SHA
 ARG VERGEN_GIT_COMMIT_TIMESTAMP
@@ -144,11 +175,78 @@ ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
 ENV VERGEN_GIT_COMMIT_TIMESTAMP=${VERGEN_GIT_COMMIT_TIMESTAMP}
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
     --mount=type=cache,id=convex-backend-target-${TARGETARCH},target=/convex/target,sharing=locked \
-    --mount=type=cache,id=convex-backend-cargo-git-db,target=/usr/local/cargo/git/db,sharing=locked \
-    --mount=type=cache,id=convex-backend-cargo-git-checkouts,target=/usr/local/cargo/git/checkouts,sharing=locked \
-    --mount=type=cache,id=convex-backend-cargo-registry,target=/usr/local/cargo/registry,sharing=locked <<EOF
+    --mount=type=cache,id=convex-backend-cargo-git-db-${TARGETARCH},target=/usr/local/cargo/git/db,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-git-checkouts-${TARGETARCH},target=/usr/local/cargo/git/checkouts,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=convex-backend-sccache-${TARGETARCH},target=/sccache,sharing=locked <<EOF
 set -euo pipefail
 find /usr/local/cargo/git -type f -name '*.lock' -delete
+: "${CARGO_BUILD_PROFILE:?CARGO_BUILD_PROFILE must not be empty}"
+: "${TARGETARCH:?TARGETARCH must not be empty}"
+if [[ ! "$CARGO_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CARGO_BUILD_JOBS must be a positive integer" >&2
+  exit 1
+fi
+if [[ ! "$NATIVE_PREBUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "NATIVE_PREBUILD_JOBS must be a positive integer" >&2
+  exit 1
+fi
+native_prebuild_package_args=()
+read -r -a native_prebuild_packages <<< "$NATIVE_PREBUILD_PACKAGES"
+for package_spec in "${native_prebuild_packages[@]}"; do
+  if [[ "$package_spec" == -* ]]; then
+    echo "NATIVE_PREBUILD_PACKAGES contains an invalid package spec: $package_spec" >&2
+    exit 1
+  fi
+  native_prebuild_package_args+=(--package "$package_spec")
+done
+local_backend_codegen_units="$CARGO_PROFILE_RELEASE_PACKAGE_LOCAL_BACKEND_CODEGEN_UNITS"
+# Cargo does not support environment variables for package profile overrides.
+# Remove the Docker ARG from Cargo's environment and pass a checked config
+# override on the command line instead.
+unset CARGO_PROFILE_RELEASE_PACKAGE_LOCAL_BACKEND_CODEGEN_UNITS
+cargo_profile_args=()
+if [[ -n "$local_backend_codegen_units" ]]; then
+  if [[ ! "$local_backend_codegen_units" =~ ^[1-9][0-9]*$ ]]; then
+    echo "CARGO_PROFILE_RELEASE_PACKAGE_LOCAL_BACKEND_CODEGEN_UNITS must be a positive integer" >&2
+    exit 1
+  fi
+  if [[ "$CARGO_BUILD_PROFILE" != release ]]; then
+    echo "CARGO_PROFILE_RELEASE_PACKAGE_LOCAL_BACKEND_CODEGEN_UNITS requires the release Cargo profile" >&2
+    exit 1
+  fi
+  cargo_profile_args+=(
+    --config
+    "profile.release.package.local_backend.codegen-units=$local_backend_codegen_units"
+  )
+fi
+case "$SERIALIZE_LOCAL_BACKEND_CODEGEN" in
+  false)
+    ;;
+  true)
+    if [[ "$CARGO_BUILD_PROFILE" != release ]]; then
+      echo "SERIALIZE_LOCAL_BACKEND_CODEGEN requires the release Cargo profile" >&2
+      exit 1
+    fi
+    if ! rustc -Z help | grep -Eq '^[[:space:]]+-Z[[:space:]]+no-parallel-backend=val'; then
+      echo "The selected Rust toolchain does not support -Zno-parallel-backend" >&2
+      exit 1
+    fi
+    # Keep multiple codegen units so LLVM sees smaller modules, but optimize
+    # only one local_backend module at a time. Package profile rustflags avoid
+    # invalidating the already-built dependency graph.
+    cargo_profile_args+=(
+      -Z
+      profile-rustflags
+      --config
+      'profile.release.package.local_backend.rustflags=["-Zno-parallel-backend"]'
+    )
+    ;;
+  *)
+    echo "SERIALIZE_LOCAL_BACKEND_CODEGEN must be true or false" >&2
+    exit 1
+    ;;
+esac
 if [[ -n "$CARGO_PROFILE_RELEASE_DEBUG" ]]; then
   export CARGO_PROFILE_RELEASE_DEBUG
 else
@@ -159,24 +257,125 @@ if [[ -n "$CARGO_PROFILE_RELEASE_STRIP" ]]; then
 else
   unset CARGO_PROFILE_RELEASE_STRIP
 fi
+if [[ -n "$SCCACHE_CACHE_SIZE" ]]; then
+  export SCCACHE_CACHE_SIZE
+else
+  unset SCCACHE_CACHE_SIZE
+fi
 export PROTOC="$(mise which protoc)"
 export PATH="$(dirname "$(mise which uv)"):$PATH"
+# Start before Cargo creates build-script pipes: a lazily spawned server can
+# retain their write descriptors and prevent Cargo from observing EOF.
+sccache --start-server
+trap 'sccache --stop-server' EXIT
 artifact_dir=/convex/backend-artifacts
 mkdir "$artifact_dir"
-# The pinned nightly Cargo copies each requested binary and final companion
-# artifacts such as packed split-debuginfo files out of the cache mount.
-cargo -Z unstable-options build \
-  --artifact-dir "$artifact_dir" \
-  --profile "$CARGO_BUILD_PROFILE" \
-  -p local_backend \
-  --bin convex-local-backend
+feature_args=()
+if [[ -n "$LOCAL_BACKEND_FEATURES" ]]; then
+  feature_args=(--features "$LOCAL_BACKEND_FEATURES")
+fi
+# The authenticated AOT contract is pinned to x86_64-unknown-linux-gnu. Reject
+# an unsupported image target before spending time on a native prebuild.
+static_hermes_wasmtime_gate_selected=false
+read -r -a local_backend_features <<< "${LOCAL_BACKEND_FEATURES//,/ }"
+for feature in "${local_backend_features[@]}"; do
+  case "$feature" in
+    static-hermes-wasmtime-gate|local_backend/static-hermes-wasmtime-gate)
+      static_hermes_wasmtime_gate_selected=true
+      ;;
+  esac
+done
+if [[ "$static_hermes_wasmtime_gate_selected" == true && "$TARGETARCH" != amd64 ]]; then
+  echo "static-hermes-wasmtime-gate requires Docker target architecture amd64" >&2
+  exit 1
+fi
+helper_cargo_args=()
+helper_parallel_args=()
+case "$BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY" in
+  true)
+    if [[ "$static_hermes_wasmtime_gate_selected" != true ]]; then
+      echo "BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY requires static-hermes-wasmtime-gate" >&2
+      exit 1
+    fi
+    helper_cargo_args=(-p application --bin source_package_preactivation_authority
+      --features application/static-hermes-wasmtime-gate)
+    # Keep the backend's feature selection in the helper/key-generator graph even when
+    # target-only rustc flags require compiling the backend binary separately.
+    helper_parallel_args=(-p local_backend "${feature_args[@]}" "${helper_cargo_args[@]}")
+    ;;
+  false) ;;
+  *)
+    echo "BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY must be true or false" >&2
+    exit 1
+    ;;
+esac
+# Build selected native dependency packages with a wider Cargo jobserver before
+# the constrained final graph. Matching profile arguments and the shared target
+# directory make these artifacts reusable by the final build.
+if ((${#native_prebuild_package_args[@]} > 0)); then
+  cargo -Z unstable-options "${cargo_profile_args[@]}" build \
+    --locked \
+    --jobs "$NATIVE_PREBUILD_JOBS" \
+    --profile "$CARGO_BUILD_PROFILE" \
+    "${native_prebuild_package_args[@]}"
+fi
+if [[ -n "$RUSTC_PARALLEL_FRONTEND_THREADS" ]]; then
+  if [[ ! "$RUSTC_PARALLEL_FRONTEND_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "RUSTC_PARALLEL_FRONTEND_THREADS must be a positive integer" >&2
+    exit 1
+  fi
+  if ! rustc -Z help | grep -Eq '^[[:space:]]+-Z[[:space:]]+threads=val'; then
+    echo "The selected Rust toolchain does not support -Zthreads" >&2
+    exit 1
+  fi
+fi
+# The pinned nightly Cargo copies requested build artifacts out of the cache
+# mount. The target-only rustc path copies its backend binary explicitly.
+if [[ -z "$RUSTC_PARALLEL_FRONTEND_THREADS" ]]; then
+  cargo -Z unstable-options "${cargo_profile_args[@]}" build \
+    --locked \
+    --artifact-dir "$artifact_dir" \
+    --profile "$CARGO_BUILD_PROFILE" \
+    -p local_backend \
+    -p keybroker \
+    "${feature_args[@]}" \
+    --bin convex-local-backend \
+    --bin generate_key \
+    "${helper_cargo_args[@]}"
+else
+  # `cargo rustc` accepts extra compiler arguments for only one selected target.
+  # Build keybroker separately, then apply parallel front-end threads only to
+  # the large backend binary. This can produce separate dependency feature
+  # variants, but it avoids invalidating and parallelizing every dependency.
+  cargo -Z unstable-options "${cargo_profile_args[@]}" build \
+    --locked \
+    --artifact-dir "$artifact_dir" \
+    --profile "$CARGO_BUILD_PROFILE" \
+    -p keybroker \
+    --bin generate_key \
+    "${helper_parallel_args[@]}"
+  cargo "${cargo_profile_args[@]}" rustc \
+    --locked \
+    --profile "$CARGO_BUILD_PROFILE" \
+    -p local_backend \
+    "${feature_args[@]}" \
+    --bin convex-local-backend \
+    -- "-Zthreads=$RUSTC_PARALLEL_FRONTEND_THREADS"
+  case "$CARGO_BUILD_PROFILE" in
+    dev|test) profile_dir=debug ;;
+    release|bench) profile_dir=release ;;
+    *) profile_dir=$CARGO_BUILD_PROFILE ;;
+  esac
+  cp "$CARGO_TARGET_DIR/$profile_dir/convex-local-backend" "$artifact_dir/"
+  if [[ -f "$CARGO_TARGET_DIR/$profile_dir/convex-local-backend.dwp" ]]; then
+    cp "$CARGO_TARGET_DIR/$profile_dir/convex-local-backend.dwp" "$artifact_dir/"
+  fi
+fi
 test -x "$artifact_dir/convex-local-backend"
-cargo -Z unstable-options build \
-  --artifact-dir "$artifact_dir" \
-  --profile "$CARGO_BUILD_PROFILE" \
-  -p keybroker \
-  --bin generate_key
 test -x "$artifact_dir/generate_key"
+if [[ "$BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY" == true ]]; then
+  test -x "$artifact_dir/source_package_preactivation_authority"
+fi
 EOF
 ARG debug
 RUN <<EOF
@@ -191,6 +390,9 @@ if [[ -z "${debug:-}" &&
     ""|false|0|none)
       strip ./backend-artifacts/convex-local-backend
       strip ./backend-artifacts/generate_key
+      if [[ "$BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY" == true ]]; then
+        strip ./backend-artifacts/source_package_preactivation_authority
+      fi
       ;;
   esac
 fi

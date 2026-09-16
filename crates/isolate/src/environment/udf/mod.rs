@@ -27,6 +27,8 @@ use model::{
     modules::user_error::FunctionNotFoundError,
 };
 use sync_types::types::SerializedArgs;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::{
     select,
     sync::oneshot,
@@ -67,8 +69,24 @@ use crate::{
 pub mod async_syscall;
 
 mod astral_future;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+mod generated_wasm_memory;
+mod host_operation_error_cause;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+#[path = "static_hermes_wasmtime_gate/module_graph_registry.rs"]
+mod module_graph_registry;
 mod phase;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub(crate) mod static_hermes_wasmtime_gate;
 pub mod syscall;
+#[cfg(feature = "wasm-udf")]
+pub mod wasm;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub(crate) mod wasm_udf_abi;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub(crate) mod wasm_udf_manifest;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub(crate) mod wasm_udf_package;
 use std::{
     cmp::Ordering,
     collections::VecDeque,
@@ -126,7 +144,10 @@ use deno_core::{
         scope,
     },
 };
-use errors::ErrorMetadata;
+use errors::{
+    ErrorMetadata,
+    ErrorMetadataAnyhowExt as _,
+};
 use file_storage::TransactionalFileStorage;
 use keybroker::FunctionRunnerKeyBroker;
 use rand_chacha::ChaCha12Rng;
@@ -137,6 +158,8 @@ use udf::{
         approaching_limit_warning,
         SystemWarning,
     },
+    HostOperationErrorV1,
+    HostOperationTrace,
     UdfOutcome,
 };
 use value::{
@@ -155,6 +178,7 @@ use value::{
 use self::{
     async_syscall::{
         AsyncSyscallBatch,
+        AsyncSyscallResult,
         PendingSyscall,
         QueryManager,
     },
@@ -230,16 +254,69 @@ pub struct DatabaseUdfSyscallProvider<RT: Runtime> {
     next_journal: QueryJournal,
 
     syscall_trace: SyscallTrace,
+    host_operation_trace: HostOperationTrace,
+    terminal_host_operation_error: Option<HostOperationErrorV1>,
+    handler_read_capture_started: bool,
 
     context: ExecutionContext,
 
     reactor_depth: usize,
+    /// Retains shadow admission through separately scheduled descendant V8
+    /// execution after the parent Wasm request is cancelled.
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    shadow_work_guard: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 pub struct DatabaseUdfEnvironment<RT: Runtime, S = DatabaseUdfSyscallProvider<RT>> {
     pub syscall_provider: S,
     pub pending_syscalls: WithHeapSize<VecDeque<PendingSyscall>>,
     pub _phantom: PhantomData<RT>,
+}
+
+fn append_audit_log_line(
+    audit_log_lines: &mut AuditLogLines,
+    audit_log_line: AuditLogLine,
+) -> anyhow::Result<()> {
+    let max_heap = *AUDIT_LOG_MAX_HEAP_SIZE_BYTES;
+    anyhow::ensure!(
+        audit_log_lines.heap_size() + audit_log_line.heap_size() <= max_heap,
+        ErrorMetadata::bad_request(
+            "AuditLogsExceedLimits",
+            "Audit logs exceed function execution limits",
+        )
+    );
+    audit_log_lines.push(audit_log_line);
+    Ok(())
+}
+
+fn append_sub_function_log_lines<RT: Runtime>(
+    rt: &RT,
+    parent_log_lines: &mut LogLines,
+    path: CanonicalizedComponentFunctionPath,
+    log_lines: LogLines,
+) {
+    // Reserve one line for the overflow error.
+    if parent_log_lines.len() > MAX_LOG_LINES - 1 {
+        return;
+    }
+    if parent_log_lines.len() + log_lines.len() > MAX_LOG_LINES - 1 {
+        let allowed_length = MAX_LOG_LINES - 1 - parent_log_lines.len();
+        parent_log_lines.push(LogLine::SubFunction {
+            path,
+            log_lines: log_lines.truncated(allowed_length),
+        });
+        parent_log_lines.push(LogLine::new_developer_log_line(
+            LogLevel::Error,
+            vec![format!(
+                "Log overflow (maximum {MAX_LOG_LINES}). Remaining log lines omitted."
+            )],
+            // Reading the current time here stays deterministic because the function
+            // cannot observe it.
+            rt.unix_timestamp(),
+        ));
+    } else {
+        parent_log_lines.push(LogLine::SubFunction { path, log_lines });
+    }
 }
 
 fn not_allowed_in_udf(name: &str, description: &str) -> ErrorMetadata {
@@ -388,7 +465,7 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
         &mut self,
         batch: AsyncSyscallBatch,
         udf_callback: impl UdfCallback<RT>,
-    ) -> Vec<anyhow::Result<String>> {
+    ) -> Vec<AsyncSyscallResult> {
         run_async_syscall_batch(self, batch, udf_callback).await
     }
 
@@ -406,6 +483,14 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
 
     fn reactor_depth(&self) -> usize {
         self.reactor_depth
+    }
+
+    fn clear_terminal_host_operation_error(&mut self) {
+        self.terminal_host_operation_error = None;
+    }
+
+    fn set_terminal_host_operation_error(&mut self, error: HostOperationErrorV1) {
+        self.terminal_host_operation_error = Some(error);
     }
 
     async fn initialize(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()> {
@@ -430,11 +515,11 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
         let user_execution_time = execution_time.elapsed;
 
         let success_result_value = result.as_ref().ok();
-        let parsed_args =
-            parse_pending_udf_args(&self.path.udf_path, args.udf_args.clone().into_args()?)?;
+        let parsed_args = parse_pending_udf_args(&self.path.udf_path, args.udf_args.as_args()?)?;
+        let path_for_logging = self.path.for_logging();
         let mut log_lines = self.log_lines;
         add_warnings_to_log_lines(
-            &self.path.clone().for_logging(),
+            &path_for_logging,
             &parsed_args,
             execution_time,
             self.phase.execution_size()?,
@@ -452,7 +537,7 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
         // TODO: Add num_writes and write_bandwidth to UdfOutcome,
         // and use them in log_mutation.
         let outcome = UdfOutcome {
-            path: self.path.for_logging(),
+            path: path_for_logging,
             arguments: args.udf_args,
             identity: args.identity,
             observed_identity: self.phase.observed_identity(),
@@ -467,8 +552,10 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
                 Ok(v) => Ok(JsonPackedValue::pack(v)),
                 Err(e) => Err(e),
             },
+            host_operation_error: self.terminal_host_operation_error,
+            host_operation_trace: self.host_operation_trace,
             syscall_trace: self.syscall_trace,
-            udf_server_version: args.udf_server_version,
+            udf_server_version: self.udf_server_version,
             memory_in_mb,
             user_execution_time: Some(user_execution_time),
         };
@@ -482,6 +569,30 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
 
     fn snoop_reads(&mut self) -> anyhow::Result<()> {
         self.phase.snoop_reads()
+    }
+
+    fn start_handler_read_capture(&mut self) -> anyhow::Result<()> {
+        self.phase.start_handler_read_capture()?;
+        self.handler_read_capture_started = true;
+        Ok(())
+    }
+
+    fn finish_handler_read_capture(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.handler_read_capture_started,
+            "Called finish_handler_read_capture before capture started"
+        );
+        self.phase.finish_handler_read_capture()?;
+        self.handler_read_capture_started = false;
+        Ok(())
+    }
+
+    fn handler_read_capture_enabled(&self) -> bool {
+        self.phase.handler_read_capture_enabled()
+    }
+
+    fn handler_read_capture_started(&self) -> bool {
+        self.handler_read_capture_started
     }
 
     async fn finish_snoop(
@@ -609,6 +720,10 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
             log_lines: nested_provider.syscall_provider.log_lines,
             journal: nested_provider.syscall_provider.next_journal,
             result: result?,
+            host_operation_error: nested_provider
+                .syscall_provider
+                .terminal_host_operation_error,
+            host_operation_trace: nested_provider.syscall_provider.host_operation_trace,
             syscall_trace: nested_provider.syscall_provider.syscall_trace,
         };
         let transaction = nested_provider.syscall_provider.phase.into_transaction()?;
@@ -629,7 +744,6 @@ pub struct DatabaseUdfArgs {
     pub rng_seed: [u8; 32],
     pub udf_args: SerializedArgs,
     pub identity: InertIdentity,
-    pub udf_server_version: Option<semver::Version>,
     pub reuse_context: bool,
 }
 
@@ -645,12 +759,14 @@ pub trait DatabaseUdfInnerProvider<RT: Runtime>:
         &mut self,
         batch: AsyncSyscallBatch,
         udf_callback: impl UdfCallback<RT>,
-    ) -> Vec<anyhow::Result<String>>;
+    ) -> Vec<AsyncSyscallResult>;
 
     fn rt(&self) -> &RT;
     fn path(&self) -> &ResolvedComponentFunctionPath;
     fn udf_type(&self) -> UdfType;
     fn reactor_depth(&self) -> usize;
+    fn clear_terminal_host_operation_error(&mut self);
+    fn set_terminal_host_operation_error(&mut self, error: HostOperationErrorV1);
     async fn initialize(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()>;
     fn begin_execution(
         &mut self,
@@ -665,6 +781,10 @@ pub trait DatabaseUdfInnerProvider<RT: Runtime>:
     ) -> anyhow::Result<Self::Outcome>;
 
     fn snoop_reads(&mut self) -> anyhow::Result<()>;
+    fn start_handler_read_capture(&mut self) -> anyhow::Result<()>;
+    fn finish_handler_read_capture(&mut self) -> anyhow::Result<()>;
+    fn handler_read_capture_enabled(&self) -> bool;
+    fn handler_read_capture_started(&self) -> bool;
     /// If `should_capture` is false, always returns None
     async fn finish_snoop(
         &mut self,
@@ -688,6 +808,10 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
             journal,
             context,
             environment_data,
+            trace_host_operations,
+            capture_handler_reads,
+            #[cfg(feature = "static-hermes-wasmtime-gate")]
+            shadow_work_guard,
         }: UdfRequest<RT>,
         reactor_depth: usize,
         client_id: String,
@@ -699,6 +823,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
             file_storage,
             module_loader,
             deployment,
+            ..
         } = environment_data;
         let reuse_context = path_and_args.reuse_context(udf_type);
         let (path, arguments, udf_server_version) = path_and_args.consume();
@@ -710,7 +835,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
                     rt: rt.clone(),
                     udf_type,
                     path,
-                    udf_server_version: udf_server_version.clone(),
+                    udf_server_version,
 
                     phase: UdfPhase::new(
                         transaction,
@@ -718,6 +843,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
                         module_loader.clone(),
                         default_system_env_vars,
                         component,
+                        capture_handler_reads,
                     ),
                     file_storage,
 
@@ -730,9 +856,16 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
                     next_journal: QueryJournal::new(),
 
                     syscall_trace: SyscallTrace::new(),
+                    host_operation_trace: trace_host_operations
+                        .then(HostOperationTrace::for_query_shadow)
+                        .unwrap_or_default(),
+                    terminal_host_operation_error: None,
+                    handler_read_capture_started: false,
                     context,
 
                     reactor_depth,
+                    #[cfg(feature = "static-hermes-wasmtime-gate")]
+                    shadow_work_guard,
                     deployment,
                     client_id,
                 },
@@ -744,10 +877,14 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
                 rng_seed,
                 udf_args: arguments,
                 identity,
-                udf_server_version,
                 reuse_context,
             },
         )
+    }
+
+    #[cfg(all(test, feature = "static-hermes-wasmtime-gate"))]
+    pub(super) fn shadow_work_guard_for_test(&self) -> Option<Arc<OwnedSemaphorePermit>> {
+        self.syscall_provider.shadow_work_guard.clone()
     }
 }
 
@@ -779,7 +916,7 @@ where
             // reject the function for capacity reasons.
             _ = tx.send(());
         }
-        let (this, mut result, reusable_context) = executor
+        let (mut this, mut result, reusable_context) = executor
             .run_until(Self::run_nested(
                 &executor,
                 &args,
@@ -801,11 +938,15 @@ where
         // environment.
         match handle.take_termination_error(&path_for_logging) {
             Ok(Ok(())) => (),
-            Ok(Err(e)) => result = Ok(Err(e)),
+            Ok(Err(e)) => {
+                this.syscall_provider.clear_terminal_host_operation_error();
+                result = Ok(Err(e));
+            },
             Err(e) => result = Err(e),
         }
         let result = result?;
         let reusable_context = if result.is_ok() {
+            this.syscall_provider.clear_terminal_host_operation_error();
             reusable_context
         } else {
             None
@@ -935,11 +1076,29 @@ where
         // to ensure the microtask queue is empty. Otherwise, JS from this request may
         // leak to a subsequent one on isolate reuse.
         isolate_context.checkpoint();
+        {
+            let v8_scope = isolate_context.scope();
+            let mut scope = RequestScope::<RT, Self>::enter(v8_scope);
+            if scope
+                .state()?
+                .environment
+                .syscall_provider
+                .handler_read_capture_started()
+            {
+                scope
+                    .state_mut()?
+                    .environment
+                    .syscall_provider
+                    .finish_handler_read_capture()?;
+            }
+        }
         // The final checkpoint can run user code and trigger termination after
         // `run_inner` performed its last check. Preserve that failure through the
         // context-save gate; the top-level request will extract the specific error.
+        let mut terminal_result_overridden = false;
         if let Err(e) = execution_handle.check_terminated() {
             result = Err(e);
+            terminal_result_overridden = true;
         }
         *isolate_clean = true;
 
@@ -961,11 +1120,17 @@ where
         // would preserve request work that the next invocation cannot finish.
         let has_pending_syscalls =
             args.reuse_context && !request_state.environment.pending_syscalls.is_empty();
-        let this = request_state.environment;
+        let mut this = request_state.environment;
         // Override the returned result if we hit a termination error.
         match execution_handle.pop_context(request_state.context_id)? {
             Ok(()) => (),
-            Err(e) => result = Ok(Err(e)),
+            Err(e) => {
+                result = Ok(Err(e));
+                terminal_result_overridden = true;
+            },
+        }
+        if terminal_result_overridden {
+            this.syscall_provider.clear_terminal_host_operation_error();
         }
 
         // Database UDFs do not poll cancellation while synchronous JavaScript runs.
@@ -1176,13 +1341,16 @@ where
             .ok_or_else(|| anyhow!("Couldn't find invoke function in {udf_path:?}"))?
             .try_into()?;
 
-        // Switch our phase to executing right before calling into the UDF.
+        // Switch our phase to executing and start handler capture right before calling
+        // into the UDF. Starting capture earlier would include function lookup
+        // and classification.
         {
             let state = scope.state_mut()?;
-            state
-                .environment
-                .syscall_provider
-                .begin_execution(args.rng_seed, args.unix_timestamp)?;
+            let syscall_provider = &mut state.environment.syscall_provider;
+            syscall_provider.begin_execution(args.rng_seed, args.unix_timestamp)?;
+            if syscall_provider.handler_read_capture_enabled() {
+                syscall_provider.start_handler_read_capture()?;
+            }
         }
         let global = scope.get_current_context().global(&scope);
         let promise_r =
@@ -1199,6 +1367,7 @@ where
             Ok(None) => anyhow::bail!("Successful invocation returned None"),
             Err(e) => return Ok(Err(e)),
         };
+        let mut host_operation_rejections = Vec::new();
         loop {
             // Advance the user's promise as far as it can go by draining the microtask
             // queue.
@@ -1315,11 +1484,29 @@ where
             // queue.
             for (resolver, result) in resolvers.into_iter().zip(results.into_iter()) {
                 scope!(let result_scope, &mut *scope);
-                let result_v8 = match result {
-                    Ok(v) => Ok(serde_v8::to_v8(result_scope, v)?),
-                    Err(e) => Err(e),
-                };
-                resolve_promise(result_scope, resolver, result_v8)?;
+                let AsyncSyscallResult {
+                    result,
+                    host_operation_error,
+                } = result;
+                if let Some(host_operation_error) = host_operation_error {
+                    let error =
+                        result.expect_err("host operation error marked a successful syscall");
+                    let message = error.user_facing_message();
+                    let message = v8::String::new(result_scope, &message)
+                        .context("Failed to create host operation error message")?;
+                    let exception = v8::Exception::error(result_scope, message);
+                    resolver.open(result_scope).reject(result_scope, exception);
+                    host_operation_rejections.push((
+                        v8::Global::new(result_scope, exception),
+                        host_operation_error,
+                    ));
+                } else {
+                    let result_v8 = match result {
+                        Ok(value) => Ok(serde_v8::to_v8(result_scope, value)?),
+                        Err(error) => Err(error),
+                    };
+                    resolve_promise(result_scope, resolver, result_v8)?;
+                }
             }
             handle.check_terminated()?;
         }
@@ -1359,7 +1546,21 @@ where
             },
             v8::PromiseState::Rejected => {
                 let e = promise.result(&scope);
-                Err(scope.format_traceback(e)?)
+                let host_operation_error = host_operation_error_cause::find_rejection_index(
+                    &mut scope,
+                    e,
+                    &host_operation_rejections,
+                )?
+                .map(|index| host_operation_rejections[index].1);
+                let error = scope.format_traceback(e)?;
+                if let Some(host_operation_error) = host_operation_error {
+                    scope
+                        .state_mut()?
+                        .environment
+                        .syscall_provider
+                        .set_terminal_host_operation_error(host_operation_error);
+                }
+                Err(error)
             },
         };
 
@@ -1417,17 +1618,15 @@ where
 }
 
 impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
+    pub(crate) async fn initialize_static_hermes(
+        &mut self,
+        timeout: &mut Timeout<RT>,
+    ) -> anyhow::Result<()> {
+        self.phase.initialize_static_hermes(timeout).await
+    }
+
     pub fn emit_audit_log_line(&mut self, audit_log_line: AuditLogLine) -> anyhow::Result<()> {
-        let max_heap = *AUDIT_LOG_MAX_HEAP_SIZE_BYTES;
-        anyhow::ensure!(
-            self.audit_log_lines.heap_size() + audit_log_line.heap_size() <= max_heap,
-            ErrorMetadata::bad_request(
-                "AuditLogsExceedLimits",
-                "Audit logs exceed function execution limits",
-            )
-        );
-        self.audit_log_lines.push(audit_log_line);
-        Ok(())
+        append_audit_log_line(&mut self.audit_log_lines, audit_log_line)
     }
 
     /// Emit a warning-level log line to the developer's function logs.
@@ -1461,32 +1660,7 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
         path: CanonicalizedComponentFunctionPath,
         log_lines: LogLines,
     ) {
-        // -1 to reserve for the [ERROR] log line
-        if self.log_lines.len() > MAX_LOG_LINES - 1 {
-            // We have previously exceeded the logging limit, so skip these logs.
-            return;
-        }
-        if self.log_lines.len() + log_lines.len() > MAX_LOG_LINES - 1 {
-            // We are about to exceed the logging limit, so truncate the logs.
-            let allowed_length = MAX_LOG_LINES - 1 - self.log_lines.len();
-            self.log_lines.push(LogLine::SubFunction {
-                path,
-                log_lines: log_lines.truncated(allowed_length),
-            });
-            let log_line = LogLine::new_developer_log_line(
-                LogLevel::Error,
-                vec![format!(
-                    "Log overflow (maximum {MAX_LOG_LINES}). Remaining log lines omitted."
-                )],
-                // Note: accessing the current time here is still deterministic since
-                // we don't externalize the time to the function.
-                self.rt.unix_timestamp(),
-            );
-            self.log_lines.push(log_line);
-        } else {
-            self.log_lines
-                .push(LogLine::SubFunction { path, log_lines });
-        }
+        append_sub_function_log_lines(&self.rt, &mut self.log_lines, path, log_lines)
     }
 }
 

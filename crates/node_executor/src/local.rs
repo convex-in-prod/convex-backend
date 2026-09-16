@@ -48,6 +48,8 @@ use async_trait::async_trait;
 use common::{
     execution_start::FunctionExecutionStartGate,
     knobs::{
+        local_node_executor_pool_background_drain_timeout,
+        local_node_executor_pool_generation_age,
         local_node_executor_pool_memory_pressure_min_rss_bytes,
         local_node_executor_pool_old_space_size_mib,
         local_node_executor_pool_rss_bytes,
@@ -220,6 +222,8 @@ pub struct LocalNodeExecutorConfig {
     memory_pressure_min_rss_bytes: u64,
     memory_pressure_grace: Duration,
     max_generation_age: Duration,
+    max_generation_age_enabled: bool,
+    background_drain_timeout: Duration,
     max_imported_source_packages: u64,
     diagnostics_dir: Option<PathBuf>,
     diagnostic_pruning_in_progress: Arc<AtomicBool>,
@@ -643,7 +647,7 @@ enum PreparationResidency {
     Retained,
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PreparationResult {
     Initialized,
@@ -1242,6 +1246,16 @@ impl HotTransitionCleanupOwner {
             },
             HotTransitionCleanupTarget::Candidate(None) => None,
             HotTransitionCleanupTarget::Draining(old) => {
+                let forced = self
+                    .outcome
+                    .lock()
+                    .expect("Local Node hot-transition cleanup outcome lock poisoned")
+                    .is_some_and(|outcome| {
+                        matches!(outcome, "stale" | "pressure_canceled" | "shutdown_canceled")
+                    });
+                if !forced {
+                    old.request_background_drain(self.reason).await;
+                }
                 let observation = old.terminate_for_hot_cleanup().await?;
                 Some((old.clone(), observation))
             },
@@ -1608,6 +1622,45 @@ struct InnerLocalNodeExecutor {
     // termination cannot complete or startup is canceled.
     server_handle: Arc<Mutex<ManagedChild>>,
     client: reqwest::Client,
+    background_drain_timeout: Duration,
+    background_drain_started: AtomicBool,
+    background_drain_result: AtomicBool,
+    background_drain_completed: AtomicBool,
+    background_drain_notify: Notify,
+}
+
+struct BackgroundDrainCompletionGuard<'a> {
+    inner: &'a InnerLocalNodeExecutor,
+    reason: GenerationRetirementReason,
+    armed: bool,
+}
+
+impl<'a> BackgroundDrainCompletionGuard<'a> {
+    fn new(inner: &'a InnerLocalNodeExecutor, reason: GenerationRetirementReason) -> Self {
+        Self {
+            inner,
+            reason,
+            armed: true,
+        }
+    }
+
+    fn finish(mut self, result: bool, outcome: &'static str) -> bool {
+        self.armed = false;
+        self.inner
+            .finish_background_drain(self.reason, result, outcome)
+    }
+}
+
+impl Drop for BackgroundDrainCompletionGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Cancellation or an unwind must still wake concurrent retirement
+            // owners; otherwise they could wait forever after the child owner
+            // that claimed the callback disappears.
+            self.inner
+                .finish_background_drain(self.reason, false, "canceled");
+        }
+    }
 }
 
 struct RetirementTaskGuard {
@@ -1979,6 +2032,15 @@ enum GenerationRetirementReason {
     ExplicitShutdown,
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BackgroundDrainResponse {
+    NotRegistered,
+    Completed,
+    CallbackError,
+    Timeout,
+}
+
 impl GenerationRetirementReason {
     fn as_str(self) -> &'static str {
         match self {
@@ -1996,6 +2058,28 @@ impl GenerationRetirementReason {
             Self::TopologyChange => "topology_change",
             Self::SystemOperationTaskLost => "system_operation_task_lost",
             Self::ExplicitShutdown => "explicit_shutdown",
+        }
+    }
+
+    fn background_drain_reason(self) -> &'static str {
+        match self {
+            Self::AgeLimit => "generation_age",
+            Self::RssLimit => "rss_limit",
+            Self::PackageLimit => "package_limit",
+            Self::CgroupPressure => "memory_pressure",
+            // The public SDK calls this source_change. Keep the wire value
+            // aligned with the SDK's closed reason union; deployment is the
+            // supervisor's internal lifecycle term, not a callback reason.
+            Self::FingerprintChange => "source_change",
+            Self::TopologyChange => "topology_change",
+            Self::ExplicitShutdown => "shutdown",
+            Self::RequestTimeout
+            | Self::ResponseStreamTimeout
+            | Self::ResponseStreamError
+            | Self::ConnectionError
+            | Self::ProcessExiting
+            | Self::HealthCheckFailed
+            | Self::SystemOperationTaskLost => "request_failure",
         }
     }
 }
@@ -2142,7 +2226,7 @@ fn proactive_retirement_reason(
         Some(GenerationRetirementReason::RssLimit)
     } else if imported_source_packages >= config.max_imported_source_packages {
         Some(GenerationRetirementReason::PackageLimit)
-    } else if age >= config.max_generation_age {
+    } else if config.max_generation_age_enabled && age >= config.max_generation_age {
         Some(GenerationRetirementReason::AgeLimit)
     } else {
         None
@@ -3654,6 +3738,10 @@ impl LocalNodeExecutorConfig {
             "Local Node executor generation age threshold must be greater than zero"
         );
         anyhow::ensure!(
+            self.background_drain_timeout > Duration::ZERO,
+            "Local Node executor background drain timeout must be greater than zero"
+        );
+        anyhow::ensure!(
             self.max_imported_source_packages > 0,
             "Local Node executor package threshold must be greater than zero"
         );
@@ -3682,6 +3770,14 @@ impl LocalNodeExecutorConfig {
             .get(pool_name.as_ref())
             .and_then(|policy| policy.max_event_loop_unresponsive_seconds)
             .map(Duration::from_secs);
+        if let Some(age) = local_node_executor_pool_generation_age(&pool_name) {
+            self.max_generation_age = age;
+            self.max_generation_age_enabled = true;
+        } else {
+            self.max_generation_age_enabled = false;
+        }
+        self.background_drain_timeout =
+            local_node_executor_pool_background_drain_timeout(&pool_name);
         self.max_old_space_size_mib = local_node_executor_pool_old_space_size_mib(&pool_name);
         self.max_rss_bytes = u64::try_from(local_node_executor_pool_rss_bytes(&pool_name))
             .context("Local Node executor RSS threshold does not fit u64")?;
@@ -3697,6 +3793,9 @@ impl LocalNodeExecutorConfig {
         self.pool_name = Arc::from("_system");
         self.role = LocalNodeExecutorRole::System;
         self.max_event_loop_unresponsive = None;
+        self.max_generation_age = *LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE;
+        self.max_generation_age_enabled = true;
+        self.background_drain_timeout = Duration::from_secs(30);
         self.max_old_space_size_mib = *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB;
         self.max_rss_bytes = u64::try_from(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES)
             .context("Local Node executor RSS threshold does not fit u64")?;
@@ -4004,6 +4103,11 @@ impl InnerLocalNodeExecutor {
                     diagnostic_paths,
                     server_handle,
                     client,
+                    background_drain_timeout: config.background_drain_timeout,
+                    background_drain_started: AtomicBool::new(false),
+                    background_drain_result: AtomicBool::new(false),
+                    background_drain_completed: AtomicBool::new(false),
+                    background_drain_notify: Notify::new(),
                 });
             }
             tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
@@ -4245,6 +4349,143 @@ impl InnerLocalNodeExecutor {
         }
         let mut child = self.server_handle.lock().await;
         child.terminate().await
+    }
+
+    fn finish_background_drain(
+        &self,
+        reason: GenerationRetirementReason,
+        result: bool,
+        outcome: &'static str,
+    ) -> bool {
+        self.background_drain_result
+            .store(result, Ordering::Release);
+        self.background_drain_completed
+            .store(true, Ordering::Release);
+        self.background_drain_notify.notify_waiters();
+        crate::metrics::log_local_node_background_drain(
+            &self.pool_name,
+            reason.background_drain_reason(),
+            outcome,
+        );
+        result
+    }
+
+    async fn request_background_drain(&self, reason: GenerationRetirementReason) -> bool {
+        if self
+            .background_drain_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // A hard retirement or another healthy-retirement owner can race
+            // the first callback request. Joining completion is required:
+            // observing only `started` would permit reaping while the resident
+            // callback still owns cleanup.
+            let notified = self.background_drain_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.background_drain_completed.load(Ordering::Acquire) {
+                notified.await;
+            }
+            return self.background_drain_result.load(Ordering::Acquire);
+        }
+        let completion = BackgroundDrainCompletionGuard::new(self, reason);
+        let deadline = Instant::now() + self.background_drain_timeout;
+        let remaining_ms =
+            u64::try_from(self.background_drain_timeout.as_millis()).unwrap_or(u64::MAX);
+        let request = self
+            .client
+            .post("http://localhost/retire")
+            .json(&serde_json::json!({
+                "reason": reason.background_drain_reason(),
+                "remainingMs": remaining_ms,
+            }))
+            .send();
+        let response = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            request,
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    pool_name = %self.pool_name,
+                    generation = self.generation,
+                    reason = reason.as_str(),
+                    error = %error,
+                    "Local Node resident retirement callback request failed"
+                );
+                return completion.finish(false, "request_error");
+            },
+            Err(_) => {
+                tracing::warn!(
+                    pool_name = %self.pool_name,
+                    generation = self.generation,
+                    reason = reason.as_str(),
+                    "Local Node resident retirement callback request timed out"
+                );
+                return completion.finish(false, "request_timeout");
+            },
+        };
+        if !response.status().is_success() {
+            tracing::warn!(
+                pool_name = %self.pool_name,
+                generation = self.generation,
+                reason = reason.as_str(),
+                status = %response.status(),
+                "Local Node resident retirement callback returned an invalid status"
+            );
+            return completion.finish(false, "invalid_status");
+        }
+        let response_body = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            response.json::<BackgroundDrainResponse>(),
+        )
+        .await;
+        let result = match response_body {
+            Ok(Ok(BackgroundDrainResponse::NotRegistered)) => {
+                completion.finish(true, "not_registered")
+            },
+            Ok(Ok(BackgroundDrainResponse::Completed)) => completion.finish(true, "completed"),
+            Ok(Ok(BackgroundDrainResponse::CallbackError)) => {
+                tracing::warn!(
+                    pool_name = %self.pool_name,
+                    generation = self.generation,
+                    reason = reason.as_str(),
+                    "Local Node resident retirement callback failed"
+                );
+                completion.finish(false, "callback_error")
+            },
+            Ok(Ok(BackgroundDrainResponse::Timeout)) => {
+                tracing::warn!(
+                    pool_name = %self.pool_name,
+                    generation = self.generation,
+                    reason = reason.as_str(),
+                    "Local Node resident retirement callback exceeded its deadline"
+                );
+                completion.finish(false, "timeout")
+            },
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    pool_name = %self.pool_name,
+                    generation = self.generation,
+                    reason = reason.as_str(),
+                    error = %error,
+                    "Local Node resident retirement callback response was malformed"
+                );
+                completion.finish(false, "malformed_response")
+            },
+            Err(_) => {
+                tracing::warn!(
+                    pool_name = %self.pool_name,
+                    generation = self.generation,
+                    reason = reason.as_str(),
+                    "Local Node resident retirement callback response timed out"
+                );
+                completion.finish(false, "response_timeout")
+            },
+        };
+        result
     }
 
     async fn terminate_for_hot_cleanup(
@@ -4804,12 +5045,12 @@ impl LocalNodeExecutor {
     }
 
     #[cfg(all(test, unix))]
-    pub(crate) async fn test_has_failed_retirement(&self) -> bool {
+    pub(crate) async fn test_termination_failures_exhausted(&self) -> bool {
         let state = self.state.lock().await;
-        state.retiring.as_ref().is_some_and(|inner| {
-            inner.retirement_failed.load(Ordering::Acquire)
-                && inner.termination_failures_remaining.load(Ordering::Acquire) == 0
-        })
+        state
+            .retiring
+            .as_ref()
+            .is_some_and(|inner| inner.termination_failures_remaining.load(Ordering::Acquire) == 0)
     }
 
     #[cfg(all(test, unix))]
@@ -5138,6 +5379,7 @@ impl LocalNodeExecutor {
         node_process_timeout: Duration,
         memory_pressure: MemoryPressureSignal,
     ) -> anyhow::Result<LocalNodeExecutorConfig> {
+        let default_generation_age = local_node_executor_pool_generation_age("default");
         let config = LocalNodeExecutorConfig {
             pool_name: Arc::from("default"),
             role: LocalNodeExecutorRole::Application,
@@ -5159,7 +5401,10 @@ impl LocalNodeExecutor {
             )
             .context("Local Node executor cgroup-pressure RSS threshold does not fit u64")?,
             memory_pressure_grace: *LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE,
-            max_generation_age: *LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE,
+            max_generation_age: default_generation_age
+                .unwrap_or(*LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE),
+            max_generation_age_enabled: default_generation_age.is_some(),
+            background_drain_timeout: local_node_executor_pool_background_drain_timeout("default"),
             max_imported_source_packages: u64::try_from(
                 *LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES,
             )
@@ -5226,8 +5471,13 @@ impl LocalNodeExecutor {
             executor.config.max_rss_bytes,
             executor.config.memory_pressure_min_rss_bytes,
             executor.config.memory_pressure_grace,
-            executor.config.max_generation_age,
+            if executor.config.max_generation_age_enabled {
+                executor.config.max_generation_age
+            } else {
+                Duration::ZERO
+            },
             executor.config.max_imported_source_packages,
+            executor.config.background_drain_timeout,
         );
 
         Ok(executor)
@@ -6581,6 +6831,9 @@ impl LocalNodeExecutor {
         let drain_expected = expected.clone();
         let mut task_guard = RetirementTaskGuard::new(drain_expected.clone());
         let retirement = tokio::spawn(async move {
+            let _ = drain_expected
+                .request_background_drain(diagnostics.reason)
+                .await;
             let result = tokio::select! {
                 _ = drain_expected.wait_until_idle() => {
                     Self::retire_inner_state(&state, &drain_expected, diagnostics).await
@@ -6785,7 +7038,11 @@ impl LocalNodeExecutor {
                 old_space_limit_bytes: config.old_space_bytes(),
                 rss_retirement_threshold_bytes: config.max_rss_bytes,
                 generation_age_retirement_threshold_ms: u64::try_from(
-                    config.max_generation_age.as_millis(),
+                    if config.max_generation_age_enabled {
+                        config.max_generation_age.as_millis()
+                    } else {
+                        0
+                    },
                 )
                 .unwrap_or(u64::MAX),
                 imported_source_packages,
@@ -8137,6 +8394,11 @@ fn test_inner_with_owner(
             None,
         ))),
         client,
+        background_drain_timeout: Duration::from_secs(30),
+        background_drain_started: AtomicBool::new(false),
+        background_drain_result: AtomicBool::new(false),
+        background_drain_completed: AtomicBool::new(false),
+        background_drain_notify: Notify::new(),
     })
 }
 
@@ -8183,6 +8445,8 @@ mod tests {
             memory_pressure_min_rss_bytes: 192 * MIB_BYTES,
             memory_pressure_grace: Duration::from_secs(5),
             max_generation_age: Duration::from_secs(60),
+            max_generation_age_enabled: true,
+            background_drain_timeout: Duration::from_secs(30),
             max_imported_source_packages: 100,
             diagnostics_dir: None,
             diagnostic_pruning_in_progress: Arc::new(AtomicBool::new(false)),
@@ -8551,6 +8815,62 @@ mod tests {
             .build()
             .unwrap();
         (test_inner_with_client(1, client).await, server)
+    }
+
+    #[tokio::test]
+    async fn concurrent_background_drain_requests_join_response_body() {
+        let socket_dir = TempDir::new().unwrap();
+        let socket_path = socket_dir.path().join("executor.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (request_received_sender, request_received_receiver) = oneshot::channel();
+        let (release_body_sender, release_body_receiver) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let _socket_dir = socket_dir;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            request_received_sender.send(()).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            release_body_receiver.await.unwrap();
+            socket.write_all(b"{\"type\":\"completed\"}").await.unwrap();
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .unix_socket(socket_path)
+            .build()
+            .unwrap();
+        let generation = test_inner_with_client(1, client).await;
+        let first = {
+            let generation = generation.clone();
+            tokio::spawn(async move {
+                generation
+                    .request_background_drain(GenerationRetirementReason::PackageLimit)
+                    .await
+            })
+        };
+        request_received_receiver.await.unwrap();
+        let mut second = {
+            let generation = generation.clone();
+            tokio::spawn(async move {
+                generation
+                    .request_background_drain(GenerationRetirementReason::PackageLimit)
+                    .await
+            })
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut second)
+            .await
+            .is_err());
+
+        release_body_sender.send(()).unwrap();
+        assert!(first.await.unwrap());
+        assert!(second.await.unwrap());
+        server.await.unwrap();
+        generation.terminate().await.unwrap();
     }
 
     #[tokio::test]
@@ -9196,7 +9516,7 @@ mod tests {
     }
 
     #[test]
-    fn default_override_cannot_mask_invalid_system_rss_ordering() {
+    fn default_override_does_not_change_system_memory_policy() {
         let global_rss_bytes = u64::try_from(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES).unwrap();
         let Some(default_rss_bytes) = global_rss_bytes.checked_add(1) else {
             return;
@@ -9207,13 +9527,12 @@ mod tests {
         application.max_rss_bytes = default_rss_bytes;
         application.validate().unwrap();
 
-        let error = match application.into_system_role() {
-            Ok(_) => panic!("Invalid system RSS ordering was accepted"),
-            Err(error) => error,
-        };
-        assert!(error
-            .to_string()
-            .contains("cgroup-pressure RSS threshold must be below"));
+        let system = application.into_system_role().unwrap();
+        assert_eq!(system.max_rss_bytes, global_rss_bytes);
+        assert_eq!(
+            system.memory_pressure_min_rss_bytes,
+            u64::try_from(*LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES).unwrap()
+        );
     }
 
     #[test]
@@ -9255,6 +9574,28 @@ mod tests {
                 config.max_generation_age,
                 Some(config.max_rss_bytes),
                 config.max_imported_source_packages,
+                None,
+            ),
+            Some(GenerationRetirementReason::RssLimit)
+        );
+        let mut age_disabled = config;
+        age_disabled.max_generation_age_enabled = false;
+        assert_eq!(
+            proactive_retirement_reason(
+                &age_disabled,
+                age_disabled.max_generation_age,
+                Some(age_disabled.max_rss_bytes - 1),
+                age_disabled.max_imported_source_packages - 1,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            proactive_retirement_reason(
+                &age_disabled,
+                age_disabled.max_generation_age,
+                Some(age_disabled.max_rss_bytes),
+                age_disabled.max_imported_source_packages - 1,
                 None,
             ),
             Some(GenerationRetirementReason::RssLimit)
@@ -10662,6 +11003,9 @@ done
     async fn resident_readiness_fails_when_target_generation_becomes_unavailable() {
         let fingerprint = test_fingerprint(b"first");
         let generation = test_inner_with_fingerprint(1, fingerprint.clone()).await;
+        generation
+            .resident_package_ready
+            .store(false, Ordering::Release);
         let (executor, state) = test_executor(generation.clone(), test_config());
         let executor = Arc::new(executor);
         let readiness_executor = executor.clone();
