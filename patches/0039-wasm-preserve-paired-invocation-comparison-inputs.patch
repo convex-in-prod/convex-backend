@@ -1,0 +1,1267 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 16 Sep 2026 17:40:11 +0800
+Subject: [PATCH 39/39] wasm: preserve paired invocation comparison inputs
+
+Keep inherited uncommitted insert identities fixed in both runtime directions. Treat encoded bytes as opaque scalar values, and verify an exact shared-allocation relation before constructing bounded alternative ID mappings. Equivalent large insert batches can then compare without exhausting a permutation budget, while changed results, reads, and writes remain mismatches.
+
+Validate detached verifier snapshot retention after failed execution as well as success. Extend the warm-entry fixtures to exercise distinct lazy entry preparation, configuration invalidation, preserved dependency hashes, and capability revocation. Preserve the established distinction between derived OCC dependencies and direct-read accounting; no production accounting change is needed.
+
+Validated with the database merge regression, all 35 runnable isolate acceptance tests (three external-artifact fixtures ignored), all 73 feature-enabled function-runner tests, changed-file rustfmt, and scoped library/test clippy. The all-targets clippy invocation remains blocked by pre-existing database benchmark references to removed APIs.
+---
+ crates/database/src/reads.rs                  |  80 ++++++
+ crates/function_runner/src/query_shadow.rs    | 265 +++++++++++++++++-
+ crates/function_runner/src/server.rs          |  83 +++++-
+ .../artifact_registry_contract_tests.rs       |  11 +
+ .../runtime_acceptance_tests.rs               | 117 +++++++-
+ .../test_support/fixtures.rs                  | 148 ++++++++--
+ patches/static_hermes_wasm_udfs/operations.md |  24 +-
+ 7 files changed, 673 insertions(+), 55 deletions(-)
+
+diff --git a/crates/database/src/reads.rs b/crates/database/src/reads.rs
+index ebd829a9462fe7ae619c16c4b07eb64109cbcdeb..787d4855d400ed9da1f97df23a45afa782d53fc5 100644
+--- a/crates/database/src/reads.rs
++++ b/crates/database/src/reads.rs
+@@ -901,4 +901,84 @@ mod tests {
+         );
+         Ok(())
+     }
++
++    #[test]
++    fn merge_unions_derived_dependencies_and_adds_accounting() -> anyhow::Result<()> {
++        let limits = TransactionLimits::default();
++        let derived_index = TabletIndexName::by_id(TabletId::MIN);
++        let direct_index = TabletIndexName::by_creation_time(TabletId::MIN);
++        let mut previous = TransactionReadSet::new();
++        previous.record_indexed_derived(
++            derived_index.clone(),
++            IndexedFields::by_id(),
++            Interval::prefix(vec![0].into()),
++        );
++        previous.record_indexed_directly(
++            direct_index.clone(),
++            IndexedFields::creation_time(),
++            Interval::prefix(vec![0].into()),
++            &limits,
++        )?;
++        previous.user_tx_size = TransactionReadSize {
++            total_document_size: 10,
++            total_document_count: 1,
++        };
++        previous.system_tx_size = TransactionReadSize {
++            total_document_size: 20,
++            total_document_count: 2,
++        };
++
++        let mut additional = TransactionReadSet::new();
++        for key in [0, 2] {
++            additional.record_indexed_derived(
++                derived_index.clone(),
++                IndexedFields::by_id(),
++                Interval::prefix(vec![key].into()),
++            );
++        }
++        additional.record_indexed_directly(
++            direct_index,
++            IndexedFields::creation_time(),
++            Interval::prefix(vec![0].into()),
++            &limits,
++        )?;
++        additional.user_tx_size = TransactionReadSize {
++            total_document_size: 30,
++            total_document_count: 3,
++        };
++        additional.system_tx_size = TransactionReadSize {
++            total_document_size: 40,
++            total_document_count: 4,
++        };
++
++        let additional_num_intervals = additional.num_intervals();
++        let additional_user_tx_size = additional.user_tx_size().clone();
++        let additional_system_tx_size = additional.system_tx_size().clone();
++        previous.merge(
++            additional.into_read_set(),
++            additional_num_intervals,
++            additional_user_tx_size,
++            additional_system_tx_size,
++        );
++
++        // Derived ranges remain OCC dependencies without becoming query
++        // accounting, while the direct range is charged once per segment.
++        assert_eq!(previous.num_intervals(), 2);
++        assert_eq!(previous.read_set.num_intervals(), 3);
++        assert_eq!(
++            previous.user_tx_size,
++            TransactionReadSize {
++                total_document_size: 40,
++                total_document_count: 4,
++            }
++        );
++        assert_eq!(
++            previous.system_tx_size,
++            TransactionReadSize {
++                total_document_size: 60,
++                total_document_count: 6,
++            }
++        );
++        Ok(())
++    }
+ }
+diff --git a/crates/function_runner/src/query_shadow.rs b/crates/function_runner/src/query_shadow.rs
+index 0f83fde04c8ba72565ea3952d0be4f363edf7f2b..1c4448c3b4e83ec49862098f256e1f8980264a26 100644
+--- a/crates/function_runner/src/query_shadow.rs
++++ b/crates/function_runner/src/query_shadow.rs
+@@ -608,7 +608,7 @@ pub(crate) struct QueryShadowObservation {
+     reads: ReadSet,
+ }
+ 
+-/// Observation of existing-document transitions from paired mutation lanes at
++/// Observation of document transitions from paired mutation lanes at
+ /// one database snapshot.
+ #[cfg(feature = "static-hermes-wasmtime-gate")]
+ pub(crate) struct MutationShadowObservation {
+@@ -622,6 +622,7 @@ pub(crate) struct MutationShadowObservation {
+ #[derive(Debug, Eq, PartialEq)]
+ struct NormalizedMutationWriteSet {
+     existing: BTreeMap<ResolvedDocumentId, NormalizedExistingDocumentWrite>,
++    preexisting_inserts: BTreeMap<ResolvedDocumentId, JsonValue>,
+     inserts: BTreeMap<ResolvedDocumentId, JsonValue>,
+     scheduled_job_inserts: BTreeSet<ResolvedDocumentId>,
+ }
+@@ -685,6 +686,9 @@ impl MutationInsertIdMapping {
+                     .map(|value| self.replace_primary_ids(value))
+                     .collect(),
+             ),
++            // Base64 is a scalar encoding, not a document-ID value, even
++            // when its text happens to equal an allocated ID.
++            JsonValue::Object(fields) if fields.contains_key("$bytes") => value.clone(),
+             JsonValue::Object(fields) => JsonValue::Object(
+                 fields
+                     .iter()
+@@ -705,6 +709,7 @@ impl MutationShadowObservation {
+     pub(crate) fn new(
+         transaction: &FunctionFinalTransaction,
+         outcome: &FunctionOutcome,
++        preexisting_write_ids: &BTreeSet<ResolvedDocumentId>,
+     ) -> anyhow::Result<Self> {
+         let FunctionOutcome::Mutation(outcome) = outcome else {
+             anyhow::bail!("mutation shadow received a non-mutation outcome");
+@@ -723,6 +728,7 @@ impl MutationShadowObservation {
+             writes: normalize_mutation_writes(
+                 &transaction.writes.updates,
+                 &transaction.table_mapping,
++                preexisting_write_ids,
+             )?,
+         })
+     }
+@@ -735,6 +741,7 @@ impl MutationShadowObservation {
+     pub(crate) fn from_owned(
+         mut transaction: FunctionFinalTransaction,
+         outcome: FunctionOutcome,
++        preexisting_write_ids: &BTreeSet<ResolvedDocumentId>,
+     ) -> anyhow::Result<Self> {
+         let FunctionOutcome::Mutation(outcome) = outcome else {
+             anyhow::bail!("mutation shadow received a non-mutation outcome");
+@@ -754,6 +761,7 @@ impl MutationShadowObservation {
+             writes: normalize_mutation_writes(
+                 &transaction.writes.updates,
+                 &transaction.table_mapping,
++                preexisting_write_ids,
+             )?,
+         })
+     }
+@@ -763,8 +771,10 @@ impl MutationShadowObservation {
+ fn normalize_mutation_writes(
+     updates: &[PendingDocumentUpdate],
+     table_mapping: &TableMapping,
++    preexisting_write_ids: &BTreeSet<ResolvedDocumentId>,
+ ) -> anyhow::Result<NormalizedMutationWriteSet> {
+     let mut existing = BTreeMap::new();
++    let mut preexisting_inserts = BTreeMap::new();
+     let mut inserts = BTreeMap::new();
+     let mut scheduled_job_inserts = BTreeSet::new();
+     for update in updates {
+@@ -807,6 +817,15 @@ fn normalize_mutation_writes(
+                 if table_name == SCHEDULED_JOBS_ARGS_TABLE {
+                     document = normalize_inserted_scheduled_args(document)?;
+                 }
++                // An inherited uncommitted insert is an invocation input, not
++                // a lane-local allocation. Its ID and creation time are fixed.
++                if preexisting_write_ids.contains(&update.id()) {
++                    anyhow::ensure!(
++                        preexisting_inserts.insert(update.id(), document).is_none(),
++                        "mutation shadow received duplicate inherited-document writes"
++                    );
++                    continue;
++                }
+                 anyhow::ensure!(
+                     inserts.insert(update.id(), document).is_none(),
+                     "mutation shadow received duplicate inserted-document writes"
+@@ -822,6 +841,7 @@ fn normalize_mutation_writes(
+     }
+     Ok(NormalizedMutationWriteSet {
+         existing,
++        preexisting_inserts,
+         inserts,
+         scheduled_job_inserts,
+     })
+@@ -929,6 +949,9 @@ fn erase_insert_identities_in_value(
+                 .map(|value| erase_insert_identities_in_value(value, insert_ids, false))
+                 .collect(),
+         ),
++        // Candidate pruning must preserve the same opaque byte values as
++        // the complete comparison, including inside decoded scheduler args.
++        JsonValue::Object(fields) if fields.contains_key("$bytes") => value.clone(),
+         JsonValue::Object(fields) => JsonValue::Object(
+             fields
+                 .iter()
+@@ -999,6 +1022,13 @@ fn mutation_write_sets_equal(
+             })
+         })
+         && primary.inserts.len() == shadow.inserts.len()
++        && primary.preexisting_inserts.len() == shadow.preexisting_inserts.len()
++        && primary.preexisting_inserts.iter().all(|(id, primary)| {
++            shadow
++                .preexisting_inserts
++                .get(id)
++                .is_some_and(|shadow| insert_id_mapping.replace_primary_ids(primary) == *shadow)
++        })
+         && primary
+             .inserts
+             .iter()
+@@ -1155,6 +1185,30 @@ where
+         return Ok(());
+     }
+ 
++    let mut found_solution = false;
++    if primary_writes
++        .inserts
++        .keys()
++        .eq(shadow_writes.inserts.keys())
++    {
++        let identity_mapping = MutationInsertIdMapping::new(
++            primary_writes.inserts.keys().map(|id| (*id, *id)).collect(),
++        )?;
++        if mutation_write_sets_equal(primary_writes, shadow_writes, &identity_mapping) {
++            found_solution = true;
++            // Shared allocation normally supplies this relation directly.
++            // Prove every dimension before building a quadratic candidate
++            // graph or spending the bounded search on an identical write set.
++            if let std::ops::ControlFlow::Break(()) = on_mapping(identity_mapping) {
++                return Ok(());
++            }
++        }
++    }
++    anyhow::ensure!(
++        primary_writes.inserts.len() <= MAX_MUTATION_SHADOW_INSERT_MAPPING_CANDIDATES,
++        "mutation shadow inserted-document identity mapping exceeded its bounded search"
++    );
++
+     let primary_insert_ids = encoded_insert_ids(&primary_writes.inserts)?;
+     let shadow_insert_ids = encoded_insert_ids(&shadow_writes.inserts)?;
+     let mut candidate_sets = Vec::with_capacity(primary_writes.inserts.len());
+@@ -1199,7 +1253,6 @@ where
+         primary_insert_ids,
+         shadow_insert_ids,
+     };
+-    let mut found_solution = false;
+     let _ = search.visit(
+         &candidate_sets,
+         primary_writes,
+@@ -1735,7 +1788,10 @@ fn log_comparison_dimensions(udf_type: UdfType, comparison: &QueryShadowComparis
+ #[cfg(test)]
+ mod tests {
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+-    use std::collections::BTreeMap;
++    use std::collections::{
++        BTreeMap,
++        BTreeSet,
++    };
+     use std::time::Duration;
+ 
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+@@ -2422,6 +2478,7 @@ mod tests {
+             begin_timestamp,
+             table_mapping,
+             ReadSet::empty(),
++            &BTreeSet::new(),
+         )
+     }
+ 
+@@ -2432,6 +2489,7 @@ mod tests {
+         begin_timestamp: Timestamp,
+         table_mapping: TableMapping,
+         handler_read_set: ReadSet,
++        preexisting_write_ids: &BTreeSet<ResolvedDocumentId>,
+     ) -> anyhow::Result<MutationShadowTestObservation> {
+         let reads = || crate::FunctionReads {
+             reads: ReadSet::empty(),
+@@ -2452,7 +2510,7 @@ mod tests {
+             rows_read_by_tablet: Default::default(),
+             table_mapping,
+         };
+-        MutationShadowTestObservation::new(&transaction, &outcome)
++        MutationShadowTestObservation::new(&transaction, &outcome, preexisting_write_ids)
+     }
+ 
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+@@ -3103,6 +3161,70 @@ mod tests {
+         compare_mutation_for_test(primary, shadow)
+     }
+ 
++    #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
++    #[test]
++    fn mutation_shadow_preserves_inherited_insert_identity_and_dependencies() -> anyhow::Result<()>
++    {
++        let inherited_first = test_document_id(1);
++        let inherited_second = test_document_id(2);
++        let inherited_ids = BTreeSet::from([inherited_first, inherited_second]);
++        let primary_new = test_document_id(3);
++        let shadow_new = test_document_id(4);
++        let observation = |new_id: ResolvedDocumentId,
++                           result_id: ResolvedDocumentId,
++                           read_id,
++                           inherited_creation_time| {
++            mutation_observation_with_table_mapping_and_reads(
++                vec![
++                    inserted_document_with_creation_time(
++                        inherited_first,
++                        serde_json::json!({ "value": "inherited" }),
++                        inherited_creation_time,
++                    )?,
++                    inserted_document(
++                        inherited_second,
++                        serde_json::json!({ "value": "inherited" }),
++                    )?,
++                    inserted_document(new_id, serde_json::json!({ "value": "new" }))?,
++                ],
++                mutation_outcome_with_result(serde_json::json!({
++                    "inherited": result_id.developer_id.encode(),
++                    "new": new_id.developer_id.encode(),
++                }))?,
++                Timestamp::MIN,
++                user_table_mapping(),
++                insert_id_read_set(&[read_id, new_id]),
++                &inherited_ids,
++            )
++        };
++        let primary = || observation(primary_new, inherited_first, inherited_first, 1.0);
++        assert!(compare_mutation(
++            primary()?,
++            observation(shadow_new, inherited_first, inherited_first, 1.0)?,
++        )
++        .matches());
++
++        let changed_result = compare_mutation(
++            primary()?,
++            observation(shadow_new, inherited_second, inherited_first, 1.0)?,
++        );
++        assert!(!changed_result.result_matches, "{changed_result:?}");
++        let changed_read = compare_mutation(
++            primary()?,
++            observation(shadow_new, inherited_first, inherited_second, 1.0)?,
++        );
++        assert!(!changed_read.read_dependencies_match, "{changed_read:?}");
++        let changed_creation_time = compare_mutation(
++            primary()?,
++            observation(shadow_new, inherited_first, inherited_first, 2.0)?,
++        );
++        assert!(
++            !changed_creation_time.write_set_matches,
++            "{changed_creation_time:?}"
++        );
++        Ok(())
++    }
++
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+     #[test]
+     fn mutation_shadow_normalizes_insert_ids_in_error_custom_data() -> anyhow::Result<()> {
+@@ -3295,6 +3417,7 @@ mod tests {
+                 Timestamp::MIN,
+                 table_mapping.clone(),
+                 insert_id_read_set(&[operation_id, args_id, job_id]),
++                &BTreeSet::new(),
+             )
+         };
+ 
+@@ -3399,6 +3522,7 @@ mod tests {
+                 Timestamp::MIN,
+                 table_mapping.clone(),
+                 insert_id_read_set(&ids),
++                &BTreeSet::new(),
+             )
+         };
+ 
+@@ -3436,6 +3560,65 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
++    #[test]
++    fn mutation_shadow_preserves_bytes_whose_base64_matches_inserted_ids() -> anyhow::Result<()> {
++        // Two-byte table numbers produce 32-character IDs that are also
++        // canonical Base64 for unrelated binary values.
++        let primary_id = test_document_id_in_table(11, 128, 1);
++        let shadow_id = test_document_id_in_table(11, 128, 2);
++        let primary_bytes = serde_json::json!({ "$bytes": primary_id.developer_id.encode() });
++        let shadow_bytes = serde_json::json!({ "$bytes": shadow_id.developer_id.encode() });
++        for bytes in [&primary_bytes, &shadow_bytes] {
++            assert_eq!(
++                ConvexValue::try_from(bytes.clone())?.to_internal_json(),
++                *bytes
++            );
++        }
++        let mut table_mapping = TableMapping::new();
++        table_mapping.insert(
++            primary_id.tablet_id,
++            TableNamespace::Global,
++            primary_id.developer_id.table(),
++            "shadowTestDocuments".parse()?,
++        );
++        let observation = |id, payload, outcome| {
++            mutation_observation_with_table_mapping(
++                vec![inserted_document(
++                    id,
++                    serde_json::json!({ "payload": payload }),
++                )?],
++                outcome,
++                Timestamp::MIN,
++                table_mapping.clone(),
++            )
++        };
++
++        // Equal bytes must survive shape pruning even if only one lane
++        // allocated the ID matching their encoding; changed bytes must fail.
++        for (payload, expected_match) in [(&primary_bytes, true), (&shadow_bytes, false)] {
++            let comparison = compare_mutation(
++                observation(primary_id, &primary_bytes, mutation_outcome()?)?,
++                observation(shadow_id, payload, mutation_outcome()?)?,
++            );
++            assert_eq!(comparison.matches(), expected_match, "{comparison:?}");
++        }
++        let comparison = compare_mutation(
++            observation(
++                primary_id,
++                &primary_bytes,
++                mutation_outcome_with_result(primary_bytes.clone())?,
++            )?,
++            observation(
++                shadow_id,
++                &primary_bytes,
++                mutation_outcome_with_result(shadow_bytes.clone())?,
++            )?,
++        );
++        assert!(!comparison.result_matches, "{comparison:?}");
++        Ok(())
++    }
++
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+     #[test]
+     fn mutation_shadow_uses_result_ids_to_disambiguate_identical_inserts() -> anyhow::Result<()> {
+@@ -3544,6 +3727,80 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
++    #[test]
++    fn mutation_shadow_shared_allocation_proves_large_identical_write_sets() -> anyhow::Result<()> {
++        let observation = || {
++            mutation_observation(
++                (0..=super::MAX_MUTATION_SHADOW_INSERT_MAPPING_CANDIDATES)
++                    .map(|number| {
++                        let mut bytes = [0; 16];
++                        bytes[..8].copy_from_slice(&u64::try_from(number)?.to_le_bytes());
++                        let id = ResolvedDocumentId::new(
++                            TabletId::MIN,
++                            DeveloperDocumentId::new(TableNumber::MIN, InternalId(bytes)),
++                        );
++                        inserted_document(id, serde_json::json!({ "value": "same" }))
++                    })
++                    .collect::<anyhow::Result<_>>()?,
++            )
++        };
++        let comparison = compare_mutation(observation()?, observation()?);
++        assert!(comparison.matches(), "{comparison:?}");
++        let mut changed = observation()?;
++        changed.outcome.result = Ok(JsonPackedValue::pack(PendingValue::Concrete(
++            ConvexValue::Boolean(true),
++        )));
++        changed.reads = comparator_read_set();
++        let comparison = compare_mutation(observation()?, changed);
++        assert!(!comparison.result_matches, "{comparison:?}");
++        assert!(!comparison.read_dependencies_match, "{comparison:?}");
++        assert!(!comparison.matches(), "{comparison:?}");
++        Ok(())
++    }
++
++    #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
++    #[test]
++    fn mutation_shadow_matches_cycles_with_overlapping_insert_id_domains() -> anyhow::Result<()> {
++        let first = test_document_id(1);
++        let second = test_document_id(2);
++        let third = test_document_id(3);
++        let observation = |ids: [ResolvedDocumentId; 3], changed_result| {
++            mutation_observation_with(
++                (0..3)
++                    .map(|index| {
++                        inserted_document(
++                            ids[index],
++                            serde_json::json!({
++                                "next": ids[(index + 1) % 3].developer_id.encode(),
++                            }),
++                        )
++                    })
++                    .collect::<anyhow::Result<_>>()?,
++                mutation_outcome_with_result(serde_json::json!([
++                    ids[0].developer_id.encode(),
++                    ids[1].developer_id.encode(),
++                    ids[if changed_result { 0 } else { 2 }]
++                        .developer_id
++                        .encode(),
++                ]))?,
++                Timestamp::MIN,
++            )
++        };
++        for (primary, shadow) in [
++            ([first, second, third], [second, first, third]),
++            ([second, first, third], [first, second, third]),
++        ] {
++            let comparison =
++                compare_mutation(observation(primary, false)?, observation(shadow, false)?);
++            assert!(comparison.matches(), "{comparison:?}");
++            let changed =
++                compare_mutation(observation(primary, false)?, observation(shadow, true)?);
++            assert!(!changed.result_matches, "{changed:?}");
++        }
++        Ok(())
++    }
++
+     #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+     #[test]
+     fn mutation_shadow_bounds_partial_insert_identity_mapping_search() -> anyhow::Result<()> {
+diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
+index a4a82b5834887e12a842eaf47252fb1af3e3c819..fa61e7eaeb6fddc16f2284bb77087340fb073cb5 100644
+--- a/crates/function_runner/src/server.rs
++++ b/crates/function_runner/src/server.rs
+@@ -133,6 +133,8 @@ use usage_tracking::{
+     FunctionUsageTracker,
+ };
+ use value::identifier::Identifier;
++#[cfg(feature = "static-hermes-wasmtime-gate")]
++use value::ResolvedDocumentId;
+ 
+ use super::in_memory_indexes::InMemoryIndexCache;
+ #[cfg(all(feature = "static-hermes-wasmtime-gate", feature = "testing"))]
+@@ -505,13 +507,16 @@ impl PrimaryShadowObservation {
+         transaction: &FunctionFinalTransaction,
+         outcome: &FunctionOutcome,
+         duration: Duration,
++        preexisting_write_ids: &BTreeSet<ResolvedDocumentId>,
+     ) -> Self {
+         let observation = match udf_type {
+             UdfType::Query => {
+                 QueryShadowObservation::new(transaction, outcome).map(ShadowObservation::Query)
+             },
+-            UdfType::Mutation => MutationShadowObservation::new(transaction, outcome)
+-                .map(ShadowObservation::Mutation),
++            UdfType::Mutation => {
++                MutationShadowObservation::new(transaction, outcome, preexisting_write_ids)
++                    .map(ShadowObservation::Mutation)
++            },
+             UdfType::Action | UdfType::HttpAction => {
+                 return Self::Terminal(QueryShadowTerminal::InvalidPrimary);
+             },
+@@ -608,14 +613,17 @@ where
+         Ok(PrimaryShadowObservation::Terminal(terminal)) => return Err(terminal),
+         Err(_) => return Err(QueryShadowTerminal::PrimaryFailure),
+     };
+-    let verifier = match verifier.await {
++    let verifier = verifier.await;
++    // Failed reads may also have observed expired history. Match the forward
++    // lane's retention-first classification before reporting execution failure.
++    snapshot_validation.validate().await?;
++    let verifier = match verifier {
+         V8VerifierOutcome::Observation {
+             observation,
+             duration,
+         } => (observation, duration),
+         V8VerifierOutcome::Terminal(terminal) => return Err(terminal),
+     };
+-    snapshot_validation.validate().await?;
+     Ok((primary, verifier))
+ }
+ 
+@@ -1276,6 +1284,12 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                         primary_prestarted.transaction.next_creation_time(),
+                     ),
+                 };
++                let preexisting_write_ids: BTreeSet<_> = primary_request
++                    .existing_writes
++                    .updates
++                    .iter()
++                    .map(|update| update.id())
++                    .collect();
+                 let shadow_candidate = match configured_static_hermes_route {
+                     Ok(Some(route_candidate)) => {
+                         let shadow_request = DatabaseLaneRequest {
+@@ -1401,6 +1415,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                             .snapshot_validation
+                             .clone();
+                         let shadow_runner = self.clone();
++                        let shadow_preexisting_write_ids = preexisting_write_ids.clone();
+                         self.rt
+                             .spawn_background("static_hermes_shadow", async move {
+                                 let result = run_admitted_shadow_lane(
+@@ -1469,6 +1484,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                                                             MutationShadowObservation::from_owned(
+                                                                 transaction,
+                                                                 outcome,
++                                                                &shadow_preexisting_write_ids,
+                                                             );
+                                                         observation.map(ShadowObservation::Mutation)
+                                                     },
+@@ -1573,6 +1589,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                         &transaction,
+                         &outcome,
+                         primary_duration,
++                        &preexisting_write_ids,
+                     );
+                     query_shadow_primary_publication.record_primary(primary);
+                 }
+@@ -1734,6 +1751,13 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                 };
+                 let shadow_work_guard = shadow_permit.work_guard();
+                 let shadow_runner = self.clone();
++                let preexisting_write_ids: BTreeSet<_> = primary_request
++                    .existing_writes
++                    .updates
++                    .iter()
++                    .map(|update| update.id())
++                    .collect();
++                let shadow_preexisting_write_ids = preexisting_write_ids.clone();
+                 let document_creation_state =
+                     primary_prestarted.transaction.document_creation_state();
+                 let verifier = async move {
+@@ -1782,6 +1806,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                         UdfType::Mutation => MutationShadowObservation::from_owned(
+                             shadow_transaction,
+                             shadow_outcome,
++                            &shadow_preexisting_write_ids,
+                         )
+                         .map(ShadowObservation::Mutation),
+                         UdfType::Action | UdfType::HttpAction => unreachable!(),
+@@ -1822,6 +1847,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                             transaction,
+                             outcome,
+                             *duration,
++                            &preexisting_write_ids,
+                         )
+                     },
+                 )
+@@ -1884,6 +1910,12 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                 };
+                 let primary_runner = self.clone();
+                 let shadow_runner = self.clone();
++                let preexisting_write_ids: BTreeSet<_> = primary_request
++                    .existing_writes
++                    .updates
++                    .iter()
++                    .map(|update| update.id())
++                    .collect();
+                 let primary_prestarted = self
+                     .begin_database_lane_transaction(&primary_request, false)
+                     .await?;
+@@ -1922,8 +1954,16 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                 let (transaction, outcome, usage_stats) = primary;
+                 let (shadow_transaction, shadow_outcome, _) = shadow;
+                 compare_mutation_shadow_for_test(
+-                    MutationShadowTestObservation::new(&transaction, &outcome)?,
+-                    MutationShadowTestObservation::new(&shadow_transaction, &shadow_outcome)?,
++                    MutationShadowTestObservation::new(
++                        &transaction,
++                        &outcome,
++                        &preexisting_write_ids,
++                    )?,
++                    MutationShadowTestObservation::new(
++                        &shadow_transaction,
++                        &shadow_outcome,
++                        &preexisting_write_ids,
++                    )?,
+                 )?;
+                 return Ok(FunctionExecutionResult::Completed {
+                     transaction: Some(transaction),
+@@ -2706,6 +2746,7 @@ mod query_shadow_lane_contract_tests {
+             &query_transaction(Timestamp::MIN, true),
+             &query_outcome()?,
+             Duration::ZERO,
++            &Default::default(),
+         ))
+     }
+ 
+@@ -2721,6 +2762,7 @@ mod query_shadow_lane_contract_tests {
+                 &transaction,
+                 &outcome,
+                 Duration::ZERO,
++                &Default::default(),
+             ),
+             PrimaryShadowObservation::Terminal(QueryShadowTerminal::InvalidPrimary),
+         ));
+@@ -3127,7 +3169,9 @@ mod query_shadow_lane_contract_tests {
+     #[tokio::test]
+     async fn detached_shadows_validate_retention_after_execution() -> anyhow::Result<()> {
+         for wasm_primary in [false, true] {
+-            for expire_during_shadow in [false, true] {
++            for (expire_during_shadow, shadow_failed) in
++                [(false, false), (true, false), (false, true), (true, true)]
++            {
+                 let validator = Arc::new(ExpiringTestSnapshot {
+                     valid: AtomicBool::new(true),
+                     validations: AtomicUsize::new(0),
+@@ -3155,9 +3199,17 @@ mod query_shadow_lane_contract_tests {
+                         release_receiver
+                             .await
+                             .expect("shadow release sender dropped");
+-                        V8VerifierOutcome::Observation {
+-                            observation,
+-                            duration,
++                        if shadow_failed {
++                            V8VerifierOutcome::Terminal(QueryShadowTerminal::ShadowFailure {
++                                stage: QueryShadowFailureStage::VerifierExecution,
++                                reason: QueryShadowFailureReason::VerifierExecution,
++                                generated_export_diagnostic: None,
++                            })
++                        } else {
++                            V8VerifierOutcome::Observation {
++                                observation,
++                                duration,
++                            }
+                         }
+                     };
+                     if wasm_primary {
+@@ -3171,7 +3223,11 @@ mod query_shadow_lane_contract_tests {
+                     } else {
+                         await_shadow_lanes(&mut primary_receiver, shadow, &snapshot_validation)
+                             .await
+-                            .map(|_| ())
++                            .and_then(|paired| match paired {
++                                Some((_, V8VerifierOutcome::Terminal(terminal))) => Err(terminal),
++                                Some((_, V8VerifierOutcome::Observation { .. })) => Ok(()),
++                                None => Err(QueryShadowTerminal::PrimaryFailure),
++                            })
+                     }
+                 });
+ 
+@@ -3190,6 +3246,11 @@ mod query_shadow_lane_contract_tests {
+                 let result = pairing.await?;
+                 if expire_during_shadow {
+                     assert!(matches!(result, Err(QueryShadowTerminal::InvalidShadow)));
++                } else if shadow_failed {
++                    assert!(matches!(
++                        result,
++                        Err(QueryShadowTerminal::ShadowFailure { .. })
++                    ));
+                 } else {
+                     assert!(result.is_ok());
+                 }
+diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/artifact_registry_contract_tests.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/artifact_registry_contract_tests.rs
+index c09349c06939418cf89b3d1e6125cf2a413a7e4d..b5ca932d7cc23014eac348e1434924028d24b445 100644
+--- a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/artifact_registry_contract_tests.rs
++++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/artifact_registry_contract_tests.rs
+@@ -4527,6 +4527,17 @@ fn generated_wasm_real_module_graph_registry_v5_executes_authenticated_route() -
+             u64::from_str_radix(selector, 16).context("invalid preparation entry selector")
+         })
+         .collect::<anyhow::Result<Vec<_>>>()?;
++    if !preparation_entry_selectors.is_empty() {
++        anyhow::ensure!(
++            preparation_entry_selectors
++                .iter()
++                .copied()
++                .collect::<BTreeSet<_>>()
++                .len()
++                >= 2,
++            "preparation sequence must contain at least two distinct entry selectors"
++        );
++    }
+     let registry = DeploymentRegistry::load(runtime_registry_root)?;
+     let generation = registry.current();
+     let (package_key, runtime_entry, route_lease, deployed_runtime_identity) =
+diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests.rs
+index 53a3fb5978e8d82ab6c8afa3b9cf875b5e975341..387a2b121401c0cb1c8e2599d275d9ddd9a2c7de 100644
+--- a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests.rs
++++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests.rs
+@@ -193,7 +193,7 @@ async fn run_generated_warm_entry_prepare_environment_test(rt: ProdRuntime) -> a
+         Vec::new(),
+         1 << 20,
+         1_000_000_000,
+-        1,
++        2,
+     )?;
+     let names: [EnvVarName; 2] = [
+         "INITIALIZATION_FIRST_SETTING".parse()?,
+@@ -222,12 +222,16 @@ async fn run_generated_warm_entry_prepare_environment_test(rt: ProdRuntime) -> a
+             )
+         })
+         .collect::<Result<Vec<_>, _>>()?;
++    let unauthorized_request = GuestNativeValueCodec::encode(
++        json!({ "version": 4, "kind": "performanceNow" }),
++        MAX_REQUEST_BYTES,
++    )?;
+     let routed = generated_test_routed_module_from_bytes(
+         Arc::clone(&manifest),
+-        super::test_support::generated_entry_prepare_environment_test_module([
+-            &environment_requests[0],
+-            &environment_requests[1],
+-        ]),
++        super::test_support::generated_entry_prepare_environment_test_module(
++            [&environment_requests[0], &environment_requests[1]],
++            &unauthorized_request,
++        ),
+     )?;
+     anyhow::ensure!(
+         routed.package_identity.requires_entry_selector()
+@@ -238,7 +242,8 @@ async fn run_generated_warm_entry_prepare_environment_test(rt: ProdRuntime) -> a
+     let controller = generated_module_cache_test_controller(8 << 20, 12 << 20)?;
+     let mut retained: Option<RetainedGeneratedTestRuntime> = None;
+     let mut first_runtime_id = None;
+-    for iteration in 0..2 {
++    let mut first_range_hashes = None;
++    for (iteration, selector) in [0, 1].into_iter().enumerate() {
+         let (instance, existing_slot, values) = match retained.take() {
+             Some(retained) => (
+                 Some(retained.instance),
+@@ -247,6 +252,10 @@ async fn run_generated_warm_entry_prepare_environment_test(rt: ProdRuntime) -> a
+             ),
+             None => (None, None, None),
+         };
++        let previous_interval_accounting = instance
++            .as_ref()
++            .and_then(|instance| instance.context_read_set.as_ref())
++            .map(|read_set| read_set.read_set.num_intervals());
+         let mut transaction = database.begin_system().await?;
+         if let Some(instance) = &instance {
+             assert!(
+@@ -289,7 +298,14 @@ async fn run_generated_warm_entry_prepare_environment_test(rt: ProdRuntime) -> a
+             Duration::from_secs(5),
+             *DATABASE_UDF_SYSTEM_TIMEOUT,
+         )?;
+-        let mut output = execute_generated(Arc::clone(&routed), state, instance, true).await?;
++        let mut output = execute_generated_with_entry_selector(
++            Arc::clone(&routed),
++            Some(selector),
++            state,
++            instance,
++            true,
++        )
++        .await?;
+         assert_eq!(
+             output.invocation.outcome,
+             InvocationOutcome::Success,
+@@ -297,11 +313,62 @@ async fn run_generated_warm_entry_prepare_environment_test(rt: ProdRuntime) -> a
+             output.system_error
+         );
+         assert_eq!(output.invocation.function_result, Some(JsonValue::Null));
++        assert_eq!(
++            output.invocation.operation_count,
++            u64::try_from(iteration + 1)?
++        );
++        assert!(output.invocation.capability_revoked);
+         if let Some(first_id) = first_runtime_id {
+             assert_eq!(output.runtime_id, first_id);
+         } else {
+             first_runtime_id = Some(output.runtime_id);
+         }
++        let context_read_set = output
++            .reusable_instance
++            .as_ref()
++            .and_then(|instance| instance.context_read_set.as_ref())
++            .context("successful preparation omitted its context read set")?;
++        let structural_intervals = context_read_set
++            .read_set
++            .read_set()
++            .iter_indexed()
++            .map(|(_, reads)| reads.intervals.len())
++            .sum::<usize>();
++        let interval_accounting = context_read_set.read_set.num_intervals();
++        assert_eq!(
++            output.invocation.read_accounting.intervals, interval_accounting,
++            "iteration {iteration} transaction and retained context accounting diverged"
++        );
++        if let Some(previous_interval_accounting) = previous_interval_accounting {
++            assert!(
++                interval_accounting > previous_interval_accounting,
++                "warm preparation did not add its read accounting"
++            );
++        } else {
++            assert!(
++                structural_intervals > interval_accounting,
++                "cold preparation did not retain its unaccounted derived dependencies"
++            );
++        }
++        assert_eq!(
++            context_read_set.read_set.read_set().iter_search().count(),
++            0,
++            "preparation configuration reads unexpectedly captured search dependencies"
++        );
++        if iteration == 0 {
++            assert!(!context_read_set.range_hashes.is_empty());
++            first_range_hashes = Some(context_read_set.range_hashes.clone());
++        } else {
++            let first_range_hashes = first_range_hashes
++                .as_ref()
++                .context("cold preparation dependency hashes disappeared")?;
++            assert!(
++                first_range_hashes
++                    .iter()
++                    .all(|hash| context_read_set.range_hashes.contains(hash)),
++                "warm preparation discarded an earlier initialization dependency hash"
++            );
++        }
+         retained = Some(retain_generated_test_runtime(&mut output)?);
+         drop(output.invocation.transaction);
+     }
+@@ -502,6 +569,7 @@ async fn run_generated_selected_entry_dispatch_failure_test(rt: ProdRuntime) ->
+         let mut output =
+             execute_generated_with_entry_selector(routed, Some(ENTRY_SELECTOR), state, None, false)
+                 .await?;
++        assert!(output.invocation.capability_revoked);
+         if expected.success {
+             assert_eq!(output.invocation.outcome, InvocationOutcome::Success);
+             assert_eq!(output.invocation.function_result, Some(JsonValue::Null));
+@@ -3469,6 +3537,7 @@ async fn run_generated_lifecycle_barrier_tests(rt: ProdRuntime) -> anyhow::Resul
+     assert!(cancellation.invocation.function_result.is_none());
+     assert_eq!(cancellation.invocation.opaque_live_handles, 0);
+     assert_eq!(cancellation.invocation.opaque_current_bytes, 0);
++    assert!(cancellation.invocation.capability_revoked);
+     assert_eq!(
+         cancellation_metrics
+             .terminal_cancellations
+@@ -3523,6 +3592,7 @@ async fn run_generated_lifecycle_barrier_tests(rt: ProdRuntime) -> anyhow::Resul
+         deadline.invocation.outcome,
+         InvocationOutcome::SystemTimeout
+     );
++    assert!(deadline.invocation.capability_revoked);
+     assert!(deadline.system_error.take().is_some());
+     assert!(deadline.reusable_instance.is_none());
+     assert!(deadline.memory_permit.is_none());
+@@ -3603,6 +3673,7 @@ async fn run_generated_lifecycle_barrier_tests(rt: ProdRuntime) -> anyhow::Resul
+     .await?;
+     let mut warm = tokio::time::timeout(Duration::from_secs(5), warm).await???;
+     assert_eq!(warm.invocation.outcome, InvocationOutcome::Success);
++    assert!(warm.invocation.capability_revoked);
+     let retained = retain_generated_test_runtime(&mut warm)?;
+     let runtime_id = retained.instance.id;
+     let routed = Arc::clone(&retained.instance.routed);
+@@ -3657,6 +3728,7 @@ async fn run_generated_lifecycle_barrier_tests(rt: ProdRuntime) -> anyhow::Resul
+     assert!(cancelled_warm.invocation.function_result.is_none());
+     assert_eq!(cancelled_warm.invocation.opaque_live_handles, 0);
+     assert_eq!(cancelled_warm.invocation.opaque_current_bytes, 0);
++    assert!(cancelled_warm.invocation.capability_revoked);
+     assert!(cancelled_warm.reusable_instance.is_none());
+     assert!(cancelled_warm.memory_permit.is_none());
+     assert_eq!(
+@@ -11099,15 +11171,35 @@ fn paired_insert_then_first_read_dependencies() -> anyhow::Result<()> {
+     block_rt.block_on("paired_insert_then_first", async move {
+         let database = new_test_database(rt).await?;
+         let table: TableName = "pending_operations".parse()?;
++        let inherited_table: TableName = "inherited_operations".parse()?;
+         let namespace = TableNamespace::root_component();
+         let mut setup = database.begin_system().await?;
+         database::TableModel::new(&mut setup)
+             .insert_table_metadata(namespace, &table)
+             .await?;
++        database::TableModel::new(&mut setup)
++            .insert_table_metadata(namespace, &inherited_table)
++            .await?;
+         database
+             .commit_with_write_source(setup, "test_setup")
+             .await?;
+         let timestamp = *database.now_ts_for_reads();
++        let mut inherited = database
++            .begin_with_ts(
++                Identity::system(),
++                timestamp,
++                usage_tracking::FunctionUsageTracker::new(),
++            )
++            .await?;
++        let inherited_id = SystemMetadataModel::new(&mut inherited, namespace)
++            .insert_metadata(&inherited_table, obj!("status" => "ready")?)
++            .await?;
++        let (_, inherited_writes) = inherited.into_reads_and_writes();
++        let inherited_writes = inherited_writes
++            .as_flat()?
++            .coalesced_writes()
++            .cloned()
++            .collect::<Vec<_>>();
+         for (share_allocation_inputs, extra_shadow_read) in
+             [(false, false), (true, false), (true, true)]
+         {
+@@ -11121,6 +11213,17 @@ fn paired_insert_then_first_read_dependencies() -> anyhow::Result<()> {
+                         usage_tracking::FunctionUsageTracker::new(),
+                     )
+                     .await?;
++                // Match function-runner setup: merge the same pending writes
++                // before capturing or applying the initial allocation cursor.
++                transaction.merge_writes(inherited_writes.clone())?;
++                assert_eq!(
++                    transaction
++                        .get(inherited_id)
++                        .await?
++                        .context("inherited insert missing from paired transaction")?
++                        .id(),
++                    inherited_id,
++                );
+                 if is_shadow && share_allocation_inputs {
+                     transaction.apply_document_creation_state(
+                         allocation_inputs
+diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/test_support/fixtures.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/test_support/fixtures.rs
+index 6ca206db9bc0a0dcf872feb860236805b0261461..d817a64887e4a02de7f62156d4c5a4af5be5dbad 100644
+--- a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/test_support/fixtures.rs
++++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/test_support/fixtures.rs
+@@ -2049,6 +2049,7 @@ pub(in super::super) fn generated_fixed_entry_prepare_test_module() -> Vec<u8> {
+ #[cfg(test)]
+ pub(in super::super) fn generated_entry_prepare_environment_test_module(
+     environment_requests: [&[u8]; 2],
++    unauthorized_request: &[u8],
+ ) -> Vec<u8> {
+     let mut types = EncodedTypeSection::new();
+     types
+@@ -2129,12 +2130,22 @@ pub(in super::super) fn generated_entry_prepare_environment_test_module(
+     let mut globals = EncodedGlobalSection::new();
+     globals.global(
+         EncodedGlobalType {
+-            val_type: EncodedValType::I32,
++            val_type: EncodedValType::I64,
+             mutable: true,
+             shared: false,
+         },
+-        &EncodedConstExpr::i32_const(0),
++        &EncodedConstExpr::i64_const(-1),
+     );
++    for _ in 0..2 {
++        globals.global(
++            EncodedGlobalType {
++                val_type: EncodedValType::I32,
++                mutable: true,
++                shared: false,
++            },
++            &EncodedConstExpr::i32_const(0),
++        );
++    }
+ 
+     let mut exports = EncodedExportSection::new();
+     exports.export("memory", EncodedExportKind::Memory, 0);
+@@ -2156,56 +2167,124 @@ pub(in super::super) fn generated_entry_prepare_environment_test_module(
+     initialize.instruction(&EncodedInstruction::End);
+     let mut run = EncodedFunction::new([]);
+     run.instruction(&EncodedInstruction::GlobalGet(0));
++    run.instruction(&EncodedInstruction::I64Eqz);
++    run.instruction(&EncodedInstruction::If(EncodedBlockType::Result(
++        EncodedValType::I32,
++    )));
++    run.instruction(&EncodedInstruction::GlobalGet(1));
++    run.instruction(&EncodedInstruction::Else);
++    run.instruction(&EncodedInstruction::GlobalGet(2));
++    run.instruction(&EncodedInstruction::End);
+     run.instruction(&EncodedInstruction::I32Eqz);
+     run.instruction(&EncodedInstruction::If(EncodedBlockType::Empty));
+     run.instruction(&EncodedInstruction::I32Const(1));
+     run.instruction(&EncodedInstruction::Return);
+     run.instruction(&EncodedInstruction::End);
++    run.instruction(&EncodedInstruction::Call(6));
++    run.instruction(&EncodedInstruction::I64Eqz);
++    run.instruction(&EncodedInstruction::If(EncodedBlockType::Empty));
++    run.instruction(&EncodedInstruction::I32Const(2));
++    run.instruction(&EncodedInstruction::Return);
++    run.instruction(&EncodedInstruction::End);
+     run.instruction(&EncodedInstruction::Call(0));
+     run.instruction(&EncodedInstruction::Call(1));
+     run.instruction(&EncodedInstruction::I32Const(0));
+     run.instruction(&EncodedInstruction::End);
+     let mut destroy = EncodedFunction::new([]);
+     destroy.instruction(&EncodedInstruction::End);
++    let append_environment_read =
++        |prepare: &mut EncodedFunction, request_offset: i32, request_len: i32| {
++            prepare.instruction(&EncodedInstruction::I64Const(0));
++            prepare.instruction(&EncodedInstruction::I32Const(request_offset));
++            prepare.instruction(&EncodedInstruction::I32Const(request_len));
++            prepare.instruction(&EncodedInstruction::Call(2));
++            prepare.instruction(&EncodedInstruction::Call(3));
++            prepare.instruction(&EncodedInstruction::LocalTee(0));
++            prepare.instruction(&EncodedInstruction::I64Const(0));
++            prepare.instruction(&EncodedInstruction::I64LtS);
++            prepare.instruction(&EncodedInstruction::If(EncodedBlockType::Empty));
++            prepare.instruction(&EncodedInstruction::I32Const(65));
++            prepare.instruction(&EncodedInstruction::Return);
++            prepare.instruction(&EncodedInstruction::End);
++            prepare.instruction(&EncodedInstruction::LocalGet(0));
++            prepare.instruction(&EncodedInstruction::Call(4));
++        };
++    let append_unauthorized_initialization_request =
++        |prepare: &mut EncodedFunction, request_offset: i32, request_len: i32| {
++            prepare.instruction(&EncodedInstruction::Call(6));
++            prepare.instruction(&EncodedInstruction::I32Const(request_offset));
++            prepare.instruction(&EncodedInstruction::I32Const(request_len));
++            prepare.instruction(&EncodedInstruction::Call(2));
++            prepare.instruction(&EncodedInstruction::LocalTee(0));
++            prepare.instruction(&EncodedInstruction::Call(3));
++            prepare.instruction(&EncodedInstruction::I64Const(-2));
++            prepare.instruction(&EncodedInstruction::I64Ne);
++            prepare.instruction(&EncodedInstruction::If(EncodedBlockType::Empty));
++            prepare.instruction(&EncodedInstruction::I32Const(66));
++            prepare.instruction(&EncodedInstruction::Return);
++            prepare.instruction(&EncodedInstruction::End);
++            prepare.instruction(&EncodedInstruction::LocalGet(0));
++            prepare.instruction(&EncodedInstruction::Call(5));
++        };
+     let mut prepare = EncodedFunction::new([(1, EncodedValType::I64)]);
+-    prepare.instruction(&EncodedInstruction::I64Const(0));
+-    // The second preparation models a previously unused module reading a
+-    // different configuration key in an already initialized Store.
+     prepare.instruction(&EncodedInstruction::GlobalGet(0));
++    prepare.instruction(&EncodedInstruction::I64Eqz);
++    prepare.instruction(&EncodedInstruction::If(EncodedBlockType::Empty));
++    prepare.instruction(&EncodedInstruction::GlobalGet(1));
+     prepare.instruction(&EncodedInstruction::I32Eqz);
+-    prepare.instruction(&EncodedInstruction::If(EncodedBlockType::Result(
+-        EncodedValType::I64,
+-    )));
+-    prepare.instruction(&EncodedInstruction::I32Const(0));
+-    prepare.instruction(&EncodedInstruction::I32Const(
+-        environment_requests[0].len() as i32
+-    ));
+-    prepare.instruction(&EncodedInstruction::Call(2));
+-    prepare.instruction(&EncodedInstruction::Else);
+-    prepare.instruction(&EncodedInstruction::I32Const(
+-        environment_requests[0].len() as i32
+-    ));
+-    prepare.instruction(&EncodedInstruction::I32Const(
+-        environment_requests[1].len() as i32
+-    ));
+-    prepare.instruction(&EncodedInstruction::Call(2));
+-    prepare.instruction(&EncodedInstruction::End);
+-    prepare.instruction(&EncodedInstruction::Call(3));
+-    prepare.instruction(&EncodedInstruction::LocalTee(0));
+-    prepare.instruction(&EncodedInstruction::I64Const(0));
+-    prepare.instruction(&EncodedInstruction::I64LtS);
+     prepare.instruction(&EncodedInstruction::If(EncodedBlockType::Empty));
+-    prepare.instruction(&EncodedInstruction::I32Const(65));
+-    prepare.instruction(&EncodedInstruction::Return);
++    append_unauthorized_initialization_request(
++        &mut prepare,
++        (environment_requests[0].len() + environment_requests[1].len()) as i32,
++        unauthorized_request.len() as i32,
++    );
++    append_environment_read(&mut prepare, 0, environment_requests[0].len() as i32);
++    prepare.instruction(&EncodedInstruction::I32Const(1));
++    prepare.instruction(&EncodedInstruction::GlobalSet(1));
+     prepare.instruction(&EncodedInstruction::End);
+-    prepare.instruction(&EncodedInstruction::LocalGet(0));
+-    prepare.instruction(&EncodedInstruction::Call(4));
++    prepare.instruction(&EncodedInstruction::Else);
++    prepare.instruction(&EncodedInstruction::GlobalGet(2));
++    prepare.instruction(&EncodedInstruction::I32Eqz);
++    prepare.instruction(&EncodedInstruction::If(EncodedBlockType::Empty));
++    append_unauthorized_initialization_request(
++        &mut prepare,
++        (environment_requests[0].len() + environment_requests[1].len()) as i32,
++        unauthorized_request.len() as i32,
++    );
++    // The second selected entry overlaps the first entry's configuration read
++    // before adding a new dependency in the already initialized Store.
++    append_environment_read(&mut prepare, 0, environment_requests[0].len() as i32);
++    append_environment_read(
++        &mut prepare,
++        environment_requests[0].len() as i32,
++        environment_requests[1].len() as i32,
++    );
+     prepare.instruction(&EncodedInstruction::I32Const(1));
+-    prepare.instruction(&EncodedInstruction::GlobalSet(0));
++    prepare.instruction(&EncodedInstruction::GlobalSet(2));
++    prepare.instruction(&EncodedInstruction::End);
++    prepare.instruction(&EncodedInstruction::End);
+     prepare.instruction(&EncodedInstruction::I32Const(0));
+     prepare.instruction(&EncodedInstruction::End);
+     let mut selector = EncodedFunction::new([]);
++    selector.instruction(&EncodedInstruction::LocalGet(0));
++    selector.instruction(&EncodedInstruction::I64Const(0));
++    selector.instruction(&EncodedInstruction::I64Eq);
++    selector.instruction(&EncodedInstruction::If(EncodedBlockType::Empty));
++    selector.instruction(&EncodedInstruction::I64Const(0));
++    selector.instruction(&EncodedInstruction::GlobalSet(0));
++    selector.instruction(&EncodedInstruction::I32Const(0));
++    selector.instruction(&EncodedInstruction::Return);
++    selector.instruction(&EncodedInstruction::End);
++    selector.instruction(&EncodedInstruction::LocalGet(0));
++    selector.instruction(&EncodedInstruction::I64Const(1));
++    selector.instruction(&EncodedInstruction::I64Eq);
++    selector.instruction(&EncodedInstruction::If(EncodedBlockType::Empty));
++    selector.instruction(&EncodedInstruction::I64Const(1));
++    selector.instruction(&EncodedInstruction::GlobalSet(0));
+     selector.instruction(&EncodedInstruction::I32Const(0));
++    selector.instruction(&EncodedInstruction::Return);
++    selector.instruction(&EncodedInstruction::End);
++    selector.instruction(&EncodedInstruction::I32Const(7));
+     selector.instruction(&EncodedInstruction::End);
+ 
+     let mut code = EncodedCodeSection::new();
+@@ -2226,6 +2305,13 @@ pub(in super::super) fn generated_entry_prepare_environment_test_module(
+         &EncodedConstExpr::i32_const(environment_requests[0].len() as i32),
+         environment_requests[1].iter().copied(),
+     );
++    data.active(
++        0,
++        &EncodedConstExpr::i32_const(
++            (environment_requests[0].len() + environment_requests[1].len()) as i32,
++        ),
++        unauthorized_request.iter().copied(),
++    );
+     let mut module = EncodedModule::new();
+     module
+         .section(&types)
+diff --git a/patches/static_hermes_wasm_udfs/operations.md b/patches/static_hermes_wasm_udfs/operations.md
+index 14e2cee1da5fe7f1348681ba9513615dff4ceb46..b5b51fa59f139ab3c19f37e66bb03a827ba8aa93 100644
+--- a/patches/static_hermes_wasm_udfs/operations.md
++++ b/patches/static_hermes_wasm_udfs/operations.md
+@@ -348,13 +348,21 @@ primary's advanced state after it finishes. Ordinary independent transactions
+ continue to allocate independently. Comparison still requires one consistent
+ inserted-ID relation across results, reads, and writes; sharing allocation
+ inputs does not replace read-set comparison or hide additional verifier reads.
++Uncommitted inserts supplied before the invocation remain fixed inputs: their
++IDs, creation times, and read dependencies are not lane-local allocations.
++Encoded byte values stay opaque during identity comparison, including bytes
++inside decoded scheduled arguments; Base64 text is never treated as an ID.
++When both lanes use the same inserted IDs, comparison first checks that exact
++relation across results, reads, and writes. Other relations still use the
++bounded search; identical large batches do not consume its permutation budget.
+ 
+ Holding the shared reader does not pin historical data indefinitely. The
+ primary receives its normal post-execution retention check, and a detached
+ verifier receives a separate check after its reads finish. If that final check
+ fails, the attempt is recorded as `invalid_shadow`, not agreement or semantic
+-divergence. The check runs within the bounded background deadline and cannot
+-delay or retract the already returned primary result.
++divergence. This also takes precedence over a completed verifier execution
++failure in either direction. The check runs within the bounded background
++deadline and cannot delay or retract the already returned primary result.
+ 
+ Execution and registry metrics include:
+ 
+@@ -417,6 +425,18 @@ scripts/run_cargo.sh test -p isolate \
+ scripts/run_cargo.sh test -p isolate \
+   --features static-hermes-wasmtime-gate \
+   delayed_retirement_does_not_evict_a_later_same_digest_incarnation
++
++scripts/run_cargo.sh test -p isolate \
++  --features static-hermes-wasmtime-gate \
++  generated_wasm_warm_entry_preparation_preserves_environment_dependencies
++
++scripts/run_cargo.sh test -p isolate \
++  --features static-hermes-wasmtime-gate \
++  paired_insert_then_first_read_dependencies
++
++scripts/run_cargo.sh test -p function_runner \
++  --features static-hermes-wasmtime-gate,testing \
++  query_shadow
+ ```
+ 
+ Run focused application and local-backend tests for paired `finish_push`,
