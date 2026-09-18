@@ -13,17 +13,17 @@ Document the liveness properties, accepted scheduler head-of-line limitation, ro
 ---
  .../application_function_runner/metrics.rs    |  73 ++++
  .../src/application_function_runner/mod.rs    | 369 +++++++++++++++++-
- crates/common/src/knobs.rs                    | 178 ++++++++-
- crates/node_executor/src/local.rs             | 256 ++++++++++--
- crates/node_executor/src/metrics.rs           |  19 +
+ crates/common/src/knobs.rs                    | 285 +++++++++++++-
+ crates/node_executor/src/local.rs             | 288 ++++++++++++--
+ crates/node_executor/src/metrics.rs           |  55 +++
  patches/README.md                             |   6 +-
- patches/backend_memory_resilience/README.md   |  26 +-
- .../README.md                                 | 168 ++++++++
- .../design_reference.md                       | 268 +++++++++++++
+ patches/backend_memory_resilience/README.md   |  36 +-
+ .../README.md                                 | 178 +++++++++
+ .../design_reference.md                       | 270 +++++++++++++
  .../local_node_executor_resilience/README.md  |  22 +-
- .../README.md                                 |   9 +-
- self-hosted/advanced/knobs.md                 |  91 +++--
- 12 files changed, 1391 insertions(+), 94 deletions(-)
+ .../README.md                                 |  22 +-
+ self-hosted/advanced/knobs.md                 |  94 ++++-
+ 12 files changed, 1594 insertions(+), 104 deletions(-)
  create mode 100644 patches/local_node_executor_pool_admission/README.md
  create mode 100644 patches/local_node_executor_pool_admission/design_reference.md
 
@@ -583,7 +583,7 @@ index 4ea1d6caf16a61186f7565e1f1a778d1cbd57b76..21e3fc070ff28ef49c9e83b11f134b0a
 +    }
  }
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72aaa8cc78 100644
+index 7eaf28d9702a3ed19eff074f22b856ffca730523..d3fcd939b6afbb7fe2b2ffbe51d90b155326103b 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -17,6 +17,7 @@ use std::{
@@ -617,7 +617,7 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
  fn parse_usize_strict(name: &str, value: &str) -> anyhow::Result<usize> {
      anyhow::ensure!(
          !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
-@@ -88,12 +101,31 @@ fn env_config_optional_usize_strict(name: &str) -> Option<usize> {
+@@ -88,12 +101,36 @@ fn env_config_optional_usize_strict(name: &str) -> Option<usize> {
      value
  }
  
@@ -638,8 +638,8 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
 +    value
 +}
 +
-+/// Optional admission, RSS-retirement, and watchdog policy for one local Node
-+/// executor pool.
++/// Optional admission, memory, and watchdog policy for one local Node executor
++/// pool.
  #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
  #[serde(rename_all = "camelCase", deny_unknown_fields)]
  pub struct LocalNodeExecutorPoolPolicy {
@@ -647,18 +647,25 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
      pub max_concurrency: Option<usize>,
 +    /// Sampled direct-child RSS threshold for graceful generation retirement.
 +    pub max_rss_bytes: Option<usize>,
++    /// V8 old-space allowance for the local Node executor child, in MiB.
++    pub max_old_space_size_mib: Option<usize>,
++    /// Sampled direct-child RSS threshold for retirement during sustained
++    /// cgroup memory pressure.
++    pub memory_pressure_min_rss_bytes: Option<usize>,
      /// Maximum failed-health interval tolerated before retiring this pool's
      /// event loop.
      pub max_event_loop_unresponsive_seconds: Option<u64>,
-@@ -173,6 +205,7 @@ fn parse_local_node_executor_pool_policies(
+@@ -173,6 +210,9 @@ fn parse_local_node_executor_pool_policies(
          );
          anyhow::ensure!(
              policy.max_concurrency.is_some()
 +                || policy.max_rss_bytes.is_some()
++                || policy.max_old_space_size_mib.is_some()
++                || policy.memory_pressure_min_rss_bytes.is_some()
                  || policy.max_event_loop_unresponsive_seconds.is_some()
                  || policy.queue_warning_seconds.is_some(),
              "Node pool {pool_name:?} has an empty policy"
-@@ -180,6 +213,10 @@ fn parse_local_node_executor_pool_policies(
+@@ -180,6 +220,20 @@ fn parse_local_node_executor_pool_policies(
          if let Some(max_concurrency) = policy.max_concurrency {
              validate_usize_strict_nonzero("maxConcurrency", max_concurrency)?;
          }
@@ -666,26 +673,36 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
 +            policy.max_rss_bytes.is_none_or(|bytes| bytes > 0),
 +            "Node pool {pool_name:?} maxRssBytes must be greater than zero"
 +        );
++        anyhow::ensure!(
++            policy.max_old_space_size_mib.is_none_or(|mib| mib > 0),
++            "Node pool {pool_name:?} maxOldSpaceSizeMib must be greater than zero"
++        );
++        anyhow::ensure!(
++            policy
++                .memory_pressure_min_rss_bytes
++                .is_none_or(|bytes| bytes > 0),
++            "Node pool {pool_name:?} memoryPressureMinRssBytes must be greater than zero"
++        );
          anyhow::ensure!(
              policy.queue_warning_seconds.is_none() || policy.max_concurrency.is_some(),
              "Node pool {pool_name:?} queueWarningSeconds requires maxConcurrency"
-@@ -200,11 +237,13 @@ fn parse_local_node_executor_pool_policies(
+@@ -200,11 +254,13 @@ fn parse_local_node_executor_pool_policies(
      Ok(policies)
  }
  
 -/// Per-pool local Node admission and event-loop watchdog overrides.
-+/// Per-pool local Node admission, RSS-retirement, and event-loop watchdog
-+/// overrides.
++/// Per-pool local Node admission, memory, RSS-retirement, and event-loop
++/// watchdog overrides.
  ///
  /// The value is a strict JSON object keyed by the application-declared pool
  /// name. The reserved `default` key configures the ordinary Node pool. Missing
 -/// pools retain the existing application-wide concurrency and watchdog policy.
-+/// pools retain the existing application-wide concurrency, global RSS, and
++/// pools retain the existing application-wide concurrency, memory, RSS, and
 +/// watchdog policy.
  pub static LOCAL_NODE_EXECUTOR_POOL_POLICIES: LazyLock<
      BTreeMap<String, LocalNodeExecutorPoolPolicy>,
  > = LazyLock::new(
-@@ -227,6 +266,27 @@ pub static LOCAL_NODE_EXECUTOR_POOL_POLICIES: LazyLock<
+@@ -227,6 +283,70 @@ pub static LOCAL_NODE_EXECUTOR_POOL_POLICIES: LazyLock<
      },
  );
  
@@ -700,6 +717,28 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
 +        .unwrap_or(global_rss_bytes)
 +}
 +
++fn effective_local_node_executor_pool_old_space_size_mib(
++    policies: &BTreeMap<String, LocalNodeExecutorPoolPolicy>,
++    global_old_space_size_mib: usize,
++    pool_name: &str,
++) -> usize {
++    policies
++        .get(pool_name)
++        .and_then(|policy| policy.max_old_space_size_mib)
++        .unwrap_or(global_old_space_size_mib)
++}
++
++fn effective_local_node_executor_pool_memory_pressure_min_rss_bytes(
++    policies: &BTreeMap<String, LocalNodeExecutorPoolPolicy>,
++    global_memory_pressure_min_rss_bytes: usize,
++    pool_name: &str,
++) -> usize {
++    policies
++        .get(pool_name)
++        .and_then(|policy| policy.memory_pressure_min_rss_bytes)
++        .unwrap_or(global_memory_pressure_min_rss_bytes)
++}
++
 +/// Returns the effective sampled direct-child RSS allowance for an application
 +/// pool. Pools without a `maxRssBytes` policy use the global allowance.
 +pub fn local_node_executor_pool_rss_bytes(pool_name: &str) -> usize {
@@ -710,10 +749,31 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
 +    )
 +}
 +
++/// Returns the effective V8 old-space allowance for an application pool. Pools
++/// without a `maxOldSpaceSizeMib` policy use the global allowance.
++pub fn local_node_executor_pool_old_space_size_mib(pool_name: &str) -> usize {
++    effective_local_node_executor_pool_old_space_size_mib(
++        &LOCAL_NODE_EXECUTOR_POOL_POLICIES,
++        *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB,
++        pool_name,
++    )
++}
++
++/// Returns the effective cgroup-pressure RSS threshold for an application
++/// pool. Pools without a `memoryPressureMinRssBytes` policy use the global
++/// threshold.
++pub fn local_node_executor_pool_memory_pressure_min_rss_bytes(pool_name: &str) -> usize {
++    effective_local_node_executor_pool_memory_pressure_min_rss_bytes(
++        &LOCAL_NODE_EXECUTOR_POOL_POLICIES,
++        *LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES,
++        pool_name,
++    )
++}
++
  fn env_config_duration_millis_strict(name: &str, default: usize) -> Duration {
      let millis = env_config_usize_strict(name, default)
          .try_into()
-@@ -471,14 +531,20 @@ pub static LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES: LazyLock<usize> = LazyLock::new(||
+@@ -471,14 +591,20 @@ pub static LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES: LazyLock<usize> = LazyLock::new(||
  });
  
  /// Total planning allowance for all local Node executor process slots. A
@@ -739,7 +799,7 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
              .expect("Default local Node executor RSS budget overflow"),
      );
      assert!(
-@@ -2761,4 +2827,100 @@ mod strict_capacity_tests {
+@@ -2761,4 +2887,147 @@ mod strict_capacity_tests {
          assert!(validate_active_javascript_class_minimums(28, 4, 14, None).is_err());
          assert!(validate_active_javascript_class_minimums(28, 4, 14, Some(8)).is_err());
      }
@@ -751,10 +811,14 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
 +                "default": {
 +                    "maxConcurrency": 2,
 +                    "maxRssBytes": 1073741824,
++                    "maxOldSpaceSizeMib": 512,
++                    "memoryPressureMinRssBytes": 536870912,
 +                    "queueWarningSeconds": 5
 +                },
 +                "planning": {
 +                    "maxRssBytes": 2147483648,
++                    "maxOldSpaceSizeMib": 1024,
++                    "memoryPressureMinRssBytes": 1073741824,
 +                    "maxConcurrency": 1,
 +                    "maxEventLoopUnresponsiveSeconds": 30
 +                },
@@ -768,6 +832,11 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
 +        assert_eq!(
 +            policies["planning"].max_rss_bytes,
 +            Some(2 * 1024 * 1024 * 1024)
++        );
++        assert_eq!(policies["planning"].max_old_space_size_mib, Some(1024));
++        assert_eq!(
++            policies["planning"].memory_pressure_min_rss_bytes,
++            Some(1024 * 1024 * 1024)
 +        );
 +        assert_eq!(policies["default"].queue_warning_seconds, Some(5));
 +
@@ -803,12 +872,50 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
 +            ),
 +            3 * 1024 * 1024 * 1024
 +        );
++        assert_eq!(
++            effective_local_node_executor_pool_old_space_size_mib(&policies, 2048, "unconfigured"),
++            2048
++        );
++        assert_eq!(
++            effective_local_node_executor_pool_old_space_size_mib(&policies, 2048, "default"),
++            512
++        );
++        assert_eq!(
++            effective_local_node_executor_pool_old_space_size_mib(&policies, 2048, "planning"),
++            1024
++        );
++        assert_eq!(
++            effective_local_node_executor_pool_memory_pressure_min_rss_bytes(
++                &policies,
++                2 * 1024 * 1024 * 1024,
++                "unconfigured",
++            ),
++            2 * 1024 * 1024 * 1024
++        );
++        assert_eq!(
++            effective_local_node_executor_pool_memory_pressure_min_rss_bytes(
++                &policies,
++                2 * 1024 * 1024 * 1024,
++                "default",
++            ),
++            512 * 1024 * 1024
++        );
++        assert_eq!(
++            effective_local_node_executor_pool_memory_pressure_min_rss_bytes(
++                &policies,
++                2 * 1024 * 1024 * 1024,
++                "planning",
++            ),
++            1024 * 1024 * 1024
++        );
 +
 +        for invalid in [
 +            r#"{"planning": {}}"#,
 +            r#"{"default": {"maxConcurrency": 0}}"#,
 +            r#"{"planning": {"maxRssBytes": 0}}"#,
 +            r#"{"planning": {"maxRssBytes": 18446744073709551616}}"#,
++            r#"{"planning": {"maxOldSpaceSizeMib": 0}}"#,
++            r#"{"planning": {"memoryPressureMinRssBytes": 0}}"#,
 +            r#"{"planning": {"max_rss_bytes": 1}}"#,
 +            r#"{"planning": {"maxRssBytes": 1, "maxRssBytes": 2}}"#,
 +            r#"{"Default": {"maxConcurrency": 1}}"#,
@@ -841,10 +948,19 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
 +    }
  }
 diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
-index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a8795395a941 100644
+index 6fd32f446b748044db1b55381cada0925597c3d5..1303aa0496988a1f52e2fa6a68d3386a3f1d4cdf 100644
 --- a/crates/node_executor/src/local.rs
 +++ b/crates/node_executor/src/local.rs
-@@ -55,6 +55,7 @@ use common::{
+@@ -48,6 +48,8 @@ use async_trait::async_trait;
+ use common::{
+     execution_start::FunctionExecutionStartGate,
+     knobs::{
++        local_node_executor_pool_memory_pressure_min_rss_bytes,
++        local_node_executor_pool_old_space_size_mib,
+         local_node_executor_pool_rss_bytes,
+         LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE,
+         LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES,
+@@ -55,6 +57,7 @@ use common::{
          LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES,
          LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE,
          LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES,
@@ -852,7 +968,7 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
      },
      log_lines::LogLine,
      memory_pressure::MemoryPressureSignal,
-@@ -208,6 +209,9 @@ pub struct LocalNodeExecutorConfig {
+@@ -208,6 +211,9 @@ pub struct LocalNodeExecutorConfig {
      health_check_timeout: Duration,
      watchdog_interval: Duration,
      watchdog_failure_threshold: u32,
@@ -862,7 +978,7 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
      max_old_space_size_mib: usize,
      max_rss_bytes: u64,
      memory_pressure: MemoryPressureSignal,
-@@ -3617,6 +3621,11 @@ impl LocalNodeExecutorConfig {
+@@ -3617,6 +3623,11 @@ impl LocalNodeExecutorConfig {
              self.watchdog_failure_threshold > 0,
              "Local Node executor watchdog failure threshold must be greater than zero"
          );
@@ -874,18 +990,53 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
          anyhow::ensure!(
              self.max_old_space_size_mib > 0,
              "Local Node executor old-space allowance must be greater than zero"
-@@ -5126,6 +5135,10 @@ impl LocalNodeExecutor {
+@@ -3671,8 +3682,13 @@ impl LocalNodeExecutorConfig {
+             .get(pool_name.as_ref())
+             .and_then(|policy| policy.max_event_loop_unresponsive_seconds)
+             .map(Duration::from_secs);
++        self.max_old_space_size_mib = local_node_executor_pool_old_space_size_mib(&pool_name);
+         self.max_rss_bytes = u64::try_from(local_node_executor_pool_rss_bytes(&pool_name))
+             .context("Local Node executor RSS threshold does not fit u64")?;
++        self.memory_pressure_min_rss_bytes = u64::try_from(
++            local_node_executor_pool_memory_pressure_min_rss_bytes(&pool_name),
++        )
++        .context("Local Node executor cgroup-pressure RSS threshold does not fit u64")?;
+         self.pool_name = pool_name;
+         Ok(self)
+     }
+@@ -3681,8 +3697,12 @@ impl LocalNodeExecutorConfig {
+         self.pool_name = Arc::from("_system");
+         self.role = LocalNodeExecutorRole::System;
+         self.max_event_loop_unresponsive = None;
++        self.max_old_space_size_mib = *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB;
+         self.max_rss_bytes = u64::try_from(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES)
+             .context("Local Node executor RSS threshold does not fit u64")?;
++        self.memory_pressure_min_rss_bytes =
++            u64::try_from(*LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES)
++                .context("Local Node executor cgroup-pressure RSS threshold does not fit u64")?;
+         self.validate()?;
+         // System generations recycle cold and never acquire this coordinator.
+         // Retain it so constructing the role cannot reset application-global
+@@ -5126,12 +5146,16 @@ impl LocalNodeExecutor {
              health_check_timeout: HEALTH_CHECK_TIMEOUT,
              watchdog_interval: WATCHDOG_INTERVAL,
              watchdog_failure_threshold: WATCHDOG_FAILURE_THRESHOLD,
+-            max_old_space_size_mib: *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB,
 +            max_event_loop_unresponsive: LOCAL_NODE_EXECUTOR_POOL_POLICIES
 +                .get("default")
 +                .and_then(|policy| policy.max_event_loop_unresponsive_seconds)
 +                .map(Duration::from_secs),
-             max_old_space_size_mib: *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB,
++            max_old_space_size_mib: local_node_executor_pool_old_space_size_mib("default"),
              max_rss_bytes: u64::try_from(local_node_executor_pool_rss_bytes("default"))
                  .context("Local Node executor RSS threshold does not fit u64")?,
-@@ -5191,6 +5204,10 @@ impl LocalNodeExecutor {
+             memory_pressure,
+             memory_pressure_min_rss_bytes: u64::try_from(
+-                *LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES,
++                local_node_executor_pool_memory_pressure_min_rss_bytes("default"),
+             )
+             .context("Local Node executor cgroup-pressure RSS threshold does not fit u64")?,
+             memory_pressure_grace: *LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE,
+@@ -5191,6 +5215,10 @@ impl LocalNodeExecutor {
          crate::metrics::set_local_node_waiting_requests(&pool_name, 0);
          crate::metrics::set_local_node_active_requests(&pool_name, 0);
          crate::metrics::set_local_node_consecutive_health_misses(&pool_name, 0);
@@ -896,7 +1047,7 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
          crate::metrics::set_local_node_memory_pressure_active(&pool_name, false);
          crate::metrics::set_local_node_memory_configuration(
              &pool_name,
-@@ -6916,6 +6933,34 @@ impl LocalNodeExecutor {
+@@ -6916,6 +6944,34 @@ impl LocalNodeExecutor {
          .await;
      }
  
@@ -931,7 +1082,7 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
      async fn watch_generation_checks(
          state: Weak<Mutex<LocalNodeExecutorState>>,
          expected: Weak<InnerLocalNodeExecutor>,
-@@ -6925,12 +6970,37 @@ impl LocalNodeExecutor {
+@@ -6925,12 +6981,37 @@ impl LocalNodeExecutor {
          shutting_down: Arc<AtomicBool>,
      ) {
          let mut consecutive_misses = 0;
@@ -970,7 +1121,7 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
              let Some(state) = state.upgrade() else {
                  return;
              };
-@@ -6947,17 +7017,6 @@ impl LocalNodeExecutor {
+@@ -6947,17 +7028,6 @@ impl LocalNodeExecutor {
                  return;
              }
  
@@ -988,7 +1139,7 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
              let health_check_started_at = Instant::now();
              let mut health_check = Box::pin(InnerLocalNodeExecutor::check_server_health(
                  &expected.client,
-@@ -7070,6 +7129,7 @@ impl LocalNodeExecutor {
+@@ -7070,6 +7140,7 @@ impl LocalNodeExecutor {
  
              let should_retire_unhealthy = if let Some(health) = health.filter(|_| success) {
                  consecutive_misses = 0;
@@ -996,7 +1147,7 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
                  crate::metrics::set_local_node_consecutive_health_misses(&expected.pool_name, 0);
                  if expected.runtime_stats_supported {
                      Self::record_node_health_metrics(
-@@ -7096,6 +7156,7 @@ impl LocalNodeExecutor {
+@@ -7096,6 +7167,7 @@ impl LocalNodeExecutor {
                  false
              } else {
                  consecutive_misses += 1;
@@ -1004,7 +1155,7 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
                  crate::metrics::set_local_node_consecutive_health_misses(
                      &expected.pool_name,
                      consecutive_misses,
-@@ -7118,7 +7179,15 @@ impl LocalNodeExecutor {
+@@ -7118,7 +7190,15 @@ impl LocalNodeExecutor {
                          &config,
                      );
                  }
@@ -1021,7 +1172,7 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
              };
  
              let retirement_reason = proactive_retirement_reason(
-@@ -7136,22 +7205,8 @@ impl LocalNodeExecutor {
+@@ -7136,22 +7216,8 @@ impl LocalNodeExecutor {
                  // Do not start a new graceful drain on the terminal miss. An
                  // idle drain could otherwise win the slot race and misclassify
                  // this unhealthy retirement as proactive.
@@ -1046,7 +1197,7 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
                  return;
              }
              if let Some(reason) = retirement_reason {
-@@ -8110,6 +8165,7 @@ mod tests {
+@@ -8110,6 +8176,7 @@ mod tests {
              health_check_timeout: Duration::from_millis(10),
              watchdog_interval: Duration::from_millis(10),
              watchdog_failure_threshold: 2,
@@ -1054,7 +1205,38 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
              max_old_space_size_mib: 128,
              max_rss_bytes: 256 * MIB_BYTES,
              memory_pressure: MemoryPressureSignal::default(),
-@@ -11809,6 +11865,148 @@ done
+@@ -9096,6 +9163,15 @@ mod tests {
+         assert!(below.validate().is_err());
+     }
+ 
++    #[test]
++    fn config_accepts_a_pool_sized_memory_policy() {
++        let mut config = test_config();
++        config.max_old_space_size_mib = 512;
++        config.max_rss_bytes = 1024 * MIB_BYTES;
++        config.memory_pressure_min_rss_bytes = 768 * MIB_BYTES;
++        config.validate().unwrap();
++    }
++
+     #[test]
+     fn system_role_has_a_distinct_pool_and_shared_surge_coordinator() {
+         let application = test_config();
+@@ -9108,6 +9184,14 @@ mod tests {
+             system.max_rss_bytes,
+             u64::try_from(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES).unwrap()
+         );
++        assert_eq!(
++            system.max_old_space_size_mib,
++            *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB
++        );
++        assert_eq!(
++            system.memory_pressure_min_rss_bytes,
++            u64::try_from(*LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES).unwrap()
++        );
+         assert!(Arc::ptr_eq(&application_surge, &system.surge_coordinator()));
+     }
+ 
+@@ -11809,6 +11893,148 @@ done
          assert!(generation.server_handle.lock().await.child.is_none());
      }
  
@@ -1204,7 +1386,7 @@ index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a879
      #[tokio::test]
      async fn pressure_clear_and_reentry_during_health_check_restarts_grace() {
 diff --git a/crates/node_executor/src/metrics.rs b/crates/node_executor/src/metrics.rs
-index 126b564b82754cb08d384f34bca2bd2aba934a91..71cacc4a5f96b31ad21b2d37203e582e96dbbe55 100644
+index 126b564b82754cb08d384f34bca2bd2aba934a91..d7727775303bb243b5a21588918e11481c977eaa 100644
 --- a/crates/node_executor/src/metrics.rs
 +++ b/crates/node_executor/src/metrics.rs
 @@ -585,6 +585,20 @@ pub fn set_local_node_consecutive_health_misses(pool_name: &str, misses: u32) {
@@ -1244,13 +1426,49 @@ index 126b564b82754cb08d384f34bca2bd2aba934a91..71cacc4a5f96b31ad21b2d37203e582e
          clear_local_node_pool_configuration(pool_name);
          assert!(LOCAL_NODE_EXECUTOR_POOL_CONFIGURED_INFO
              .remove_label_values(&[pool_name])
-@@ -1297,6 +1313,9 @@ mod tests {
+@@ -1297,6 +1313,45 @@ mod tests {
          assert!(LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES
              .remove_label_values(&[pool_name])
              .is_err());
 +        assert!(LOCAL_NODE_EXECUTOR_EVENT_LOOP_UNRESPONSIVE_BUDGET_SECONDS
 +            .remove_label_values(&[pool_name])
 +            .is_err());
++    }
++
++    #[test]
++    fn memory_configuration_metrics_keep_effective_pool_values() {
++        let pool_name = "metrics_memory_configuration_test";
++        set_local_node_memory_configuration(
++            pool_name,
++            512 * 1024 * 1024,
++            1024 * 1024 * 1024,
++            768 * 1024 * 1024,
++            Duration::from_secs(4),
++            Duration::from_secs(5),
++            6,
++        );
++        assert_eq!(
++            LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES
++                .get_metric_with_label_values(&[pool_name])
++                .unwrap()
++                .get(),
++            (512 * 1024 * 1024) as f64
++        );
++        assert_eq!(
++            LOCAL_NODE_EXECUTOR_RSS_RETIREMENT_THRESHOLD_BYTES
++                .get_metric_with_label_values(&[pool_name])
++                .unwrap()
++                .get(),
++            (1024 * 1024 * 1024) as f64
++        );
++        assert_eq!(
++            LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_RSS_THRESHOLD_BYTES
++                .get_metric_with_label_values(&[pool_name])
++                .unwrap()
++                .get(),
++            (768 * 1024 * 1024) as f64
++        );
++        clear_local_node_pool_configuration(pool_name);
      }
  
      #[test]
@@ -1272,10 +1490,10 @@ index d28236ff9d57003372b28183c46a6dab8f1ac5bf..3dd79092180b625b392138c084055426
    attempts to stop its process group if the Node executor generation exits.
  - Prerequisites: none.
 diff --git a/patches/backend_memory_resilience/README.md b/patches/backend_memory_resilience/README.md
-index 1cc68ca1bde4673588568c9ac3af34b4af181e01..80fc7cc30e516fc36200b6055914f63143cdf221 100644
+index 1cc68ca1bde4673588568c9ac3af34b4af181e01..0b1db76ecbc62acb7a3ae84f57faf7ab270fbd5f 100644
 --- a/patches/backend_memory_resilience/README.md
 +++ b/patches/backend_memory_resilience/README.md
-@@ -34,17 +34,23 @@ total. This planning control does not weaken the finite cgroup limit or the
+@@ -34,17 +34,24 @@ total. This planning control does not weaken the finite cgroup limit or the
  runtime memory-pressure response.
  When application-declared local Node executor pools are available, startup
  memory feasibility reserves `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`.
@@ -1301,12 +1519,29 @@ index 1cc68ca1bde4673588568c9ac3af34b4af181e01..80fc7cc30e516fc36200b6055914f631
 +allowance for the largest possible application generation, not the normally
 +smaller RSS of a fresh process. A pool without a `maxRssBytes` override in
 +`LOCAL_NODE_EXECUTOR_POOL_POLICIES` uses `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`.
-+Every pool observes the same pressure signal and applies the same grace and
-+RSS floor independently.
++Every pool observes the same pressure signal and applies the same grace
++duration, while its effective RSS floor may be configured independently by
++the later pool-policy composition.
  
  Backend memory resilience is carried as an ordered adoption composition after
  [`local_node_executor_resilience`](../local_node_executor_resilience/README.md), whose generation
-@@ -282,8 +288,10 @@ would consume the headroom the controller is trying to recover.
+@@ -199,10 +206,11 @@ policy in the patch that owns the cache.
+ The local Node watchdog observes the same pressure signal. After continuous
+ pressure for `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECS`, default 60
+ seconds, it immediately retires the current generation only when a successful
+-direct-child RSS sample is at or above
+-`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`, default 2 GiB. The pressure
+-RSS floor must be positive and strictly below the ordinary RSS replacement
+-threshold.
++direct-child RSS sample is at or above its effective pressure RSS floor.
++Without a per-pool override, that floor is
++`LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`, default 2 GiB. The
++pressure RSS floor must be positive and strictly below the ordinary RSS
++replacement threshold.
+ 
+ Trigger policy distinguishes ordinary generation maintenance from actual
+ cgroup pressure:
+@@ -282,8 +290,10 @@ would consume the headroom the controller is trying to recover.
  
  Reserving only expected fresh-process RSS was rejected because package
  preparation and concurrent work can grow the candidate before the old child is
@@ -1321,10 +1556,10 @@ index 1cc68ca1bde4673588568c9ac3af34b4af181e01..80fc7cc30e516fc36200b6055914f631
  coordinator queues and coalesces simultaneous rotations, and completed
 diff --git a/patches/local_node_executor_pool_admission/README.md b/patches/local_node_executor_pool_admission/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..65f3e883904ebee66fcc50a0d27d3cbf5d26fbd0
+index 0000000000000000000000000000000000000000..0f0aa3e2cad89c8454c6f6e85e9bd1bef2d8241b
 --- /dev/null
 +++ b/patches/local_node_executor_pool_admission/README.md
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,178 @@
 +# Local Node Executor Pool Admission Policy
 +
 +Status: implemented as an optional operator policy within the complete
@@ -1371,6 +1606,8 @@ index 0000000000000000000000000000000000000000..65f3e883904ebee66fcc50a0d27d3cbf
 +  "planning": {
 +    "maxConcurrency": 1,
 +    "maxRssBytes": 2684354560,
++    "maxOldSpaceSizeMib": 1536,
++    "memoryPressureMinRssBytes": 2147483648,
 +    "maxEventLoopUnresponsiveSeconds": 30,
 +    "queueWarningSeconds": 10
 +  }
@@ -1383,8 +1620,13 @@ index 0000000000000000000000000000000000000000..65f3e883904ebee66fcc50a0d27d3cbf
 +  be positive and no greater than
 +  `APPLICATION_MAX_CONCURRENT_NODE_ACTIONS`.
 +- `maxRssBytes` sets that pool's sampled direct-child RSS retirement threshold.
-+  It must be positive and remain above the configured V8 old-space and
++  It must be positive and remain above that pool's effective V8 old-space and
 +  cgroup-pressure RSS thresholds.
++- `maxOldSpaceSizeMib` overrides the pool's V8 old-space allowance. Pools
++  without it use `LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB`.
++- `memoryPressureMinRssBytes` overrides the pool's direct-child RSS floor for
++  retirement during sustained cgroup pressure. Pools without it use
++  `LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES`.
 +- `maxEventLoopUnresponsiveSeconds` is the maximum elapsed interval for which
 +  the pool's resident Node main event loop may fail health probes before the
 +  backend retires it. It is not a CPU-time quota.
@@ -1401,11 +1643,11 @@ index 0000000000000000000000000000000000000000..65f3e883904ebee66fcc50a0d27d3cbf
 +application topology, which permits operator configuration before application
 +deployment.
 +
-+Omitted pools preserve the existing global-only admission and global RSS and
-+watchdog behavior. Omitting one field preserves that field's existing
++Omitted pools preserve the existing global-only admission and global memory,
++RSS, and watchdog behavior. Omitting one field preserves that field's existing
 +behavior. The reserved `_system` pool is not addressed by this map and always
-+uses the global RSS threshold; it recycles cold and does not use pool-local
-+application admission policy.
++uses the global memory and RSS thresholds; it recycles cold and does not use
++pool-local application admission policy.
 +
 +## Admission behavior
 +
@@ -1469,6 +1711,8 @@ index 0000000000000000000000000000000000000000..65f3e883904ebee66fcc50a0d27d3cbf
 +- active and waiting pool-admission requests;
 +- admission wait duration and outcome;
 +- waits that reached the configured warning duration;
++- the effective V8 old-space allowance, RSS retirement threshold, and
++  cgroup-pressure RSS threshold;
 +- the configured event-loop unresponsiveness budget; and
 +- the existing health-probe, consecutive-miss, generation, and request
 +  lifecycle signals.
@@ -1480,13 +1724,14 @@ index 0000000000000000000000000000000000000000..65f3e883904ebee66fcc50a0d27d3cbf
 +
 +Apply the routing and scheduled-admission prerequisites first. Configure only
 +the pools that need an override. Verify each `maxConcurrency` against the
-+application-wide Node limit and each `maxRssBytes` against the global old-space
-+and cgroup-pressure RSS thresholds. Set the total Node RSS budget to cover the
-+effective pools in the committed topology and one largest application surge
-+allowance. Restart the backend, then verify the configuration, RSS-threshold,
-+startup-budget, and queue metrics before increasing traffic. Invalid threshold
-+ordering or a total below the default/system/surge minimum fails startup; a
-+later topology whose effective sum exceeds the total fails deployment.
++application-wide Node limit and each pool's effective memory settings against
++its `maxRssBytes`. Set the total Node RSS budget to cover the effective pools
++in the committed topology and one largest application surge allowance.
++Restart the backend, then verify the configuration, per-pool
++memory-threshold, startup-budget, and queue metrics before increasing traffic.
++Invalid threshold ordering or a total below the default/system/surge minimum
++fails startup; a later topology whose effective sum exceeds the total fails
++deployment.
 +
 +To roll back policy without changing application routing, remove
 +`LOCAL_NODE_EXECUTOR_POOL_POLICIES` and restart the patched backend. To remove
@@ -1495,10 +1740,10 @@ index 0000000000000000000000000000000000000000..65f3e883904ebee66fcc50a0d27d3cbf
 +normal conservative recovery contract.
 diff --git a/patches/local_node_executor_pool_admission/design_reference.md b/patches/local_node_executor_pool_admission/design_reference.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..063ba916af8afcae06b9d09e575a9a3fb09f7172
+index 0000000000000000000000000000000000000000..a27e8bf008f2f6835a0f85c5ceab3c9c1d6afd99
 --- /dev/null
 +++ b/patches/local_node_executor_pool_admission/design_reference.md
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,270 @@
 +# Local Node Pool Admission and Responsiveness Design Reference
 +
 +Status: accepted design for the optional application-pool policy maintained
@@ -1540,13 +1785,15 @@ index 0000000000000000000000000000000000000000..063ba916af8afcae06b9d09e575a9a3f
 +
 +### Add optional policy to existing logical pools
 +
-+An operator supplies a strict map from the existing pool name to three
-+optional values: independent concurrency, queue-warning duration, and maximum
-+event-loop unresponsiveness. The map is bounded to the routing protocol's
-+maximum of the default pool plus eight named pools, while still permitting
-+configuration before a declared name is deployed. The application continues
-+to own module-to-pool routing. Operator configuration cannot create a pool,
-+reroute a module, or alter durable topology.
++An operator supplies a strict map from the existing pool name to optional
++admission, memory, and watchdog values: independent concurrency,
++queue-warning duration, V8 old-space allowance, RSS retirement threshold,
++cgroup-pressure RSS threshold, and maximum event-loop unresponsiveness. The
++map is bounded to the routing protocol's maximum of the default pool plus eight
++named pools, while still permitting configuration before a declared name is
++deployed. The application continues to own module-to-pool routing. Operator
++configuration cannot create a pool, reroute a module, or alter durable
++topology.
 +
 +A queue-warning duration requires an independent-concurrency limit. Without
 +that gate there is no pool-local wait to observe, so accepting the field would
@@ -1816,7 +2063,7 @@ index c1083d19927fc314138ea9bbfa17c0adf636af6b..83910c92318d05acfa4651d9b9ede020
  The startup health check remains separate. Startup performs up to 50 checks at
  100 ms intervals and uses the same one-second per-check timeout before
 diff --git a/patches/pinned_local_node_executor_pools/README.md b/patches/pinned_local_node_executor_pools/README.md
-index 637a8ac58abe9f49c94a275a04b29d1a366936a3..609fca279a5d8a1ad5c786fe3e6362747c137176 100644
+index 637a8ac58abe9f49c94a275a04b29d1a366936a3..1a08c99f65a4a51f7e9d38e7813d9d4d7bab2e19 100644
 --- a/patches/pinned_local_node_executor_pools/README.md
 +++ b/patches/pinned_local_node_executor_pools/README.md
 @@ -14,9 +14,12 @@ local executor pool:
@@ -1835,8 +2082,41 @@ index 637a8ac58abe9f49c94a275a04b29d1a366936a3..609fca279a5d8a1ad5c786fe3e636274
  
  A named process can retain rebuildable module-level state between invocations,
  but it remains disposable. Timeouts, health failure, memory or lifetime limits,
+@@ -411,9 +414,11 @@ local lifecycle protocol and does not invoke application code.
+ 
+ ## Resource policy
+ 
+-Each pool inherits the existing local executor timeout, old-space, pressure,
+-age, imported-package, health, and diagnostic settings. In this homogeneous
+-routing prefix, the host-wide total policy is:
++Each pool inherits the existing local executor timeout, age, imported-package,
++health, and diagnostic settings. Its old-space and pressure settings can be
++overridden together with its RSS retirement threshold by the later per-pool
++policy composition. In this homogeneous routing prefix, the host-wide total
++policy is:
+ 
+ ```text
+ LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES
+@@ -432,14 +437,15 @@ The backend checks the proposed deployment before commit and the committed
+ topology during startup. The Linux startup memory-feasibility calculation
+ reserves the configured total Node RSS budget directly, including capacity for
+ lazy steady slots and the lazy surge slot that have no child yet. The surge
+-reserve is one complete global `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES` allowance,
++reserve is one complete allowance for the largest effective application pool,
+ not the expected smaller RSS of a fresh process. The system slot is a full
+ steady allowance even though its child starts lazily.
+ This is a planning allowance, not a hard aggregate limit; sampled child RSS
+ can grow between checks and while requests drain.
+ 
+ All pools receive the same cgroup-pressure signal and apply their ordinary
+-per-generation pressure rules independently. Pressure also cancels the global
++per-generation pressure rules independently; later pool policy can give each
++pool its own compatible pressure floor. Pressure also cancels the global
+ candidate or terminates its draining old generation before additional external
+ admission is shed. Named pools isolate JavaScript event loops and process
+ globals, but they still share CPU, cgroup memory, database capacity, outbound
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 20aab7a9aa599c8b260427128b971170839c2b15..0d3269d86fad1f10f81d48080bbeb77d1ecd3e97 100644
+index 20aab7a9aa599c8b260427128b971170839c2b15..5fe27f537e7fb98af9fb21bed26b6451d7ae6fa5 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
 @@ -54,7 +54,10 @@ metrics. `isolate_memory_capacity_bytes` independently retains the raw
@@ -1863,28 +2143,31 @@ index 20aab7a9aa599c8b260427128b971170839c2b15..0d3269d86fad1f10f81d48080bbeb77d
  
  The watchdog normally observes direct-child RSS roughly every one to two
  seconds. After promotion, an active invocation can keep the old draining
-@@ -104,33 +110,74 @@ both directives in its source prologue:
+@@ -104,33 +110,79 @@ both directives in its source prologue:
  The declaration applies to every export in the module. Pool names must match
  `[a-z][a-z0-9_]{0,31}`, `default` is reserved, and one committed deployment can
  use at most eight distinct names. Components do not support Node modules.
 -Modules without a pool declaration, package analysis, and dependency builds use
 -the default executor.
 -
--`LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` is the host resource policy for
--these pools. It defaults to twice `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`, covering
--the default steady slot and one complete global hot-replacement surge slot. A
--deployment with `N` distinct named pools requires:
 +Modules without a pool declaration use the default application executor.
 +Package analysis and dependency builds use a separate internal `_system`
 +executor that cannot run application actions.
 +
-+`LOCAL_NODE_EXECUTOR_POOL_POLICIES` can override the RSS retirement threshold
-+for an application pool with `maxRssBytes`. Pools without that field use
-+`LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`; the reserved internal `_system` pool
-+always uses the global value. `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` is
-+the host resource policy for these processes. With `Rdefault` as the effective
-+default-pool threshold, `Rsystem` as the global threshold, and `Rpool` as each
-+effective named-pool threshold, a deployment requires:
++`LOCAL_NODE_EXECUTOR_POOL_POLICIES` can override the memory settings for an
++application pool with `maxOldSpaceSizeMib`, `maxRssBytes`, and
++`memoryPressureMinRssBytes`. Pools without a field use the corresponding
++global setting. The reserved internal `_system` pool always uses all global
++values. Each effective old-space and pressure setting must remain below that
++pool's effective `maxRssBytes`; this permits a small pool to use a smaller V8
++heap and pressure boundary rather than inheriting the global 2 GiB values.
+ `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` is the host resource policy for
+-these pools. It defaults to twice `LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES`, covering
+-the default steady slot and one complete global hot-replacement surge slot. A
+-deployment with `N` distinct named pools requires:
++these processes. With `Rdefault` as the effective default-pool threshold,
++`Rsystem` as the global threshold, and `Rpool` as each effective named-pool
++threshold, a deployment requires:
  
  ```text
 -(2 + N) * LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES
@@ -1945,10 +2228,11 @@ index 20aab7a9aa599c8b260427128b971170839c2b15..0d3269d86fad1f10f81d48080bbeb77d
 +setting and every upstream timeout when the complete initiating workflow is
 +intended to permit builds longer than five minutes.
 +
-+Named pools inherit the ordinary timeout, V8 old-space, pressure, health,
-+lifetime, and diagnostic controls; their sampled RSS retirement threshold uses
-+the named policy override or the global fallback described above. A named
-+generation is replaced when its selected source package or effective
++Named pools inherit the ordinary timeout, health, lifetime, and diagnostic
++controls; each memory setting uses its named policy override or the global
++fallback described above. The effective per-pool memory settings are exported
++through the existing old-space, RSS-retirement, and pressure-threshold gauges.
++A named generation is replaced when its selected source package or effective
 +environment changes. Committed module membership changes also hot-replace every
 +affected resident named generation and the default generation when its exact
 +routed module set changes. Removed named slots close admission and drain. One
