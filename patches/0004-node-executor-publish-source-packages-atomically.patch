@@ -21,15 +21,15 @@ Correct the package verification guidance to use each package's defined lint scr
  npm-packages/node-executor/package.json       |    3 +-
  .../node-executor/src/build_deps.test.ts      |  371 ++++
  npm-packages/node-executor/src/build_deps.ts  |  550 ++++--
- npm-packages/node-executor/src/errors.test.ts |  210 +++
+ npm-packages/node-executor/src/errors.test.ts |  210 ++
  npm-packages/node-executor/src/errors.ts      |  227 ++-
- npm-packages/node-executor/src/executor.ts    |  209 ++-
+ npm-packages/node-executor/src/executor.ts    |  209 +-
  npm-packages/node-executor/src/local.ts       |   38 +-
  npm-packages/node-executor/src/prepare.ts     |   32 +
- .../node-executor/src/source_package.test.ts  | 1657 +++++++++++++++++
- .../node-executor/src/source_package.ts       | 1560 +++++++++++++---
- .../README.md                                 |  461 +++++
- 14 files changed, 4828 insertions(+), 535 deletions(-)
+ .../node-executor/src/source_package.test.ts  | 1657 ++++++++++++++++
+ .../node-executor/src/source_package.ts       | 1756 ++++++++++++++---
+ .../README.md                                 |  498 +++++
+ 14 files changed, 5060 insertions(+), 536 deletions(-)
  create mode 100644 npm-packages/node-executor/src/build_deps.test.ts
  create mode 100644 npm-packages/node-executor/src/errors.test.ts
  create mode 100644 npm-packages/node-executor/src/prepare.ts
@@ -3825,7 +3825,7 @@ index 0000000000000000000000000000000000000000..1a111dd98d6cb5d250bcc2fca7b3c82a
 +  throw new Error("Condition was not met before timeout");
 +}
 diff --git a/npm-packages/node-executor/src/source_package.ts b/npm-packages/node-executor/src/source_package.ts
-index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235bfb585f4 100644
+index 18f049cc548087ee32b8505c60ce79390953e9e2..acc316ae30cfd08b2eeb8f240415b7eaba0792e8 100644
 --- a/npm-packages/node-executor/src/source_package.ts
 +++ b/npm-packages/node-executor/src/source_package.ts
 @@ -5,11 +5,17 @@ import os from "node:os";
@@ -3867,7 +3867,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
  
  type MetadataJson = {
    modulePaths: string[];
-@@ -35,26 +53,193 @@ type MetadataJson = {
+@@ -35,26 +53,311 @@ type MetadataJson = {
    externalDepsStorageKey?: string;
  };
  
@@ -3919,6 +3919,124 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +}
 +const RUNNING_IN_AWS_LAMBDA =
 +  process.env.AWS_LAMBDA_FUNCTION_NAME !== undefined;
++const MAX_PACKAGE_STAGE_OBSERVATIONS = 256;
++
++type PackageRequestKind = "execute" | "analyze" | "prepare";
++type PackageCacheResult =
++  | "current_hit"
++  | "joined_materialization"
++  | "new_materialization"
++  | "retirement_wait";
++const PACKAGE_CACHE_RESULT_PRIORITY: Record<PackageCacheResult, number> = {
++  current_hit: 0,
++  retirement_wait: 1,
++  joined_materialization: 2,
++  new_materialization: 3,
++};
++type PackageKind = "source" | "external";
++type PackageValidationPhase = "staged" | "prebuilt";
++type PackageStageOutcome = "success" | "failure";
++type PackageStageObservation =
++  | {
++      sequence: number;
++      stage: "acquire";
++      requestKind: PackageRequestKind;
++      cacheResult: PackageCacheResult;
++      outcome: PackageStageOutcome;
++      durationMs: number;
++    }
++  | {
++      sequence: number;
++      stage: "validation";
++      packageKind: PackageKind;
++      phase: PackageValidationPhase;
++      outcome: PackageStageOutcome;
++      durationMs: number;
++    }
++  | {
++      sequence: number;
++      stage: "cleanup";
++      packageKind: PackageKind;
++      outcome: PackageStageOutcome;
++      durationMs: number;
++    };
++type PackageStageObservationInput = PackageStageObservation extends infer T
++  ? T extends PackageStageObservation
++    ? Omit<T, "sequence">
++    : never
++  : never;
++
++let packageStageObservationSequence = 0;
++let packageStageObservationsDropped = 0;
++const packageStageObservations: PackageStageObservation[] = [];
++
++function recordPackageStageObservation(
++  observation: PackageStageObservationInput,
++) {
++  packageStageObservationSequence += 1;
++  packageStageObservations.push({
++    ...observation,
++    sequence: packageStageObservationSequence,
++  } as PackageStageObservation);
++  if (packageStageObservations.length > MAX_PACKAGE_STAGE_OBSERVATIONS) {
++    packageStageObservations.shift();
++    packageStageObservationsDropped += 1;
++  }
++}
++
++async function observePackageValidation<T>(
++  packageKind: PackageKind,
++  phase: PackageValidationPhase,
++  operation: () => Promise<T>,
++): Promise<T> {
++  const started = performance.now();
++  try {
++    const result = await operation();
++    recordPackageStageObservation({
++      stage: "validation",
++      packageKind,
++      phase,
++      outcome: "success",
++      durationMs: performance.now() - started,
++    });
++    return result;
++  } catch (error) {
++    recordPackageStageObservation({
++      stage: "validation",
++      packageKind,
++      phase,
++      outcome: "failure",
++      durationMs: performance.now() - started,
++    });
++    throw error;
++  }
++}
++
++function observePackageCleanup(
++  packageKind: PackageKind,
++  operation: () => Promise<void>,
++): Promise<void> {
++  const started = performance.now();
++  return operation().then(
++    () => {
++      recordPackageStageObservation({
++        stage: "cleanup",
++        packageKind,
++        outcome: "success",
++        durationMs: performance.now() - started,
++      });
++    },
++    (error: unknown) => {
++      recordPackageStageObservation({
++        stage: "cleanup",
++        packageKind,
++        outcome: "failure",
++        durationMs: performance.now() - started,
++      });
++      throw error;
++    },
++  );
++}
 +
 +let packageUseSequence = 0;
 +const packageEvents = {
@@ -3993,7 +4111,9 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +      throw new PackageCacheError(
 +        "Failed to fetch package: response body is empty",
 +      );
-+    }
+     }
+-    // incompatible ReadableStream definitions
+-    return stream.Readable.fromWeb(response.body! as any);
 +    const contentLengthHeader = response.headers.get("content-length");
 +    if (contentLengthHeader !== null) {
 +      const contentLength = Number(contentLengthHeader);
@@ -4014,9 +4134,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +      controller.abort();
 +      clearTimeout(timeout);
 +      throw new PackageCacheError("Failed to read package response");
-     }
--    // incompatible ReadableStream definitions
--    return stream.Readable.fromWeb(response.body! as any);
++    }
 +  } else {
 +    clearTimeout(timeout);
 +    throw new PackageCacheError("Invalid package URL");
@@ -4073,7 +4191,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
  
    metadataJson.modulePaths.sort();
  
-@@ -67,7 +252,7 @@ function parseMetadataFile(contents: string): MetadataJson {
+@@ -67,7 +370,7 @@ function parseMetadataFile(contents: string): MetadataJson {
      }
    }
  
@@ -4082,25 +4200,13 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
    for (const [path, environment] of metadataJson.moduleEnvironments) {
      moduleEnvironmentsMap.set(path, environment);
    }
-@@ -79,193 +264,405 @@ function parseMetadataFile(contents: string): MetadataJson {
+@@ -79,193 +382,391 @@ function parseMetadataFile(contents: string): MetadataJson {
    };
  }
  
 -// In-flight `removeDir` promises
 -const pendingRemovals = new Map<string, Promise<void>>();
-+/// Downloads source package and external deps package, if necessary,
-+/// populating cache with result. Links external deps package into
-+/// local source package directory.
-+export async function maybeDownloadAndLinkPackages(
-+  sourcePackage: SourcePackage,
-+): Promise<LocalSourcePackage> {
-+  try {
-+    return await maybeDownloadAndLinkPackagesInner(sourcePackage);
-+  } catch (error) {
-+    throw sanitizePackageError(error, "Failed to prepare source package");
-+  }
-+}
- 
+-
 -// Removes `dir`, serialized against any other removal of the same directory.
 -function removeDir(dir: string): Promise<void> {
 -  const removal = (pendingRemovals.get(dir) ?? Promise.resolve())
@@ -4112,51 +4218,12 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 -    .finally(() => {
 -      if (pendingRemovals.get(dir) === removal) {
 -        pendingRemovals.delete(dir);
-+async function maybeDownloadAndLinkPackagesInner(
-+  sourcePackage: SourcePackage,
-+): Promise<LocalSourcePackage> {
-+  const sourcePackageKey = sourcePackage.bundled_source.key;
-+  const requiresNodeModules =
-+    sourcePackage.external_deps !== null &&
-+    sourcePackage.external_deps !== undefined;
-+  for (;;) {
-+    const retirement = sourcePackageRetirements.get(sourcePackageKey);
-+    if (retirement !== undefined) {
-+      await retirement;
-+    }
-+    // If we've previously downloaded and cached this source package, we've already linked the necessary
-+    // external modules and so there is no more work left to do, so return.
-+    const local = availableSourcePackages.get(sourcePackageKey);
-+    if (local !== undefined) {
-+      validatePackageChecksum(
-+        local.archiveSha256,
-+        sourcePackage.bundled_source,
-+      );
-+      validateExternalDepsMatch(local, sourcePackage.external_deps);
-+      // Published packages are immutable and may still back lazy imports from
-+      // earlier invocations. Fail on corruption instead of deleting a live path.
-+      const complete = await localSourcePackageIsComplete(
-+        local,
-+        requiresNodeModules,
-+      );
-+      // Validation yields between filesystem operations. A zero-owner package
-+      // can retire in that interval, so retry instead of reporting normal
-+      // retirement as cache corruption.
-+      if (availableSourcePackages.get(sourcePackageKey) !== local) {
-+        continue;
-       }
+-      }
 -    });
 -  pendingRemovals.set(dir, removal);
 -  return removal;
 -}
-+      if (!complete) {
-+        throw new PackageCacheError("Incomplete source package");
-+      }
-+      local.lastUsed = ++packageUseSequence;
-+      packageEvents.sourceHits += 1;
-+      return local;
-+    }
- 
+-
 -/**
 - * Returns the cache entry for `key`, starting the download if it isn't cached
 - * yet. Concurrent requests for the same key share a single download.
@@ -4174,30 +4241,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 -  const cached = cache.get(key);
 -  if (cached !== undefined) {
 -    return context.adopt(cached);
-+    const inFlight = sourcePackageDownloads.get(sourcePackageKey);
-+    if (inFlight !== undefined) {
-+      validatePackageChecksum(
-+        inFlight.archiveSha256,
-+        sourcePackage.bundled_source,
-+      );
-+      const result = await inFlight.promise;
-+      validateExternalDepsMatch(result, sourcePackage.external_deps);
-+      return result;
-+    }
-+
-+    const download = {
-+      archiveSha256: sourcePackage.bundled_source.sha256,
-+      promise: downloadAndLinkPackages(sourcePackage),
-+    };
-+    sourcePackageDownloads.set(sourcePackageKey, download);
-+    try {
-+      return await download.promise;
-+    } finally {
-+      if (sourcePackageDownloads.get(sourcePackageKey) === download) {
-+        sourcePackageDownloads.delete(sourcePackageKey);
-+      }
-+    }
-   }
+-  }
 -  const entry: PackageCacheEntry<T> = {
 -    dir,
 -    refcount: 0,
@@ -4221,14 +4265,13 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 -  cache.set(key, entry);
 -  context.adopt(entry);
 -  return entry;
- }
- 
--/// Downloads source package and external deps package, if necessary,
--/// populating cache with result. Links external deps package into
--/// local source package directory.
--export async function maybeDownloadAndLinkPackages(
+-}
+-
+ /// Downloads source package and external deps package, if necessary,
+ /// populating cache with result. Links external deps package into
+ /// local source package directory.
+ export async function maybeDownloadAndLinkPackages(
 -  context: PackageRefcounts,
-+async function downloadAndLinkPackages(
    sourcePackage: SourcePackage,
  ): Promise<LocalSourcePackage> {
 -  const externalDeps = sourcePackage.external_deps ?? null;
@@ -4248,12 +4291,102 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 -    path.join(os.tmpdir(), `source/${sourcePackage.key}`),
 -    (dir) =>
 -      downloadAndLinkSourcePackage(dir, sourcePackage.bundled_source, external),
+-  );
++  try {
++    return await maybeDownloadAndLinkPackagesInner(sourcePackage);
++  } catch (error) {
++    throw sanitizePackageError(error, "Failed to prepare source package");
++  }
++}
+ 
+-  const [modules] = await Promise.all([source.ready, external?.ready]);
+-  return { dir: source.dir, modules };
++async function maybeDownloadAndLinkPackagesInner(
++  sourcePackage: SourcePackage,
++  observeCacheResult?: (result: PackageCacheResult) => void,
++): Promise<LocalSourcePackage> {
++  const sourcePackageKey = sourcePackage.bundled_source.key;
++  for (;;) {
++    const retirement = sourcePackageRetirements.get(sourcePackageKey);
++    if (retirement !== undefined) {
++      observeCacheResult?.("retirement_wait");
++      await retirement;
++    }
++    // If we've previously downloaded and cached this source package, we've already linked the necessary
++    // external modules and so there is no more work left to do, so return.
++    const local = availableSourcePackages.get(sourcePackageKey);
++    if (local !== undefined) {
++      observeCacheResult?.("current_hit");
++      validatePackageChecksum(
++        local.archiveSha256,
++        sourcePackage.bundled_source,
++      );
++      validateExternalDepsMatch(local, sourcePackage.external_deps);
++      // Publication validated this immutable package before installing the
++      // current map entry. Reuse checks identity only; unsupported external
++      // filesystem mutation requires a fresh executor generation.
++      local.lastUsed = ++packageUseSequence;
++      packageEvents.sourceHits += 1;
++      return local;
++    }
++
++    const inFlight = sourcePackageDownloads.get(sourcePackageKey);
++    if (inFlight !== undefined) {
++      observeCacheResult?.("joined_materialization");
++      validatePackageChecksum(
++        inFlight.archiveSha256,
++        sourcePackage.bundled_source,
++      );
++      const result = await inFlight.promise;
++      validateExternalDepsMatch(result, sourcePackage.external_deps);
++      return result;
++    }
++
++    const download = {
++      archiveSha256: sourcePackage.bundled_source.sha256,
++      promise: downloadAndLinkPackages(sourcePackage),
++    };
++    observeCacheResult?.("new_materialization");
++    sourcePackageDownloads.set(sourcePackageKey, download);
++    try {
++      return await download.promise;
++    } finally {
++      if (sourcePackageDownloads.get(sourcePackageKey) === download) {
++        sourcePackageDownloads.delete(sourcePackageKey);
++      }
++    }
++  }
+ }
+ 
+-async function downloadAndLinkSourcePackage(
+-  dir: string,
+-  bundledSource: Package,
+-  externalPackage: PackageCacheEntry<void> | null,
+-): Promise<Set<CanonicalizedModulePath>> {
+-  const modules = await downloadSourcePackage(dir, bundledSource);
+-
+-  // Do symlinking of external package into local source package node_modules folder.
+-  //
+-  // This symlink is necessary only after the initial download, as a given
+-  // source package can only ever map to one set of external deps.
+-  // If external deps change, a new source package is created.
+-  if (externalPackage) {
+-    logDebug(
+-      `Attempting symlink from ${externalPackage.dir}/node_modules to ${dir}/node_modules`,
+-    );
+-    await fs.promises.symlink(
+-      `${externalPackage.dir}/node_modules`,
+-      `${dir}/node_modules`,
+-      "dir",
++async function downloadAndLinkPackages(
++  sourcePackage: SourcePackage,
++): Promise<LocalSourcePackage> {
 +  // Keep source startup first: in Lambda, its cleanup synchronously releases
 +  // external owners before an external cache miss can start external cleanup.
 +  const sourcePackagePromise = downloadSourcePackage(
 +    sourcePackage.bundled_source,
 +    sourcePackageCacheIdentity(sourcePackage),
-   );
++  );
 +  const externalPackagePromise: Promise<ExternalDepsPackage | null> =
 +    sourcePackage.external_deps
 +      ? acquireExternalPackageForSource(sourcePackage.external_deps)
@@ -4277,10 +4410,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +    if (externalPackageResult.status === "rejected") {
 +      throw externalPackageResult.reason;
 +    }
- 
--  const [modules] = await Promise.all([source.ready, external?.ready]);
--  return { dir: source.dir, modules };
--}
++
 +    // A new source staging directory cannot already contain node_modules. Link
 +    // its reserved external package before publishing the complete source tree.
 +    validateExternalDepsMatch(stagedPackage, sourcePackage.external_deps);
@@ -4294,7 +4424,12 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +        "dir",
 +      );
 +    }
-+    await validateLocalSourcePackage(stagedPackage, externalPackage !== null);
++    await validateLocalSourcePackage(
++      stagedPackage,
++      externalPackage !== null,
++      "staged",
+     );
+-  }
 +    localPackage = await publishStagedSourcePackage(stagedPackage);
 +    registerPrepareStackTrace(path.join(localPackage.dir, "modules"));
 +    registeredStackRoot = true;
@@ -4304,27 +4439,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +    availableSourcePackages.set(sourcePackage.bundled_source.key, localPackage);
 +    packageEvents.sourcePublishes += 1;
  
--async function downloadAndLinkSourcePackage(
--  dir: string,
--  bundledSource: Package,
--  externalPackage: PackageCacheEntry<void> | null,
--): Promise<Set<CanonicalizedModulePath>> {
--  const modules = await downloadSourcePackage(dir, bundledSource);
--
--  // Do symlinking of external package into local source package node_modules folder.
--  //
--  // This symlink is necessary only after the initial download, as a given
--  // source package can only ever map to one set of external deps.
--  // If external deps change, a new source package is created.
--  if (externalPackage) {
--    logDebug(
--      `Attempting symlink from ${externalPackage.dir}/node_modules to ${dir}/node_modules`,
--    );
--    await fs.promises.symlink(
--      `${externalPackage.dir}/node_modules`,
--      `${dir}/node_modules`,
--      "dir",
--    );
+-  return modules;
 +    return localPackage;
 +  } catch (error) {
 +    packageEvents.sourceFailedPublications += 1;
@@ -4363,9 +4478,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +      throw boundsResult.reason;
 +    }
 +    throw error;
-   }
--
--  return modules;
++  }
  }
  
 -// Downloads sourcePackage and unzips it into `source/${sourcePackage.key}/modules`
@@ -4469,16 +4582,8 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 -  logDurationMs("cleanupExternalPackages", start);
 +    if (externalDeps !== undefined) {
 +      validatePackageChecksum(externalDeps.archiveSha256, externalPackage);
-+      // Source packages retain symlinks to published external packages. Replacing
-+      // this path would break lazy imports from every source package using it.
-+      const complete = await localExternalPackageIsComplete(externalDeps);
-+      // A zero-owner package can retire while the asynchronous stat settles.
-+      if (availableExternalPackages.get(externalPackage.key) !== externalDeps) {
-+        continue;
-+      }
-+      if (!complete) {
-+        throw new PackageCacheError("Incomplete external deps package");
-+      }
++      // Source packages retain symlinks to an external package that was
++      // validated before publication. Current-entry reuse is identity-only.
 +      externalDeps.lastUsed = ++packageUseSequence;
 +      packageEvents.externalHits += 1;
 +      logDebug("External Package available locally");
@@ -4558,7 +4663,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +      externalPackage,
 +      externalPackageStream,
 +    );
-+    await validateLocalExternalPackage({ dir: stagingDir });
++    await validateLocalExternalPackage({ dir: stagingDir }, "staged");
 +    await fs.promises.rename(stagingDir, dir);
 +    const result: ExternalDepsPackage = {
 +      dir,
@@ -4642,7 +4747,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
  }
  
  async function streamToBuffer(
-@@ -307,8 +704,8 @@ async function processPackageStream(
+@@ -307,8 +808,8 @@ async function processPackageStream(
    // Assert checksum matches
    const digest = hash.digest().toString("base64url");
    if (digest !== sha256Digest) {
@@ -4653,7 +4758,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
      );
    }
  
-@@ -318,27 +715,150 @@ async function processPackageStream(
+@@ -318,27 +819,150 @@ async function processPackageStream(
  async function unzipFile(
    zipBuffer: Buffer,
    outputDir: string,
@@ -4813,7 +4918,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
      }
    };
  
-@@ -350,37 +870,49 @@ async function processExternalPackageStream(
+@@ -350,37 +974,50 @@ async function processExternalPackageStream(
    logDurationMs("unzipExternalsTime", startUnzip);
  
    const startWrites = performance.now();
@@ -4843,6 +4948,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +  dynamicallyDownloaded: boolean;
 +  retainedBytes: number;
 +  activeOwners: number;
++  residentOwners: number;
 +  lastUsed: number;
  };
  
@@ -4876,7 +4982,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
    const startUnzip = performance.now();
    const zipBuffer = await processPackageStream(
      sourcePackage.sha256,
-@@ -390,7 +922,20 @@ async function processSourcePackageStream(
+@@ -390,7 +1027,20 @@ async function processSourcePackageStream(
  
    // After finishing the pipeline, await on each File's buffer.
    const startWrites = performance.now();
@@ -4898,7 +5004,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
    const actualModulePaths = entries
      .filter(
        (entry) =>
-@@ -410,7 +955,7 @@ async function processSourcePackageStream(
+@@ -410,7 +1060,7 @@ async function processSourcePackageStream(
      }),
    );
  
@@ -4907,7 +5013,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
    createPackageJsonIfMissing(dir);
    logDurationMs("sourceWritesTime", startWrites);
    actualModulePaths.sort();
-@@ -418,25 +963,451 @@ async function processSourcePackageStream(
+@@ -418,25 +1068,538 @@ async function processSourcePackageStream(
      JSON.stringify(metadataJson.modulePaths) !==
      JSON.stringify(actualModulePaths)
    ) {
@@ -4932,6 +5038,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +    dynamicallyDownloaded: true,
 +    retainedBytes: uncompressedBytes,
 +    activeOwners: 0,
++    residentOwners: 0,
 +    lastUsed: ++packageUseSequence,
 +  };
  }
@@ -4963,33 +5070,87 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +  release: () => Promise<void>;
 +};
 +
++export type SourcePackageOwner = "request" | "resident";
++
++function sourcePackageOwnerCount(localPackage: LocalSourcePackage): number {
++  return localPackage.activeOwners + localPackage.residentOwners;
++}
++
 +export async function acquireSourcePackage(
 +  sourcePackage: SourcePackage,
++  owner: SourcePackageOwner = "request",
++  requestKind: PackageRequestKind = "execute",
 +): Promise<SourcePackageLease> {
-+  let localPackage: LocalSourcePackage;
-+  for (;;) {
-+    localPackage = await maybeDownloadAndLinkPackages(sourcePackage);
-+    // A zero-owner cache hit can retire while this async caller is resuming.
-+    // Check map identity and increment ownership without another await.
-+    if (
-+      availableSourcePackages.get(sourcePackage.bundled_source.key) !==
-+      localPackage
-+    ) {
-+      continue;
++  const started = performance.now();
++  let cacheResult: PackageCacheResult = "current_hit";
++  let acquisitionRecorded = false;
++  const recordAcquisition = (outcome: PackageStageOutcome) => {
++    if (acquisitionRecorded) {
++      throw new PackageCacheError(
++        "Source package acquisition telemetry was recorded twice",
++      );
 +    }
-+    localPackage.activeOwners += 1;
-+    break;
++    acquisitionRecorded = true;
++    recordPackageStageObservation({
++      stage: "acquire",
++      requestKind,
++      cacheResult,
++      outcome,
++      durationMs: performance.now() - started,
++    });
++  };
++  let localPackage: LocalSourcePackage;
++  try {
++    for (;;) {
++      localPackage = await maybeDownloadAndLinkPackagesInner(
++        sourcePackage,
++        (result) => {
++          // Ownership can lose a retirement race and repeat lookup. Retain the
++          // most substantial work from the complete acquisition, not only the
++          // final lookup that acquired the current map entry.
++          if (
++            PACKAGE_CACHE_RESULT_PRIORITY[result] >
++            PACKAGE_CACHE_RESULT_PRIORITY[cacheResult]
++          ) {
++            cacheResult = result;
++          }
++        },
++      );
++      // A zero-owner cache hit can retire while this async caller is resuming.
++      // Check map identity and increment ownership without another await.
++      if (
++        availableSourcePackages.get(sourcePackage.bundled_source.key) !==
++        localPackage
++      ) {
++        continue;
++      }
++      if (owner === "resident") {
++        localPackage.residentOwners += 1;
++      } else {
++        localPackage.activeOwners += 1;
++      }
++      break;
++    }
++  } catch (error) {
++    recordAcquisition("failure");
++    throw sanitizePackageError(error, "Failed to prepare source package");
 +  }
 +  localPackage.lastUsed = ++packageUseSequence;
 +  try {
 +    await enforceLocalPackageCacheBounds();
 +  } catch (error) {
-+    localPackage.activeOwners -= 1;
++    if (owner === "resident") {
++      localPackage.residentOwners -= 1;
++    } else {
++      localPackage.activeOwners -= 1;
++    }
++    recordAcquisition("failure");
 +    throw sanitizePackageError(
 +      error,
 +      "Failed to enforce source package cache bounds",
 +    );
 +  }
++  recordAcquisition("success");
 +
 +  let released = false;
 +  return {
@@ -5001,10 +5162,19 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +        );
 +      }
 +      released = true;
-+      if (localPackage.activeOwners <= 0) {
-+        throw new PackageCacheError("Source package owner count is invalid");
++      if (owner === "resident") {
++        if (localPackage.residentOwners <= 0) {
++          throw new PackageCacheError(
++            "Source package resident-owner count is invalid",
++          );
++        }
++        localPackage.residentOwners -= 1;
++      } else {
++        if (localPackage.activeOwners <= 0) {
++          throw new PackageCacheError("Source package owner count is invalid");
++        }
++        localPackage.activeOwners -= 1;
 +      }
-+      localPackage.activeOwners -= 1;
 +      localPackage.lastUsed = ++packageUseSequence;
 +      try {
 +        await enforceLocalPackageCacheBounds();
@@ -5035,11 +5205,20 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +      (total, localPackage) => total + localPackage.activeOwners,
 +      0,
 +    ),
++    residentSourceOwners: sourcePackages.reduce(
++      (total, localPackage) => total + localPackage.residentOwners,
++      0,
++    ),
 +    retainedExternalPackages: externalPackages.length,
 +    retainedExternalBytes: externalPackages.reduce(
 +      (total, localPackage) => total + localPackage.retainedBytes,
 +      0,
 +    ),
++    packageStageObservationSequence,
++    packageStageObservationsDropped,
++    packageStageObservations: packageStageObservations.map((observation) => ({
++      ...observation,
++    })),
 +    ...packageEvents,
 +  };
 +}
@@ -5057,7 +5236,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +  }
 +  const expectedExternalOwners = new Map<string, number>();
 +  for (const localPackage of availableSourcePackages.values()) {
-+    if (localPackage.activeOwners !== 0) {
++    if (sourcePackageOwnerCount(localPackage) !== 0) {
 +      throw new PackageCacheError(
 +        "Cannot reset a package cache with active owners",
 +      );
@@ -5093,6 +5272,9 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +  availableSourcePackages.clear();
 +  availableExternalPackages.clear();
 +  packageUseSequence = 0;
++  packageStageObservationSequence = 0;
++  packageStageObservationsDropped = 0;
++  packageStageObservations.length = 0;
 +  for (const event of Object.keys(packageEvents) as Array<
 +    keyof typeof packageEvents
 +  >) {
@@ -5110,7 +5292,8 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +    const candidate = [...availableSourcePackages.entries()]
 +      .filter(
 +        ([, localPackage]) =>
-+          localPackage.dynamicallyDownloaded && localPackage.activeOwners === 0,
++          localPackage.dynamicallyDownloaded &&
++          sourcePackageOwnerCount(localPackage) === 0,
 +      )
 +      .sort(([, a], [, b]) => a.lastUsed - b.lastUsed)[0];
 +    if (candidate === undefined) {
@@ -5140,7 +5323,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +      .filter(([, localPackage]) => {
 +        if (
 +          !localPackage.dynamicallyDownloaded ||
-+          localPackage.activeOwners !== 0 ||
++          sourcePackageOwnerCount(localPackage) !== 0 ||
 +          localPackage.externalDepsStorageKey === undefined
 +        ) {
 +          return false;
@@ -5160,7 +5343,11 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +  }
 +  // Map, root, and owner transitions happen synchronously above. Once no
 +  // package owns either path, source and external deletion can proceed together.
-+  await Promise.all(retirements);
++  // Wait for every selected deletion before allowing a retry to publish.
++  const results = await Promise.allSettled(retirements);
++  if (results.some((result) => result.status === "rejected")) {
++    throw new PackageCacheError("Failed to clean retired packages");
++  }
 +}
 +
 +function sourcePackageCacheExceedsBounds() {
@@ -5193,7 +5380,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +  key: string,
 +  localPackage: LocalSourcePackage,
 +): Promise<void> {
-+  if (localPackage.activeOwners !== 0) {
++  if (sourcePackageOwnerCount(localPackage) !== 0) {
 +    throw new PackageCacheError("Cannot retire an active source package");
 +  }
 +  if (availableSourcePackages.get(key) !== localPackage) {
@@ -5227,13 +5414,13 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +    externalPackage.lastUsed = ++packageUseSequence;
 +  }
 +  packageEvents.sourceRetirements += 1;
-+  const retirement = fs.promises
-+    .rm(localPackage.dir, { recursive: true, force: true })
-+    .finally(() => {
-+      if (sourcePackageRetirements.get(key) === retirement) {
-+        sourcePackageRetirements.delete(key);
-+      }
-+    });
++  const retirement = observePackageCleanup("source", () =>
++    fs.promises.rm(localPackage.dir, { recursive: true, force: true }),
++  ).finally(() => {
++    if (sourcePackageRetirements.get(key) === retirement) {
++      sourcePackageRetirements.delete(key);
++    }
++  });
 +  sourcePackageRetirements.set(key, retirement);
 +  return retirement;
 +}
@@ -5253,13 +5440,13 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +
 +  availableExternalPackages.delete(key);
 +  packageEvents.externalRetirements += 1;
-+  const retirement = fs.promises
-+    .rm(localPackage.dir, { recursive: true, force: true })
-+    .finally(() => {
-+      if (externalPackageRetirements.get(key) === retirement) {
-+        externalPackageRetirements.delete(key);
-+      }
-+    });
++  const retirement = observePackageCleanup("external", () =>
++    fs.promises.rm(localPackage.dir, { recursive: true, force: true }),
++  ).finally(() => {
++    if (externalPackageRetirements.get(key) === retirement) {
++      externalPackageRetirements.delete(key);
++    }
++  });
 +  externalPackageRetirements.set(key, retirement);
 +  return retirement;
 +}
@@ -5312,12 +5499,15 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +
 +async function validateLocalSourcePackage(
 +  local: LocalSourcePackage,
-+  requiresNodeModules = false,
++  requiresNodeModules: boolean,
++  phase: PackageValidationPhase,
 +): Promise<void> {
-+  if (await localSourcePackageIsComplete(local, requiresNodeModules)) {
-+    return;
-+  }
-+  throw new PackageCacheError("Incomplete source package");
++  await observePackageValidation("source", phase, async () => {
++    if (await localSourcePackageIsComplete(local, requiresNodeModules)) {
++      return;
++    }
++    throw new PackageCacheError("Incomplete source package");
++  });
 +}
 +
 +function validateExternalDepsMatch(
@@ -5356,19 +5546,22 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +  return nodeModulesStat?.isDirectory() ?? false;
 +}
 +
-+async function validateLocalExternalPackage(local: {
-+  dir: string;
-+}): Promise<void> {
-+  if (await localExternalPackageIsComplete(local)) {
-+    return;
-+  }
-+  throw new PackageCacheError("Incomplete external deps package");
++async function validateLocalExternalPackage(
++  local: { dir: string },
++  phase: PackageValidationPhase,
++): Promise<void> {
++  await observePackageValidation("external", phase, async () => {
++    if (await localExternalPackageIsComplete(local)) {
++      return;
++    }
++    throw new PackageCacheError("Incomplete external deps package");
++  });
 +}
 +
  /**
   * Prepopulates source and external deps caches if this Lambda was pushed with source and, optionally,
   * an external deps package.
-@@ -448,6 +1419,31 @@ export const availableExternalPackages = new Map<
+@@ -448,6 +1611,31 @@ export const availableExternalPackages = new Map<
   * - package.json
   */
  export async function populatePrebuildPackages() {
@@ -5400,7 +5593,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
    const sourceDir = path.join(__dirname, "/source");
    if (fs.statSync(sourceDir, { throwIfNoEntry: false }) === undefined) {
      // If we weren't pushed with source, skip prepopulations
-@@ -457,44 +1453,53 @@ export async function populatePrebuildPackages() {
+@@ -457,44 +1645,55 @@ export async function populatePrebuildPackages() {
    const pkgs = fs.readdirSync(sourceDir);
    for (const pkg of pkgs) {
      const pkgDir = path.join(sourceDir, pkg);
@@ -5435,11 +5628,13 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +      dynamicallyDownloaded: false,
 +      retainedBytes: 0,
 +      activeOwners: 0,
++      residentOwners: 0,
 +      lastUsed: ++packageUseSequence,
 +    };
 +    await validateLocalSourcePackage(
 +      localPackage,
 +      metadata.externalDepsStorageKey !== undefined,
++      "prebuilt",
 +    );
 +    availableSourcePackages.set(pkg, localPackage);
 +    registerPrepareStackTrace(path.join(localPackage.dir, "modules"));
@@ -5485,7 +5680,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
    // the user modules as ESM, since they have .js and not .mjs extension.
    const packageJsonPath = path.join(dir, "package.json");
    if (fs.existsSync(packageJsonPath)) {
-@@ -515,7 +1520,9 @@ function modulesFromMetadataJson(
+@@ -515,7 +1714,9 @@ function modulesFromMetadataJson(
        // Only load node files.
        const environment = metadataJson.moduleEnvironments.get(path);
        if (!environment) {
@@ -5496,7 +5691,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
        }
        if (environment !== "node") {
          continue;
-@@ -524,46 +1531,71 @@ function modulesFromMetadataJson(
+@@ -524,46 +1725,71 @@ function modulesFromMetadataJson(
      } else if (path.endsWith(".js.map")) {
        continue;
      } else {
@@ -5517,7 +5712,7 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
 +  const removedPackages: LocalSourcePackage[] = [];
 +  for (const [key, localPackage] of availableSourcePackages) {
 +    if (localPackage.dynamicallyDownloaded) {
-+      if (localPackage.activeOwners !== 0) {
++      if (sourcePackageOwnerCount(localPackage) !== 0) {
 +        throw new PackageCacheError(
 +          "Cannot clean an active Lambda source package",
 +        );
@@ -5599,10 +5794,10 @@ index 18f049cc548087ee32b8505c60ce79390953e9e2..14c742f585512e66d89925fffb0a6235
  }
 diff --git a/patches/atomic_node_executor_source_packages/README.md b/patches/atomic_node_executor_source_packages/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..507b40b927f11e9fcd101c610758e3c3f76151cd
+index 0000000000000000000000000000000000000000..3a3e52951b593ab16c374bec59e761fcb1c4048c
 --- /dev/null
 +++ b/patches/atomic_node_executor_source_packages/README.md
-@@ -0,0 +1,461 @@
+@@ -0,0 +1,498 @@
 +# Atomic Node Executor Source Packages
 +
 +This patch fixes a local Node executor source-package cache race that can break
@@ -5691,9 +5886,9 @@ index 0000000000000000000000000000000000000000..507b40b927f11e9fcd101c610758e3c3
 +- Each source archive's `externalDepsStorageKey` must match the requested
 +  external dependency package before the source is linked, published, or
 +  returned from cache. A same-source-key waiter with inconsistent dependency
-+  metadata fails instead of receiving the first caller's package. Cached
-+  metadata is checked before completeness validation, and neither failure path
-+  removes a package that another invocation may still be using.
++  metadata fails instead of receiving the first caller's package. Current-entry
++  identity is checked before reuse, and neither failure path removes a package
++  that another invocation may still be using.
 +- Source archives extract into private staging directories named under
 +  `source/.<cache-id>.<random>` created atomically with `mkdtemp()`.
 +- External dependency archives extract into private staging directories named
@@ -5738,17 +5933,15 @@ index 0000000000000000000000000000000000000000..507b40b927f11e9fcd101c610758e3c3
 +  instance later used by execution.
 +- Failed or superseded in-flight work cannot later publish over a successful
 +  retry.
-+- Cached source reuse verifies `package.json`, `modules/`, every module file
-+  declared in `metadata.json` including `_deps` chunks and source maps, and
-+  required `node_modules`. If a published package is incomplete, the request
-+  fails without deleting or replacing the path because an earlier invocation may
-+  still be using it. File checks settle asynchronously and sequentially, so a
-+  package with many bundled files does not block `/health` or issue an unbounded
-+  batch of filesystem operations. A package that retires during validation is
-+  retried instead of being misreported as corrupt.
-+- Cached external dependency reuse verifies `node_modules` and likewise fails
-+  without deleting the published path, which may still be the target of source
-+  package symlinks.
++- Source and external trees are checked for completeness before atomic
++  publication. Prebuilt package trees receive the same check before cache
++  registration. A current cache hit compares the immutable source and external
++  keys and checksums, updates recency, and acquires ownership without traversing
++  the filesystem. Warm lookup work is therefore independent of module count.
++  Complete lease acquisition can still wait for unrelated zero-owner cache
++  entries selected for bounded retirement.
++  Unsupported deletion or mutation after publication requires a fresh executor
++  generation; the cache does not perform recurring defensive scans.
 +- HTTP and local-file package downloads have a 120 second abort timeout that
 +  remains active until the package stream ends, closes, or errors.
 +- Downloads reject 90 MB or larger compressed archives before buffering them,
@@ -5774,11 +5967,13 @@ index 0000000000000000000000000000000000000000..507b40b927f11e9fcd101c610758e3c3
 +  syscall disposal settle. Lookup and ownership acquisition verify the same map
 +  entry without an intervening asynchronous operation, so a zero-owner cache hit
 +  cannot retire while a new request is acquiring it.
-+- Candidate preparation validates the complete request shape, acquires and
-+  releases the same source-package lease, and carries no function path or
-+  arguments. It therefore exercises source and external package publication
-+  without importing or invoking application code. A preparation failure is a
-+  typed endpoint result and cannot make a candidate ready.
++- Candidate preparation validates the complete request shape, acquires the same
++  source-package lease, and carries no function path or arguments. Base `warm`
++  preparation releases that lease after publication; the later pinned-pool
++  runtime uses `resident` preparation to retain it for the generation. Both
++  modes exercise source and external package publication without importing or
++  invoking application code. A preparation failure is a typed endpoint result
++  and cannot make a candidate ready.
 +- The local cache targets at most eight dynamic source packages and 512 MiB of
 +  source-package data, plus at most eight dynamic external packages and 2 GiB of
 +  external-package data. Byte accounting uses successfully extracted
@@ -5799,6 +5994,10 @@ index 0000000000000000000000000000000000000000..507b40b927f11e9fcd101c610758e3c3
 +  racing deletion of the old final path. Failed source publication does not
 +  consume source-cache capacity or register a stack root. A successful external
 +  download may remain as an ordinary bounded external-cache entry.
++- Cache enforcement removes ownership and map entries synchronously, starts
++  independent source and external removals together, and waits for every
++  selected removal before returning a failure. A retry therefore cannot publish
++  while an earlier failed enforcement pass still has deletion work in flight.
 +- Stack-frame mapping ref-counts each retained source-package module root. It
 +  derives the enclosing `modules` root from each frame path and verifies that
 +  root with a map lookup, so lookup work does not grow with the number of
@@ -5871,17 +6070,23 @@ index 0000000000000000000000000000000000000000..507b40b927f11e9fcd101c610758e3c3
 +Complete cached directories are reused and are not replaced by the internal hot
 +path. A final directory unknown to the current in-memory cache is stale and is
 +removed before archive download; publication uses rename without another
-+removal. A final directory already registered in the current cache is never
-+deleted or replaced, even if validation finds corruption, because prior
-+invocations may still use it. External deletion or mutation of the tempdir is
-+unsupported and requires restarting the executor to obtain a fresh tempdir.
++removal. A current registered directory is not deleted or replaced in response
++to a cache hit. Bounded retirement can remove it only after both request and
++resident ownership reach zero. External deletion or mutation of the tempdir is
++unsupported and requires restarting the executor to obtain a fresh tempdir;
++current hits do not scan for or repair that mutation.
 +
 +## Package lifetime
 +
 +The local lease covers the supported invocation, analysis, or preparation
-+boundary. Preparation releases its lease after publication because it does not
-+evaluate application code. User syscalls are disposed when an invocation or
-+analysis boundary returns success, an error, or a timeout. The Node timeout
++boundary. The base `warm` preparation mode releases its lease after publication
++because it does not evaluate application code. The package primitive supports a
++separate resident-owner category without depending on pool routing or backend
++package IDs. The later pinned-pool runtime adopts that category through the
++explicit `resident` mode and retains one lease for the complete application
++generation lifetime, while ordinary invocations retain their own leases. User
++syscalls are disposed when an invocation or analysis boundary returns success,
++an error, or a timeout. The Node timeout
 +race cannot cancel the underlying JavaScript promise, and timed-out work and
 +un-awaited callbacks are not supported after the boundary. A future lazy import
 +is safe while its invocation owns the lease. Work that resumes after the
@@ -5932,13 +6137,30 @@ index 0000000000000000000000000000000000000000..507b40b927f11e9fcd101c610758e3c3
 +## Metrics
 +
 +The Node health response reports aggregate retained source/external count and
-+bytes, active source owners, registered stack roots, package
-+hit/publish/retire/failed-publication counters, and stack-format
-+invocation/frame/duration counters. A failed-publication event covers a package
++bytes, active and generation-resident source owners, registered stack roots,
++package hit/publish/retire/failed-publication counters, and stack-format
++invocation/frame/duration counters. It also carries a bounded sequence of exact
++package acquisition, staged/prebuilt validation, and retirement-cleanup
++observations. Rust de-duplicates the sequence per child generation and exports
++`local_node_package_acquire_seconds`,
++`local_node_package_validation_seconds`, and
++`local_node_package_cleanup_seconds`. If more than 256 observations accumulate
++between successful health snapshots, the overwritten count is exported in
++`local_node_package_stage_observations_dropped_total`. A killed child can lose
++observations that were never read, while Rust request and preparation timers
++still report the outer failure. A failed-publication event covers a package
 +download, validation, linking, or publication attempt that does not publish the
 +requested package. The local resilience patch exports those values as backend
 +metrics. Package keys, paths, module names, and function names are not metric
 +labels or lifecycle log fields.
++
++When application-declared pinned local executor pools are enabled, each pool has
++its own package cache and tempdir, and these metrics carry that pool's bounded
++`pool_name`. Named generations rotate on complete source-package identity and
++effective environment changes. Source archives also retain module pool
++metadata. Ordinary invocation leases remain request scoped, while the pool
++runtime extends one source and external ownership chain for each application
++generation.
 +
 +## Tests
 +
@@ -5951,6 +6173,20 @@ index 0000000000000000000000000000000000000000..507b40b927f11e9fcd101c610758e3c3
 +- Sixteen concurrent requests for the same source package share one source
 +  download and one external dependency download, publish one final directory,
 +  and reuse it in a second concurrent wave.
++- Synthetic one-module and 32-module packages acquire and release production
++  leases with zero completeness stats on current source-cache reuse. Current
++  external-cache reuse likewise performs no stat beneath the published
++  dependency path.
++- Concurrent resident preparations retain one owner, join one initialization,
++  reject a different package identity, reuse the retained package after archive
++  authority becomes unavailable, and recover cleanly after failed initialization.
++- A resident package and its transitively owned external dependency survive
++  unrelated source and external turnover at the real cache-count limits, remain
++  included in byte accounting, and become eligible for retirement after the
++  resident lease releases.
++- Acquisition timing records one terminal success or failure, retains material
++  work across an ownership retry, copies health snapshots, and bounds the
++  sequence buffer to 256 entries with explicit dropped-observation accounting.
 +- A cold source download exposes only its private staging directory until the
 +  complete source package is published.
 +- Different source packages sharing the same external dependency share one
@@ -5989,13 +6225,14 @@ index 0000000000000000000000000000000000000000..507b40b927f11e9fcd101c610758e3c3
 +  the executor through the process-global fatal handler.
 +- A failed local-file package read has the same bounded timeout and sanitized
 +  error boundary and does not expose its path or query string.
-+- If a cached package is missing a declared bundled `_deps` chunk, source map,
-+  or `package.json`, the next request fails without deleting or redownloading
-+  the published package. The generated package marker matters because user
-+  modules are `.js` files that Node must import as ESM.
-+- If a cached external dependency package is missing `node_modules`, the next
-+  source request fails without deleting that external package or a source
-+  package that still links to it.
++- Current source hits do not inspect a removed bundled `_deps` chunk, source
++  map, or `package.json`; unsupported mutation is reused until the executor
++  generation is replaced. The generated package marker still matters because
++  user modules are `.js` files that Node must import as ESM.
++- If a newly staged source links to a cached external package whose
++  `node_modules` was removed out of band, staged source validation fails without
++  deleting that external package or an older source package that still links to
++  it. The external-cache hit itself performs no completeness scan.
 +- Concurrent registrations of different module roots preserve source-map frame
 +  identities for errors created by both packages.
 +- Unregistering an evicted source-package root removes it from process-global
@@ -6004,11 +6241,12 @@ index 0000000000000000000000000000000000000000..507b40b927f11e9fcd101c610758e3c3
 +  released packages retire back to the count and byte bounds, paired external
 +  dependencies retire after their final source owner, and owner count returns to
 +  zero.
-+- Lease acquisition retries if a cache hit retires before the asynchronous
-+  caller resumes.
++- Lease acquisition retries if a source cache hit retires before the
++  asynchronous caller resumes. Source publication likewise retries if an
++  external cache hit retires before its source owner resumes.
 +- Source publication reserves a cached external package before linking, and
-+  repeated failed source downloads keep successful external downloads within the
-+  external cache bounds.
++  repeated failed source downloads keep successful external downloads within
++  the external cache bounds.
 +- Retired source and external keys requested with changed checksums publish at
 +  different paths, so Node cannot return modules cached for the retired package
 +  identity.
@@ -6053,14 +6291,8 @@ index 0000000000000000000000000000000000000000..507b40b927f11e9fcd101c610758e3c3
 +The targeted test command for this parcel is:
 +
 +```sh
-+npm exec vitest -- run src/build_deps.test.ts src/source_package.test.ts src/errors.test.ts
++npm exec --no -- vitest run src/source_package.test.ts src/build_deps.test.ts src/errors.test.ts --maxWorkers=1
 +```
 +
-+It passed with nine dependency-build tests, thirty source-package tests, and
-+nine stack-frame registration tests for the changed Node executor files.
-+
-+A self-hosted cold-cache smoke run after backend restart also exercised the
-+runtime failure class: 256 concurrent Node actions in two waves, 512/512
-+successful responses, and no targeted backend log matches for
-+`Cannot find module`, `Incomplete source package`, or
-+`Incomplete external deps package`.
++The source-package suite includes deterministic filesystem-operation counts;
++it does not use timing-sensitive warm-cache assertions.
