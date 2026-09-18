@@ -14,20 +14,24 @@ The generated snapshot contains:
 - `RESULT_TREE`: the exact tree produced by applying the series; and
 - `patches/`: stable `git format-patch` files with commit messages and authors.
 
-`scripts/update.sh` is the only supported way to refresh generated files. It
-requires a clean source worktree from this repository, derives the configured
-upstream base, regenerates the complete series, applies every patch to a
-temporary index, compares the result with the source tree, and creates the
-history commit. For example:
+The canonical updater at `$HOME/.local/lib/patch-history/update.sh` is the
+supported way to refresh generated files. Run it from this history worktree;
+it derives the configured upstream base, regenerates the complete series,
+applies every patch to a temporary index, compares the result with the source
+tree, and creates the history commit. Use `--history-root` when invoking it
+from another directory. For example:
 
 ```sh
-./scripts/update.sh ../convex-backend
-./scripts/update.sh --push operator-fork ../convex-backend
+"$HOME/.local/lib/patch-history/update.sh" --message "integrate upstream executor fixes" ../convex-backend
+"$HOME/.local/lib/patch-history/update.sh" --push operator-fork --message "integrate upstream executor fixes" ../convex-backend
 ```
 
-The first command records locally. The second also publishes the resulting
-fast-forward update to the remote `patch-history` branch. Use `--no-commit` only
-to inspect generated changes before recording them.
+The required `--message` is a concise human summary of why this snapshot is
+being recorded; it becomes the subject of the history commit. The generated
+source and upstream identifiers remain in the commit body and files. The first
+command records locally. The second also publishes the resulting fast-forward
+update to the remote `patch-history` branch. Use `--no-commit` only to inspect
+generated changes before recording them; it does not accept `--message`.
 
 Run the updater before rebasing or otherwise rewriting the source train, while
 the version being replaced is still checked out, and again after the rewrite.
