@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Tue, 4 Aug 2026 17:39:00 +0800
-Subject: [PATCH 19/26] runtime: harden backend memory pressure
+Subject: [PATCH 18/25] runtime: harden backend memory pressure
 
 Harden the composed memory-control, bounded-context, and local-Node lifecycle patches at their integration boundaries. Resolve the process's effective cgroup-v2 directory through procfs mount metadata instead of assuming the hierarchy root. Validate memory and Node settings before database initialization, reject unsupported non-Linux controls, and pass every documented setting through the stock self-hosted Compose file.
 
@@ -24,10 +24,10 @@ On a representative long-running self-hosted workload, one glibc trim took 4.122
  10 files changed, 1016 insertions(+), 158 deletions(-)
 
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index fb70471499f0b323c4e14f8ab751aaac44e46484..516b0a5430f0c90b0e40af8842773f738d35507d 100644
+index 1d4ee4c5c8ed0205d31722fda060c587fe342b7a..45e1a7429aa19bc726ff75881e797eb22d660d6a 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -556,7 +556,11 @@ pub static LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES: LazyLock<usize> = LazyLock:
+@@ -567,7 +567,11 @@ pub static LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES: LazyLock<usize> = LazyLock:
  /// Minimum time between explicit glibc trim attempts during one or more
  /// pressure episodes.
  pub static LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN: LazyLock<Duration> = LazyLock::new(|| {
@@ -40,7 +40,7 @@ index fb70471499f0b323c4e14f8ab751aaac44e46484..516b0a5430f0c90b0e40af8842773f73
  });
  
  /// Minimum sampled direct-child RSS for sustained cgroup pressure to retire a
-@@ -572,10 +576,11 @@ pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES: LazyLock<usize> =
+@@ -583,10 +587,11 @@ pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES: LazyLock<usize> =
  /// Time internal cgroup pressure must remain active before it may retire a
  /// material local Node executor generation.
  pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE: LazyLock<Duration> = LazyLock::new(|| {
@@ -57,7 +57,7 @@ index fb70471499f0b323c4e14f8ab751aaac44e46484..516b0a5430f0c90b0e40af8842773f73
  
  /// Reject new external HTTP work when finite cgroup memory headroom is low.
 diff --git a/crates/local_backend/src/lib.rs b/crates/local_backend/src/lib.rs
-index f0c4860de2ff1e918957bb200dd54d1f7c4ad403..53ff3a5a6f5178a2c83d75dd3dea4e4b496a6663 100644
+index 88e2f3cf621336b2fa04bfe4609138df646ef952..ee890e966e7cc1e422c1a4c27fcca9a06cc3d328 100644
 --- a/crates/local_backend/src/lib.rs
 +++ b/crates/local_backend/src/lib.rs
 @@ -7,7 +7,6 @@
@@ -80,7 +80,7 @@ index f0c4860de2ff1e918957bb200dd54d1f7c4ad403..53ff3a5a6f5178a2c83d75dd3dea4e4b
      NodeActions,
  };
  use runtime::prod::ProdRuntime;
-@@ -158,6 +160,7 @@ pub async fn make_app(
+@@ -159,6 +161,7 @@ pub async fn make_app(
      zombify_rx: async_broadcast::Receiver<()>,
      preempt_tx: ShutdownSignal,
      memory_reclamation: MemoryPressureSignal,
@@ -88,7 +88,7 @@ index f0c4860de2ff1e918957bb200dd54d1f7c4ad403..53ff3a5a6f5178a2c83d75dd3dea4e4b
  ) -> anyhow::Result<LocalAppState> {
      let key_broker = config.key_broker()?;
      let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
-@@ -204,14 +207,8 @@ pub async fn make_app(
+@@ -205,14 +208,8 @@ pub async fn make_app(
          region: None,
          class: DeploymentClass::S16,
      };
@@ -1579,7 +1579,7 @@ index 224f87a04ba6aad062738e8b3dd6a7837c79a502..65d6ff728082a2895489bdc20a97c470
      async fn unhealthy_watchdog_preempts_stuck_proactive_drain() {
          let socket_dir = TempDir::new().unwrap();
 diff --git a/patches/README.md b/patches/README.md
-index c1adc89768f930dc90b9624af942f12ffbe8da74..3e1554e9fc68892330437283419a0dab73290b2e 100644
+index 969cbbdecdb167c73dce3ee858e01ac923376426..9e247150b5559222d0a8b23928527109fafa0f9e 100644
 --- a/patches/README.md
 +++ b/patches/README.md
 @@ -5,8 +5,10 @@ They are operator adoption units, not one all-or-nothing fork. Read the owning e
@@ -1595,7 +1595,7 @@ index c1adc89768f930dc90b9624af942f12ffbe8da74..3e1554e9fc68892330437283419a0dab
  extension are one queue-control patch. The matching degradable-query client half is maintained in
  `convex-js`; it shares the protocol and adoption essay but is not another commit in this backend
  chain.
-@@ -79,8 +81,8 @@ chain.
+@@ -65,8 +67,8 @@ chain.
    requires Linux cgroup v2 with a finite readable memory limit; explicit allocator trim and arena
    counting require glibc.
  - Activation: all pressure switches default to disabled. Internal reclamation, allocator trim, and

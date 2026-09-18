@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 5 Aug 2026 04:01:45 +0800
-Subject: [PATCH 21/26] local_backend: build with bounded jemalloc
+Subject: [PATCH 20/25] local_backend: build with bounded jemalloc
 
 Select jemalloc by default for local backend targets where the bundled allocator is supported, while retaining no-default-features builds as a system-allocator control. On GNU/Linux, enable background purging, use 32 automatic arenas by default, accept effective startup overrides from 1 through 128, require fatal handling for invalid settings, and keep heap profiling disabled and inactive. Validate the effective Linux configuration at startup and reject the glibc-only trim path.
 
@@ -26,10 +26,10 @@ This is an initial fresh-process observation, not evidence of long-duration allo
  10 files changed, 805 insertions(+), 71 deletions(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 7f2adc85c0e4fb3d0541fcbeb99cb0e9256001e9..64d7ff3a93c7b2ba15ec650fa5cf4ad979261faf 100644
+index a3fc17e56a01fe5cd42dbd72faed9b4ff8ca592a..7b3d1ceec1d3efeacce1f469f8dced5132f6eae6 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -6032,6 +6032,9 @@ dependencies = [
+@@ -6031,6 +6031,9 @@ dependencies = [
   "streaming_export",
   "sync",
   "tempfile",
@@ -40,7 +40,7 @@ index 7f2adc85c0e4fb3d0541fcbeb99cb0e9256001e9..64d7ff3a93c7b2ba15ec650fa5cf4ad9
   "tokio-stream",
   "tokio-tungstenite",
 diff --git a/Cargo.toml b/Cargo.toml
-index e34d5f21c96bc04cf69f4aa82374c31cbe366b8c..d181de27e9c0e1565c17c61c76c5ad667532798e 100644
+index d0a7320a66fee7a56f3aa73e8218468c5f9a6a8f..9bde420147046478dd786ef681c447d5fdf675ae 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -227,6 +227,7 @@ text_search = { path = "crates/text_search" }
@@ -52,10 +52,10 @@ index e34d5f21c96bc04cf69f4aa82374c31cbe366b8c..d181de27e9c0e1565c17c61c76c5ad66
  tikv-jemallocator = { version = "0.7", features = [ "profiling", "stats", "unprefixed_malloc_on_supported_platforms" ] }
  tld = "2.36.0"
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 8893102578867a7f00bf388da3af709a235bc2db..70495c39d776946276dcf4cfe5aad3f0773fb433 100644
+index 2b9ed5803c3403328cad6d5f12939b64d2f5f0cf..296b8971162a9f8c1019973634a4283e5ed7c73f 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -541,7 +541,7 @@ pub static LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES: LazyLock<usize>
+@@ -552,7 +552,7 @@ pub static LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES: LazyLock<usize>
      });
  
  /// Ask glibc to discard free arena pages while internal cgroup reclamation is
@@ -65,7 +65,7 @@ index 8893102578867a7f00bf388da3af709a235bc2db..70495c39d776946276dcf4cfe5aad3f0
      LazyLock::new(|| env_config_bool_strict("LOCAL_BACKEND_MALLOC_TRIM_ENABLED", false));
  
 diff --git a/crates/local_backend/Cargo.toml b/crates/local_backend/Cargo.toml
-index 7760e9c67a99bbe0a1d9862e04bdf0e682339c4c..144153a0195d4a31aaf1fe041a78bbf07444d934 100644
+index 64beb35339880bde5d40709cce51ff01e8008c22..8be10f55499b9b02c86f86b84f3b69329716bee7 100644
 --- a/crates/local_backend/Cargo.toml
 +++ b/crates/local_backend/Cargo.toml
 @@ -12,6 +12,15 @@ name = "convex-local-backend"
@@ -84,7 +84,7 @@ index 7760e9c67a99bbe0a1d9862e04bdf0e682339c4c..144153a0195d4a31aaf1fe041a78bbf0
  testing = [
      "common/testing",
      "clusters/testing",
-@@ -108,6 +117,11 @@ utoipa-axum = { workspace = true }
+@@ -110,6 +119,11 @@ utoipa-axum = { workspace = true }
  value = { workspace = true }
  vector = { workspace = true }
  
@@ -129,7 +129,7 @@ index e51ac67031a703934658183dac4bd04786e4b675..5b45122ed2f37d3c46f1d42ee1614ba4
      // This is a workaround for https://github.com/rustyhorde/vergen/issues/174
      // In docker builds, we need a way to pass overrides to Vergen when there's no
 diff --git a/crates/local_backend/src/lib.rs b/crates/local_backend/src/lib.rs
-index 53ff3a5a6f5178a2c83d75dd3dea4e4b496a6663..a1ecd83d1b7abbc9bc0f5390c301a4aef29a0e65 100644
+index ee890e966e7cc1e422c1a4c27fcca9a06cc3d328..97589efe992edc9617df1548c29112899d132694 100644
 --- a/crates/local_backend/src/lib.rs
 +++ b/crates/local_backend/src/lib.rs
 @@ -84,6 +84,117 @@ use search::{
@@ -249,7 +249,7 @@ index 53ff3a5a6f5178a2c83d75dd3dea4e4b496a6663..a1ecd83d1b7abbc9bc0f5390c301a4ae
 +}
  
  pub mod admin;
- mod app_metrics;
+ mod ai_gateway;
 diff --git a/crates/local_backend/src/memory_metrics.rs b/crates/local_backend/src/memory_metrics.rs
 index cc3dd8a533b0a6efd7255c4dfb10618de7329230..436b863566bdf39f8b35584badf104c5d5e3364b 100644
 --- a/crates/local_backend/src/memory_metrics.rs
@@ -1105,10 +1105,10 @@ index cc3dd8a533b0a6efd7255c4dfb10618de7329230..436b863566bdf39f8b35584badf104c5
      fn live_process_memory_accounting_reconciles() {
          assert!(report().is_empty());
 diff --git a/patches/README.md b/patches/README.md
-index 6480509996982d5a85b05f7371e3786bdd4133b9..8f143a6d1a586de2979816aede3fbeb071731f30 100644
+index 9fecc916c7c383b33099b33e2ec3aa3e32213fa5..958bcabe7725598d09ac78b82ba81c8298d0e466 100644
 --- a/patches/README.md
 +++ b/patches/README.md
-@@ -90,15 +90,18 @@ chain.
+@@ -76,15 +76,18 @@ chain.
  ### [Backend memory resilience](backend_memory_resilience/README.md)
  
  - Purpose: account for configured and observed backend memory, reclaim optional allocator and local
