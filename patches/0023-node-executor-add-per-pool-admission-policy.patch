@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Sun, 23 Aug 2026 23:56:18 +0800
-Subject: [PATCH 23/25] node-executor: add per-pool admission policy
+Subject: [PATCH 23/26] node-executor: add per-pool admission policy
 
 Add a strict optional LOCAL_NODE_EXECUTOR_POOL_POLICIES map for independent-action concurrency, queue-warning thresholds, and elapsed event-loop unresponsiveness budgets on the default and named local Node pools.
 
@@ -14,7 +14,7 @@ Document the liveness properties, accepted scheduler head-of-line limitation, ro
  .../application_function_runner/metrics.rs    |  73 ++++
  .../src/application_function_runner/mod.rs    | 369 +++++++++++++++++-
  crates/common/src/knobs.rs                    | 178 ++++++++-
- crates/node_executor/src/local.rs             | 255 ++++++++++--
+ crates/node_executor/src/local.rs             | 256 ++++++++++--
  crates/node_executor/src/metrics.rs           |  19 +
  patches/README.md                             |   6 +-
  patches/backend_memory_resilience/README.md   |  26 +-
@@ -23,7 +23,7 @@ Document the liveness properties, accepted scheduler head-of-line limitation, ro
  .../local_node_executor_resilience/README.md  |  22 +-
  .../README.md                                 |   9 +-
  self-hosted/advanced/knobs.md                 |  91 +++--
- 12 files changed, 1391 insertions(+), 93 deletions(-)
+ 12 files changed, 1391 insertions(+), 94 deletions(-)
  create mode 100644 patches/local_node_executor_pool_admission/README.md
  create mode 100644 patches/local_node_executor_pool_admission/design_reference.md
 
@@ -841,7 +841,7 @@ index 7eaf28d9702a3ed19eff074f22b856ffca730523..6e22cd067bd5f6673762a9ba22653a72
 +    }
  }
 diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
-index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd0385b119 100644
+index 6fd32f446b748044db1b55381cada0925597c3d5..ccdbaed75355e48d3c73113fec19a8795395a941 100644
 --- a/crates/node_executor/src/local.rs
 +++ b/crates/node_executor/src/local.rs
 @@ -55,6 +55,7 @@ use common::{
@@ -874,15 +874,7 @@ index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd
          anyhow::ensure!(
              self.max_old_space_size_mib > 0,
              "Local Node executor old-space allowance must be greater than zero"
-@@ -3673,7 +3682,6 @@ impl LocalNodeExecutorConfig {
-             .map(Duration::from_secs);
-         self.max_rss_bytes = u64::try_from(local_node_executor_pool_rss_bytes(&pool_name))
-             .context("Local Node executor RSS threshold does not fit u64")?;
-->>>>>>> e6eabcec1 (fixup! node-executor: add coordinated local executor pools)
-         self.pool_name = pool_name;
-         Ok(self)
-     }
-@@ -5127,6 +5135,10 @@ impl LocalNodeExecutor {
+@@ -5126,6 +5135,10 @@ impl LocalNodeExecutor {
              health_check_timeout: HEALTH_CHECK_TIMEOUT,
              watchdog_interval: WATCHDOG_INTERVAL,
              watchdog_failure_threshold: WATCHDOG_FAILURE_THRESHOLD,
@@ -893,7 +885,7 @@ index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd
              max_old_space_size_mib: *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB,
              max_rss_bytes: u64::try_from(local_node_executor_pool_rss_bytes("default"))
                  .context("Local Node executor RSS threshold does not fit u64")?,
-@@ -5192,6 +5204,10 @@ impl LocalNodeExecutor {
+@@ -5191,6 +5204,10 @@ impl LocalNodeExecutor {
          crate::metrics::set_local_node_waiting_requests(&pool_name, 0);
          crate::metrics::set_local_node_active_requests(&pool_name, 0);
          crate::metrics::set_local_node_consecutive_health_misses(&pool_name, 0);
@@ -904,7 +896,7 @@ index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd
          crate::metrics::set_local_node_memory_pressure_active(&pool_name, false);
          crate::metrics::set_local_node_memory_configuration(
              &pool_name,
-@@ -6917,6 +6933,34 @@ impl LocalNodeExecutor {
+@@ -6916,6 +6933,34 @@ impl LocalNodeExecutor {
          .await;
      }
  
@@ -939,7 +931,7 @@ index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd
      async fn watch_generation_checks(
          state: Weak<Mutex<LocalNodeExecutorState>>,
          expected: Weak<InnerLocalNodeExecutor>,
-@@ -6926,12 +6970,37 @@ impl LocalNodeExecutor {
+@@ -6925,12 +6970,37 @@ impl LocalNodeExecutor {
          shutting_down: Arc<AtomicBool>,
      ) {
          let mut consecutive_misses = 0;
@@ -978,10 +970,12 @@ index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd
              let Some(state) = state.upgrade() else {
                  return;
              };
-@@ -6950,15 +7019,6 @@ impl LocalNodeExecutor {
+@@ -6947,17 +7017,6 @@ impl LocalNodeExecutor {
+                 return;
+             }
  
-             let health_check = async {
-                 let started_at = Instant::now();
+-            let health_check = async {
+-                let started_at = Instant::now();
 -                let health = InnerLocalNodeExecutor::check_server_health(
 -                    &expected.client,
 -                    config.health_check_timeout,
@@ -994,7 +988,7 @@ index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd
              let health_check_started_at = Instant::now();
              let mut health_check = Box::pin(InnerLocalNodeExecutor::check_server_health(
                  &expected.client,
-@@ -7071,6 +7131,7 @@ impl LocalNodeExecutor {
+@@ -7070,6 +7129,7 @@ impl LocalNodeExecutor {
  
              let should_retire_unhealthy = if let Some(health) = health.filter(|_| success) {
                  consecutive_misses = 0;
@@ -1002,7 +996,7 @@ index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd
                  crate::metrics::set_local_node_consecutive_health_misses(&expected.pool_name, 0);
                  if expected.runtime_stats_supported {
                      Self::record_node_health_metrics(
-@@ -7097,6 +7158,7 @@ impl LocalNodeExecutor {
+@@ -7096,6 +7156,7 @@ impl LocalNodeExecutor {
                  false
              } else {
                  consecutive_misses += 1;
@@ -1010,7 +1004,7 @@ index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd
                  crate::metrics::set_local_node_consecutive_health_misses(
                      &expected.pool_name,
                      consecutive_misses,
-@@ -7119,7 +7181,15 @@ impl LocalNodeExecutor {
+@@ -7118,7 +7179,15 @@ impl LocalNodeExecutor {
                          &config,
                      );
                  }
@@ -1027,7 +1021,7 @@ index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd
              };
  
              let retirement_reason = proactive_retirement_reason(
-@@ -7137,22 +7207,8 @@ impl LocalNodeExecutor {
+@@ -7136,22 +7205,8 @@ impl LocalNodeExecutor {
                  // Do not start a new graceful drain on the terminal miss. An
                  // idle drain could otherwise win the slot race and misclassify
                  // this unhealthy retirement as proactive.
@@ -1052,7 +1046,7 @@ index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd
                  return;
              }
              if let Some(reason) = retirement_reason {
-@@ -8110,6 +8166,7 @@ mod tests {
+@@ -8110,6 +8165,7 @@ mod tests {
              health_check_timeout: Duration::from_millis(10),
              watchdog_interval: Duration::from_millis(10),
              watchdog_failure_threshold: 2,
@@ -1060,7 +1054,7 @@ index 236331c2f347b7b63671946872c7b7112bd754d4..c1adbfa05c1b4ba86a4ef37f0cf479bd
              max_old_space_size_mib: 128,
              max_rss_bytes: 256 * MIB_BYTES,
              memory_pressure: MemoryPressureSignal::default(),
-@@ -11809,6 +11866,148 @@ done
+@@ -11809,6 +11865,148 @@ done
          assert!(generation.server_handle.lock().await.child.is_none());
      }
  
