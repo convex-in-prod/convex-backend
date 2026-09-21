@@ -1,31 +1,33 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Fri, 17 Jul 2026 05:49:59 +0800
-Subject: [PATCH 09/27] node-executor: retire unhealthy local generations
+Subject: [PATCH 09/26] node-executor: retire unhealthy local generations
 
 Use one absolute deadline across local Node request submission, response headers, and response streaming. Retire the selected generation on timeout, transport failure, child exit, repeated watchdog failure, or backend shutdown, and lazily start one replacement for the next request.
 
 Fence retirement by generation identity and serialize startup outside generation-state locking. Transfer the direct child and tempdir to cancellation-safe cleanup, delete the tempdir only after confirmed reaping, and preserve it when runtime teardown or a wait failure leaves reaping unconfirmed.
 
-Bound startup probes and invocation responses, isolate child stdio from backend logs, and keep diagnostics fixed and sanitized. Parse streamed NDJSON with bounded bytes and parts, reject duplicate results immediately, and retire the generation for every post-header reqwest transport failure.
+Bound startup probes and invocation responses, isolate child stdio from backend logs, and keep diagnostics fixed and sanitized. Rewrite streamed NDJSON parsing with bounded bytes and parts while preserving the existing public stream API. Reject duplicate results immediately and retire the generation for every post-header reqwest transport failure.
 
 Record bounded attribution for the initiating request kind, phase, sanitized transport category, child state before termination, supervisor signal ownership, final exit class, and replacement outcome. Keep generation IDs in structured logs rather than metric labels, and never retain raw requests, transport errors, stdout, or stderr.
 
 Track cancellation-safe waiting and active requests and export bounded generation, child, request, watchdog, replacement, package, stack, and retirement-diagnostic metrics. Keep the executor single-process and document the direct-child ownership and rollback contract.
 ---
- crates/node_executor/src/executor.rs          |  499 +++-
- crates/node_executor/src/lib.rs               |    4 -
+ crates/node_executor/src/executor.rs          |  497 +++-
+ crates/node_executor/src/lib.rs               |    1 -
  crates/node_executor/src/local.rs             | 2243 ++++++++++++++++-
  crates/node_executor/src/metrics.rs           |  336 +++
+ .../node_executor/tests/stream_completion.rs  |   58 +
  npm-packages/node-executor/src/local.ts       |    4 -
  patches/README.md                             |  209 ++
  .../local_node_executor_resilience/README.md  |  312 +++
- 7 files changed, 3350 insertions(+), 257 deletions(-)
+ 8 files changed, 3407 insertions(+), 253 deletions(-)
+ create mode 100644 crates/node_executor/tests/stream_completion.rs
  create mode 100644 patches/README.md
  create mode 100644 patches/local_node_executor_resilience/README.md
 
 diff --git a/crates/node_executor/src/executor.rs b/crates/node_executor/src/executor.rs
-index 02d6381e28d8ff80a6bc0fd4a1d26943f99acc76..ce4b245ef8c0a88ba68704b0d3b38b5267169074 100644
+index 02d6381e28d8ff80a6bc0fd4a1d26943f99acc76..8bbfc00a35278127d431b14e169dd07bea5a2e35 100644
 --- a/crates/node_executor/src/executor.rs
 +++ b/crates/node_executor/src/executor.rs
 @@ -14,6 +14,7 @@ use async_trait::async_trait;
@@ -207,13 +209,7 @@ index 02d6381e28d8ff80a6bc0fd4a1d26943f99acc76..ce4b245ef8c0a88ba68704b0d3b38b52
                      .into(),
                  memory_allocated_mb: memory_allocated_mb.unwrap_or(512),
                  egress_bytes: egress_bytes.unwrap_or(0),
-@@ -947,31 +977,70 @@ impl From<VisibilityJson> for Visibility {
-     }
- }
- 
--pub enum ResponsePart {
-+enum ResponsePart {
-     LogLine(LogLine),
+@@ -952,26 +982,65 @@ pub enum ResponsePart {
      Result(JsonValue),
  }
  
@@ -652,7 +648,7 @@ index 02d6381e28d8ff80a6bc0fd4a1d26943f99acc76..ce4b245ef8c0a88ba68704b0d3b38b52
 +    }
 +}
 diff --git a/crates/node_executor/src/lib.rs b/crates/node_executor/src/lib.rs
-index 5ef903d84d230bb0c336a9d6204e1a39950684a8..6926cfe8d1e860444df19ec504d9bca5e87fb1e2 100644
+index 5ef903d84d230bb0c336a9d6204e1a39950684a8..53a9569bbf07ac521bef19cbbc36b87678745f27 100644
 --- a/crates/node_executor/src/lib.rs
 +++ b/crates/node_executor/src/lib.rs
 @@ -1,6 +1,5 @@
@@ -662,24 +658,6 @@ index 5ef903d84d230bb0c336a9d6204e1a39950684a8..6926cfe8d1e860444df19ec504d9bca5
  #![feature(stmt_expr_attributes)]
  #![feature(try_blocks)]
  #![feature(try_blocks_heterogeneous)]
-@@ -15,7 +14,6 @@ pub mod source_package;
- 
- pub use crate::executor::{
-     error_response_json,
--    handle_node_executor_stream,
-     AnalyzeRequest,
-     AnalyzeResponse,
-     BuildDepsRequest,
-@@ -26,9 +24,7 @@ pub use crate::executor::{
-     NodeActionOutcome,
-     NodeActions,
-     NodeExecutor,
--    NodeExecutorStreamPart,
-     Package,
--    ResponsePart,
-     SourcePackage,
-     ARGS_TOO_LARGE_RESPONSE_MESSAGE,
-     EXECUTE_TIMEOUT_RESPONSE_JSON,
 diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
 index 9847a92bb9077383015c13d8e496fe0257a17732..b2f312ae9a82d8d3569036887e76266a23119435 100644
 --- a/crates/node_executor/src/local.rs
@@ -3470,6 +3448,70 @@ index 2b9290b54baf96948d614503ec0730af50f27bf3..2fc6d3a7755fe7a07e991787e9e05c7a
 +        &LOCAL_NODE_EXECUTOR_STACK_FORMAT_SECONDS,
 +        duration_ms / 1000.0,
 +    );
++}
+diff --git a/crates/node_executor/tests/stream_completion.rs b/crates/node_executor/tests/stream_completion.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e32d8d39002463e54b41123de17fb86116b10284
+--- /dev/null
++++ b/crates/node_executor/tests/stream_completion.rs
+@@ -0,0 +1,58 @@
++use bytes::Bytes;
++use node_executor::{
++    handle_node_executor_stream,
++    InvokeCompletion,
++    InvokeResponse,
++    NodeExecutorStreamPart,
++};
++use serde_json::json;
++use tokio::sync::mpsc;
++
++#[tokio::test]
++async fn public_stream_api_preserves_completion_authority() {
++    for explicit in [false, true] {
++        let failure = InvokeResponse {
++            response: json!({ "type": "error" }),
++            aws_request_id: None,
++        };
++        let completion = if explicit {
++            InvokeCompletion::ExplicitError(failure)
++        } else {
++            InvokeCompletion::ImplicitError(failure)
++        };
++        let (sender, _receiver) = mpsc::unbounded_channel();
++        let stream = futures::stream::iter([
++            Ok(NodeExecutorStreamPart::Chunk(Bytes::from_static(
++                b"{\"type\":\"success\"}\n{\"crash\":\"\xff",
++            ))),
++            Ok(NodeExecutorStreamPart::InvokeComplete(completion)),
++        ]);
++        match handle_node_executor_stream(sender, stream).await.unwrap() {
++            Ok(result) => {
++                assert!(!explicit);
++                assert_eq!(result, json!({ "type": "success" }));
++            },
++            Err(failure) => {
++                assert!(explicit);
++                assert_eq!(failure.response, json!({ "type": "error" }));
++            },
++        }
++    }
++}
++
++#[tokio::test]
++async fn public_stream_api_rejects_duplicate_results_with_inferred_failure() {
++    let (sender, _receiver) = mpsc::unbounded_channel();
++    let stream = futures::stream::iter([
++        Ok(NodeExecutorStreamPart::Chunk(Bytes::from_static(
++            b"{\"type\":\"success\"}\n{\"type\":\"success\"}",
++        ))),
++        Ok(NodeExecutorStreamPart::InvokeComplete(
++            InvokeCompletion::ImplicitError(InvokeResponse {
++                response: json!({ "type": "error" }),
++                aws_request_id: None,
++            }),
++        )),
++    ]);
++    assert!(handle_node_executor_stream(sender, stream).await.is_err());
 +}
 diff --git a/npm-packages/node-executor/src/local.ts b/npm-packages/node-executor/src/local.ts
 index ebb55e05e68baaa4e8a4a3b3434856300a2bf7c7..d74f7ca8dcf9e75be82992d0a8b6653e267c4648 100644
