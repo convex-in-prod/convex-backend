@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Tue, 4 Aug 2026 15:51:18 +0800
-Subject: [PATCH 19/26] mysql: make pooled connections cancellation-safe
+Subject: [PATCH 19/25] mysql: make pooled connections cancellation-safe
 
 Own each direct MySQL operation, streamed collection, and lease transaction through a cancel-on-drop guard. Preserve a pooled connection only after the protocol response is complete, poison transaction ownership after interrupted methods, and install replacements only after the failed transport has been removed and force-closed.
 
@@ -17,7 +17,7 @@ Export bounded cancellation request, terminal-outcome, and latency metrics. Docu
  crates/common/src/knobs.rs                    |   12 +
  crates/db_connection/src/lib.rs               |   13 +-
  crates/mysql/src/cancellation.rs              |  933 ++++++
- crates/mysql/src/connection.rs                |  729 +++-
+ crates/mysql/src/connection.rs                |  751 ++++-
  crates/mysql/src/lib.rs                       |    2 +
  crates/mysql/src/metrics.rs                   |   36 +
  crates/mysql/src/v5/deployment_deletion.rs    |    6 +-
@@ -89,7 +89,7 @@ Export bounded cancellation request, terminal-outcome, and latency metrics. Docu
  third_party/mysql_async/test/key.pem          |   27 +
  third_party/mysql_async/tests/exports.rs      |   18 +
  third_party/mysql_async/tests/generic.rs      |   61 +
- 78 files changed, 17804 insertions(+), 191 deletions(-)
+ 78 files changed, 17826 insertions(+), 191 deletions(-)
  create mode 100644 crates/mysql/src/cancellation.rs
  create mode 100644 patches/cancellation_safe_mysql_connections/README.md
  create mode 100644 third_party/mysql_async/.gitignore
@@ -172,10 +172,10 @@ index b1bfb7cdc245b87b1b256933ec6f7eb3e538b219..cc51533ad3bb501a8e7e996e481f2e3c
  !/rust-toolchain
  !/self-hosted/*
 diff --git a/Cargo.lock b/Cargo.lock
-index 799fae9662614ddcf7a6ec51caff02b0d7e414fd..a3fc17e56a01fe5cd42dbd72faed9b4ff8ca592a 100644
+index d5e5b275b0668331659745e36e80b5564c343649..904bb18ff2ed3f44db0c5e9c4ca4887503298841 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -6631,8 +6631,6 @@ dependencies = [
+@@ -6634,8 +6634,6 @@ dependencies = [
  [[package]]
  name = "mysql_async"
  version = "0.37.1"
@@ -185,7 +185,7 @@ index 799fae9662614ddcf7a6ec51caff02b0d7e414fd..a3fc17e56a01fe5cd42dbd72faed9b4f
   "arc-swap",
   "bytes",
 diff --git a/Cargo.toml b/Cargo.toml
-index fd0210f21c7206aee01f18c26a0c2d77a5cf3bb0..d0a7320a66fee7a56f3aa73e8218468c5f9a6a8f 100644
+index 93d4b28fb2278c036fac6f38a0e3fb5c8e813074..108c9ce8227fcfffd2724ec40da6911507e576fa 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -1,7 +1,7 @@
@@ -197,7 +197,7 @@ index fd0210f21c7206aee01f18c26a0c2d77a5cf3bb0..d0a7320a66fee7a56f3aa73e8218468c
  
  [workspace.dependencies]
  aes = "0.8.4"
-@@ -139,7 +139,8 @@ moka = { version = "0.12", features = [ "future", "sync" ] }
+@@ -140,7 +140,8 @@ moka = { version = "0.12", features = [ "future", "sync" ] }
  multer = "3.1.0"
  must-let = { git = "https://github.com/sujayakar/must-let", rev = "5b487d78db235e396e61dd03ce261ced0eafff9d" }
  mysql = { path = "crates/mysql" }
@@ -208,10 +208,10 @@ index fd0210f21c7206aee01f18c26a0c2d77a5cf3bb0..d0a7320a66fee7a56f3aa73e8218468c
  oauth2 = { version = "5", default-features = false }
  once_cell = "1.19"
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 45e1a7429aa19bc726ff75881e797eb22d660d6a..2b9ed5803c3403328cad6d5f12939b64d2f5f0cf 100644
+index 7581d7903e8227468c6b2eee0ca2eaed0be33085..3d0b592baa55ad87277a0193ca3c23ce4d4192d1 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -1754,6 +1754,18 @@ pub static MYSQL_TIMEOUT: LazyLock<u64> = LazyLock::new(|| env_config("MYSQL_TIM
+@@ -1809,6 +1809,18 @@ pub static MYSQL_TIMEOUT: LazyLock<u64> = LazyLock::new(|| env_config("MYSQL_TIM
  pub static MYSQL_MAX_CONNECTIONS: LazyLock<usize> =
      LazyLock::new(|| env_config("MYSQL_MAX_CONNECTIONS", 128));
  
@@ -231,7 +231,7 @@ index 45e1a7429aa19bc726ff75881e797eb22d660d6a..2b9ed5803c3403328cad6d5f12939b64
  pub static MYSQL_MIN_QUERY_BATCH_SIZE: LazyLock<usize> =
      LazyLock::new(|| env_config("MYSQL_MIN_QUERY_BATCH_SIZE", 1));
 diff --git a/crates/db_connection/src/lib.rs b/crates/db_connection/src/lib.rs
-index fc2a1bc8b490734ed142434f533d2ab9542bf78b..81504d633234013c60662c601fec6f5f76275c73 100644
+index df68fad0d06bc13b9ac93459965020b099efe4e2..b2db589308af435f27463412d53a400a2010bd69 100644
 --- a/crates/db_connection/src/lib.rs
 +++ b/crates/db_connection/src/lib.rs
 @@ -10,7 +10,10 @@ use clusters::{
@@ -254,7 +254,7 @@ index fc2a1bc8b490734ed142434f533d2ab9542bf78b..81504d633234013c60662c601fec6f5f
      MySqlOptions,
      MySqlReaderOptions,
  };
-@@ -125,7 +129,12 @@ pub fn persistence_seed<RT: Runtime>(
+@@ -127,7 +131,12 @@ pub fn persistence_seed<RT: Runtime>(
                              &url,
                              *DATABASE_USE_PREPARED_STATEMENTS,
                              require_leader,
@@ -1208,7 +1208,7 @@ index 0000000000000000000000000000000000000000..611b11761b7686cde93533ce387a0dfa
 +    }
 +}
 diff --git a/crates/mysql/src/connection.rs b/crates/mysql/src/connection.rs
-index 21e481fb1e4fa7e171aa10f7e4450307bb386210..6035e5a91447522ee68ee9dc306f4a0ae6b4c0f1 100644
+index 3ba7727f27dbd45ae389a487e454ad9027605c62..4406ab56d359938faa5a1535d92e4cb36043e364 100644
 --- a/crates/mysql/src/connection.rs
 +++ b/crates/mysql/src/connection.rs
 @@ -1,6 +1,5 @@
@@ -1876,12 +1876,12 @@ index 21e481fb1e4fa7e171aa10f7e4450307bb386210..6035e5a91447522ee68ee9dc306f4a0a
      }
  
      /// Executes the given statement and drops the result.
-@@ -563,15 +858,28 @@ impl MySqlTransaction<'_> {
+@@ -563,11 +858,28 @@ impl MySqlTransaction<'_> {
          statement: &str,
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<()> {
--        let future = if self.use_prepared_statements {
--            let statement = format_mysql_binary_protocol(self.db_name, statement)?;
+-        if !self.use_prepared_statements {
+-            return self.query_drop(statement, params).await;
 +        let (statement, prepared_params) = if self.use_prepared_statements {
 +            (
 +                format_mysql_binary_protocol(self.db_name, statement)?,
@@ -1895,30 +1895,26 @@ index 21e481fb1e4fa7e171aa10f7e4450307bb386210..6035e5a91447522ee68ee9dc306f4a0a
 +        };
 +        let operation = TransactionConnectionUse::begin(self.connection_poisoned)?;
 +        let future = if let Some(params) = prepared_params {
-             self.inner.exec_drop(statement, Params::Positional(params))
-         } else {
--            let statement =
--                format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
-             self.inner.query_drop(statement)
-         };
--        with_timeout(future).await
++            self.inner.exec_drop(statement, Params::Positional(params))
++        } else {
++            self.inner.query_drop(statement)
++        };
 +        let result = with_timeout(future).await;
 +        if !connection_result_requires_discard(&self.inner, &result) {
 +            operation.complete();
-+        }
+         }
+-        let statement = format_mysql_binary_protocol(self.db_name, statement)?;
+-        with_timeout(self.inner.exec_drop(statement, Params::Positional(params))).await
 +        result
      }
  
      /// Execute a SQL statement, returning the number of rows affected.
-@@ -580,29 +888,65 @@ impl MySqlTransaction<'_> {
+@@ -576,15 +888,42 @@ impl MySqlTransaction<'_> {
          statement: &str,
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<u64> {
--        let affected_rows = if self.use_prepared_statements {
--            let statement = format_mysql_binary_protocol(self.db_name, statement)?;
--            with_timeout(self.inner.exec_iter(statement, Params::Positional(params)))
--                .await?
--                .affected_rows()
+-        if !self.use_prepared_statements {
+-            return self.query_iter(statement, params).await;
 +        let (statement, prepared_params) = if self.use_prepared_statements {
 +            (
 +                format_mysql_binary_protocol(self.db_name, statement)?,
@@ -1942,12 +1938,7 @@ index 21e481fb1e4fa7e171aa10f7e4450307bb386210..6035e5a91447522ee68ee9dc306f4a0a
 +                Ok(affected_rows)
 +            })
 +            .await
-         } else {
--            let statement =
--                format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
--            with_timeout(self.inner.query_iter(statement))
--                .await?
--                .affected_rows()
++        } else {
 +            with_timeout(async {
 +                let result = self.inner.query_iter(statement).await?;
 +                let affected_rows = result.affected_rows();
@@ -1955,8 +1946,49 @@ index 21e481fb1e4fa7e171aa10f7e4450307bb386210..6035e5a91447522ee68ee9dc306f4a0a
 +                Ok(affected_rows)
 +            })
 +            .await
-         };
--        Ok(affected_rows)
++        };
++        if !connection_result_requires_discard(&self.inner, &result) {
++            operation.complete();
+         }
+-        let statement = format_mysql_binary_protocol(self.db_name, statement)?;
+-        Ok(
+-            with_timeout(self.inner.exec_iter(statement, Params::Positional(params)))
+-                .await?
+-                .affected_rows(),
+-        )
++        result
+     }
+ 
+     /// Executes a raw query using the text protocol, even when the connection
+@@ -595,7 +934,12 @@ impl MySqlTransaction<'_> {
+         params: Vec<MySqlValue>,
+     ) -> anyhow::Result<()> {
+         let statement = format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
+-        with_timeout(self.inner.query_drop(statement)).await
++        let operation = TransactionConnectionUse::begin(self.connection_poisoned)?;
++        let result = with_timeout(self.inner.query_drop(statement)).await;
++        if !connection_result_requires_discard(&self.inner, &result) {
++            operation.complete();
++        }
++        result
+     }
+ 
+     /// Like [`Self::query_drop`], returning the number of rows affected.
+@@ -605,19 +949,41 @@ impl MySqlTransaction<'_> {
+         params: Vec<MySqlValue>,
+     ) -> anyhow::Result<u64> {
+         let statement = format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
+-        Ok(with_timeout(self.inner.query_iter(statement))
+-            .await?
+-            .affected_rows())
++        let operation = TransactionConnectionUse::begin(self.connection_poisoned)?;
++        let result = with_timeout(async {
++            let result = self.inner.query_iter(statement).await?;
++            let affected_rows = result.affected_rows();
++            result.drop_result().await?;
++            Ok(affected_rows)
++        })
++        .await;
 +        if !connection_result_requires_discard(&self.inner, &result) {
 +            operation.complete();
 +        }
@@ -1989,7 +2021,7 @@ index 21e481fb1e4fa7e171aa10f7e4450307bb386210..6035e5a91447522ee68ee9dc306f4a0a
      use_prepared_statements: bool,
      runtime: Option<RT>,
      stats: ConnectionPoolStats,
-@@ -632,7 +976,8 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -647,7 +1013,8 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
          url: &Url,
          use_prepared_statements: bool,
          require_leader: bool,
@@ -1999,7 +2031,7 @@ index 21e481fb1e4fa7e171aa10f7e4450307bb386210..6035e5a91447522ee68ee9dc306f4a0a
      ) -> anyhow::Result<Self> {
          let cluster_name = derive_cluster_name(url).to_owned();
          // NOTE: the inactive_connection_ttl only applies to connections > min
-@@ -693,16 +1038,39 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -708,16 +1075,39 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
                  .with_root_certs(vec![ca_file_path.into()]);
              opts = opts.ssl_opts(ssl_opts);
          }
@@ -2040,7 +2072,7 @@ index 21e481fb1e4fa7e171aa10f7e4450307bb386210..6035e5a91447522ee68ee9dc306f4a0a
          let pool_get_timer = get_connection_timer(&self.cluster_name);
          let conn = with_timeout(self.pool.get_conn())
              .trace_if_pending(func_path!()) // only trace if slow
-@@ -717,8 +1085,9 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -732,8 +1122,9 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
          db_name: &'a str,
      ) -> anyhow::Result<MySqlConnection<'a, RT>> {
          let conn = self.acquire_internal().await?;
@@ -2051,7 +2083,7 @@ index 21e481fb1e4fa7e171aa10f7e4450307bb386210..6035e5a91447522ee68ee9dc306f4a0a
              labels: vec![
                  StaticMetricLabel::new("name", name),
                  StaticMetricLabel::new("cluster_name", self.cluster_name.clone()),
-@@ -743,7 +1112,10 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -758,7 +1149,10 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
  
      pub async fn shutdown(&self) -> anyhow::Result<()> {
          tracing::info!("Shutting down ConvexMySqlPool");
@@ -2063,7 +2095,7 @@ index 21e481fb1e4fa7e171aa10f7e4450307bb386210..6035e5a91447522ee68ee9dc306f4a0a
      }
  }
  
-@@ -754,9 +1126,122 @@ impl<RT: Runtime> Drop for ConvexMySqlPool<RT> {
+@@ -769,9 +1163,122 @@ impl<RT: Runtime> Drop for ConvexMySqlPool<RT> {
              return;
          };
          let pool = self.pool.clone();
@@ -2189,7 +2221,7 @@ index 21e481fb1e4fa7e171aa10f7e4450307bb386210..6035e5a91447522ee68ee9dc306f4a0a
 +    }
 +}
 diff --git a/crates/mysql/src/lib.rs b/crates/mysql/src/lib.rs
-index 1093796193321bbbfca88352b72fafb6dc5d52fb..ef8e8f6ea7a80552b5cfce59d0ed708bd6fae072 100644
+index 34b6b030b672764f7f522c34bafdfb9546efbc91..861006b17e120b5486a5fd59d8c8e37e72c59ef2 100644
 --- a/crates/mysql/src/lib.rs
 +++ b/crates/mysql/src/lib.rs
 @@ -2,6 +2,7 @@
@@ -2256,7 +2288,7 @@ index de2d30a4cbb888d61417a816e42be791ce12243c..3ca083bb57aeaa2a1cf5cc4ccc15e1b2
      StaticMetricLabel::new("key", String::from(key))
  }
 diff --git a/crates/mysql/src/v5/deployment_deletion.rs b/crates/mysql/src/v5/deployment_deletion.rs
-index d2f4ae1fcc3c588ff46fe0a64cd530cd1a0a77d6..481db1c201a985f4d51967fe6ba54e3efe60713a 100644
+index b9bee2480f219fec8e9d3e4f83979fb87cdb915a..93a0539704d5bbc5cdd16df6fb96d9bf1e41ebb1 100644
 --- a/crates/mysql/src/v5/deployment_deletion.rs
 +++ b/crates/mysql/src/v5/deployment_deletion.rs
 @@ -24,6 +24,7 @@ use url::Url;
@@ -2267,7 +2299,7 @@ index d2f4ae1fcc3c588ff46fe0a64cd530cd1a0a77d6..481db1c201a985f4d51967fe6ba54e3e
      MySqlInstanceName,
  };
  
-@@ -155,7 +156,10 @@ impl<RT: Runtime> DeploymentDeletionPool<RT> {
+@@ -153,7 +154,10 @@ impl<RT: Runtime> DeploymentDeletionPool<RT> {
              &url,
              *DATABASE_USE_PREPARED_STATEMENTS,
              true, /* require_leader */
@@ -2388,10 +2420,10 @@ index a0e06176f773275c0ffb5933e3c3e7b234804a8a..ee3fa405e9911fabc782aaed250fcbd0
  }
  
 diff --git a/crates/mysql/src/v6/persistence.rs b/crates/mysql/src/v6/persistence.rs
-index 987f978bf50d441e8e1eaffe95005d230d5bb34a..2704d088250462aa32422fd03b5a55876a6d658a 100644
+index e97f6443f44031e9e8c0c2a57e094009f28eee4b..0d0ade683cc5064592514b6900d59486cfd90c44 100644
 --- a/crates/mysql/src/v6/persistence.rs
 +++ b/crates/mysql/src/v6/persistence.rs
-@@ -1257,6 +1257,7 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1306,6 +1306,7 @@ impl<RT: Runtime> Lease<RT> {
              "failed to acquire V6 lease: a higher lease timestamp already exists"
          );
          timer.finish();
@@ -2399,7 +2431,7 @@ index 987f978bf50d441e8e1eaffe95005d230d5bb34a..2704d088250462aa32422fd03b5a5587
          Ok(Self {
              pool,
              db_name,
-@@ -1294,30 +1295,23 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1343,30 +1344,23 @@ impl<RT: Runtime> Lease<RT> {
          F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
      {
          let mut client = self.pool.acquire("v6_transact", &self.db_name).await?;

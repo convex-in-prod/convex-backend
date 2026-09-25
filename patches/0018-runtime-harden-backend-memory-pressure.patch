@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Tue, 4 Aug 2026 17:39:00 +0800
-Subject: [PATCH 18/26] runtime: harden backend memory pressure
+Subject: [PATCH 18/25] runtime: harden backend memory pressure
 
 Harden the composed memory-control, bounded-context, and local-Node lifecycle patches at their integration boundaries. Resolve the process's effective cgroup-v2 directory through procfs mount metadata instead of assuming the hierarchy root. Validate memory and Node settings before database initialization, reject unsupported non-Linux controls, and pass every documented setting through the stock self-hosted Compose file.
 
@@ -24,10 +24,10 @@ On a representative long-running self-hosted workload, one glibc trim took 4.122
  10 files changed, 1016 insertions(+), 158 deletions(-)
 
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 1d4ee4c5c8ed0205d31722fda060c587fe342b7a..45e1a7429aa19bc726ff75881e797eb22d660d6a 100644
+index 8d2e201e7d0c2a20793ea4caa669845e6880d79c..7581d7903e8227468c6b2eee0ca2eaed0be33085 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -567,7 +567,11 @@ pub static LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES: LazyLock<usize> = LazyLock:
+@@ -582,7 +582,11 @@ pub static LOCAL_BACKEND_MALLOC_TRIM_MIN_FREE_BYTES: LazyLock<usize> = LazyLock:
  /// Minimum time between explicit glibc trim attempts during one or more
  /// pressure episodes.
  pub static LOCAL_BACKEND_MALLOC_TRIM_COOLDOWN: LazyLock<Duration> = LazyLock::new(|| {
@@ -40,7 +40,7 @@ index 1d4ee4c5c8ed0205d31722fda060c587fe342b7a..45e1a7429aa19bc726ff75881e797eb2
  });
  
  /// Minimum sampled direct-child RSS for sustained cgroup pressure to retire a
-@@ -583,10 +587,11 @@ pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES: LazyLock<usize> =
+@@ -598,10 +602,11 @@ pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_MIN_RSS_BYTES: LazyLock<usize> =
  /// Time internal cgroup pressure must remain active before it may retire a
  /// material local Node executor generation.
  pub static LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE: LazyLock<Duration> = LazyLock::new(|| {
@@ -106,7 +106,7 @@ index 88e2f3cf621336b2fa04bfe4609138df646ef952..ee890e966e7cc1e422c1a4c27fcca9a0
          node_executor,
          config.convex_origin_url()?,
 diff --git a/crates/local_backend/src/main.rs b/crates/local_backend/src/main.rs
-index 2543cb0c20516bca2f8e19e9ca642d3204fac9e3..c0117f0dc551fd6c928a5cccc13933691ff23334 100644
+index 56b2d32e349465480f1bd9b04b2768be2f6dbf31..98cf7517d2c6e0e0cc318349a7be89796285e5ca 100644
 --- a/crates/local_backend/src/main.rs
 +++ b/crates/local_backend/src/main.rs
 @@ -12,6 +12,7 @@ use common::{
@@ -117,8 +117,8 @@ index 2543cb0c20516bca2f8e19e9ca642d3204fac9e3..c0117f0dc551fd6c928a5cccc1393369
      },
      runtime::Runtime,
      sentry::set_sentry_tags,
-@@ -19,6 +20,12 @@ use common::{
-     types::MemberId,
+@@ -22,6 +23,12 @@ use common::{
+     },
      version::SERVER_VERSION_STR,
  };
 +#[cfg(not(target_os = "linux"))]
@@ -130,7 +130,7 @@ index 2543cb0c20516bca2f8e19e9ca642d3204fac9e3..c0117f0dc551fd6c928a5cccc1393369
  use db_connection::{
      connect_persistence,
      ConnectPersistenceFlags,
-@@ -30,6 +37,7 @@ use futures::{
+@@ -33,6 +40,7 @@ use futures::{
      },
      FutureExt,
  };
@@ -138,7 +138,7 @@ index 2543cb0c20516bca2f8e19e9ca642d3204fac9e3..c0117f0dc551fd6c928a5cccc1393369
  use keybroker::{
      DeploymentSecret,
      KeyBroker,
-@@ -48,6 +56,7 @@ use local_backend::{
+@@ -51,6 +59,7 @@ use local_backend::{
      router::router,
      HttpActionRouteMapper,
  };
@@ -146,7 +146,7 @@ index 2543cb0c20516bca2f8e19e9ca642d3204fac9e3..c0117f0dc551fd6c928a5cccc1393369
  use runtime::prod::ProdRuntime;
  use tokio::{
      signal::{
-@@ -187,10 +196,24 @@ async fn run_server_inner(
+@@ -190,10 +199,24 @@ async fn run_server_inner(
          (external_request_shedding, memory_reclamation)
      };
      #[cfg(not(target_os = "linux"))]
@@ -175,7 +175,7 @@ index 2543cb0c20516bca2f8e19e9ca642d3204fac9e3..c0117f0dc551fd6c928a5cccc1393369
  
      // Use to signal to the http service to stop.
      let (shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
-@@ -217,6 +240,7 @@ async fn run_server_inner(
+@@ -220,6 +243,7 @@ async fn run_server_inner(
          shutdown_rx.clone(),
          preempt_signal.clone(),
          memory_reclamation,

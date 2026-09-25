@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Fri, 14 Aug 2026 11:52:23 +0800
-Subject: [PATCH 22/26] deployment: return non-committing analysis for codegen
+Subject: [PATCH 22/25] deployment: return non-committing analysis for codegen
 
 Extend evaluate_push with an opt-in evaluated component map while retaining the schema-only response for ordinary deployment preflight. Compute schema and index differences through the canonical preparation path in a dropped transaction so validation and backfill workers cannot observe pending metadata.
 
@@ -13,7 +13,6 @@ Document the matching CLI protocol, backend-first rollout, residual analysis sid
  crates/local_backend/src/deploy_config2.rs    |  19 +-
  crates/model/src/components/type_checking.rs  | 229 ++++++++++++++++-
  crates/model/src/components/types.rs          |  13 +-
- npm-packages/convex/src/cli/codegen.ts        |   5 +-
  .../cli/codegen_templates/component_api.ts    |  29 +--
  .../src/cli/codegen_templates/dataModel.ts    |  16 +-
  npm-packages/convex/src/cli/lib/codegen.ts    |  16 +-
@@ -23,7 +22,7 @@ Document the matching CLI protocol, backend-first rollout, residual analysis sid
  .../convex/src/cli/lib/deployApi/startPush.ts |  12 +-
  patches/README.md                             |  30 ++-
  .../non_committing_codegen_analysis/README.md | 154 ++++++++++++
- 14 files changed, 816 insertions(+), 96 deletions(-)
+ 13 files changed, 813 insertions(+), 94 deletions(-)
  create mode 100644 npm-packages/convex/src/cli/lib/deploy2.test.ts
  create mode 100644 patches/non_committing_codegen_analysis/README.md
 
@@ -541,22 +540,6 @@ index 80631b6f548a99dddbd7b35283fe87b118770495..eed64341431c1532faba1289664562a9
  }
  
  #[derive(Debug)]
-diff --git a/npm-packages/convex/src/cli/codegen.ts b/npm-packages/convex/src/cli/codegen.ts
-index 4e60be6fd846f962f3e7800da0903c5c851cb605..ae5c09f578422e22064c480c1552569c38ca0bd4 100644
---- a/npm-packages/convex/src/cli/codegen.ts
-+++ b/npm-packages/convex/src/cli/codegen.ts
-@@ -67,8 +67,9 @@ export const codegen = new Command("codegen")
-       liveComponentSources: !!options.liveComponentSources,
-       debugNodeApis: false,
-       systemUdfs: !!options.systemUdfs,
--      largeIndexDeletionCheck: "no verification" as const, // `codegen` is a read-only operation
--      warnOnSlowSchemaValidation: false, // ditto: a codegen dry run never deploys
-+      // Codegen does not perform an additional large-index-deletion preflight.
-+      largeIndexDeletionCheck: "no verification" as const,
-+      warnOnSlowSchemaValidation: false, // A codegen dry run never deploys.
-       codegenOnlyThisComponent: options.componentDir,
-     };
- 
 diff --git a/npm-packages/convex/src/cli/codegen_templates/component_api.ts b/npm-packages/convex/src/cli/codegen_templates/component_api.ts
 index 1734ef3c97bef9f4a63bdb4c0aa0f6678edd052b..22b18d1d6c985f995943e02a7a4ddf7946f8e9a3 100644
 --- a/npm-packages/convex/src/cli/codegen_templates/component_api.ts
@@ -749,7 +732,7 @@ index 4ec0f9724ce0a820abbe54a116c366309f3db745..e77a481b0cf54c495dcc2c14ecf9f3ab
      componentDirectory,
      true,
 diff --git a/npm-packages/convex/src/cli/lib/codegen.ts b/npm-packages/convex/src/cli/lib/codegen.ts
-index 7c38a10b6676f598385b09c97f8827c89a5e0d3e..c3db3ed9c203df858ccd0fc9afa6077ecd3d4bfc 100644
+index adc8050c2c99448df776c28e852ebb0fe4396f35..b71e4ec297c56d5da170bdeea859a32dc335b213 100644
 --- a/npm-packages/convex/src/cli/lib/codegen.ts
 +++ b/npm-packages/convex/src/cli/lib/codegen.ts
 @@ -35,7 +35,7 @@ import {
@@ -761,7 +744,7 @@ index 7c38a10b6676f598385b09c97f8827c89a5e0d3e..c3db3ed9c203df858ccd0fc9afa6077e
  import {
    componentApiDTS,
    componentApiJs,
-@@ -327,7 +327,7 @@ export async function doFinalComponentCodegen(
+@@ -329,7 +329,7 @@ export async function doFinalComponentCodegen(
    tmpDir: TempDir,
    rootComponent: ComponentDirectory,
    componentDirectory: ComponentDirectory,
@@ -770,7 +753,7 @@ index 7c38a10b6676f598385b09c97f8827c89a5e0d3e..c3db3ed9c203df858ccd0fc9afa6077e
    componentsMap: Map<string, ComponentDirectory>,
    opts?: {
      dryRun?: boolean;
-@@ -364,13 +364,13 @@ export async function doFinalComponentCodegen(
+@@ -366,13 +366,13 @@ export async function doFinalComponentCodegen(
        dataModelContents = useTypeScript
          ? await staticDataModelTS(
              ctx,
@@ -786,7 +769,7 @@ index 7c38a10b6676f598385b09c97f8827c89a5e0d3e..c3db3ed9c203df858ccd0fc9afa6077e
              rootComponent,
              componentDirectory,
            );
-@@ -402,7 +402,7 @@ export async function doFinalComponentCodegen(
+@@ -404,7 +404,7 @@ export async function doFinalComponentCodegen(
      const componentTSPath = path.join(codegenDir, "component.ts");
      const componentTSContents = await componentTS(
        ctx,
@@ -795,7 +778,7 @@ index 7c38a10b6676f598385b09c97f8827c89a5e0d3e..c3db3ed9c203df858ccd0fc9afa6077e
        rootComponent,
        componentDirectory,
      );
-@@ -421,7 +421,7 @@ export async function doFinalComponentCodegen(
+@@ -423,7 +423,7 @@ export async function doFinalComponentCodegen(
      rootComponent,
      componentDirectory,
    );
@@ -804,7 +787,7 @@ index 7c38a10b6676f598385b09c97f8827c89a5e0d3e..c3db3ed9c203df858ccd0fc9afa6077e
    const envVars: EnvVarMeta[] =
      analysis?.definition.envVars && analysis.definition.envVars.length > 0
        ? analysis.definition.envVars
-@@ -441,7 +441,7 @@ export async function doFinalComponentCodegen(
+@@ -443,7 +443,7 @@ export async function doFinalComponentCodegen(
      const apiDTSPath = path.join(codegenDir, "api.d.ts");
      const apiContents = await componentApiDTS(
        ctx,
@@ -813,7 +796,7 @@ index 7c38a10b6676f598385b09c97f8827c89a5e0d3e..c3db3ed9c203df858ccd0fc9afa6077e
        rootComponent,
        componentDirectory,
        componentsMap,
-@@ -474,7 +474,7 @@ export async function doFinalComponentCodegen(
+@@ -476,7 +476,7 @@ export async function doFinalComponentCodegen(
      const apiTSPath = path.join(codegenDir, "api.ts");
      const apiContents = await componentApiTSWithTypes(
        ctx,
@@ -823,7 +806,7 @@ index 7c38a10b6676f598385b09c97f8827c89a5e0d3e..c3db3ed9c203df858ccd0fc9afa6077e
        componentDirectory,
        componentsMap,
 diff --git a/npm-packages/convex/src/cli/lib/components.ts b/npm-packages/convex/src/cli/lib/components.ts
-index c952f5cbbfc372c52c25bcdd22e3b965e8f75618..4f12dd4e952bfe475835506551f69cc2e25e56e0 100644
+index b51ef7fc705443d0846aa00482e59204d32bdacb..0ef9971c0a3fbbf31611b90b0d2b4fb7425da5ef 100644
 --- a/npm-packages/convex/src/cli/lib/components.ts
 +++ b/npm-packages/convex/src/cli/lib/components.ts
 @@ -16,8 +16,9 @@ import {
@@ -850,7 +833,7 @@ index c952f5cbbfc372c52c25bcdd22e3b965e8f75618..4f12dd4e952bfe475835506551f69cc2
  import { DetailedDeploymentCredentials } from "./api.js";
  import { FinishPushDiff } from "./deployApi/finishPush.js";
  import { Reporter, Span } from "./tracing.js";
-@@ -127,6 +132,7 @@ export async function runCodegen(
+@@ -133,6 +138,7 @@ export async function runCodegen(
          typecheckComponents: false,
          debugNodeApis: options.debugNodeApis,
        },
@@ -858,7 +841,7 @@ index c952f5cbbfc372c52c25bcdd22e3b965e8f75618..4f12dd4e952bfe475835506551f69cc2
      );
    } else {
      if (options.typecheck !== "disable") {
-@@ -241,6 +247,7 @@ async function startComponentsPushAndCodegen(
+@@ -248,6 +254,7 @@ async function startComponentsPushAndCodegen(
      codegenOnlyThisComponent?: string | undefined;
      forceNodeCutover?: boolean | undefined;
    },
@@ -866,7 +849,7 @@ index c952f5cbbfc372c52c25bcdd22e3b965e8f75618..4f12dd4e952bfe475835506551f69cc2
  ): Promise<StartPushResponse | null> {
    const convexDir = await getFunctionsDirectoryPath(ctx);
  
-@@ -479,13 +486,23 @@ async function startComponentsPushAndCodegen(
+@@ -501,13 +508,23 @@ async function startComponentsPushAndCodegen(
      );
    }
  
@@ -895,7 +878,7 @@ index c952f5cbbfc372c52c25bcdd22e3b965e8f75618..4f12dd4e952bfe475835506551f69cc2
        await ctx.crash({
          exitCode: 1,
          errorType: "fatal",
-@@ -501,9 +518,16 @@ async function startComponentsPushAndCodegen(
+@@ -523,9 +540,16 @@ async function startComponentsPushAndCodegen(
    }
  
    if (options.verbose) {
@@ -913,7 +896,7 @@ index c952f5cbbfc372c52c25bcdd22e3b965e8f75618..4f12dd4e952bfe475835506551f69cc2
    if (options.codegen) {
      changeSpinner("Generating TypeScript bindings...");
      await parentSpan.enterAsync("doFinalComponentCodegen", () =>
-@@ -517,7 +541,7 @@ async function startComponentsPushAndCodegen(
+@@ -539,7 +563,7 @@ async function startComponentsPushAndCodegen(
              tmpDir,
              rootComponent,
              rootComponent,
@@ -922,7 +905,7 @@ index c952f5cbbfc372c52c25bcdd22e3b965e8f75618..4f12dd4e952bfe475835506551f69cc2
              components,
              options,
            );
-@@ -538,7 +562,7 @@ async function startComponentsPushAndCodegen(
+@@ -560,7 +584,7 @@ async function startComponentsPushAndCodegen(
              tmpDir,
              rootComponent,
              directory,
@@ -931,7 +914,7 @@ index c952f5cbbfc372c52c25bcdd22e3b965e8f75618..4f12dd4e952bfe475835506551f69cc2
              components,
              options,
            );
-@@ -581,7 +605,7 @@ async function startComponentsPushAndCodegen(
+@@ -603,7 +627,7 @@ async function startComponentsPushAndCodegen(
      }
    });
  
@@ -940,7 +923,7 @@ index c952f5cbbfc372c52c25bcdd22e3b965e8f75618..4f12dd4e952bfe475835506551f69cc2
  }
  
  function logStartPushSizes(span: Span, startPushRequest: StartPushRequest) {
-@@ -632,6 +656,7 @@ export async function runComponentsPush(
+@@ -654,6 +678,7 @@ export async function runComponentsPush(
          projectConfig,
          configPath,
          options,
@@ -1187,7 +1170,7 @@ index 0000000000000000000000000000000000000000..56cace747f4fdd2c61871a27b1180cc8
 +  expect(parsePushRequest(init).includeAnalysis).toBeUndefined();
 +});
 diff --git a/npm-packages/convex/src/cli/lib/deploy2.ts b/npm-packages/convex/src/cli/lib/deploy2.ts
-index 5e89501e7900116935f193b8b8ce08095ebc87fd..b5052bd88b8d718f409032ac4c6e7abacb6f06ee 100644
+index 9dccc15fa8c48dd93b5dc3e1b8c5520a5546596a..c054f493ea3e3d55f1d3609e499ae9df3154f9f8 100644
 --- a/npm-packages/convex/src/cli/lib/deploy2.ts
 +++ b/npm-packages/convex/src/cli/lib/deploy2.ts
 @@ -15,6 +15,7 @@ import {
