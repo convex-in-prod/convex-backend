@@ -77,6 +77,16 @@ admission failure instead.
 `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is configured. The query cache and every
 isolate analysis call from that runner receive clones of the same gate.
 
+The integrated Wasm runtime separates this application bound from V8 capacity.
+Each isolate client also has a V8 query/analysis gate configured by
+`ISOLATE_DEGRADABLE_QUERY_ANALYSIS_CAPACITY`, inheriting the application cap when
+unset. Degradable V8 dispatch requires immediate admission; analysis waits fairly
+after acquiring the application permit. The queued request and then the actual
+worker own the V8 permit through cancellation cleanup and preparation for reuse. Wasm demand does not hold
+this permit, and V8 dependency work retains its ancestor-unblocking exemption.
+If the application cap is unset but an explicit V8 cap remains, only V8 dispatch
+and analysis are bounded by that gate; it does not enable degradable clients.
+
 Degradable cache-miss leaders retain their existing contract:
 
 1. inspect the cache without publishing a waiting leader;
@@ -84,15 +94,16 @@ Degradable cache-miss leaders retain their existing contract:
 3. return the typed degradable-capacity outcome when no permit is available;
 4. recheck the cache after acquisition and retain the permit only for actual leader execution.
 
-Each isolate module analysis future instead waits for one permit immediately before creating and
-sending an `Analyze` isolate request. The queued request's response sender owns the reservation
+Each isolate module analysis future instead waits for an application permit and then a V8 permit
+before creating and sending an `Analyze` isolate request. The queued request's response sender owns the application reservation
 through queueing, initial active-JavaScript admission, and worker execution. A terminal response
 returns the reservation to the caller, which releases it before retry matching and backoff. If the
 caller has disappeared after dispatch, failed response delivery releases the reservation only after
 the analysis attempt produces its terminal result. A request discarded before dispatch releases it
 without allocating a worker.
 Node module analysis, source upload, schema and configuration evaluation, push commit, and the
-complete deployment lifetime do not hold a permit.
+complete deployment lifetime do not hold a root-analysis permit. The separate V8 reservation
+remains with worker activity after a response until cleanup and preparation for reuse finish.
 
 The Tokio semaphore assigns released permits to queued asynchronous waiters before making them
 available to a later immediate acquisition. Once at least one analysis future has entered the fair
@@ -125,11 +136,11 @@ control-plane queue when enabled.
 
 This is intentionally not a mathematical bound on physical workers. One admitted query leader can
 spawn separately scheduled dependencies, and dependency work retains its existing reserve. Normal
-queries, mutations, actions, and non-degradable clients also bypass the elastic gate. The configured
-cap must therefore leave measured headroom at the application query gate, isolate shared base, and
-other lifetime limits. With active-JavaScript service floors enabled, the cap can exceed finite
+queries, mutations, actions, and non-degradable clients also bypass the elastic gate. The application
+cap must leave headroom at the application query gate; the separate V8 cap must leave headroom at
+the isolate shared base. With active-JavaScript service floors enabled, the V8 cap can exceed finite
 active capacity because these gates bound different resources. Without service floors, any
-configured finite active capacity must exceed the cap; `0` continues to mean unlimited.
+configured finite V8 active capacity must exceed the V8 cap; `0` continues to mean unlimited.
 
 Root pacing creates no additional worker or CPU capacity. The enabled
 deployment lane reserves queue and worker space within the existing base and
@@ -140,14 +151,16 @@ can take effect.
 
 ## Metrics and controlled validation
 
-The integration adds two bounded process metrics without application, module, deployment, or caller
-labels and reuses the existing shared-capacity metric:
+The integration uses bounded process metrics without application, module, deployment, or caller
+labels:
 
 - `degradable_query_leader_capacity_info` reports the configured shared gate capacity from
   application-runner construction;
 - `isolate_analysis_reservations_in_use_info` reports analysis permits currently held;
 - `isolate_analysis_capacity_wait_seconds` records each analysis acquisition wait, including
   retries, immediate acquisitions, and canceled waiters.
+- `isolate_analysis_v8_capacity_wait_seconds` records the subsequent wait for V8 admission;
+  `isolate_scheduler_capacity_info{capacity_kind="degradable_query_analysis"}` reports its cap.
 - `active_javascript_capacity_info`, `active_javascript_occupancy_info`,
   `active_javascript_waiters_info`, and class-and-phase labels on active permit acquisition report
   the lower execution gate independently from the root-work gate.
@@ -190,15 +203,18 @@ environment where the prior overload behavior is acceptable.
 ## Activation, rollout, and rollback
 
 The integration is active whenever
-`APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is configured. It adds no second enable knob.
-When the setting is absent, degradable clients retain normal query admission and isolate analysis
-preserves its previous unpaced behavior.
+`APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is configured. There is no separate
+application pacing enable knob. When that setting is absent, degradable clients retain normal
+query admission. Analysis remains paced at V8 dispatch if
+`ISOLATE_DEGRADABLE_QUERY_ANALYSIS_CAPACITY` is explicitly configured; with both caps absent,
+analysis preserves its previous unpaced behavior.
 
 Roll out with the existing cap unchanged, confirm the existing shared-capacity gauge, and run one
 controlled push before relying on the behavior under normal deployment traffic. Do not raise
 `ANALYZE_CONCURRENCY` at the same time. The immediate operational rollback is to restore the prior
-backend image. Unsetting the cap also disables pacing, but simultaneously disables degradable-query
-backpressure and is therefore not an equivalent isolated rollback.
+backend image. Unsetting the application cap disables application pacing and degradable-query
+backpressure. An explicitly configured V8 cap continues to pace analysis; remove both to restore
+unpaced analysis. Neither change is an equivalent isolated rollback.
 
 Focused tests prove that analysis reservations reduce available degradable admission, a queued
 analysis attempt receives a released permit before a new immediate degradable acquisition,

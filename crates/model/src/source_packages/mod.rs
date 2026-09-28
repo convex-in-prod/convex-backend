@@ -31,6 +31,7 @@ use crate::{
 };
 
 pub mod native;
+pub mod runtime_content;
 pub mod types;
 pub mod upload_download;
 
@@ -122,8 +123,36 @@ impl<'a, RT: Runtime> SourcePackageModel<'a, RT> {
         Ok(latest_source_pkg)
     }
 
-    /// Returns the newest committed package record, including an empty package
-    /// that no module metadata references.
+    /// Select activation authority at the caller's snapshot without making the
+    /// activation record a behavioral dependency. Execution must separately
+    /// track all code/configuration it can observe. Explicit
+    /// deployment-metadata reads must continue to use `get_latest_record`.
+    pub async fn get_latest_for_runtime_selection(
+        &mut self,
+    ) -> anyhow::Result<Option<Arc<ParsedDocument<SourcePackage>>>> {
+        let component = match self.namespace {
+            TableNamespace::Global => ComponentId::Root,
+            TableNamespace::ByComponent(id) => ComponentId::Child(id),
+        };
+        let pending_package = self
+            .tx
+            .table_mapping()
+            .namespace(self.namespace)
+            .id_if_exists(&SOURCE_PACKAGES_TABLE)
+            .is_some_and(|tablet| self.tx.has_pending_write(tablet));
+        if pending_package || ModuleModel::new(self.tx).has_pending_module(component) {
+            // A snapshot clone discards pending writes, including standalone
+            // module changes. Keep the transactional read in this exceptional case.
+            return self.get_latest_record().await;
+        }
+        let mut snapshot = self.tx.clone_for_snapshot_query();
+        SourcePackageModel::new(&mut snapshot, self.namespace)
+            .get_latest_record()
+            .await
+    }
+
+    /// Returns the newest package record visible to this transaction, including
+    /// an empty package that no module metadata references.
     pub async fn get_latest_record(
         &mut self,
     ) -> anyhow::Result<Option<Arc<ParsedDocument<SourcePackage>>>> {
