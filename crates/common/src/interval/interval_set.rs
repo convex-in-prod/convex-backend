@@ -36,6 +36,14 @@ pub enum IntervalSet {
     All,
 }
 
+impl PartialEq for IntervalSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for IntervalSet {}
+
 impl Default for IntervalSet {
     fn default() -> Self {
         Self::new()

@@ -6,7 +6,10 @@ use std::sync::{
 };
 
 use common::{
-    bootstrap_model::schema::SchemaState,
+    bootstrap_model::schema::{
+        SchemaMetadata,
+        SchemaState,
+    },
     document::{
         ParseDocument,
         ParsedDocument,
@@ -157,6 +160,64 @@ impl<'a, RT: Runtime> SchemaValidationModel<'a, RT> {
             .into_iter()
             .map(|validation| (*validation).clone())
             .collect())
+    }
+
+    async fn attempt_is_active(
+        tx: &mut Transaction<RT>,
+        namespace: TableNamespace,
+        metadata: &SchemaValidationMetadata,
+    ) -> anyhow::Result<bool> {
+        let schema_id = tx.resolve_developer_id(&metadata.schema_id, namespace)?;
+        let Some(schema) = tx.get(schema_id).await? else {
+            return Ok(false);
+        };
+        let schema = SchemaMetadata::try_from(schema.into_value().into_value())?;
+        Ok(match schema.state {
+            SchemaState::Pending | SchemaState::Validated => true,
+            SchemaState::Active => metadata.validator_hash.is_some(),
+            SchemaState::Failed { .. } | SchemaState::Overwritten => false,
+        })
+    }
+
+    /// Stream inactive attempts without putting a table-range read in the
+    /// transactions that delete them. The limit bounds retained IDs, while an
+    /// active prefix may still require a longer scan.
+    pub async fn inactive_attempt_ids(
+        &mut self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ResolvedDocumentId>> {
+        anyhow::ensure!(limit > 0, "inactive attempt scan requires a positive limit");
+        let by_id_index = SystemIndex::<SchemaValidationTable>::by_id();
+        let mut validations = self.tx.query_system(self.namespace, &by_id_index)?.build();
+        let mut inactive = Vec::new();
+        while let Some(validation) = validations.next().await? {
+            if !Self::attempt_is_active(validations.tx(), self.namespace, &validation).await? {
+                inactive.push(validation.id());
+                if inactive.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(inactive)
+    }
+
+    /// Recheck ownership by document ID before deleting a discovered batch.
+    pub async fn delete_inactive_attempts(
+        &mut self,
+        attempt_ids: &[ResolvedDocumentId],
+    ) -> anyhow::Result<usize> {
+        let mut deleted = 0;
+        for attempt_id in attempt_ids {
+            let Some(doc) = self.tx.get(*attempt_id).await? else {
+                continue;
+            };
+            let validation: ParsedDocument<SchemaValidationMetadata> = doc.parse()?;
+            if !Self::attempt_is_active(self.tx, self.namespace, &validation).await? {
+                self.delete_attempt(*attempt_id).await?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     /// The validation for one table under `schema_id`, if any.

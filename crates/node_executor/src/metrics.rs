@@ -424,6 +424,11 @@ register_convex_gauge!(
      generation retirement",
     &["pool_name"]
 );
+register_convex_gauge!(
+    LOCAL_NODE_EXECUTOR_BACKGROUND_DRAIN_TIMEOUT_SECONDS,
+    "Configured timeout for registered local Node resident retirement callbacks",
+    &["pool_name"]
+);
 pub fn set_local_node_memory_configuration(
     pool_name: &str,
     old_space_limit_bytes: u64,
@@ -432,6 +437,7 @@ pub fn set_local_node_memory_configuration(
     memory_pressure_grace: Duration,
     age_threshold: Duration,
     package_threshold: u64,
+    background_drain_timeout: Duration,
 ) {
     let labels = || vec![StaticMetricLabel::new("pool_name", pool_name.to_owned())];
     log_gauge_with_labels(
@@ -462,6 +468,11 @@ pub fn set_local_node_memory_configuration(
     log_gauge_with_labels(
         &LOCAL_NODE_EXECUTOR_PACKAGE_RETIREMENT_THRESHOLD_INFO,
         package_threshold as f64,
+        labels(),
+    );
+    log_gauge_with_labels(
+        &LOCAL_NODE_EXECUTOR_BACKGROUND_DRAIN_TIMEOUT_SECONDS,
+        background_drain_timeout.as_secs_f64(),
         labels(),
     );
 }
@@ -546,6 +557,27 @@ pub fn log_local_node_retirement_decision(
             StaticMetricLabel::new("pool_name", pool_name.to_owned()),
             StaticMetricLabel::new("reason", reason),
             StaticMetricLabel::new("decision", decision),
+        ],
+    );
+}
+
+register_convex_counter!(
+    LOCAL_NODE_EXECUTOR_BACKGROUND_DRAIN_OUTCOMES_TOTAL,
+    "Local Node resident retirement callback outcomes",
+    &["pool_name", "reason", "outcome"]
+);
+pub fn log_local_node_background_drain(
+    pool_name: &str,
+    reason: &'static str,
+    outcome: &'static str,
+) {
+    log_counter_with_labels(
+        &LOCAL_NODE_EXECUTOR_BACKGROUND_DRAIN_OUTCOMES_TOTAL,
+        1,
+        vec![
+            StaticMetricLabel::new("pool_name", pool_name.to_owned()),
+            StaticMetricLabel::new("reason", reason),
+            StaticMetricLabel::new("outcome", outcome),
         ],
     );
 }
@@ -986,6 +1018,7 @@ pub fn clear_local_node_pool_configuration(pool_name: &str) {
         &*LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE_SECONDS,
         &*LOCAL_NODE_EXECUTOR_AGE_RETIREMENT_THRESHOLD_SECONDS,
         &*LOCAL_NODE_EXECUTOR_PACKAGE_RETIREMENT_THRESHOLD_INFO,
+        &*LOCAL_NODE_EXECUTOR_BACKGROUND_DRAIN_TIMEOUT_SECONDS,
         &*LOCAL_NODE_EXECUTOR_EVENT_LOOP_UNRESPONSIVE_BUDGET_SECONDS,
     ] {
         let _ = gauge.remove_label_values(&[pool_name]);
@@ -1301,6 +1334,7 @@ mod tests {
             Duration::from_secs(4),
             Duration::from_secs(5),
             6,
+            Duration::from_secs(8),
         );
         set_local_node_event_loop_unresponsive_budget(pool_name, Some(Duration::from_secs(7)));
         clear_local_node_pool_configuration(pool_name);
@@ -1316,6 +1350,9 @@ mod tests {
         assert!(LOCAL_NODE_EXECUTOR_EVENT_LOOP_UNRESPONSIVE_BUDGET_SECONDS
             .remove_label_values(&[pool_name])
             .is_err());
+        assert!(LOCAL_NODE_EXECUTOR_BACKGROUND_DRAIN_TIMEOUT_SECONDS
+            .remove_label_values(&[pool_name])
+            .is_err());
     }
 
     #[test]
@@ -1329,6 +1366,7 @@ mod tests {
             Duration::from_secs(4),
             Duration::from_secs(5),
             6,
+            Duration::from_secs(8),
         );
         assert_eq!(
             LOCAL_NODE_EXECUTOR_OLD_SPACE_LIMIT_BYTES

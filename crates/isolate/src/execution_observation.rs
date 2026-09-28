@@ -311,6 +311,52 @@ pub(crate) fn set_phase(phase: Phase) {
     });
 }
 
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub(crate) fn install_wasm_hook_if_observed<T: 'static>(store: &mut wasmtime::Store<T>) -> bool {
+    if ACTIVE.with_borrow(Option::is_none) {
+        return false;
+    }
+    // This Wasmtime version cannot remove a hook. Install it only on Stores
+    // selected for observation, retaining it across reuse without changing
+    // pool identity or lifetime. Inactive callbacks do no timing or locking.
+    store.call_hook(|_, transition| {
+        wasm_transition(transition);
+        Ok(())
+    });
+    true
+}
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub(crate) fn wasm_transition(transition: wasmtime::CallHook) {
+    ACTIVE.with_borrow_mut(|active| {
+        let Some(frame) = active else { return };
+        frame.local.wasm_transitions += 1;
+        frame.flush();
+        match transition {
+            wasmtime::CallHook::CallingWasm | wasmtime::CallHook::CallingHost => {
+                if frame.owners.len() == 128 {
+                    frame.local.invalid = Some(ExecutionObservationInvalid::OwnerStackLimit);
+                    return;
+                }
+                frame.owners.push(frame.owner);
+                frame.owner = match transition {
+                    wasmtime::CallHook::CallingWasm => Owner::Guest,
+                    wasmtime::CallHook::CallingHost => Owner::Host,
+                    wasmtime::CallHook::ReturningFromWasm
+                    | wasmtime::CallHook::ReturningFromHost => unreachable!(),
+                };
+            },
+            wasmtime::CallHook::ReturningFromWasm | wasmtime::CallHook::ReturningFromHost => {
+                if let Some(owner) = frame.owners.pop() {
+                    frame.owner = owner;
+                } else {
+                    frame.local.invalid = Some(ExecutionObservationInvalid::OwnerStackMismatch);
+                }
+            },
+        }
+    });
+}
+
 pub(crate) async fn observe_poll<F: Future>(
     future: F,
     owner: Option<Owner>,
@@ -594,8 +640,19 @@ mod tests {
         let future = Box::pin(observe(
             async {
                 set_phase(Phase::Handler);
+                #[cfg(feature = "static-hermes-wasmtime-gate")]
+                {
+                    wasm_transition(wasmtime::CallHook::CallingWasm);
+                    wasm_transition(wasmtime::CallHook::CallingHost);
+                }
                 let result =
                     observe_poll(receiver, Some(Owner::Provider), Suspension::Provider).await;
+                #[cfg(feature = "static-hermes-wasmtime-gate")]
+                {
+                    wasm_transition(wasmtime::CallHook::ReturningFromHost);
+                    work();
+                    wasm_transition(wasmtime::CallHook::ReturningFromWasm);
+                }
                 result.unwrap()
             },
             Some(task),
@@ -701,5 +758,175 @@ mod tests {
         );
         assert_eq!(observer.snapshot().active_tasks, 0);
         assert!(current().is_none());
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    fn wasm_fixture(
+        trap: bool,
+        host_calls: usize,
+    ) -> (wasmtime::Store<()>, wasmtime::TypedFunc<(), ()>) {
+        let mut types = wasm_encoder::TypeSection::new();
+        types.ty().function([], []);
+        let mut imports = wasm_encoder::ImportSection::new();
+        if host_calls > 0 {
+            imports.import("env", "noop", wasm_encoder::EntityType::Function(0));
+        }
+        let mut functions = wasm_encoder::FunctionSection::new();
+        functions.function(0);
+        let mut exports = wasm_encoder::ExportSection::new();
+        exports.export(
+            "run",
+            wasm_encoder::ExportKind::Func,
+            u32::from(host_calls > 0),
+        );
+        let mut function = wasm_encoder::Function::new([]);
+        for _ in 0..host_calls {
+            function.instruction(&wasm_encoder::Instruction::Call(0));
+        }
+        if trap {
+            function.instruction(&wasm_encoder::Instruction::Unreachable);
+        }
+        function.instruction(&wasm_encoder::Instruction::End);
+        let mut code = wasm_encoder::CodeSection::new();
+        code.function(&function);
+        let mut module = wasm_encoder::Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&exports)
+            .section(&code);
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, module.finish()).unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let imports = if host_calls > 0 {
+            vec![wasmtime::Func::wrap(&mut store, || {}).into()]
+        } else {
+            vec![]
+        };
+        let instance =
+            block_on(wasmtime::Instance::new_async(&mut store, &module, &imports)).unwrap();
+        let run = instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .unwrap();
+        (store, run)
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    #[test]
+    fn reused_store_uses_the_current_invocation_collector() {
+        let (mut store, run) = wasm_fixture(false, 3);
+        assert!(!install_wasm_hook_if_observed(&mut store));
+        block_on(run.call_async(&mut store, ())).unwrap();
+        let first = ExecutionObserver::default();
+        block_on(observe(
+            async {
+                assert!(install_wasm_hook_if_observed(&mut store));
+                run.call_async(&mut store, ()).await
+            },
+            Some(first.task(TaskKind::Runtime)),
+        ))
+        .unwrap();
+        let retained = first.snapshot();
+        assert!(retained.preparation.guest.cpu_nanos > 0);
+        assert_eq!(retained.wasm_transitions, 8);
+        assert_eq!(retained.invalid, None);
+        let second = ExecutionObserver::default();
+        block_on(observe(
+            run.call_async(&mut store, ()),
+            Some(second.task(TaskKind::Runtime)),
+        ))
+        .unwrap();
+        block_on(run.call_async(&mut store, ())).unwrap();
+        assert_eq!(first.snapshot(), retained);
+        let result = second.snapshot();
+        assert!(result.preparation.guest.cpu_nanos > 0);
+        assert_eq!(result.runtime_tasks, 1);
+        assert_eq!(result.wasm_transitions, 8);
+        assert_eq!(result.invalid, None);
+        assert!(current().is_none());
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    #[test]
+    fn wasm_trap_balances_owners_without_changing_the_error() {
+        let (mut store, run) = wasm_fixture(true, 0);
+        let observer = ExecutionObserver::default();
+        let result = block_on(observe(
+            async {
+                assert!(install_wasm_hook_if_observed(&mut store));
+                run.call_async(&mut store, ()).await
+            },
+            Some(observer.task(TaskKind::Runtime)),
+        ));
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<wasmtime::Trap>(),
+            Some(wasmtime::Trap::UnreachableCodeReached)
+        ));
+        let result = observer.snapshot();
+        assert_eq!(result.invalid, None);
+        assert_eq!(result.completed_tasks, 1);
+        assert_eq!(result.active_tasks, 0);
+        assert!(current().is_none());
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    #[test]
+    #[ignore = "manual observer calibration; use --release --ignored --nocapture"]
+    fn wasm_import_observer_calibration() {
+        const IMPORTS_PER_CALL: usize = 1000;
+        const CALLS: usize = 500;
+        let (mut plain_store, plain_run) = wasm_fixture(false, IMPORTS_PER_CALL);
+        let (mut hooked_store, hooked_run) = wasm_fixture(false, IMPORTS_PER_CALL);
+        let warmup = ExecutionObserver::default();
+        block_on(observe(
+            async {
+                assert!(install_wasm_hook_if_observed(&mut hooked_store));
+                for _ in 0..100 {
+                    plain_run.call_async(&mut plain_store, ()).await.unwrap();
+                    hooked_run.call_async(&mut hooked_store, ()).await.unwrap();
+                }
+            },
+            Some(warmup.task(TaskKind::Runtime)),
+        ));
+        // Bracket both controls to expose drift. This compares no installed
+        // hook, installed but inactive, and collecting within the same
+        // call-hook-enabled binary; it does not measure the Cargo feature tax.
+        for mode in ["no_hook", "inactive", "collecting", "inactive", "no_hook"] {
+            let observer = ExecutionObserver::default();
+            let (store, run) = if mode == "no_hook" {
+                (&mut plain_store, &plain_run)
+            } else {
+                (&mut hooked_store, &hooked_run)
+            };
+            let task = (mode == "collecting").then(|| observer.task(TaskKind::Runtime));
+            let wall = Instant::now();
+            let cpu = thread_cpu().unwrap();
+            block_on(observe(
+                async {
+                    for _ in 0..CALLS {
+                        run.call_async(&mut *store, ()).await.unwrap();
+                    }
+                },
+                task,
+            ));
+            let cpu = thread_cpu().unwrap() - cpu;
+            let wall = nanos(wall.elapsed());
+            let result = observer.snapshot();
+            assert_eq!(result.invalid, None);
+            if mode == "collecting" {
+                assert_eq!(
+                    result.wasm_transitions,
+                    (CALLS * (IMPORTS_PER_CALL + 1) * 2) as u64,
+                );
+            }
+            println!(
+                "observer_calibration mode={mode} imports={} cpu_nanos={cpu} wall_nanos={wall} \
+                 accounting_flushes={} wasm_transitions={}",
+                CALLS * IMPORTS_PER_CALL,
+                result.accounting_flushes,
+                result.wasm_transitions,
+            );
+        }
     }
 }

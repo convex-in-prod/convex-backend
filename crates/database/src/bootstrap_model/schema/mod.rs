@@ -54,6 +54,7 @@ pub static SCHEMA_STATE_FIELD: LazyLock<FieldPath> =
     LazyLock::new(|| "state".parse().expect("invalid state field"));
 
 const MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS: Duration = Duration::from_secs(60 * 60); // 1 hour
+const MAX_SCHEMA_HISTORY_DELETIONS_PER_TRANSACTION: usize = 32;
 
 pub struct SchemasTable;
 impl SystemTable for SchemasTable {
@@ -137,7 +138,10 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
                 if let Err(enforcement_error) =
                     in_progress_schema.check_delete_table(active_table_to_delete)
                 {
-                    self.mark_failed(id, enforcement_error.into()).await?;
+                    anyhow::ensure!(
+                        self.mark_failed(id, enforcement_error.into()).await?,
+                        "In-progress schema changed state within one enforcement transaction"
+                    );
                 }
             },
             (Some(_), Some(_)) => {
@@ -180,7 +184,10 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
                     table_mapping_for_schema,
                     self.tx.virtual_system_mapping(),
                 ) {
-                    self.mark_failed(id, enforcement_error.into()).await?;
+                    anyhow::ensure!(
+                        self.mark_failed(id, enforcement_error.into()).await?,
+                        "In-progress schema changed state within one enforcement transaction"
+                    );
                 }
             },
             (Some(_), Some(_)) => {
@@ -347,20 +354,18 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
     }
 
     #[async_recursion]
-    /// Mark pending or validated schemas as failed. Error if the schema is
-    /// already active, and do nothing if it is already overwritten or failed.
+    /// Mark pending or validated schemas as failed. Return false if a worker's
+    /// schema was overwritten or removed before its failure transaction began.
     pub async fn mark_failed(
         &mut self,
         document_id: ResolvedDocumentId,
         error: SchemaValidationError,
-    ) -> anyhow::Result<()> {
-        let doc = self
-            .tx
-            .get(document_id)
-            .await?
-            .context("Schema to mark as failed must exist.")?;
+    ) -> anyhow::Result<bool> {
+        let Some(doc) = self.tx.get(document_id).await? else {
+            return Ok(false);
+        };
         let schema = SchemaMetadata::try_from(doc.into_value().into_value())?;
-        match schema.state {
+        let schema_is_failed = match schema.state {
             SchemaState::Pending | SchemaState::Validated => {
                 let error_message = error.to_string();
                 let table_name = match error {
@@ -384,16 +389,18 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
                         )?,
                     )
                     .await?;
+                true
             },
             SchemaState::Active => {
                 anyhow::bail!("Active schemas cannot be marked as failed.")
             },
-            SchemaState::Failed { .. } | SchemaState::Overwritten => {},
-        }
-        self.delete_old_failed_and_overwritten_schemas().await?;
-        let mut model = SchemaValidationModel::new(self.tx, self.namespace);
-        model.delete_validations_for_schema(document_id).await?;
-        Ok(())
+            SchemaState::Failed { .. } => true,
+            SchemaState::Overwritten => false,
+        };
+        // Application writes can fail a pending schema. Keep validation progress
+        // out of that transaction; the schema worker fences its checkpoints on
+        // this state and removes the canceled attempts separately.
+        Ok(schema_is_failed)
     }
 
     pub async fn overwrite_all(&mut self) -> anyhow::Result<bool> {
@@ -424,53 +431,73 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
         }
     }
 
-    /// Deletes failed and overwritten schemas older than an hour, returning the
-    /// number of documents deleted. Keeps schemas table small.
-    async fn delete_old_failed_and_overwritten_schemas(&mut self) -> anyhow::Result<usize> {
+    /// Deletes a bounded batch of failed and overwritten schemas older than an
+    /// hour, returning the number of documents deleted.
+    async fn delete_old_failed_and_overwritten_schemas(
+        &mut self,
+        schema_to_keep: ResolvedDocumentId,
+    ) -> anyhow::Result<usize> {
         let mut num_deleted = 0;
-        for schema_doc in self
+        let oldest_creation_time_to_keep: common::document::CreationTime = (*self
             .tx
-            .query_system(
-                self.namespace,
-                &SystemIndex::<SchemasTable>::by_creation_time(),
-            )?
-            .all()
-            .await?
-        {
+            .begin_timestamp()
+            .sub(MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS)
+            .context("Should be able to subtract an hour from creation time")?)
+        .try_into()?;
+        let creation_time_index = SystemIndex::<SchemasTable>::by_creation_time();
+        let mut schemas = self
+            .tx
+            .query_system(self.namespace, &creation_time_index)?
+            .build();
+        while let Some(schema_doc) = schemas.next().await? {
             // Only delete failed and overwritten schemas
             match schema_doc.state {
                 SchemaState::Failed { .. } | SchemaState::Overwritten => {},
                 SchemaState::Active | SchemaState::Pending | SchemaState::Validated => continue,
             }
+            // The schema changed in this transaction can still have an
+            // in-flight checkpoint from before the transition.
+            if schema_doc.id() == schema_to_keep {
+                continue;
+            }
             // Break if the schemas are not old enough to be deleted
-            if schema_doc.creation_time()
-                > (*self
-                    .tx
-                    .begin_timestamp()
-                    .sub(MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS)
-                    .context("Should be able to subtract an hour from creation time")?)
-                .try_into()?
-            {
+            if schema_doc.creation_time() > oldest_creation_time_to_keep {
                 break;
             }
-            SystemMetadataModel::new(self.tx, self.namespace)
+            SystemMetadataModel::new(schemas.tx(), self.namespace)
                 .delete(schema_doc.id())
                 .await?;
             num_deleted += 1;
+            if num_deleted >= MAX_SCHEMA_HISTORY_DELETIONS_PER_TRANSACTION {
+                break;
+            }
         }
         Ok(num_deleted)
     }
 
     async fn mark_overwritten(&mut self, id: ResolvedDocumentId) -> anyhow::Result<()> {
+        let doc = self
+            .tx
+            .get(id)
+            .await?
+            .context("Schema to mark as overwritten must exist")?;
+        let schema = SchemaMetadata::try_from(doc.into_value().into_value())?;
+        anyhow::ensure!(
+            schema.state.is_unique(),
+            "Only a unique schema state can be overwritten"
+        );
         SystemMetadataModel::new(self.tx, self.namespace)
             .patch(
                 id,
                 patch_value!("state" => Some(SchemaState::Overwritten.try_into()?))?,
             )
             .await?;
-        self.delete_old_failed_and_overwritten_schemas().await?;
-        let mut model = SchemaValidationModel::new(self.tx, self.namespace);
-        model.delete_validations_for_schema(id).await?;
+        self.delete_old_failed_and_overwritten_schemas(id).await?;
+        if schema.state != SchemaState::Pending {
+            SchemaValidationModel::new(self.tx, self.namespace)
+                .delete_validations_for_schema(id)
+                .await?;
+        }
         Ok(())
     }
 }

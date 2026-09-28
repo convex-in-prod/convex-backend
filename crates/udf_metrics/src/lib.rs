@@ -44,7 +44,10 @@ use std::{
 };
 
 use anyhow::Context;
-use hdrhistogram::Histogram;
+use hdrhistogram::{
+    Counter,
+    Histogram,
+};
 use imbl::{
     hashmap,
     ordmap,
@@ -96,14 +99,14 @@ impl CounterBucket {
 }
 
 #[derive(Clone)]
-pub struct HistogramBucket {
+pub struct HistogramBucket<C: Counter = u8> {
     pub index: BucketIndex,
-    pub histogram: Histogram<u8>,
+    pub histogram: Histogram<C>,
 }
 
-impl HistogramBucket {
+impl<C: Counter> HistogramBucket<C> {
     fn new(config: &MetricStoreConfig, index: BucketIndex) -> Result<Self, UdfMetricsError> {
-        let histogram = Histogram::new_with_bounds(
+        let histogram = Histogram::<C>::new_with_bounds(
             config.histogram_min_duration.as_millis() as u64,
             config.histogram_max_duration.as_millis() as u64,
             config.histogram_significant_figures,
@@ -147,7 +150,7 @@ pub struct MetricStoreConfig {
 }
 
 #[derive(Clone)]
-pub struct MetricStore {
+pub struct MetricStore<C: Counter = u8> {
     base_ts: SystemTime,
     config: MetricStoreConfig,
 
@@ -155,7 +158,7 @@ pub struct MetricStore {
     metrics_by_name: HashMap<MetricName, MetricKey>,
 
     counter_buckets: Slab<CounterBucket>,
-    histogram_buckets: Slab<HistogramBucket>,
+    histogram_buckets: Slab<HistogramBucket<C>>,
     gauge_buckets: Slab<GaugeBucket>,
 
     // Bucket keys in both indexes point into the slab selected by the metric's type.
@@ -163,7 +166,7 @@ pub struct MetricStore {
     bucket_by_metric: OrdMap<(MetricKey, BucketIndex), BucketKey>,
 }
 
-impl MetricStore {
+impl<C: Counter> MetricStore<C> {
     pub fn new(base_ts: SystemTime, config: MetricStoreConfig) -> Self {
         Self {
             base_ts,
@@ -505,7 +508,7 @@ impl MetricStore {
         &self,
         metric_name: &str,
         range: Range<SystemTime>,
-    ) -> Result<Vec<&HistogramBucket>, UdfMetricsError> {
+    ) -> Result<Vec<&HistogramBucket<C>>, UdfMetricsError> {
         if range.end <= range.start {
             return Err(UdfMetricsError::InvalidTimeRange {
                 start: range.start,
@@ -727,9 +730,9 @@ impl MetricsWindow {
 
     /// Resample a (potentially sparse) counter timeseries into the desired
     /// `MetricsWindow`.
-    pub fn resample_counters(
+    pub fn resample_counters<C: Counter>(
         &self,
-        metrics: &MetricStore,
+        metrics: &MetricStore<C>,
         buckets: Vec<&CounterBucket>,
         is_rate: bool,
     ) -> anyhow::Result<Timeseries> {
@@ -777,9 +780,9 @@ impl MetricsWindow {
         Ok(result)
     }
 
-    pub fn resample_gauges(
+    pub fn resample_gauges<C: Counter>(
         &self,
-        metrics: &MetricStore,
+        metrics: &MetricStore<C>,
         buckets: Vec<&GaugeBucket>,
     ) -> anyhow::Result<Timeseries> {
         // Start by filling out the output buckets with unknown values.
@@ -833,10 +836,10 @@ impl MetricsWindow {
         Ok(result)
     }
 
-    pub fn resample_histograms(
+    pub fn resample_histograms<C: Counter>(
         &self,
-        metrics: &MetricStore,
-        buckets: Vec<&HistogramBucket>,
+        metrics: &MetricStore<C>,
+        buckets: Vec<&HistogramBucket<C>>,
         percentiles: &[Percentile],
     ) -> anyhow::Result<BTreeMap<Percentile, Timeseries>> {
         if percentiles.len() > 5 {
@@ -867,7 +870,7 @@ impl MetricsWindow {
             let bucket_start = metrics.bucket_start(bucket_index);
             if (self.start..self.end).contains(&bucket_start) {
                 let (_, value) = &mut histograms[self.bucket_index(bucket_start)?];
-                let histogram = Histogram::new_with_bounds(
+                let histogram = Histogram::<C>::new_with_bounds(
                     metrics.config.histogram_min_duration.as_millis() as u64,
                     metrics.config.histogram_max_duration.as_millis() as u64,
                     metrics.config.histogram_significant_figures,
@@ -915,3 +918,47 @@ pub type Timeseries = Vec<(SystemTime, Option<f64>)>;
 
 /// Integer in [0, 100].
 pub type Percentile = usize;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u32_histograms_preserve_percentiles_after_more_than_255_samples_in_one_bin() {
+        let base_ts = SystemTime::UNIX_EPOCH;
+        let mut metrics = MetricStore::<u32>::new(
+            base_ts,
+            MetricStoreConfig {
+                bucket_width: Duration::from_secs(60),
+                max_buckets: 1,
+                histogram_min_duration: Duration::from_millis(1),
+                histogram_max_duration: Duration::from_secs(1),
+                histogram_significant_figures: 3,
+            },
+        );
+        let sample_ts = base_ts + Duration::from_secs(1);
+        for _ in 0..300 {
+            metrics
+                .add_histogram("latency", sample_ts, Duration::from_millis(10))
+                .unwrap();
+        }
+        metrics
+            .add_histogram("latency", sample_ts, Duration::from_secs(1))
+            .unwrap();
+
+        let window = MetricsWindow {
+            start: base_ts,
+            end: base_ts + Duration::from_secs(60),
+            num_buckets: 1,
+        };
+        let buckets = metrics
+            .query_histogram("latency", window.start..window.end)
+            .unwrap();
+        assert_eq!(buckets[0].histogram.len(), 301);
+
+        let percentiles = window
+            .resample_histograms(&metrics, buckets, &[90])
+            .unwrap();
+        assert_eq!(percentiles[&90][0], (base_ts, Some(0.01)));
+    }
+}

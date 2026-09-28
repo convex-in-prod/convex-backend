@@ -25,6 +25,11 @@ use serde_json::{
     json,
     Value as JsonValue,
 };
+use udf::{
+    HostOperationTraceEntryHandle,
+    LogicalHostOperation,
+    LogicalHostOperationStatus,
+};
 use value::{
     id_v6::DeveloperDocumentId,
     identifier::Identifier,
@@ -46,6 +51,16 @@ use crate::{
 };
 
 pub trait SyscallProviderInternal<RT: Runtime> {
+    fn start_logical_host_operation(
+        &mut self,
+        operation: LogicalHostOperation,
+    ) -> Option<HostOperationTraceEntryHandle>;
+    fn complete_logical_host_operation(
+        &mut self,
+        entry: Option<HostOperationTraceEntryHandle>,
+        status: LogicalHostOperationStatus,
+    );
+
     fn table_filter(&self) -> TableFilter;
 
     fn lookup_table(&mut self, name: &TableName) -> anyhow::Result<Option<TabletIdAndTableNumber>>;
@@ -61,6 +76,21 @@ pub trait SyscallProviderInternal<RT: Runtime> {
 }
 
 impl<RT: Runtime> SyscallProviderInternal<RT> for DatabaseUdfSyscallProvider<RT> {
+    fn start_logical_host_operation(
+        &mut self,
+        operation: LogicalHostOperation,
+    ) -> Option<HostOperationTraceEntryHandle> {
+        self.host_operation_trace.start(operation)
+    }
+
+    fn complete_logical_host_operation(
+        &mut self,
+        entry: Option<HostOperationTraceEntryHandle>,
+        status: LogicalHostOperationStatus,
+    ) {
+        self.host_operation_trace.complete(entry, status);
+    }
+
     fn table_filter(&self) -> TableFilter {
         if self.path.udf_path.is_system() {
             TableFilter::IncludePrivateSystemTables
@@ -129,7 +159,8 @@ pub fn syscall_impl<RT: Runtime, P: SyscallProviderInternal<RT>>(
     name: &str,
     args: JsonValue,
 ) -> anyhow::Result<JsonValue> {
-    match name {
+    let trace_entry = provider.start_logical_host_operation(logical_sync_syscall_operation(name));
+    let result = match name {
         "1.0/queryCleanup" => syscall_query_cleanup(provider, args),
         "1.0/queryStream" => syscall_query_stream(provider, args),
         "1.0/db/normalizeId" => syscall_normalize_id(provider, args),
@@ -137,16 +168,36 @@ pub fn syscall_impl<RT: Runtime, P: SyscallProviderInternal<RT>>(
         "1.0/requireOperation" => syscall_require_operation(provider, args),
         "1.0/getSnapshotTs" => syscall_snapshot_ts(provider, args),
 
-        "throwOcc" => anyhow::bail!(ErrorMetadata::user_occ(None, None, None)),
-        "throwOverloaded" => {
-            anyhow::bail!(ErrorMetadata::overloaded("Busy", "I'm a bit busy."))
+        "throwOcc" => Err(ErrorMetadata::user_occ(None, None, None).into()),
+        "throwOverloaded" => Err(ErrorMetadata::overloaded("Busy", "I'm a bit busy.").into()),
+        _ => Err(ErrorMetadata::bad_request(
+            "UnknownOperation",
+            format!("Unknown operation {name}"),
+        )
+        .into()),
+    };
+    provider.complete_logical_host_operation(
+        trace_entry,
+        if result.is_ok() {
+            LogicalHostOperationStatus::Success
+        } else {
+            LogicalHostOperationStatus::Failure
         },
-        _ => {
-            anyhow::bail!(ErrorMetadata::bad_request(
-                "UnknownOperation",
-                format!("Unknown operation {name}")
-            ));
-        },
+    );
+    result
+}
+
+fn logical_sync_syscall_operation(name: &str) -> LogicalHostOperation {
+    match name {
+        "1.0/queryCleanup" => LogicalHostOperation::DatabaseQueryCleanup,
+        "1.0/queryStream" => LogicalHostOperation::DatabaseQueryStream,
+        "1.0/db/normalizeId" => LogicalHostOperation::DatabaseNormalizeId,
+        "1.0/componentArgument" => LogicalHostOperation::ComponentArgument,
+        "1.0/requireOperation" => LogicalHostOperation::RequireOperation,
+        "1.0/getSnapshotTs" => LogicalHostOperation::SnapshotTimestamp,
+        "throwOcc" => LogicalHostOperation::ThrowOcc,
+        "throwOverloaded" => LogicalHostOperation::ThrowOverloaded,
+        _ => LogicalHostOperation::UnknownSyncSyscall,
     }
 }
 
@@ -218,12 +269,12 @@ fn syscall_component_argument<RT: Runtime, P: SyscallProviderInternal<RT>>(
     Ok(result)
 }
 
-fn syscall_query_stream<RT: Runtime, P: SyscallProviderInternal<RT>>(
-    provider: &mut P,
-    args: JsonValue,
-) -> anyhow::Result<JsonValue> {
-    let _s = static_span!();
+pub(super) struct QueryStreamRequest {
+    pub(super) query: Query,
+    pub(super) version: Option<Version>,
+}
 
+pub(super) fn parse_query_stream_request(args: JsonValue) -> anyhow::Result<QueryStreamRequest> {
     #[derive(Deserialize)]
     struct QueryStreamArgs {
         query: JsonValue,
@@ -235,7 +286,19 @@ fn syscall_query_stream<RT: Runtime, P: SyscallProviderInternal<RT>>(
         let version = parse_version(args.version)?;
         Ok((parsed_query, version))
     })?;
-    let query_id = provider.start_query(parsed_query, version)?;
+    Ok(QueryStreamRequest {
+        query: parsed_query,
+        version,
+    })
+}
+
+fn syscall_query_stream<RT: Runtime, P: SyscallProviderInternal<RT>>(
+    provider: &mut P,
+    args: JsonValue,
+) -> anyhow::Result<JsonValue> {
+    let _s = static_span!();
+    let QueryStreamRequest { query, version } = parse_query_stream_request(args)?;
+    let query_id = provider.start_query(query, version)?;
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -297,4 +360,27 @@ fn syscall_snapshot_ts<RT: Runtime, P: SyscallProviderInternal<RT>>(
 ) -> anyhow::Result<JsonValue> {
     let _s = static_span!();
     Ok(provider.snapshot_ts()?.to_internal_json())
+}
+
+#[cfg(test)]
+mod tests {
+    use udf::LogicalHostOperation;
+
+    use super::logical_sync_syscall_operation;
+
+    #[test]
+    fn logical_sync_syscalls_use_fixed_categories() {
+        assert_eq!(
+            logical_sync_syscall_operation("1.0/db/normalizeId"),
+            LogicalHostOperation::DatabaseNormalizeId
+        );
+        assert_eq!(
+            logical_sync_syscall_operation("1.0/getSnapshotTs"),
+            LogicalHostOperation::SnapshotTimestamp
+        );
+        assert_eq!(
+            logical_sync_syscall_operation("unexpected"),
+            LogicalHostOperation::UnknownSyncSyscall
+        );
+    }
 }

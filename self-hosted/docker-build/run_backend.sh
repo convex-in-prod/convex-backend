@@ -1,5 +1,6 @@
 #! /bin/bash
 
+# DATA_DIR is the durable root for backend state.
 export DATA_DIR=${DATA_DIR:-/convex/data}
 export TMPDIR=${TMPDIR:-"$DATA_DIR/tmp"}
 export STORAGE_DIR=${STORAGE_DIR:-"$DATA_DIR/storage"}
@@ -10,7 +11,7 @@ POSTGRES_DB_FLAGS=(--db postgres-v5)
 MYSQL_DB_FLAGS=(--db mysql-v5)
 
 set -e
-mkdir -p "$TMPDIR" "$STORAGE_DIR"
+mkdir -p "$DATA_DIR" "$TMPDIR" "$STORAGE_DIR"
 
 source ./read_credentials.sh
 

@@ -312,6 +312,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             file_storage,
             module_loader,
             deployment,
+            ..
         }: EnvironmentData<RT>,
         identity: Identity,
         transaction: Transaction<RT>,

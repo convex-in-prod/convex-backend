@@ -338,6 +338,8 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> RequestScope<
         args: v8::FunctionCallbackArguments,
         rv: v8::ReturnValue,
     ) {
+        let _execution_owner =
+            crate::execution_observation::enter(crate::execution_observation::Owner::Host);
         let mut scope = ExecutionScope::<RT, E>::new(scope);
         if let Err(e) = run_v8_op(&mut scope, args, rv) {
             Self::handle_syscall_or_op_error(&mut scope, e)
@@ -349,6 +351,8 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> RequestScope<
         args: v8::FunctionCallbackArguments,
         rv: v8::ReturnValue,
     ) {
+        let _execution_owner =
+            crate::execution_observation::enter(crate::execution_observation::Owner::Host);
         let mut scope = ExecutionScope::<RT, E>::new(scope);
         if let Err(e) = start_async_op(&mut scope, args, rv) {
             Self::handle_syscall_or_op_error(&mut scope, e)
@@ -360,6 +364,8 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> RequestScope<
         args: v8::FunctionCallbackArguments,
         rv: v8::ReturnValue,
     ) {
+        let _execution_owner =
+            crate::execution_observation::enter(crate::execution_observation::Owner::Host);
         let mut scope = ExecutionScope::<RT, E>::new(scope);
         if let Err(e) = scope.syscall(args, rv) {
             Self::handle_syscall_or_op_error(&mut scope, e)
@@ -371,6 +377,8 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> RequestScope<
         args: v8::FunctionCallbackArguments,
         rv: v8::ReturnValue,
     ) {
+        let _execution_owner =
+            crate::execution_observation::enter(crate::execution_observation::Owner::Host);
         let mut scope = ExecutionScope::<RT, E>::new(scope);
         if let Err(e) = scope.async_syscall(args, rv) {
             Self::handle_syscall_or_op_error(&mut scope, e)

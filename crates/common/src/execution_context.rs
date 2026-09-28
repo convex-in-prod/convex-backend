@@ -94,7 +94,6 @@ impl RequestMetadata {
             user_agent: None,
         }
     }
-
 }
 
 impl HeapSize for RequestMetadata {
@@ -132,7 +131,6 @@ impl RequestContext {
             mutation_priority: MutationPriority::Normal,
         }
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -109,6 +109,8 @@ use function_runner::{
         FunctionMetadata,
         HttpActionMetadata,
     },
+    FunctionExecutionMode,
+    FunctionExecutionResult,
     FunctionReads,
     FunctionRunner,
     FunctionWrites,
@@ -295,6 +297,8 @@ const NODE_ANALYZE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 mod http_routing;
 mod metrics;
+pub(crate) mod query_shadow;
+use query_shadow::QueryShadowCoordinator;
 
 /// Wrapper for [IsolateClient]s and [FunctionRunner]s that determines where to
 /// route requests.
@@ -369,7 +373,7 @@ pub(crate) enum DatabaseFunctionKind {
 
 impl<RT: Runtime> FunctionRouter<RT> {
     #[fastrace::trace]
-    pub(crate) async fn execute_query_or_mutation(
+    pub(crate) async fn execute_query_or_mutation_with_mode(
         &self,
         tx: Transaction<RT>,
         path_and_args: ValidatedPathAndArgs,
@@ -377,6 +381,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         journal: QueryJournal,
         context: ExecutionContext,
         scheduler_dependency: SchedulerDependencyClass,
+        execution_mode: FunctionExecutionMode,
     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
         let (udf_type, function_metadata) = match function_kind {
             DatabaseFunctionKind::Query(active_javascript_class) => (
@@ -408,6 +413,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 None,
                 scheduler_dependency,
                 false,
+                execution_mode,
             )
             .await?;
         let tx = tx.with_context(|| format!("Missing transaction in response for {udf_type}"))?;
@@ -437,6 +443,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 function_execution_start,
                 scheduler_dependency,
                 wait_for_permit,
+                FunctionExecutionMode::Configured,
             )
             .await?;
 
@@ -467,6 +474,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 None,
                 SchedulerDependencyClass::Independent,
                 false,
+                FunctionExecutionMode::Configured,
             )
             .await?;
 
@@ -498,6 +506,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         function_execution_start: Option<FunctionExecutionStartGate>,
         scheduler_dependency: SchedulerDependencyClass,
         wait_for_permit: bool,
+        execution_mode: FunctionExecutionMode,
     ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
         let in_memory_index_last_modified = self
             .database
@@ -536,6 +545,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         let timer = function_run_timer(udf_type);
         let execution = isolate::execution_observation::observe(
             self.function_runner.run_function(
+                execution_mode,
                 udf_type,
                 tx.identity().clone(),
                 tx.begin_timestamp(),
@@ -570,7 +580,15 @@ impl<RT: Runtime> FunctionRouter<RT> {
             // have both been checked.
             diagnostic.outcome = AttemptOutcome::SystemError;
         }
-        let (function_tx, outcome, usage_stats) = execution?;
+        let execution = execution?;
+        let FunctionExecutionResult::Completed {
+            transaction: function_tx,
+            outcome,
+            usage_stats,
+        } = execution
+        else {
+            anyhow::bail!("Static Hermes Wasm route was unavailable")
+        };
         timer.finish();
         drop(permit);
 
@@ -957,6 +975,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
     key_broker: KeyBroker,
 
     isolate_functions: FunctionRouter<RT>,
+    mutation_shadow: QueryShadowCoordinator,
     // Used for analyze, schema, etc.
     node_actions: NodeActions<RT>,
 
@@ -1000,6 +1019,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             default_system_env_vars.clone(),
             function_log.clone(),
         );
+        let mutation_shadow = QueryShadowCoordinator::new(Arc::new(function_log.clone()));
         // Construct this gate once per application runner. The cache manager
         // and isolate analysis must receive clones of the same semaphore or
         // their loads become additive again.
@@ -1051,6 +1071,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             database,
             key_broker,
             isolate_functions,
+            mutation_shadow,
             node_actions,
             source_map_cache,
             modules_storage,
@@ -1154,13 +1175,18 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         let (mut tx, outcome) = match validate_result {
             Ok(path_and_args) => {
                 self.isolate_functions
-                    .execute_query_or_mutation(
+                    .execute_query_or_mutation_with_mode(
                         tx,
                         path_and_args,
                         DatabaseFunctionKind::Query(ActiveJavascriptClass::Protected),
                         QueryJournal::new(),
                         context.clone(),
                         SchedulerDependencyClass::Independent,
+                        // Direct admin/system queries must preserve the same V8-primary
+                        // shadow policy as cache misses. A disabled sampler returns
+                        // `Configured`, retaining the ordinary route behavior.
+                        self.mutation_shadow
+                            .execution_mode(&self.runtime, UdfType::Query),
                     )
                     .await?
             },
@@ -1433,6 +1459,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     return Ok(Err(MutationError {
                         error: error.to_owned(),
                         log_lines,
+                        host_operation_error: outcome.host_operation_error,
                     }));
                 },
             };
@@ -1476,6 +1503,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         Err(MutationError {
                             error: js_error,
                             log_lines,
+                            host_operation_error: outcome.host_operation_error,
                         })
                     } else {
                         if let Some(occ_info) = e.occ_info()
@@ -1663,13 +1691,15 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         let path = path_and_args.path().clone();
         let (mut tx, outcome) = self
             .isolate_functions
-            .execute_query_or_mutation(
+            .execute_query_or_mutation_with_mode(
                 tx,
                 path_and_args,
                 DatabaseFunctionKind::Mutation,
                 QueryJournal::new(),
                 context.clone(),
                 scheduler_dependency,
+                self.mutation_shadow
+                    .execution_mode(&self.runtime, UdfType::Mutation),
             )
             .await?;
         let mutation_outcome = match outcome {
@@ -3501,4 +3531,7 @@ mod tests {
             Ok(())
         })
     }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    mod static_hermes_wasmtime_gate;
 }
