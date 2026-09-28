@@ -217,6 +217,12 @@ impl ConcurrencyLimiter {
         )
     }
 
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub(crate) fn new_for_wasm(max_concurrency: usize) -> Self {
+        // Wasm shares permit scheduling, not the V8 capacity or occupancy budget.
+        // Its routing layer already records separate CPU capacity and admission.
+        Self::new_inner(max_concurrency, 0, 0, false, false)
+    }
 
     fn new_inner(
         max_concurrency: usize,

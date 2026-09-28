@@ -24,6 +24,7 @@ use value::{
 mod buffer;
 mod debug;
 mod flexbuilder;
+pub mod memory;
 mod walk;
 
 pub use self::buffer::{

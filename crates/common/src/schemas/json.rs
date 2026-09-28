@@ -809,11 +809,16 @@ impl TryFrom<LiteralValidator> for JsonValue {
         let v = match s {
             LiteralValidator::Float64(f) => {
                 let f: f64 = f.into();
-                let n = serde_json::Number::from_f64(f).context(ErrorMetadata::bad_request(
-                    "UnsupportedFloatLiteral",
-                    "Infinite or NaN values are not supported in literal validators.",
-                ))?;
-                JsonValue::Number(n)
+                anyhow::ensure!(
+                    f.is_finite(),
+                    ErrorMetadata::bad_request(
+                        "UnsupportedFloatLiteral",
+                        "Infinite or NaN values are not supported in literal validators.",
+                    )
+                );
+                // Literal equality distinguishes signed zero. Use the Convex
+                // encoding so a JavaScript JSON round trip preserves its sign.
+                JsonValue::from(ConvexValue::Float64(f))
             },
             LiteralValidator::Int64(i) => JsonValue::from(ConvexValue::Int64(i)),
             LiteralValidator::Boolean(b) => JsonValue::Bool(b),

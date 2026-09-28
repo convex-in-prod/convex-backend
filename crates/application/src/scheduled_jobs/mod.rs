@@ -170,6 +170,21 @@ pub struct ScheduledJobRunner {
 }
 
 impl ScheduledJobRunner {
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub fn disabled<RT: Runtime>(rt: RT) -> Self {
+        let executor = Arc::new(Mutex::new(
+            rt.spawn("scheduled_job_executor_disabled", std::future::pending()),
+        ));
+        let garbage_collector = Arc::new(Mutex::new(rt.spawn(
+            "scheduled_job_garbage_collector_disabled",
+            std::future::pending(),
+        )));
+        Self {
+            executor,
+            garbage_collector,
+        }
+    }
+
     pub fn start<RT: Runtime>(
         rt: RT,
         deployment_name: String,

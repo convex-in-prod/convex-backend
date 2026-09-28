@@ -4,8 +4,9 @@ Status: implemented as an optional operator policy within the complete
 application-declared local Node executor pools adoption unit.
 
 This document describes independent-action concurrency limits, queue-delay
-observability, event-loop unresponsiveness budgets, and optional RSS retirement
-thresholds for the default and named local Node executor pools. An application
+observability, event-loop unresponsiveness budgets, and optional RSS and
+generation-retirement thresholds for the default and named local Node executor
+pools. An application
 declaration selects a process pool, while this subordinate policy lets an
 operator constrain how work enters that pool, choose how long its main event
 loop may stop responding before replacement, and set its sampled direct-child
@@ -47,7 +48,9 @@ without a named assignment. For example:
     "maxOldSpaceSizeMib": 1536,
     "memoryPressureMinRssBytes": 2147483648,
     "maxEventLoopUnresponsiveSeconds": 30,
-    "queueWarningSeconds": 10
+    "queueWarningSeconds": 10,
+    "maxGenerationAgeSeconds": 21600,
+    "backgroundDrainTimeoutSeconds": 30
   }
 }
 ```
@@ -72,6 +75,14 @@ All fields are optional within a non-empty pool policy:
   pool-admission wait reaches the configured duration. It requires
   `maxConcurrency`; it does not reject a scheduled job or change its durable
   state.
+- `maxGenerationAgeSeconds` sets the healthy generation-age retirement limit.
+  Omission inherits `LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS`; explicit
+  `null` disables only age retirement for that pool. RSS, package, pressure,
+  watchdog, and deployment/topology retirement remain active.
+- `backgroundDrainTimeoutSeconds` bounds the process-generation resident
+  cleanup callback. It defaults to 30 seconds and is used when a generation
+  registers the callback; callback errors and expiry are recorded before the
+  child is reaped.
 
 Unknown fields, invalid pool names, empty policies, zero values, a queue
 warning without a pool concurrency limit, and a per-pool concurrency limit
@@ -151,9 +162,13 @@ Metrics report, by pool:
 - waits that reached the configured warning duration;
 - the effective V8 old-space allowance, RSS retirement threshold, and
   cgroup-pressure RSS threshold;
-- the configured event-loop unresponsiveness budget; and
+- the configured event-loop unresponsiveness budget, healthy generation-age
+  threshold, and resident callback timeout;
 - the existing health-probe, consecutive-miss, generation, and request
-  lifecycle signals.
+  lifecycle signals;
+- `local_node_executor_background_drain_outcomes_total{pool_name,reason,outcome}`
+  records callback presence, completion, error, timeout, response, and
+  cancellation outcomes.
 
 Queue warnings are evidence for capacity tuning. They do not automatically
 fail or retry work.

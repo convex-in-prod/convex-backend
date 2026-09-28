@@ -59,6 +59,7 @@ use common::{
         IndexName,
         ModuleEnvironment,
         NodeDependency,
+        ObjectKey,
         RepeatableTimestamp,
         Timestamp,
     },
@@ -91,8 +92,13 @@ use fastrace::{
     Span,
 };
 use futures::FutureExt;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use isolate::{
+    source_keyed_paired_deployment_guard_enabled,
+    SourceKeyedRuntimeGenerationIdentity,
+    SourceKeyedRuntimeReadiness,
+};
 use keybroker::Identity;
-use storage::ObjectKey;
 use maplit::btreeset;
 use model::{
     auth::{
@@ -141,20 +147,28 @@ use model::{
         },
     },
     environment_variables::EnvironmentVariablesModel,
-    external_packages::types::ExternalDepsPackageId,
+    external_packages::{
+        types::{
+            ExternalDepsPackage,
+            ExternalDepsPackageId,
+        },
+        ExternalPackagesModel,
+    },
     modules::module_versions::{
         AnalyzedModule,
         ModuleSource,
         SourceMap,
     },
     source_packages::{
+        runtime_content::runtime_content_sha256,
         types::{
             NodeExecutorPoolTopology,
             NodeVersion,
             NodeVersionDiff,
             SourcePackage,
+            SourcePackageRuntimeGeneration,
         },
-        upload_download::download_package,
+        upload_download::download_package_with_metadata,
         SourcePackageModel,
     },
     udf_config::types::UdfConfig,
@@ -184,6 +198,7 @@ use value::{
 };
 
 use crate::{
+    application_function_runner::ApplicationFunctionRunner,
     schema_worker::table_shape_provider,
     validate_env_var_values,
     Application,
@@ -204,6 +219,26 @@ pub struct PushMetrics {
     pub upload_source_package_time: Duration,
     pub analyze_time: Duration,
     pub occ_stats: OccRetryStats,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceKeyedRuntimeExpectedPrior {
+    pub source_package_id: DeveloperDocumentId,
+    pub source_package_sha256: Sha256Digest,
+    pub source_package_runtime_content_sha256: Option<Sha256Digest>,
+    pub runtime_generation: Option<SourcePackageRuntimeGeneration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceKeyedRuntimeActivation {
+    pub expected_prior: SourceKeyedRuntimeExpectedPrior,
+    pub target_generation: SourcePackageRuntimeGeneration,
+}
+
+struct PreparedSourceKeyedRuntimeActivation {
+    expected_prior: SourceKeyedRuntimeExpectedPrior,
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    preparation: isolate::PreparedSourceKeyedRuntime,
 }
 
 pub(crate) async fn validate_native_resident_activation_in_tx<RT: Runtime>(
@@ -285,7 +320,219 @@ struct EvaluatedPushContents {
     app_functions: Vec<ModuleConfig>,
 }
 
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+fn validate_source_keyed_runtime_readiness(
+    paired_primary_enabled: bool,
+    runtime_content_sha256: Option<&Sha256Digest>,
+    runtime_generation: Option<&SourcePackageRuntimeGeneration>,
+    readiness: Option<SourceKeyedRuntimeReadiness>,
+) -> anyhow::Result<()> {
+    if !paired_primary_enabled {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        runtime_content_sha256.is_some(),
+        ErrorMetadata::bad_request(
+            "StaticHermesWasmGenerationNotReady",
+            "The source package has no load-verified Wasm generation staged for paired deployment",
+        )
+    );
+    anyhow::ensure!(
+        runtime_generation.is_some(),
+        ErrorMetadata::bad_request(
+            "StaticHermesWasmGenerationNotReady",
+            "The paired deployment request has no exact Wasm generation selector",
+        )
+    );
+    anyhow::ensure!(
+        readiness == Some(SourceKeyedRuntimeReadiness::Ready),
+        ErrorMetadata::bad_request(
+            "StaticHermesWasmGenerationNotReady",
+            "The source package has no load-verified Wasm generation staged for paired deployment",
+        )
+    );
+    Ok(())
+}
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+async fn prepare_source_keyed_runtime_activation<RT: Runtime>(
+    runner: impl FnOnce() -> Arc<ApplicationFunctionRunner<RT>>,
+    source_package: &mut SourcePackage,
+    activation: Option<SourceKeyedRuntimeActivation>,
+) -> anyhow::Result<Option<PreparedSourceKeyedRuntimeActivation>> {
+    // Paired activation is opt-in per publication, not mandatory for every client
+    // of a Wasm-capable backend. Ordinary clients publish V8 source and clear the
+    // selected generation; retained artifacts cannot authorize that new source.
+    let Some(activation) = activation else {
+        source_package.runtime_generation = None;
+        return Ok(None);
+    };
+    let paired_deployment_enabled = source_keyed_paired_deployment_guard_enabled()?;
+    anyhow::ensure!(
+        paired_deployment_enabled,
+        ErrorMetadata::bad_request(
+            "SourceKeyedRuntimeActivationUnsupported",
+            "This backend is not configured for paired source-keyed activation",
+        )
+    );
+    let runtime_content_sha256 = source_package.runtime_content_sha256.as_ref();
+    let generation_identity = SourceKeyedRuntimeGenerationIdentity {
+        deployment_sha256: activation.target_generation.deployment_sha256.as_hex(),
+        generation_manifest_sha256: activation
+            .target_generation
+            .generation_manifest_sha256
+            .as_hex(),
+        generation_sha256: activation.target_generation.generation_sha256.as_hex(),
+    };
+    let preparation = match runtime_content_sha256.map(Sha256Digest::as_hex) {
+        Some(sha256) => Some(
+            runner()
+                .prepare_source_keyed_runtime(&sha256, &generation_identity)
+                .await?,
+        ),
+        None => None,
+    };
+    validate_source_keyed_runtime_readiness(
+        paired_deployment_enabled,
+        runtime_content_sha256,
+        Some(&activation.target_generation),
+        preparation.as_ref().map(|preparation| match preparation {
+            isolate::SourceKeyedRuntimePreparation::Prepared(_) => {
+                SourceKeyedRuntimeReadiness::Ready
+            },
+            isolate::SourceKeyedRuntimePreparation::CapacityUnavailable => {
+                SourceKeyedRuntimeReadiness::CapacityUnavailable
+            },
+            isolate::SourceKeyedRuntimePreparation::NotStaged => {
+                SourceKeyedRuntimeReadiness::NotStaged
+            },
+        }),
+    )?;
+    let Some(isolate::SourceKeyedRuntimePreparation::Prepared(preparation)) = preparation else {
+        anyhow::bail!("validated runtime preparation has no initialized inventory");
+    };
+    source_package.runtime_generation = Some(activation.target_generation);
+    Ok(Some(PreparedSourceKeyedRuntimeActivation {
+        expected_prior: activation.expected_prior,
+        preparation,
+    }))
+}
+
+#[cfg(not(feature = "static-hermes-wasmtime-gate"))]
+async fn prepare_source_keyed_runtime_activation<RT: Runtime>(
+    _runner: impl FnOnce() -> Arc<ApplicationFunctionRunner<RT>>,
+    _source_package: &mut SourcePackage,
+    activation: Option<SourceKeyedRuntimeActivation>,
+) -> anyhow::Result<Option<PreparedSourceKeyedRuntimeActivation>> {
+    anyhow::ensure!(
+        activation.is_none(),
+        ErrorMetadata::bad_request(
+            "SourceKeyedRuntimeActivationUnsupported",
+            "This backend does not support paired source-keyed activation",
+        )
+    );
+    Ok(None)
+}
+
+fn validate_source_keyed_runtime_expected_prior(
+    expected: &SourceKeyedRuntimeExpectedPrior,
+    actual_id: DeveloperDocumentId,
+    actual: &SourcePackage,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        actual_id == expected.source_package_id
+            && actual.sha256 == expected.source_package_sha256
+            && actual.runtime_content_sha256 == expected.source_package_runtime_content_sha256
+            && actual.runtime_generation == expected.runtime_generation,
+        ErrorMetadata::bad_request(
+            "SourceKeyedRuntimeExpectedPriorMismatch",
+            "The committed source/runtime state changed before paired activation",
+        )
+    );
+    Ok(())
+}
+
+async fn validate_source_keyed_runtime_expected_prior_in_tx<RT: Runtime>(
+    tx: &mut database::Transaction<RT>,
+    expected: &SourceKeyedRuntimeExpectedPrior,
+) -> anyhow::Result<()> {
+    let actual = SourcePackageModel::new(tx, TableNamespace::Global)
+        .get_latest_record()
+        .await?
+        .context(ErrorMetadata::bad_request(
+            "SourceKeyedRuntimeExpectedPriorMismatch",
+            "The committed source package disappeared before paired activation",
+        ))?;
+    validate_source_keyed_runtime_expected_prior(expected, actual.developer_id(), &actual)
+}
+
+fn restore_source_package_runtime_content_sha256(
+    source_package: &mut SourcePackage,
+    verified_runtime_content_sha256: Sha256Digest,
+) -> anyhow::Result<()> {
+    if let Some(returned_runtime_content_sha256) = &source_package.runtime_content_sha256 {
+        anyhow::ensure!(
+            returned_runtime_content_sha256 == &verified_runtime_content_sha256,
+            ErrorMetadata::bad_request(
+                "SourcePackageRuntimeContentMismatch",
+                "The source package runtime-content identity does not match its downloaded \
+                 contents",
+            )
+        );
+    }
+    source_package.runtime_content_sha256 = Some(verified_runtime_content_sha256);
+    Ok(())
+}
+
+fn validate_source_package_external_deps_identity(
+    archive_external_deps_storage_key: Option<&ObjectKey>,
+    external_deps_package: Option<&ExternalDepsPackage>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        archive_external_deps_storage_key
+            == external_deps_package.map(|package| &package.storage_key),
+        ErrorMetadata::bad_request(
+            "SourcePackageExternalDepsMismatch",
+            "The source package dependencies do not match its downloaded contents",
+        )
+    );
+    Ok(())
+}
+
 impl<RT: Runtime> Application<RT> {
+    async fn restore_downloaded_source_package_runtime_content_identity(
+        &self,
+        source_package: &mut SourcePackage,
+        downloaded_package: &BTreeMap<CanonicalizedModulePath, ModuleConfig>,
+        archive_external_deps_storage_key: Option<&ObjectKey>,
+    ) -> anyhow::Result<()> {
+        let external_deps_package = match &source_package.external_deps_package_id {
+            Some(external_deps_package_id) => {
+                let mut tx = self.begin(Identity::system()).await?;
+                let external_deps_package = ExternalPackagesModel::new(&mut tx)
+                    .get(external_deps_package_id.clone())
+                    .await?
+                    .into_value();
+                tx.into_token()?;
+                Some(external_deps_package)
+            },
+            None => None,
+        };
+        validate_source_package_external_deps_identity(
+            archive_external_deps_storage_key,
+            external_deps_package.as_ref(),
+        )?;
+        let verified_runtime_content_sha256 = runtime_content_sha256(
+            downloaded_package.values(),
+            external_deps_package.as_ref(),
+            source_package.node_version,
+        )?;
+        restore_source_package_runtime_content_sha256(
+            source_package,
+            verified_runtime_content_sha256,
+        )
+    }
+
     async fn complete_node_executor_pool_cutover_after_commit(
         &self,
         topology: &NodeExecutorPoolTopology,
@@ -1164,6 +1411,7 @@ impl<RT: Runtime> Application<RT> {
         request_metadata: RequestMetadata,
         mut start_push: StartPushResponse,
         message: Option<PushMessage>,
+        source_keyed_runtime_activation: Option<SourceKeyedRuntimeActivation>,
         native_resident_activation: Option<
             model::source_packages::native::NativeResidentActivation,
         >,
@@ -1198,22 +1446,34 @@ impl<RT: Runtime> Application<RT> {
         );
         // Resolve source bytes from this server's retained preparation or the
         // uploaded archive. Both paths still validate activation inputs below.
-        let mut downloaded_source_packages = BTreeMap::new();
+        let mut downloaded_packages = BTreeMap::new();
+        let mut root_archive_external_deps_storage_key = None;
         for (definition_path, source_package) in &mut start_push.component_definition_packages {
-            // The client round trip cannot supply durable native selection.
+            // `StartPushResponse` crosses a client round trip. A client cannot
+            // provide durable runtime-generation authority for any component.
+            source_package.runtime_generation = None;
             source_package.native_resident = None;
             let package = if let Some(prepared) = prepared {
+                if definition_path.is_root() {
+                    root_archive_external_deps_storage_key =
+                        prepared.external_deps_storage_key.clone();
+                }
                 prepared
                     .packages
                     .get(definition_path)
                     .context("prepared component package missing")?
             } else {
-                let package =
-                    download_package(self.modules_storage().clone(), source_package).await?;
-                anyhow::ensure!(downloaded_source_packages
-                    .insert(definition_path.clone(), package)
+                let downloaded_package =
+                    download_package_with_metadata(self.modules_storage().clone(), source_package)
+                        .await?;
+                if definition_path.is_root() {
+                    root_archive_external_deps_storage_key =
+                        downloaded_package.external_deps_storage_key.clone();
+                }
+                anyhow::ensure!(downloaded_packages
+                    .insert(definition_path.clone(), downloaded_package.modules)
                     .is_none());
-                downloaded_source_packages
+                downloaded_packages
                     .get(definition_path)
                     .context("downloaded component package missing")?
             };
@@ -1240,11 +1500,28 @@ impl<RT: Runtime> Application<RT> {
         // finish outside the registry's retained-source reservation.
         let downloaded_source_packages = match prepared {
             Some(prepared) => &prepared.packages,
-            None => &downloaded_source_packages,
+            None => &downloaded_packages,
         };
+        let root_definition_path = ComponentDefinitionPath::root();
+        let downloaded_root_package = downloaded_source_packages
+            .get(&root_definition_path)
+            .context("No downloaded source package for the root component")?;
+        let root_source_package = start_push
+            .component_definition_packages
+            .get_mut(&root_definition_path)
+            .context("No source package for the root component")?;
+        // The source-package response crosses a client round trip. Restore the
+        // runtime identity from the downloaded contents before it becomes
+        // deployment authority.
+        self.restore_downloaded_source_package_runtime_content_identity(
+            root_source_package,
+            downloaded_root_package,
+            root_archive_external_deps_storage_key.as_ref(),
+        )
+        .await?;
         let committed_pool_topology = start_push
             .component_definition_packages
-            .get(&ComponentDefinitionPath::root())
+            .get(&root_definition_path)
             .context("No source package for the root component")?
             .node_executor_pool_topology
             .clone();
@@ -1255,14 +1532,26 @@ impl<RT: Runtime> Application<RT> {
         self.runner()
             .validate_node_executor_pool_topology(&committed_pool_topology)?;
 
-        let root_definition_path = ComponentDefinitionPath::root();
-        if let Some(activation) = &native_resident_activation {
-            activation.validate()?;
-            start_push
+        let prepared_runtime_activation = {
+            let source_package = start_push
                 .component_definition_packages
                 .get_mut(&root_definition_path)
-                .context("Missing root source package")?
-                .native_resident = activation.target.clone();
+                .context("No source package for the root component")?;
+            prepare_source_keyed_runtime_activation(
+                || self.runner(),
+                source_package,
+                source_keyed_runtime_activation,
+            )
+            .await?
+        };
+
+        if let Some(activation) = &native_resident_activation {
+            activation.validate()?;
+            let root_source_package = start_push
+                .component_definition_packages
+                .get_mut(&root_definition_path)
+                .context("Missing root source package")?;
+            root_source_package.native_resident = activation.target.clone();
         }
 
         let cutover_reservation = self
@@ -1288,188 +1577,243 @@ impl<RT: Runtime> Application<RT> {
                     .and_then(|activation| activation.application_contract.as_deref()),
             )
             .await?;
-
-        let (diff, ts) = self
-            .execute_with_audit_log_events_and_occ_retries_with_timestamp(
-                identity.clone(),
-                request_metadata,
-                finish_push_write_source,
-                *FINISH_PUSH_MAX_OCC_FAILURES,
-                |tx| {
-                    let operation = &operation;
-                    let start_push = &start_push;
-                    let message = &message;
-                    let native_resident_activation = &native_resident_activation;
-                    async move {
-                        // Reading the bounded receipt table participates in OCC.
-                        // Concurrent retries cannot both activate this operation.
-                        if let Some(operation) = operation {
-                            if let Some((diff, ts)) = operation.validate(tx).await? {
-                                return Ok((FinishPushCommit::Replayed(diff, ts), vec![]));
-                            }
-                        }
-                        validate_native_resident_activation_in_tx(
-                            tx,
-                            native_resident_activation.as_ref(),
-                        )
-                        .await?;
-                        // Validate that environment variables haven't changed since `start_push`.
-                        let environment_variables =
-                            EnvironmentVariablesModel::new(tx).get_all().await?;
-                        if environment_variables != start_push.environment_variables {
-                            anyhow::bail!(ErrorMetadata::bad_request(
-                                "RaceDetected",
-                                "Environment variables have changed during push"
-                            ));
-                        }
-
-                        // Validate that all required env vars declared in the
-                        // app definition are present.
-                        if let Some(app_def) =
-                            start_push.analysis.get(&ComponentDefinitionPath::root())
-                        {
-                            let missing: Vec<_> = app_def
-                                .definition
-                                .required_env_var_names()
-                                .into_iter()
-                                .filter(|name| {
-                                    !environment_variables
-                                        .iter()
-                                        .any(|(k, _)| k.to_string() == *name)
-                                })
-                                .collect();
-                            if !missing.is_empty() {
-                                anyhow::bail!(ErrorMetadata::bad_request(
-                                    "MissingEnvironmentVariables",
-                                    format!(
-                                        "Required environment variables are not set: {}. Set them \
-                                         in the Convex dashboard or CLI before pushing.",
-                                        missing.join(", ")
+        #[cfg(feature = "static-hermes-wasmtime-gate")]
+        let runtime_reservation = prepared_runtime_activation
+            .as_ref()
+            .map(|prepared| prepared.preparation.reserve::<RT>())
+            .transpose()?;
+        let application = self.clone();
+        // Database commit can outlive a cancelled HTTP waiter. This task owns
+        // the publication guards and capacity until commit handoff is complete.
+        tokio::spawn(async move {
+            let downloaded_source_packages = match operation
+                .as_ref()
+                .and_then(|operation| operation.prepared.as_ref())
+            {
+                Some(prepared) => &prepared.packages,
+                None => &downloaded_packages,
+            };
+            let finish_push_result = application
+                .execute_with_audit_log_events_and_occ_retries_with_timestamp(
+                    identity.clone(),
+                    request_metadata,
+                    finish_push_write_source,
+                    *FINISH_PUSH_MAX_OCC_FAILURES,
+                    |tx| {
+                        let operation = &operation;
+                        let start_push = &start_push;
+                        let message = &message;
+                        let prepared_runtime_activation = &prepared_runtime_activation;
+                        #[cfg(feature = "static-hermes-wasmtime-gate")]
+                        let runtime_reservation = &runtime_reservation;
+                        let native_resident_activation = &native_resident_activation;
+                        async move {
+                                // Reading the bounded receipt table participates in OCC.
+                                // Concurrent retries cannot both activate this operation.
+                                if let Some(operation) = operation {
+                                    if let Some((diff, ts)) = operation.validate(tx).await? {
+                                        return Ok((FinishPushCommit::Replayed(diff, ts), vec![]));
+                                    }
+                                }
+                                if let Some(prepared) = prepared_runtime_activation {
+                                    validate_source_keyed_runtime_expected_prior_in_tx(
+                                        tx,
+                                        &prepared.expected_prior,
                                     )
-                                ));
-                            }
-
-                            // Validate existing values match the new validators.
-                            validate_env_var_values(
-                                &environment_variables,
-                                &app_def.definition.env_vars,
-                            )?;
-                        }
-
-                        // Update app state: auth info and UDF server version.
-                        let auth_diff = AuthInfoModel::new(tx)
-                            .put(start_push.app_auth.clone())
-                            .await?;
-
-                        let prev_node_version = SourcePackageModel::new(tx, TableNamespace::Global)
-                            .get_latest()
-                            .await?
-                            .and_then(|p| p.node_version);
-
-                        // Diff the component definitions.
-                        let (definition_diffs, modules_by_definition, udf_config_by_definition) =
-                            ComponentDefinitionConfigModel::new(tx)
-                                .apply_component_definitions_diff(
-                                    &start_push.analysis,
-                                    &start_push.component_definition_packages,
-                                    downloaded_source_packages,
+                                    .await?;
+                                }
+                                #[cfg(feature = "static-hermes-wasmtime-gate")]
+                                if let Some(reservation) = runtime_reservation {
+                                    reservation.validate_dependencies(tx).await?;
+                                }
+                                validate_native_resident_activation_in_tx(
+                                    tx,
+                                    native_resident_activation.as_ref(),
                                 )
                                 .await?;
+                                // Validate that environment variables haven't changed since
+                                // `start_push`.
+                                let environment_variables =
+                                    EnvironmentVariablesModel::new(tx).get_all().await?;
+                                if environment_variables != start_push.environment_variables {
+                                    anyhow::bail!(ErrorMetadata::bad_request(
+                                        "RaceDetected",
+                                        "Environment variables have changed during push"
+                                    ));
+                                }
 
-                        // Diff component tree.
-                        let component_diffs = ComponentConfigModel::new(tx)
-                            .apply_component_tree_diff(
-                                &start_push.app,
-                                udf_config_by_definition,
-                                &start_push.schema_change,
-                                modules_by_definition,
-                            )
-                            .await?;
+                                // Validate that all required env vars declared in the
+                                // app definition are present.
+                                if let Some(app_def) =
+                                    start_push.analysis.get(&ComponentDefinitionPath::root())
+                                {
+                                    let missing: Vec<_> = app_def
+                                        .definition
+                                        .required_env_var_names()
+                                        .into_iter()
+                                        .filter(|name| {
+                                            !environment_variables
+                                                .iter()
+                                                .any(|(k, _)| k.to_string() == *name)
+                                        })
+                                        .collect();
+                                    if !missing.is_empty() {
+                                        anyhow::bail!(ErrorMetadata::bad_request(
+                                            "MissingEnvironmentVariables",
+                                            format!(
+                                                "Required environment variables are not set: {}. \
+                                                 Set them in the Convex dashboard or CLI before \
+                                                 pushing.",
+                                                missing.join(", ")
+                                            )
+                                        ));
+                                    }
 
-                        let next_node_version = SourcePackageModel::new(tx, TableNamespace::Global)
-                            .get_latest()
-                            .await?
-                            .and_then(|p| p.node_version);
+                                    // Validate existing values match the new validators.
+                                    validate_env_var_values(
+                                        &environment_variables,
+                                        &app_def.definition.env_vars,
+                                    )?;
+                                }
 
-                        let node_version_diff =
-                            (prev_node_version != next_node_version).then_some(NodeVersionDiff {
-                                previous_version: prev_node_version,
-                                next_version: next_node_version,
-                            });
+                                // Update app state: auth info and UDF server version.
+                                let auth_diff = AuthInfoModel::new(tx)
+                                    .put(start_push.app_auth.clone())
+                                    .await?;
 
-                        let diffs = PushComponentDiffs {
-                            auth_diff: auth_diff.clone(),
-                            component_diffs: component_diffs.clone(),
-                            message: message.clone(),
-                            node_version_diff,
-                        };
-                        let audit_log_events =
-                            vec![DeploymentAuditLogEvent::PushConfigWithComponents { diffs }];
-                        let diff = FinishPushDiff {
-                            auth_diff,
-                            definition_diffs,
-                            component_diffs,
-                        };
-                        let diff = SerializedFinishPushDiff::try_from(diff)?;
-                        if let Some(operation) = operation {
-                            model::deployment_receipts::DeploymentReceiptModel::new(tx)
-                                .record(model::deployment_receipts::DeploymentReceipt {
-                                    operation_id: operation.operation_id.clone(),
-                                    input_sha256: operation.input_sha256.clone(),
-                                    expires_unix_seconds: operation.expires_unix_seconds,
-                                    result_json: serde_json::to_string(&diff)?,
-                                })
-                                .await?;
+                                let prev_node_version =
+                                    SourcePackageModel::new(tx, TableNamespace::Global)
+                                        .get_latest_record()
+                                        .await?
+                                        .and_then(|p| p.node_version);
+
+                                // Diff the component definitions.
+                                let (
+                                    definition_diffs,
+                                    modules_by_definition,
+                                    udf_config_by_definition,
+                                ) = ComponentDefinitionConfigModel::new(tx)
+                                    .apply_component_definitions_diff(
+                                        &start_push.analysis,
+                                        &start_push.component_definition_packages,
+                                        downloaded_source_packages,
+                                    )
+                                    .await?;
+
+                                // Diff component tree.
+                                let component_diffs = ComponentConfigModel::new(tx)
+                                    .apply_component_tree_diff(
+                                        &start_push.app,
+                                        udf_config_by_definition,
+                                        &start_push.schema_change,
+                                        modules_by_definition,
+                                    )
+                                    .await?;
+
+                                let next_node_version =
+                                    SourcePackageModel::new(tx, TableNamespace::Global)
+                                        .get_latest_record()
+                                        .await?
+                                        .and_then(|p| p.node_version);
+
+                                let node_version_diff = (prev_node_version != next_node_version)
+                                    .then_some(NodeVersionDiff {
+                                        previous_version: prev_node_version,
+                                        next_version: next_node_version,
+                                    });
+
+                                let diffs = PushComponentDiffs {
+                                    auth_diff: auth_diff.clone(),
+                                    component_diffs: component_diffs.clone(),
+                                    message: message.clone(),
+                                    node_version_diff,
+                                };
+                                let audit_log_events =
+                                    vec![DeploymentAuditLogEvent::PushConfigWithComponents {
+                                        diffs,
+                                    }];
+                                let diff = FinishPushDiff {
+                                    auth_diff,
+                                    definition_diffs,
+                                    component_diffs,
+                                };
+                                let diff = SerializedFinishPushDiff::try_from(diff)?;
+                                if let Some(operation) = operation {
+                                    model::deployment_receipts::DeploymentReceiptModel::new(tx)
+                                        .record(model::deployment_receipts::DeploymentReceipt::new(
+                                            operation.operation_id.clone(),
+                                            operation.input_sha256.clone(),
+                                            operation.expires_unix_seconds,
+                                            &diff,
+                                        )?)
+                                        .await?;
+                                }
+                                Ok((FinishPushCommit::Applied(diff), audit_log_events))
+                            }
+                            .in_span(Span::enter_with_local_parent("finish_push_tx"))
+                            .into()
+                    },
+                    |result, ts| {
+                        if matches!(result, FinishPushCommit::Applied(_)) {
+                            #[cfg(feature = "static-hermes-wasmtime-gate")]
+                            match runtime_reservation.as_ref() {
+                                Some(reservation) => reservation.committed(ts),
+                                None => isolate::source_keyed_runtime_unpaired_committed(ts),
+                            }
                         }
-                        Ok((FinishPushCommit::Applied(diff), audit_log_events))
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    if let Some(occ_error_info) = e.occ_info()
+                        && let Some(write_source) = occ_error_info.write_source
+                        && write_source == finish_push_write_source
+                    {
+                        e.context(ErrorMetadata::bad_request(
+                            "ConcurrentPush",
+                            "Are you running multiple `npx convex dev` processes in the same \
+                             directory?"
+                                .to_string(),
+                        ))
+                    } else {
+                        e
                     }
-                    .in_span(Span::enter_with_local_parent("finish_push_tx"))
-                    .into()
+                });
+            let (diff, ts) = finish_push_result?;
+
+            let diff = match diff {
+                FinishPushCommit::Applied(diff) => {
+                    DEPLOYMENT_FINISH_EVENTS_TOTAL
+                        .with_label_values(&["activation_committed"])
+                        .inc();
+                    diff
                 },
-            )
-            .await
-            .map_err(|e| {
-                if let Some(occ_error_info) = e.occ_info()
-                    && let Some(write_source) = occ_error_info.write_source
-                    && write_source == finish_push_write_source
-                {
-                    e.context(ErrorMetadata::bad_request(
-                        "ConcurrentPush",
-                        "Are you running multiple `npx convex dev` processes in the same \
-                         directory?"
-                            .to_string(),
-                    ))
-                } else {
-                    e
-                }
-            })?;
+                // A receipt proves commit only. Do not repeat activation or launch
+                // a second cutover when the original owner already committed it.
+                FinishPushCommit::Replayed(diff, ts) => {
+                    DEPLOYMENT_FINISH_EVENTS_TOTAL
+                        .with_label_values(&["historical_replay"])
+                        .inc();
+                    return Ok((diff, ts));
+                },
+            };
 
-        let diff = match diff {
-            FinishPushCommit::Applied(diff) => {
-                DEPLOYMENT_FINISH_EVENTS_TOTAL
-                    .with_label_values(&["activation_committed"])
-                    .inc();
-                diff
-            },
-            // A receipt proves commit only. Do not repeat activation or launch
-            // a second cutover when the original owner already committed it.
-            FinishPushCommit::Replayed(diff, ts) => {
-                DEPLOYMENT_FINISH_EVENTS_TOTAL
-                    .with_label_values(&["historical_replay"])
-                    .inc();
-                return Ok((diff, ts));
-            },
-        };
+            #[cfg(feature = "static-hermes-wasmtime-gate")]
+            drop(runtime_reservation);
 
-        drop(native_publication);
-        self.complete_node_executor_pool_cutover_after_commit(
-            &committed_pool_topology,
-            ts,
-            cutover_reservation,
-        )
-        .await?;
+            drop(native_publication);
+            application
+                .complete_node_executor_pool_cutover_after_commit(
+                    &committed_pool_topology,
+                    ts,
+                    cutover_reservation,
+                )
+                .await?;
 
-        Ok((diff, ts))
+            Ok((diff, ts))
+        })
+        .await
+        .context("publication task failed")?
     }
 
     /// N.B.: does not check auth
@@ -1525,9 +1869,15 @@ impl<RT: Runtime> Application<RT> {
                     .map(|(_, pkg)| pkg.package_size)
                     .unwrap_or_default();
 
-                let source_package = self
+                let mut source_package = self
                     .upload_package(&modules, external_deps_id_and_pkg, node_version)
                     .await?;
+                prepare_source_keyed_runtime_activation(
+                    || self.runner(),
+                    &mut source_package,
+                    None,
+                )
+                .await?;
                 let committed_pool_topology = source_package.node_executor_pool_topology.clone();
                 let end_upload_source_package = Instant::now();
                 // Verify that we have not exceeded the max unzipped file size
@@ -1623,11 +1973,11 @@ impl<RT: Runtime> Application<RT> {
             .await
     }
 
-    async fn lock_native_resident_publication<'a>(
+    async fn lock_native_resident_publication(
         &self,
-        supervisor: &'a node_executor::native::NativeResidentSupervisor,
+        supervisor: &node_executor::native::NativeResidentSupervisor,
         contract: Option<&str>,
-    ) -> anyhow::Result<tokio::sync::MutexGuard<'a, ()>> {
+    ) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
         let guard = supervisor.publication_guard().await;
         // A canceled HTTP caller can commit before notifying supervision. Read
         // the durable head under the guard before trusting live compatibility.
@@ -1740,6 +2090,14 @@ pub struct StartPushRequest {
 
     pub node_dependencies: Vec<NodeDependencyJson>,
 
+    /// Omitted by ordinary clients; provided when staging selected exact
+    /// dependency material.
+    #[serde(
+        default,
+        deserialize_with = "SerializedExternalDepsPackageSelection::deserialize_present"
+    )]
+    pub external_deps_package: Option<SerializedExternalDepsPackageSelection>,
+
     pub node_version: Option<String>,
 
     #[serde(default)]
@@ -1788,10 +2146,52 @@ impl StartPushRequest {
                 .into_iter()
                 .map(NodeDependency::from)
                 .collect(),
+            external_deps_package: self
+                .external_deps_package
+                .map(TryInto::try_into)
+                .transpose()?,
             node_version,
             dry_run: self.dry_run,
             for_codegen: self.for_codegen,
             include_analysis: self.include_analysis,
+        })
+    }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SerializedExternalDepsPackageSelection {
+    pub id: String,
+    pub sha256: String,
+}
+
+impl SerializedExternalDepsPackageSelection {
+    fn deserialize_present<'de, D>(deserializer: D) -> Result<Option<Self>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // A present null selector must not silently select the ordinary build path.
+        Self::deserialize(deserializer).map(Some)
+    }
+}
+
+impl TryFrom<SerializedExternalDepsPackageSelection>
+    for model::external_packages::types::ExternalDepsPackageSelection
+{
+    type Error = anyhow::Error;
+
+    fn try_from(value: SerializedExternalDepsPackageSelection) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            value.sha256.len() == 64
+                && value
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "External dependency package SHA-256 must be lowercase hex"
+        );
+        Ok(Self {
+            id: value.id.try_into()?,
+            sha256: const_hex::decode(value.sha256)?.try_into()?,
         })
     }
 }
@@ -2835,19 +3235,89 @@ mod deployment_receipt_tests {
     use super::*;
 
     fn receipt(id: &str, expires: i64) -> DeploymentReceipt {
-        DeploymentReceipt {
-            operation_id: id.to_owned(),
-            input_sha256: "input".to_owned(),
-            expires_unix_seconds: expires,
-            result_json: "{}".to_owned(),
+        DeploymentReceipt::new(
+            id.to_owned(),
+            "input".to_owned(),
+            expires,
+            &serde_json::json!({}),
+        )
+        .unwrap()
+    }
+
+    fn large_finish_diff() -> anyhow::Result<SerializedFinishPushDiff> {
+        use common::json::JsonForm;
+        use database::SchemaDiff;
+        use model::{
+            components::config::ComponentDiffType,
+            config::types::{
+                CronDiff,
+                ModuleDiff,
+            },
+            deployment_audit_log::types::AuditLogIndexDiff,
+        };
+        let mut tables = Vec::new();
+        for table in 0..96 {
+            let mut fields = serde_json::Map::new();
+            for field in 0..48 {
+                fields.insert(
+                    format!("field_{field}"),
+                    serde_json::json!({
+                        "fieldType": {"type": "union", "value": [
+                            {"type": "string"},
+                            {"type": "literal", "value": "Unicode α and \"quoted\" text\n"}
+                        ]},
+                        "optional": true,
+                    }),
+                );
+            }
+            tables.push(serde_json::json!({
+                "tableName": format!("table_{table}"),
+                "indexes": [{"indexDescriptor": "by_field", "fields": ["field_0"]}],
+                "documentType": {"type": "object", "value": fields},
+            }));
         }
+        let previous = DatabaseSchema::json_deserialize(
+            &serde_json::json!({
+                "tables": tables,
+                "schemaValidation": true,
+            })
+            .to_string(),
+        )?;
+        let mut next = previous.clone();
+        next.schema_validation = false;
+        SerializedFinishPushDiff::try_from(FinishPushDiff {
+            auth_diff: AuthDiff::default(),
+            definition_diffs: BTreeMap::from([(
+                ComponentDefinitionPath::root(),
+                ComponentDefinitionDiff {},
+            )]),
+            component_diffs: BTreeMap::from([(
+                ComponentPath::root(),
+                ComponentDiff {
+                    diff_type: ComponentDiffType::Modify,
+                    module_diff: ModuleDiff {
+                        added: (0..512).map(|index| format!("module_{index}.js")).collect(),
+                        removed: vec!["previous.js".to_owned()],
+                    },
+                    udf_config_diff: None,
+                    cron_diff: CronDiff::default(),
+                    index_diff: AuditLogIndexDiff::default(),
+                    schema_diff: Some(SchemaDiff {
+                        previous_schema: Some(previous),
+                        next_schema: Some(next),
+                    }),
+                },
+            )]),
+        })
     }
 
     fn source() -> SourcePackage {
         SourcePackage {
             storage_key: "deployment-receipt-test".try_into().unwrap(),
             sha256: Sha256Digest::from([1; 32]),
+            runtime_content_sha256: None,
             native_resident: None,
+            runtime_generation: None,
             external_deps_package_id: None,
             package_size: Default::default(),
             node_version: None,
@@ -3017,8 +3487,10 @@ mod deployment_receipt_tests {
                 system_env_var_overrides: BTreeMap::new(),
             }));
             assert!(operation.validate(&mut tx).await?.is_none());
-            let mut committed_receipt = receipt("operation", operation.expires_unix_seconds);
-            committed_receipt.result_json = serde_json::to_string(
+            let committed_receipt = DeploymentReceipt::new(
+                "operation".to_owned(),
+                "input".to_owned(),
+                operation.expires_unix_seconds,
                 &SerializedFinishPushDiff::try_from(FinishPushDiff::default())?,
             )?;
             DeploymentReceiptModel::new(&mut tx)
@@ -3113,6 +3585,9 @@ mod deployment_receipt_tests {
             let db = deployment_test_database(rt.clone(), persistence.clone()).await?;
             model::initialize_application_system_tables(&db).await?;
             let expiry = i64::try_from(rt.unix_timestamp().as_secs())? + 600;
+            let diff = large_finish_diff()?;
+            let original_result = serde_json::to_string(&diff)?;
+            assert!(original_result.len() > 128 * 1024);
             let prepared = PreparedPush {
                 packages: BTreeMap::new(),
                 external_deps_storage_key: None,
@@ -3131,7 +3606,12 @@ mod deployment_receipt_tests {
                     .put(source())
                     .await?;
                 DeploymentReceiptModel::new(tx)
-                    .record(receipt("operation", expiry))
+                    .record(DeploymentReceipt::new(
+                        "operation".to_owned(),
+                        "input".to_owned(),
+                        expiry,
+                        &diff,
+                    )?)
                     .await?;
             }
             let committed = db
@@ -3143,12 +3623,34 @@ mod deployment_receipt_tests {
                 .unwrap_err();
             assert!(conflict.is_occ());
             let mut tx = db.begin_system().await?;
+            let stored = database::ResolvedQuery::new(
+                &mut tx,
+                TableNamespace::Global,
+                common::query::Query::full_table_scan(
+                    value::TableName::const_new("_deployment_receipts"),
+                    common::query::Order::Asc,
+                ),
+            )?
+            .next(&mut tx, Some(1))
+            .await?
+            .unwrap();
+            // This checks the persisted representation, including system fields
+            // and JSON/base64 overhead, rather than only an increased input cap.
+            assert!(stored.value().json_serialize()?.len() < original_result.len() / 2);
             assert!(prepared.validate_activation(&mut tx).await.is_err());
             assert!(DeploymentReceiptModel::new(&mut tx)
                 .lookup("operation", "different")
                 .await
                 .is_err());
+            let committed_source = SourcePackageModel::new(&mut tx, TableNamespace::Global)
+                .get_latest_record()
+                .await?
+                .unwrap()
+                .id();
             // A failed transaction cannot leave a replay receipt or activation.
+            SourcePackageModel::new(&mut tx, TableNamespace::Global)
+                .put(source())
+                .await?;
             DeploymentReceiptModel::new(&mut tx)
                 .record(receipt("aborted", expiry))
                 .await?;
@@ -3165,13 +3667,49 @@ mod deployment_receipt_tests {
                 DeploymentReceiptModel::new(&mut tx)
                     .lookup("operation", "input")
                     .await?,
-                Some(("{}".to_owned(), committed))
+                Some((original_result.clone(), committed))
             );
             assert!(DeploymentReceiptModel::new(&mut tx)
                 .lookup("aborted", "input")
                 .await?
                 .is_none());
             assert!(prepared.validate_activation(&mut tx).await.is_err());
+            assert_eq!(
+                SourcePackageModel::new(&mut tx, TableNamespace::Global)
+                    .get_latest_record()
+                    .await?
+                    .unwrap()
+                    .id(),
+                committed_source
+            );
+            drop(tx);
+            let mut newer = db.begin_system().await?;
+            let newer_source = SourcePackageModel::new(&mut newer, TableNamespace::Global)
+                .put(source())
+                .await?;
+            db.commit_with_write_source(newer, "test_newer_activation_after_restart")
+                .await?;
+            let mut tx = db.begin_system().await?;
+            let operation = FinishPushOperation {
+                operation_id: "operation".to_owned(),
+                input_sha256: "input".to_owned(),
+                expires_unix_seconds: expiry,
+                prepared: None,
+            };
+            let (mut replay, replay_ts) = operation.validate(&mut tx).await?.unwrap();
+            assert_eq!(replay_ts, committed);
+            let replay_metadata = replay.activation_replay.take().unwrap();
+            assert_eq!(replay_metadata.commit_timestamp, committed.to_string());
+            assert_eq!(replay_metadata.node_cutover_completion, "unverified");
+            assert_eq!(serde_json::to_string(&replay)?, original_result);
+            assert_eq!(
+                SourcePackageModel::new(&mut tx, TableNamespace::Global)
+                    .get_latest_record()
+                    .await?
+                    .unwrap()
+                    .developer_id(),
+                DeveloperDocumentId::from(newer_source)
+            );
             Ok(())
         })
     }
@@ -3194,6 +3732,23 @@ mod deployment_receipt_tests {
                 .await
                 .is_err());
             drop(tx);
+            let table = value::TableName::const_new("_deployment_receipts");
+            let mut tx = db.begin_system().await?;
+            // Old malformed payloads are irrelevant once their replay window
+            // closes; metadata reclamation must not try to decode them.
+            database::SystemMetadataModel::new_global(&mut tx)
+                .insert(
+                    &table,
+                    value::serde::to_object(serde_json::json!({
+                        "operationId": "expired-legacy",
+                        "inputSha256": "input",
+                        "expiresUnixSeconds": now - 1,
+                        "resultJson": "not JSON",
+                    }))?,
+                )
+                .await?;
+            db.commit_with_write_source(tx, "test_expired_legacy_receipt")
+                .await?;
             for index in 0..16 {
                 let mut tx = db.begin_system().await?;
                 DeploymentReceiptModel::new(&mut tx)
@@ -3203,11 +3758,629 @@ mod deployment_receipt_tests {
                     .await?;
             }
             let mut tx = db.begin_system().await?;
+            SourcePackageModel::new(&mut tx, TableNamespace::Global)
+                .put(source())
+                .await?;
             let error = DeploymentReceiptModel::new(&mut tx)
                 .record(receipt("excess", now + 600))
                 .await
                 .unwrap_err();
             assert_eq!(error.short_msg(), "DeploymentReceiptsFull");
+            drop(tx);
+            let mut tx = db.begin_system().await?;
+            assert!(SourcePackageModel::new(&mut tx, TableNamespace::Global)
+                .get_latest_record()
+                .await?
+                .is_none());
+            assert!(DeploymentReceiptModel::new(&mut tx)
+                .lookup("excess", "input")
+                .await?
+                .is_none());
+            assert!(DeploymentReceiptModel::new(&mut tx)
+                .lookup("expired-legacy", "input")
+                .await?
+                .is_none());
+            let mut query = database::ResolvedQuery::new(
+                &mut tx,
+                TableNamespace::Global,
+                common::query::Query::full_table_scan(table.clone(), common::query::Order::Asc),
+            )?;
+            let mut expired_ids = Vec::new();
+            while let Some(document) = query.next(&mut tx, Some(1)).await? {
+                expired_ids.push(document.id());
+            }
+            for id in expired_ids {
+                database::SystemMetadataModel::new_global(&mut tx)
+                    .patch(id, value::obj!("expiresUnixSeconds" => now - 1)?.into())
+                    .await?;
+            }
+            db.commit_with_write_source(tx, "test_expire_receipt_capacity")
+                .await?;
+            let mut first = db.begin_system().await?;
+            let mut competing = db.begin_system().await?;
+            DeploymentReceiptModel::new(&mut first)
+                .record(receipt("replacement", now + 600))
+                .await?;
+            DeploymentReceiptModel::new(&mut competing)
+                .record(receipt("competing-replacement", now + 600))
+                .await?;
+            db.commit_with_write_source(first, "test_reclaim_receipt")
+                .await?;
+            assert!(db
+                .commit_with_write_source(competing, "test_competing_receipt_reclamation")
+                .await
+                .unwrap_err()
+                .is_occ());
+            let mut retry = db.begin_system().await?;
+            DeploymentReceiptModel::new(&mut retry)
+                .record(receipt("competing-replacement", now + 600))
+                .await?;
+            db.commit_with_write_source(retry, "test_reclaim_next_receipt")
+                .await?;
+            let mut tx = db.begin_system().await?;
+            for id in ["replacement", "competing-replacement"] {
+                assert!(DeploymentReceiptModel::new(&mut tx)
+                    .lookup(id, "input")
+                    .await?
+                    .is_some());
+            }
+            let mut query = database::ResolvedQuery::new(
+                &mut tx,
+                TableNamespace::Global,
+                common::query::Query::full_table_scan(table, common::query::Order::Asc),
+            )?;
+            let mut retained = 0;
+            while query.next(&mut tx, Some(1)).await?.is_some() {
+                retained += 1;
+            }
+            // Reclaim only the required slots; remaining expired payloads stay
+            // outside the deletion write set and cannot block the next insert.
+            assert_eq!(retained, 16);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn malformed_receipt_is_an_error_even_with_retained_preparation() -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let db = deployment_test_database(
+                rt.clone(),
+                Arc::new(sqlite::SqlitePersistence::new(":memory:")?),
+            )
+            .await?;
+            model::initialize_application_system_tables(&db).await?;
+            let expiry = i64::try_from(rt.unix_timestamp().as_secs())? + 600;
+            let mut tx = db.begin_system().await?;
+            database::SystemMetadataModel::new_global(&mut tx)
+                .insert(
+                    &value::TableName::const_new("_deployment_receipts"),
+                    value::serde::to_object(serde_json::json!({
+                        "operationId": "malformed", "inputSha256": "input",
+                        "expiresUnixSeconds": expiry, "resultJson": "{",
+                    }))?,
+                )
+                .await?;
+            db.commit_with_write_source(tx, "test_malformed_receipt")
+                .await?;
+            let mut tx = db.begin_system().await?;
+            let valid = SerializedFinishPushDiff::try_from(FinishPushDiff::default())?;
+            DeploymentReceiptModel::new(&mut tx)
+                .record(DeploymentReceipt::new(
+                    "valid".to_owned(),
+                    "input".to_owned(),
+                    expiry,
+                    &valid,
+                )?)
+                .await?;
+            db.commit_with_write_source(tx, "test_unrelated_valid_receipt")
+                .await?;
+            let mut tx = db.begin_system().await?;
+            let mut operation = FinishPushOperation {
+                operation_id: "valid".to_owned(),
+                input_sha256: "input".to_owned(),
+                expires_unix_seconds: expiry,
+                prepared: Some(Arc::new(PreparedPush {
+                    packages: BTreeMap::new(),
+                    external_deps_storage_key: None,
+                    expected_prior: None,
+                    system_env_var_overrides: BTreeMap::new(),
+                })),
+            };
+            assert!(operation.validate(&mut tx).await?.is_some());
+            operation.operation_id = "malformed".to_owned();
+            assert!(operation.validate(&mut tx).await.is_err());
+            assert!(SourcePackageModel::new(&mut tx, TableNamespace::Global)
+                .get_latest_record()
+                .await?
+                .is_none());
+            IndexModel::new(&mut tx)
+                .drop_system_index(
+                    TableNamespace::Global,
+                    "_deployment_receipts.by_operation".parse()?,
+                )
+                .await?;
+            db.commit_with_write_source(tx, "test_receipt_index_upgrade")
+                .await?;
+            let mut tx = db.begin_system().await?;
+            operation.operation_id = "valid".to_owned();
+            assert!(operation.validate(&mut tx).await?.is_some());
+            operation.operation_id = "malformed".to_owned();
+            assert!(operation.validate(&mut tx).await.is_err());
+            drop(tx);
+            model::initialize_application_system_tables(&db).await?;
+            let mut tx = db.begin_system().await?;
+            operation.operation_id = "valid".to_owned();
+            assert!(operation.validate(&mut tx).await?.is_some());
+            Ok(())
+        })
+    }
+}
+
+#[cfg(all(test, feature = "static-hermes-wasmtime-gate"))]
+mod source_keyed_deployment_readiness_tests {
+    use database::Database;
+    use model::initialize_application_system_tables;
+    use runtime::prod::ProdRuntime;
+
+    use super::{
+        deployment_test_database as new_test_database,
+        *,
+    };
+
+    #[test]
+    fn selected_external_deps_survive_cache_replacement_and_eviction() -> anyhow::Result<()> {
+        use model::external_packages::types::ExternalDepsPackageSelection;
+
+        let tokio = ProdRuntime::init_tokio()?;
+        let runtime = ProdRuntime::new(&tokio);
+        let block_runtime = runtime.clone();
+        block_runtime.block_on("selected_external_deps", async move {
+            let database = new_test_database(
+                runtime,
+                Arc::new(sqlite::SqlitePersistence::new(":memory:")?),
+            )
+            .await?;
+            initialize_application_system_tables(&database).await?;
+            let dependencies = vec![NodeDependency {
+                package: "example-package".to_owned(),
+                version: "1.0.0".to_owned(),
+            }];
+            let mut original = external_deps_package("original-dependencies");
+            original.deps = dependencies.clone();
+            let mut tx = database.begin_system().await?;
+            let id = ExternalPackagesModel::new(&mut tx)
+                .put(original.clone())
+                .await?;
+            database
+                .commit_with_write_source(tx, "test_original_dependencies")
+                .await?;
+            let selection = ExternalDepsPackageSelection {
+                id,
+                sha256: original.sha256.clone(),
+            };
+
+            let mut replacement = original.clone();
+            replacement.sha256 = Sha256Digest::from([8; 32]);
+            replacement.storage_key = "replacement-dependencies".try_into()?;
+            let mut tx = database.begin_system().await?;
+            let replacement_id = ExternalPackagesModel::new(&mut tx)
+                .put(replacement.clone())
+                .await?;
+            database
+                .commit_with_write_source(tx, "test_replacement_dependencies")
+                .await?;
+            let mut tx = database.begin_system().await?;
+            let mut model = ExternalPackagesModel::new(&mut tx);
+            assert_eq!(
+                model
+                    .get_cached_package_match(dependencies.clone())
+                    .await?
+                    .unwrap()
+                    .0,
+                replacement_id
+            );
+            assert_eq!(model.get_selected(&selection).await?, original);
+
+            for index in 0..11 {
+                let mut other = replacement.clone();
+                other.deps[0].package = format!("other-package-{index}");
+                let mut tx = database.begin_system().await?;
+                ExternalPackagesModel::new(&mut tx).put(other).await?;
+                database
+                    .commit_with_write_source(tx, "test_dependency_cache_churn")
+                    .await?;
+            }
+            let mut tx = database.begin_system().await?;
+            let mut model = ExternalPackagesModel::new(&mut tx);
+            assert!(model
+                .get_cached_package_match(dependencies.clone())
+                .await?
+                .is_none());
+            let selected = model.get_selected(&selection).await?;
+            selected.validate_dependencies(&dependencies)?;
+            assert_eq!(selected, original);
+            assert_eq!(
+                runtime_content_sha256(&[], Some(&selected), None)?,
+                runtime_content_sha256(&[], Some(&original), None)?
+            );
+            assert_ne!(
+                runtime_content_sha256(&[], Some(&selected), None)?,
+                runtime_content_sha256(&[], Some(&replacement), None)?
+            );
+            assert!(model
+                .get_selected(&ExternalDepsPackageSelection {
+                    sha256: replacement.sha256,
+                    ..selection.clone()
+                })
+                .await
+                .is_err());
+            assert!(model
+                .get_selected(&ExternalDepsPackageSelection {
+                    id: DeveloperDocumentId::MAX.into(),
+                    ..selection
+                })
+                .await
+                .is_err());
+            Ok(())
+        })
+    }
+
+    fn source_package(runtime_content_sha256: Option<Sha256Digest>) -> SourcePackage {
+        SourcePackage {
+            storage_key: "runtime-content-identity-test".try_into().unwrap(),
+            sha256: Sha256Digest::from([0; 32]),
+            runtime_content_sha256,
+            native_resident: None,
+            runtime_generation: None,
+            external_deps_package_id: None,
+            package_size: Default::default(),
+            node_version: None,
+            node_executor_pool_topology: Default::default(),
+        }
+    }
+
+    fn runtime_generation() -> SourcePackageRuntimeGeneration {
+        SourcePackageRuntimeGeneration {
+            deployment_sha256: Sha256Digest::from([2; 32]),
+            generation_manifest_sha256: Sha256Digest::from([3; 32]),
+            generation_sha256: Sha256Digest::from([4; 32]),
+        }
+    }
+
+    fn external_deps_package(storage_key: &str) -> ExternalDepsPackage {
+        ExternalDepsPackage {
+            storage_key: storage_key.try_into().unwrap(),
+            sha256: Sha256Digest::from([9; 32]),
+            deps: vec![],
+            package_size: Default::default(),
+        }
+    }
+
+    fn source_package_with_generation(
+        sha256_byte: u8,
+        runtime_generation: Option<SourcePackageRuntimeGeneration>,
+    ) -> SourcePackage {
+        SourcePackage {
+            storage_key: format!("source-keyed-finish-push-{sha256_byte}")
+                .try_into()
+                .unwrap(),
+            sha256: Sha256Digest::from([sha256_byte; 32]),
+            runtime_content_sha256: Some(Sha256Digest::from([sha256_byte.wrapping_add(1); 32])),
+            runtime_generation,
+            native_resident: None,
+            external_deps_package_id: None,
+            package_size: Default::default(),
+            node_version: None,
+            node_executor_pool_topology: Default::default(),
+        }
+    }
+
+    async fn commit_source_package(
+        database: &Database<ProdRuntime>,
+        source_package: SourcePackage,
+        write_source: &'static str,
+    ) -> anyhow::Result<()> {
+        let mut tx = database.begin_system().await?;
+        SourcePackageModel::new(&mut tx, TableNamespace::Global)
+            .put(source_package)
+            .await?;
+        database.commit_with_write_source(tx, write_source).await?;
+        Ok(())
+    }
+
+    async fn latest_source_package(
+        database: &Database<ProdRuntime>,
+    ) -> anyhow::Result<(DeveloperDocumentId, SourcePackage)> {
+        let mut tx = database.begin_system().await?;
+        let source_package = SourcePackageModel::new(&mut tx, TableNamespace::Global)
+            .get_latest_record()
+            .await?
+            .context("source-keyed finish-push test has no source package")?;
+        let source_package_id = source_package.developer_id();
+        let source_package = source_package.as_ref().clone().into_value();
+        tx.into_token()?;
+        Ok((source_package_id, source_package))
+    }
+
+    fn expected_prior(
+        source_package_id: DeveloperDocumentId,
+        source_package: &SourcePackage,
+    ) -> SourceKeyedRuntimeExpectedPrior {
+        SourceKeyedRuntimeExpectedPrior {
+            source_package_id,
+            source_package_sha256: source_package.sha256.clone(),
+            source_package_runtime_content_sha256: source_package.runtime_content_sha256.clone(),
+            runtime_generation: source_package.runtime_generation.clone(),
+        }
+    }
+
+    async fn commit_paired_source_package(
+        database: &Database<ProdRuntime>,
+        expected_prior: &SourceKeyedRuntimeExpectedPrior,
+        source_package: SourcePackage,
+    ) -> anyhow::Result<()> {
+        let mut tx = database.begin_system().await?;
+        validate_source_keyed_runtime_expected_prior_in_tx(&mut tx, expected_prior).await?;
+        SourcePackageModel::new(&mut tx, TableNamespace::Global)
+            .put(source_package)
+            .await?;
+        database
+            .commit_with_write_source(tx, "source_keyed_paired_finish_push")
+            .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn downloaded_runtime_content_identity_is_restored_but_cannot_be_replaced() {
+        let verified = Sha256Digest::from([1; 32]);
+        let mut omitted = source_package(None);
+        restore_source_package_runtime_content_sha256(&mut omitted, verified.clone()).unwrap();
+        assert_eq!(omitted.runtime_content_sha256, Some(verified.clone()));
+
+        let mut matching = source_package(Some(verified.clone()));
+        restore_source_package_runtime_content_sha256(&mut matching, verified.clone()).unwrap();
+        assert_eq!(matching.runtime_content_sha256, Some(verified));
+
+        let mut replaced = source_package(Some(Sha256Digest::from([2; 32])));
+        assert!(restore_source_package_runtime_content_sha256(
+            &mut replaced,
+            Sha256Digest::from([1; 32]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn downloaded_external_deps_identity_must_match_the_source_package_record() {
+        let external_deps = external_deps_package("source-keyed-external-deps");
+        assert!(validate_source_package_external_deps_identity(
+            Some(&external_deps.storage_key),
+            Some(&external_deps),
+        )
+        .is_ok());
+        assert!(validate_source_package_external_deps_identity(None, None).is_ok());
+
+        let different_external_deps = external_deps_package("source-keyed-other-external-deps");
+        assert!(validate_source_package_external_deps_identity(
+            Some(&different_external_deps.storage_key),
+            Some(&external_deps),
+        )
+        .is_err());
+        assert!(
+            validate_source_package_external_deps_identity(None, Some(&external_deps)).is_err()
+        );
+        assert!(validate_source_package_external_deps_identity(
+            Some(&external_deps.storage_key),
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ordinary_publication_clears_wasm_selection_without_requiring_runtime_configuration(
+    ) -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let runtime = ProdRuntime::new(&tokio);
+        runtime.block_on("ordinary_v8_publication", async {
+            for digest in [None, Some(Sha256Digest::from([1; 32]))] {
+                let mut package = source_package(digest.clone());
+                package.runtime_generation = Some(runtime_generation());
+                assert!(prepare_source_keyed_runtime_activation::<ProdRuntime>(
+                    || panic!("ordinary publication must not access runtime preparation"),
+                    &mut package,
+                    None,
+                )
+                .await?
+                .is_none());
+                assert!(package.runtime_generation.is_none());
+                assert_eq!(package.runtime_content_sha256, digest);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn paired_source_package_requires_the_exact_ready_runtime_content() {
+        let runtime_content_sha256 = Sha256Digest::from([1; 32]);
+        let runtime_generation = runtime_generation();
+        assert!(validate_source_keyed_runtime_readiness(
+            true,
+            Some(&runtime_content_sha256),
+            Some(&runtime_generation),
+            Some(SourceKeyedRuntimeReadiness::Ready),
+        )
+        .is_ok());
+        assert!(validate_source_keyed_runtime_readiness(
+            true,
+            Some(&runtime_content_sha256),
+            Some(&runtime_generation),
+            Some(SourceKeyedRuntimeReadiness::NotStaged),
+        )
+        .is_err());
+        assert!(validate_source_keyed_runtime_readiness(
+            true,
+            Some(&runtime_content_sha256),
+            Some(&runtime_generation),
+            None,
+        )
+        .is_err());
+        assert!(validate_source_keyed_runtime_readiness(
+            true,
+            None,
+            Some(&runtime_generation),
+            Some(SourceKeyedRuntimeReadiness::Ready),
+        )
+        .is_err());
+        assert!(validate_source_keyed_runtime_readiness(
+            true,
+            Some(&runtime_content_sha256),
+            None,
+            Some(SourceKeyedRuntimeReadiness::Ready),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn disabled_paired_deployment_ignores_catalog_readiness() {
+        assert!(validate_source_keyed_runtime_readiness(false, None, None, None).is_ok());
+        assert!(validate_source_keyed_runtime_readiness(
+            false,
+            None,
+            None,
+            Some(SourceKeyedRuntimeReadiness::NotStaged),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn expected_prior_requires_the_exact_transaction_visible_source_and_generation() {
+        let mut actual = source_package(Some(Sha256Digest::from([1; 32])));
+        actual.sha256 = Sha256Digest::from([5; 32]);
+        actual.runtime_generation = Some(runtime_generation());
+        let expected = SourceKeyedRuntimeExpectedPrior {
+            source_package_id: DeveloperDocumentId::MIN,
+            source_package_sha256: actual.sha256.clone(),
+            source_package_runtime_content_sha256: actual.runtime_content_sha256.clone(),
+            runtime_generation: actual.runtime_generation.clone(),
+        };
+        validate_source_keyed_runtime_expected_prior(&expected, DeveloperDocumentId::MIN, &actual)
+            .unwrap();
+
+        assert!(validate_source_keyed_runtime_expected_prior(
+            &expected,
+            DeveloperDocumentId::MAX,
+            &actual,
+        )
+        .is_err());
+        actual.runtime_generation = None;
+        assert!(validate_source_keyed_runtime_expected_prior(
+            &expected,
+            DeveloperDocumentId::MIN,
+            &actual,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn source_keyed_finish_push_persists_exact_generation_and_fences_both_commit_orders(
+    ) -> anyhow::Result<()> {
+        let tokio = ProdRuntime::init_tokio()?;
+        let runtime = ProdRuntime::new(&tokio);
+        let block_runtime = runtime.clone();
+        block_runtime.block_on("source_keyed_finish_push_fencing", async move {
+            let foreign_first_database = new_test_database(
+                runtime.clone(),
+                Arc::new(sqlite::SqlitePersistence::new(":memory:")?),
+            )
+            .await?;
+            initialize_application_system_tables(&foreign_first_database).await?;
+            let initial = source_package_with_generation(10, None);
+            commit_source_package(
+                &foreign_first_database,
+                initial,
+                "source_keyed_finish_push_initial",
+            )
+            .await?;
+            let (initial_id, initial) = latest_source_package(&foreign_first_database).await?;
+            let initial_expected_prior = expected_prior(initial_id, &initial);
+            let mut stale_paired_tx = foreign_first_database.begin_system().await?;
+            validate_source_keyed_runtime_expected_prior_in_tx(
+                &mut stale_paired_tx,
+                &initial_expected_prior,
+            )
+            .await?;
+            SourcePackageModel::new(&mut stale_paired_tx, TableNamespace::Global)
+                .put(source_package_with_generation(
+                    30,
+                    Some(runtime_generation()),
+                ))
+                .await?;
+            let foreign = source_package_with_generation(20, None);
+            commit_source_package(
+                &foreign_first_database,
+                foreign.clone(),
+                "source_keyed_finish_push_competing",
+            )
+            .await?;
+            let stale_commit_error = foreign_first_database
+                .commit_with_write_source(stale_paired_tx, "source_keyed_paired_finish_push")
+                .await
+                .err()
+                .context("the transaction-visible expected-prior read did not fence its commit")?;
+            assert!(stale_commit_error.occ_info().is_some());
+            // An OCC retry starts a fresh transaction and observes the competing
+            // source package, so the exact expected-prior check must then reject it.
+            assert!(commit_paired_source_package(
+                &foreign_first_database,
+                &initial_expected_prior,
+                source_package_with_generation(30, Some(runtime_generation())),
+            )
+            .await
+            .is_err());
+            let (_, active_after_foreign_first) =
+                latest_source_package(&foreign_first_database).await?;
+            assert_eq!(active_after_foreign_first, foreign);
+
+            let paired_first_database = new_test_database(
+                runtime.clone(),
+                Arc::new(sqlite::SqlitePersistence::new(":memory:")?),
+            )
+            .await?;
+            initialize_application_system_tables(&paired_first_database).await?;
+            let initial = source_package_with_generation(40, None);
+            commit_source_package(
+                &paired_first_database,
+                initial,
+                "source_keyed_finish_push_initial",
+            )
+            .await?;
+            let (initial_id, initial) = latest_source_package(&paired_first_database).await?;
+            let initial_expected_prior = expected_prior(initial_id, &initial);
+            let paired = source_package_with_generation(50, Some(runtime_generation()));
+            commit_paired_source_package(
+                &paired_first_database,
+                &initial_expected_prior,
+                paired.clone(),
+            )
+            .await?;
+            let (_, active_after_paired_first) =
+                latest_source_package(&paired_first_database).await?;
+            assert_eq!(active_after_paired_first, paired);
+
+            let stale_foreign = source_package_with_generation(60, Some(runtime_generation()));
+            assert!(commit_paired_source_package(
+                &paired_first_database,
+                &initial_expected_prior,
+                stale_foreign,
+            )
+            .await
+            .is_err());
+            let (_, active_after_foreign_second) =
+                latest_source_package(&paired_first_database).await?;
+            assert_eq!(active_after_foreign_second, paired);
+            foreign_first_database.shutdown().await?;
+            paired_first_database.shutdown().await?;
             Ok(())
         })
     }

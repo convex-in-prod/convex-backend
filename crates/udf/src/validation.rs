@@ -88,9 +88,11 @@ use crate::{
         parse_udf_args,
         validate_pending_udf_args_size,
         validate_udf_args_size,
+        UdfArgsJson,
     },
     metrics::log_context_reuse_decision,
     ActionOutcome,
+    HostOperationErrorV1,
     SyscallTrace,
     UdfOutcome,
 };
@@ -185,9 +187,32 @@ pub async fn fail_while_not_running<RT: Runtime>(
     Ok(Ok(()))
 }
 
+pub enum ScheduleArgumentInput {
+    Json(Vec<JsonValue>),
+    Legacy(UdfArgsJson),
+    Typed(ConvexArray),
+}
+
 pub async fn validate_schedule_args<RT: Runtime>(
     path: CanonicalizedComponentFunctionPath,
     udf_args: Vec<JsonValue>,
+    scheduled_ts: UnixTimestamp,
+    udf_ts: UnixTimestamp,
+    tx: &mut Transaction<RT>,
+) -> anyhow::Result<(CanonicalizedComponentFunctionPath, ConvexArray)> {
+    validate_schedule_args_with_input(
+        path,
+        ScheduleArgumentInput::Json(udf_args),
+        scheduled_ts,
+        udf_ts,
+        tx,
+    )
+    .await
+}
+
+pub async fn validate_schedule_args_with_input<RT: Runtime>(
+    path: CanonicalizedComponentFunctionPath,
+    udf_args: ScheduleArgumentInput,
     scheduled_ts: UnixTimestamp,
     udf_ts: UnixTimestamp,
     tx: &mut Transaction<RT>,
@@ -207,7 +232,13 @@ pub async fn validate_schedule_args<RT: Runtime>(
             format!("{scheduled_ts:?} is more than 5 years in the past")
         ));
     }
-    let udf_args = parse_udf_args(&path.udf_path, udf_args)?;
+    let udf_args = match udf_args {
+        ScheduleArgumentInput::Json(args) => parse_udf_args(&path.udf_path, args)?,
+        ScheduleArgumentInput::Legacy(args) => {
+            parse_udf_args(&path.udf_path, args.into_serialized_args()?.into_args()?)?
+        },
+        ScheduleArgumentInput::Typed(args) => args,
+    };
 
     // Even though we might use different version of modules when executing,
     // we do validate that the scheduled function exists at time of scheduling.
@@ -427,6 +458,18 @@ pub struct VisibilityInfo {
 }
 
 impl VisibilityInfo {
+    pub fn new(
+        visibility: Option<Visibility>,
+        component: ComponentId,
+        is_system_module: bool,
+    ) -> Self {
+        Self {
+            visibility,
+            component,
+            is_system_module,
+        }
+    }
+
     pub fn check_access(
         &self,
         allowed_visibility: AllowedVisibility,
@@ -749,6 +792,10 @@ impl ValidatedPathAndArgs {
 
     pub fn args_size(&self) -> usize {
         self.args.heap_size()
+    }
+
+    pub fn args(&self) -> &SerializedArgs {
+        &self.args
     }
 
     pub fn path(&self) -> &ResolvedComponentFunctionPath {
@@ -1278,6 +1325,8 @@ pub struct ValidatedUdfOutcome {
     // queries should be concrete.
     pub result: Result<JsonPackedValue<PendingValue>, JsError>,
 
+    pub host_operation_error: Option<HostOperationErrorV1>,
+
     pub syscall_trace: SyscallTrace,
 
     pub udf_server_version: Option<semver::Version>,
@@ -1321,6 +1370,7 @@ impl ValidatedUdfOutcome {
             log_lines: vec![].into(),
             journal: QueryJournal::new(),
             result: Err(js_error),
+            host_operation_error: None,
             syscall_trace: SyscallTrace::new(),
             udf_server_version,
             mutation_queue_length: None,
@@ -1346,6 +1396,7 @@ impl ValidatedUdfOutcome {
             log_lines: outcome.log_lines,
             journal: outcome.journal,
             result: outcome.result,
+            host_operation_error: outcome.host_operation_error,
             syscall_trace: outcome.syscall_trace,
             udf_server_version: outcome.udf_server_version,
             mutation_queue_length,
