@@ -338,7 +338,33 @@ pub async fn run_test_function(
 }
 
 pub fn local_only_dashboard_router() -> OpenApiRouter<crate::LocalAppState> {
-    OpenApiRouter::new()
+    let router = OpenApiRouter::new();
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    let router = router
+        .routes(utoipa_axum::routes!(
+            crate::wasm_runtime_policy::get_runtime_policy,
+            crate::wasm_runtime_policy::update_runtime_policy,
+        ))
+        .routes(utoipa_axum::routes!(
+            crate::static_hermes_wasmtime_quarantine::update_static_hermes_wasmtime_quarantine,
+        ))
+        .routes(utoipa_axum::routes!(
+            crate::source_keyed_runtime_active_pair::source_keyed_runtime_active_pair,
+        ))
+        .routes(utoipa_axum::routes!(
+            crate::source_keyed_runtime_readiness::source_keyed_runtime_readiness,
+        ));
+    router
+}
+
+#[cfg(all(test, feature = "static-hermes-wasmtime-gate"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_only_dashboard_routes_have_distinct_method_paths() {
+        let _router = local_only_dashboard_router();
+    }
 }
 
 // Routes with the same handlers for the local backend + closed source backend

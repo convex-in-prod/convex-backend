@@ -13,11 +13,8 @@ use metrics::{
     register_convex_gauge,
     register_convex_gauge_evictable,
     register_convex_histogram,
-<<<<<<< HEAD
-    IntoLabel,
-=======
     CancelableTimer,
->>>>>>> 6b9627540 (scheduler: admit durable actions before claim)
+    IntoLabel,
     StaticMetricLabel,
     StatusTimer,
     STATUS_LABEL,

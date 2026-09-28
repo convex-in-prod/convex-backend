@@ -104,7 +104,7 @@ async fn submit_active_and_pending_schema(
         .await?;
     assert_eq!(pending_state, SchemaState::Pending);
     database
-        .commit_with_write_source(tx, "test_schema_setup")
+        .commit(tx, "test_schema_setup")
         .await?;
     Ok(pending_id)
 }
@@ -119,7 +119,7 @@ async fn pending_schema_with_attempt(
         .start_table_validation(schema_id, table_name.clone(), None, Some(10))
         .await?;
     database
-        .commit_with_write_source(tx, "test_validation_setup")
+        .commit(tx, "test_validation_setup")
         .await?;
     Ok((schema_id, validation_id))
 }
@@ -166,7 +166,7 @@ fn schema_failure_write_commits_after_progress_checkpoint() -> anyhow::Result<()
                     .await?
             );
             database
-                .commit_with_write_source(application_tx, "test_schema_failing_write")
+                .commit(application_tx, "test_schema_failing_write")
                 .await?;
 
             let mut verify_tx = database.begin_system().await?;
@@ -233,11 +233,11 @@ fn stale_progress_checkpoint_loses_to_schema_failure() -> anyhow::Result<()> {
                 .insert(table_name, ConvexObject::empty())
                 .await?;
             database
-                .commit_with_write_source(application_tx, "test_schema_failing_write")
+                .commit(application_tx, "test_schema_failing_write")
                 .await?;
 
             let error = database
-                .commit_with_write_source(stale_checkpoint, "test_stale_schema_checkpoint")
+                .commit(stale_checkpoint, "test_stale_schema_checkpoint")
                 .await
                 .expect_err("a checkpoint based on Pending must lose to Failed");
             assert!(error.is_occ(), "expected OCC, got {error:#}");
@@ -298,7 +298,7 @@ fn staged_checkpoint_tracks_schema_ownership() -> anyhow::Result<()> {
                     .unwrap()
                     .id();
                 database
-                    .commit_with_write_source(tx, "test_staged_setup")
+                    .commit(tx, "test_staged_setup")
                     .await?;
 
                 let worker = SchemaWorker {
@@ -340,10 +340,10 @@ fn staged_checkpoint_tracks_schema_ownership() -> anyhow::Result<()> {
                     .mark_active(next_id)
                     .await?;
                 database
-                    .commit_with_write_source(replacement, "test_replace_staged_schema")
+                    .commit(replacement, "test_replace_staged_schema")
                     .await?;
                 let error = database
-                    .commit_with_write_source(stale_checkpoint, "test_stale_staged_checkpoint")
+                    .commit(stale_checkpoint, "test_stale_staged_checkpoint")
                     .await
                     .expect_err("overwriting the owner must fence a staged checkpoint");
                 assert!(error.is_occ(), "expected OCC, got {error:#}");

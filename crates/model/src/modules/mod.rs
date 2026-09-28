@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::Context;
 use common::{
+    bootstrap_model::index::database_index::IndexedFields,
     components::{
         CanonicalizedComponentFunctionPath,
         CanonicalizedComponentModulePath,
@@ -18,8 +19,12 @@ use common::{
         ResolvedComponentFunctionPath,
     },
     document::ParsedDocument,
+    interval::Interval,
     runtime::Runtime,
-    types::ModuleEnvironment,
+    types::{
+        ModuleEnvironment,
+        TabletIndexName,
+    },
     value::ResolvedDocumentId,
 };
 use database::{
@@ -27,6 +32,7 @@ use database::{
     BootstrapComponentsModel,
     SystemMetadataModel,
     Transaction,
+    TransactionReadSet,
 };
 use errors::ErrorMetadata;
 use storage::Storage;
@@ -348,7 +354,8 @@ impl<'a, RT: Runtime> ModuleModel<'a, RT> {
                     // with the highest creation time is valid to read all
                     // modules at
                     if new_src_pkg.creation_time() > current_src_pkg.creation_time()
-                        && current_src_pkg.metadata_matches(&new_src_pkg)
+                        && current_src_pkg
+                            .module_execution_metadata_matches(&new_src_pkg, metadata.environment)
                     {
                         return Ok(module_id);
                     }
@@ -450,6 +457,29 @@ impl<'a, RT: Runtime> ModuleModel<'a, RT> {
 
     pub async fn has_http(&mut self, component: ComponentId) -> anyhow::Result<bool> {
         Ok(self.get_http(component).await?.is_some())
+    }
+
+    /// Package-bound generated code can observe any module in the package.
+    /// Record that dependency without fetching the entire module table on each
+    /// invocation. The full interval also protects missing and deleted imports.
+    pub fn record_package_metadata_dependency(
+        &mut self,
+        component: ComponentId,
+    ) -> anyhow::Result<()> {
+        let tablet = self
+            .tx
+            .table_mapping()
+            .namespace(component.into())
+            .id(&MODULES_TABLE)?
+            .tablet_id;
+        let mut reads = TransactionReadSet::new();
+        reads.record_indexed_derived(
+            TabletIndexName::by_id(tablet),
+            IndexedFields::by_id(),
+            Interval::all(),
+        );
+        self.tx.apply_reads(reads);
+        Ok(())
     }
 
     pub fn has_pending_module(&mut self, component: ComponentId) -> bool {

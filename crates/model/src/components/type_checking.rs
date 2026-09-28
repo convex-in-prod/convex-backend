@@ -674,6 +674,7 @@ mod json {
                 definition_path: String::from(value.definition_path),
                 component_path: String::from(value.component_path),
                 http_prefix: value.http_prefix,
+                args: BTreeMap::new(),
                 env: value
                     .env
                     .into_iter()
