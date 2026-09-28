@@ -34,6 +34,7 @@ use value::TableNamespace;
 use super::{
     query_scanned_too_many_documents_error,
     query_scanned_too_much_data,
+    QueryDocument,
     QueryStream,
     QueryStreamNext,
     MAX_QUERY_FETCH,
@@ -201,11 +202,13 @@ impl IndexRange {
                 .record_read_document(&v, self.printable_index_name.table())?;
 
             let v = if matches!(self.stable_index_name, StableIndexName::Virtual(_, _)) {
-                VirtualTable::new(tx)
-                    .system_to_virtual_doc(v.unpack(), self.version.clone())
-                    .await?
+                QueryDocument::Materialized(
+                    VirtualTable::new(tx)
+                        .system_to_virtual_doc(v.unpack(), self.version.clone())
+                        .await?,
+                )
             } else {
-                v.unpack().to_developer()
+                QueryDocument::Packed(v)
             };
 
             let index_bytes = index_position.len();

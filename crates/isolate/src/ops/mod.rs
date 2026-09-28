@@ -186,6 +186,13 @@ impl<'a, 's: 'a, 'i, RT: Runtime, E: V8IsolateEnvironment<RT>> OpProvider
         state.environment.syscall_provider().rng()
     }
 
+    fn record_generated_uuid(&mut self, uuid: [u8; 16]) -> anyhow::Result<()> {
+        self.state_mut()?
+            .environment
+            .syscall_provider()
+            .record_generated_uuid(uuid)
+    }
+
     fn crypto_rng(&mut self) -> anyhow::Result<CryptoRng> {
         let state = self.state_mut()?;
         state.environment.syscall_provider().crypto_rng()

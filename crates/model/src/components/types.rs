@@ -30,6 +30,7 @@ use crate::{
         ModuleConfig,
         ModuleHashConfig,
     },
+    external_packages::types::ExternalDepsPackageSelection,
     modules::module_versions::{
         AnalyzedModule,
         SerializedAnalyzedModule,
@@ -47,6 +48,8 @@ pub struct ProjectConfig {
 
     // TODO(CX-6483): Add support for components to declare their own external dependencies.
     pub node_dependencies: Vec<NodeDependency>,
+
+    pub external_deps_package: Option<ExternalDepsPackageSelection>,
 
     // Version of Node.js to use in the node executor.
     pub node_version: Option<NodeVersion>,

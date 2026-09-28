@@ -28,6 +28,45 @@ pub struct ExecutionPhaseObservation {
     pub host: ExecutionOwnerTime,
     pub provider: ExecutionOwnerTime,
     pub suspension: ExecutionSuspensionTime,
+    /// Subset of suspension after the first observed wake, not additional time.
+    /// Self-wakes during the preceding poll start at that poll's end. This is
+    /// executor delay for this wrapper, not remote provider service time.
+    pub wake_to_poll_nanos: u64,
+    pub resumed_polls: u64,
+    pub resumed_polls_without_wake: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectLayoutObservation {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub fallbacks: u64,
+}
+
+/// Synchronous V8 GC callback spans during observed polls, not background
+/// worker CPU or a count of complete collections. Included in owner time.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcCallbackObservation {
+    pub callbacks: u64,
+    pub time: ExecutionOwnerTime,
+}
+
+/// Hermes runtime counters sampled around handler execution and cleanup.
+/// This excludes preparation and is not additive to phase CPU/wall time.
+/// Allocated bytes are cumulative allocation traffic, not retained memory.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HermesHeapObservation {
+    pub collections: u64,
+    pub gc_wall_nanos: u64,
+    /// Absent when the host cannot provide the WASI thread CPU clock.
+    pub gc_cpu_nanos: Option<u64>,
+    pub allocated_bytes: u64,
+    pub heap_before_bytes: u64,
+    pub heap_after_bytes: u64,
 }
 
 /// Synchronous module-loading spans are included in the enclosing execution
@@ -78,6 +117,12 @@ pub struct ExecutionObservation {
     pub provider_batches: u64,
     pub provider_operations: u64,
     pub provider_response_bytes: u64,
+    /// Native document-layout counters; absent when the engine has no such
+    /// path.
+    pub object_layouts: Option<ObjectLayoutObservation>,
+    pub v8_gc_callbacks: Option<GcCallbackObservation>,
+    /// Absent on a trap or other exit before the guest could report counters.
+    pub hermes_handler_heap: Option<HermesHeapObservation>,
     pub runtime_tasks: u32,
     pub active_tasks: u32,
     pub completed_tasks: u32,

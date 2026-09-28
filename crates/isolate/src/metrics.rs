@@ -167,6 +167,10 @@ register_convex_histogram!(
     ISOLATE_ANALYSIS_CAPACITY_WAIT_SECONDS,
     "Time isolate module analysis waits to borrow shared degradable-query capacity"
 );
+register_convex_histogram!(
+    pub(crate) ISOLATE_ANALYSIS_V8_CAPACITY_WAIT_SECONDS,
+    "Time isolate module analysis waits for V8 query/analysis capacity after application admission"
+);
 register_convex_counter!(
     pub(crate) ISOLATE_ANALYSIS_ATTEMPTS_TOTAL,
     "Root analysis submissions after shared-capacity admission; retry repeats an existing root",
@@ -764,12 +768,13 @@ pub fn initialize_capacity_counters(name: &'static str) {
         "dependency_descendant_holder",
         "control_plane",
     ];
-    const SCHEDULER_REJECTION_REASONS: [&str; 5] = [
+    const SCHEDULER_REJECTION_REASONS: [&str; 6] = [
         "queue_full",
         "lane_full",
         "scheduler_closed",
         "delay_control_shed",
         "caller_dropped",
+        "degradable_query_analysis_capacity",
     ];
     const QUEUE_REJECTION_REASONS: [&str; 6] = [
         "queue_full",
@@ -1417,7 +1422,7 @@ register_convex_histogram!(
     &[STATUS_LABEL[0], "active_javascript_class", "phase"]
 );
 
-fn active_javascript_class_label(class: ActiveJavascriptClass) -> StaticMetricLabel {
+pub(crate) fn active_javascript_class_label(class: ActiveJavascriptClass) -> StaticMetricLabel {
     StaticMetricLabel::new(
         "active_javascript_class",
         match class {
@@ -1995,7 +2000,7 @@ mod tests {
         );
         assert_eq!(
             zero_series_for_pool(&*ISOLATE_SCHEDULER_REQUESTS_REJECTED_TOTAL, POOL_NAME),
-            25
+            30
         );
         assert_eq!(
             zero_series_for_pool(&*ISOLATE_QUEUE_REJECTIONS_TOTAL, POOL_NAME),
@@ -2006,4 +2011,28 @@ mod tests {
             10
         );
     }
+}
+
+register_convex_counter!(
+    WASM_OBJECT_LAYOUT_HITS_TOTAL,
+    "Native object layout cache hits"
+);
+register_convex_counter!(
+    WASM_OBJECT_LAYOUT_MISSES_TOTAL,
+    "Native object layout cache misses"
+);
+register_convex_counter!(
+    WASM_OBJECT_LAYOUT_EVICTIONS_TOTAL,
+    "Native object layout cache evictions"
+);
+register_convex_counter!(
+    WASM_OBJECT_LAYOUT_FALLBACKS_TOTAL,
+    "Native object constructions using generic property definition"
+);
+
+pub fn log_wasm_object_layouts([hits, misses, evictions, fallbacks]: [u64; 4]) {
+    log_counter(&WASM_OBJECT_LAYOUT_HITS_TOTAL, hits);
+    log_counter(&WASM_OBJECT_LAYOUT_MISSES_TOTAL, misses);
+    log_counter(&WASM_OBJECT_LAYOUT_EVICTIONS_TOTAL, evictions);
+    log_counter(&WASM_OBJECT_LAYOUT_FALLBACKS_TOTAL, fallbacks);
 }

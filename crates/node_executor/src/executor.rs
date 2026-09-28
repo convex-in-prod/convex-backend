@@ -271,6 +271,10 @@ impl NodeSystemOperationReservation {
             .map_err(|_| anyhow::anyhow!("Node system operation reservation owner is invalid"))
     }
 
+    pub(crate) fn kind(&self) -> NodeSystemOperationKind {
+        self.kind
+    }
+
     pub(crate) fn validate_request(&self, request: &ExecutorRequest) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.kind == NodeSystemOperationKind::from_request(request)?,
@@ -343,6 +347,7 @@ pub struct NodeExecutorCutoverTarget {
     pub environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
 }
 
+#[derive(Debug)]
 pub struct InvokeResponse {
     pub response: JsonValue,
     pub aws_request_id: Option<String>,

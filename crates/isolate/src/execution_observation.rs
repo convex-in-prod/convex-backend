@@ -14,6 +14,8 @@ use std::{
     task::{
         Context,
         Poll,
+        Wake,
+        Waker,
     },
     time::Instant,
 };
@@ -253,6 +255,9 @@ impl Frame {
             target.suspension.provider_nanos += source.suspension.provider_nanos;
             target.suspension.permit_nanos += source.suspension.permit_nanos;
             target.suspension.other_nanos += source.suspension.other_nanos;
+            target.wake_to_poll_nanos += source.wake_to_poll_nanos;
+            target.resumed_polls += source.resumed_polls;
+            target.resumed_polls_without_wake += source.resumed_polls_without_wake;
         }
         observation.poll_count += local.poll_count;
         observation.accounting_flushes += local.accounting_flushes;
@@ -260,6 +265,36 @@ impl Frame {
         observation.provider_batches += local.provider_batches;
         observation.provider_operations += local.provider_operations;
         observation.provider_response_bytes += local.provider_response_bytes;
+        if let Some(source) = local.object_layouts {
+            let target = observation.object_layouts.get_or_insert_default();
+            target.hits += source.hits;
+            target.misses += source.misses;
+            target.evictions += source.evictions;
+            target.fallbacks += source.fallbacks;
+        }
+        if let Some(source) = local.v8_gc_callbacks {
+            let target = observation.v8_gc_callbacks.get_or_insert_default();
+            target.callbacks += source.callbacks;
+            target.time.cpu_nanos += source.time.cpu_nanos;
+            target.time.poll_wall_nanos += source.time.poll_wall_nanos;
+        }
+        if let Some(source) = local.hermes_handler_heap {
+            let target = observation.hermes_handler_heap.get_or_insert_with(|| {
+                udf::execution_observation::HermesHeapObservation {
+                    heap_before_bytes: source.heap_before_bytes,
+                    gc_cpu_nanos: source.gc_cpu_nanos.map(|_| 0),
+                    ..Default::default()
+                }
+            });
+            target.collections += source.collections;
+            target.gc_wall_nanos += source.gc_wall_nanos;
+            target.gc_cpu_nanos = target
+                .gc_cpu_nanos
+                .zip(source.gc_cpu_nanos)
+                .map(|(before, added)| before + added);
+            target.allocated_bytes += source.allocated_bytes;
+            target.heap_after_bytes = source.heap_after_bytes;
+        }
         if local.reused_runtime.is_some() {
             observation.reused_runtime = local.reused_runtime;
         }
@@ -311,6 +346,52 @@ pub(crate) fn set_phase(phase: Phase) {
     });
 }
 
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub(crate) fn install_wasm_hook_if_observed<T: 'static>(store: &mut wasmtime::Store<T>) -> bool {
+    if ACTIVE.with_borrow(Option::is_none) {
+        return false;
+    }
+    // This Wasmtime version cannot remove a hook. Install it only on Stores
+    // selected for observation, retaining it across reuse without changing
+    // pool identity or lifetime. Inactive callbacks do no timing or locking.
+    store.call_hook(|_, transition| {
+        wasm_transition(transition);
+        Ok(())
+    });
+    true
+}
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub(crate) fn wasm_transition(transition: wasmtime::CallHook) {
+    ACTIVE.with_borrow_mut(|active| {
+        let Some(frame) = active else { return };
+        frame.local.wasm_transitions += 1;
+        frame.flush();
+        match transition {
+            wasmtime::CallHook::CallingWasm | wasmtime::CallHook::CallingHost => {
+                if frame.owners.len() == 128 {
+                    frame.local.invalid = Some(ExecutionObservationInvalid::OwnerStackLimit);
+                    return;
+                }
+                frame.owners.push(frame.owner);
+                frame.owner = match transition {
+                    wasmtime::CallHook::CallingWasm => Owner::Guest,
+                    wasmtime::CallHook::CallingHost => Owner::Host,
+                    wasmtime::CallHook::ReturningFromWasm
+                    | wasmtime::CallHook::ReturningFromHost => unreachable!(),
+                };
+            },
+            wasmtime::CallHook::ReturningFromWasm | wasmtime::CallHook::ReturningFromHost => {
+                if let Some(owner) = frame.owners.pop() {
+                    frame.owner = owner;
+                } else {
+                    frame.local.invalid = Some(ExecutionObservationInvalid::OwnerStackMismatch);
+                }
+            },
+        }
+    });
+}
+
 pub(crate) async fn observe_poll<F: Future>(
     future: F,
     owner: Option<Owner>,
@@ -350,6 +431,110 @@ pub(crate) fn record_runtime_reuse(reused: bool) {
     ACTIVE.with_borrow_mut(|active| {
         if let Some(frame) = active {
             frame.local.reused_runtime = Some(reused);
+        }
+    });
+}
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub(crate) fn record_object_layouts([hits, misses, evictions, fallbacks]: [u64; 4]) {
+    ACTIVE.with_borrow_mut(|active| {
+        if let Some(frame) = active {
+            let counts = frame.local.object_layouts.get_or_insert_default();
+            counts.hits += hits;
+            counts.misses += misses;
+            counts.evictions += evictions;
+            counts.fallbacks += fallbacks;
+        }
+    });
+}
+
+pub(crate) fn record_v8_gc_support() {
+    ACTIVE.with_borrow_mut(|active| {
+        if let Some(frame) = active {
+            frame.local.v8_gc_callbacks.get_or_insert_default();
+        }
+    });
+}
+
+struct GcStart {
+    wall: Instant,
+    cpu: Option<u64>,
+    depth: u32,
+}
+
+thread_local! {
+    static V8_GC_START: RefCell<Option<GcStart>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn begin_v8_gc() {
+    if !is_observed() {
+        return;
+    }
+    V8_GC_START.with_borrow_mut(|start| {
+        if let Some(start) = start {
+            start.depth += 1;
+        } else {
+            *start = Some(GcStart {
+                wall: Instant::now(),
+                cpu: thread_cpu(),
+                depth: 1,
+            });
+        }
+    });
+}
+
+pub(crate) fn end_v8_gc() {
+    let start = V8_GC_START.with_borrow_mut(|start| {
+        let active = start.as_mut()?;
+        active.depth -= 1;
+        if active.depth == 0 {
+            start.take()
+        } else {
+            None
+        }
+    });
+    let Some(start) = start else {
+        return;
+    };
+    let wall = nanos(start.wall.elapsed());
+    let cpu = start
+        .cpu
+        .zip(thread_cpu())
+        .and_then(|(before, after)| after.checked_sub(before));
+    ACTIVE.with_borrow_mut(|active| {
+        if let Some(frame) = active {
+            let stats = frame.local.v8_gc_callbacks.get_or_insert_default();
+            stats.callbacks += 1;
+            stats.time.poll_wall_nanos += wall;
+            if let Some(cpu) = cpu {
+                stats.time.cpu_nanos += cpu;
+            } else {
+                frame.local.invalid = Some(ExecutionObservationInvalid::CpuClockUnavailable);
+            }
+        }
+    });
+}
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+pub(crate) fn record_hermes_gc([collections, wall, cpu, allocated, before, after]: [u64; 6]) {
+    let cpu = thread_cpu().map(|_| cpu);
+    ACTIVE.with_borrow_mut(|active| {
+        if let Some(frame) = active {
+            let stats = frame.local.hermes_handler_heap.get_or_insert_with(|| {
+                udf::execution_observation::HermesHeapObservation {
+                    heap_before_bytes: before,
+                    gc_cpu_nanos: cpu.map(|_| 0),
+                    ..Default::default()
+                }
+            });
+            stats.collections += collections;
+            stats.gc_wall_nanos += wall;
+            stats.gc_cpu_nanos = stats
+                .gc_cpu_nanos
+                .zip(cpu)
+                .map(|(before, added)| before + added);
+            stats.allocated_bytes += allocated;
+            stats.heap_after_bytes = after;
         }
     });
 }
@@ -417,6 +602,7 @@ pub async fn observe<F: Future>(future: F, task: Option<ObservedTask>) -> F::Out
             cpu: None,
         }),
         completed: false,
+        wake: None,
     }
     .await
 }
@@ -425,6 +611,31 @@ struct ObservedFuture<F> {
     future: Option<Pin<Box<F>>>,
     frame: Option<Frame>,
     completed: bool,
+    wake: Option<Arc<ObservedWake>>,
+}
+
+struct ObservedWake(Mutex<WakeState>);
+
+struct WakeState {
+    parent: Waker,
+    first_wake: Option<Instant>,
+}
+
+impl Wake for ObservedWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let parent = {
+            let mut state = self.0.lock();
+            state.first_wake.get_or_insert_with(Instant::now);
+            state.parent.clone()
+        };
+        // Wake outside the lock: a parent wrapper can synchronously record or
+        // forward this wake, including on another executor thread.
+        parent.wake();
+    }
 }
 
 // Restores thread-local context during both normal return and unwinding.
@@ -475,6 +686,30 @@ impl<F: Future> Future for ObservedFuture<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        let wake = this.wake.get_or_insert_with(|| {
+            Arc::new(ObservedWake(Mutex::new(WakeState {
+                parent: cx.waker().clone(),
+                first_wake: None,
+            })))
+        });
+        let woke_at = {
+            let mut state = wake.0.lock();
+            state.parent.clone_from(cx.waker());
+            state.first_wake.take()
+        };
+        let frame = this.frame.as_mut().expect("execution frame missing");
+        if let Some(suspended) = frame.suspended {
+            let phase = Frame::phase(frame.phase, &mut frame.local);
+            phase.resumed_polls += 1;
+            if let Some(woke_at) = woke_at {
+                phase.wake_to_poll_nanos +=
+                    nanos(Instant::now().duration_since(woke_at.max(suspended)));
+            } else {
+                phase.resumed_polls_without_wake += 1;
+            }
+        }
+        let waker = Waker::from(Arc::clone(wake));
+        let mut observed_context = Context::from_waker(&waker);
         let _guard = PollGuard::new(&mut this.frame);
         ACTIVE.with_borrow_mut(|active| {
             active
@@ -488,7 +723,7 @@ impl<F: Future> Future for ObservedFuture<F> {
             .as_mut()
             .expect("execution future missing")
             .as_mut()
-            .poll(cx);
+            .poll(&mut observed_context);
         this.completed = result.is_ready();
         result
     }
@@ -560,7 +795,12 @@ mod tests {
                 .await;
                 {
                     let _guest = enter(Owner::Guest);
+                    record_v8_gc_support();
+                    begin_v8_gc();
+                    begin_v8_gc();
                     work();
+                    end_v8_gc();
+                    end_v8_gc();
                     {
                         let _host = enter(Owner::Host);
                         work();
@@ -583,6 +823,11 @@ mod tests {
         assert!(result.handler.guest.cpu_nanos > 0);
         assert!(result.handler.host.cpu_nanos > 0);
         assert!(result.handler.provider.cpu_nanos > 0);
+        let gc = result.v8_gc_callbacks.unwrap();
+        assert_eq!(gc.callbacks, 1);
+        assert!(gc.time.cpu_nanos > 0);
+        assert!(gc.time.cpu_nanos <= result.handler.guest.cpu_nanos);
+        assert!(gc.time.poll_wall_nanos <= result.handler.guest.poll_wall_nanos);
         assert!(current().is_none());
     }
 
@@ -594,8 +839,19 @@ mod tests {
         let future = Box::pin(observe(
             async {
                 set_phase(Phase::Handler);
+                #[cfg(feature = "static-hermes-wasmtime-gate")]
+                {
+                    wasm_transition(wasmtime::CallHook::CallingWasm);
+                    wasm_transition(wasmtime::CallHook::CallingHost);
+                }
                 let result =
                     observe_poll(receiver, Some(Owner::Provider), Suspension::Provider).await;
+                #[cfg(feature = "static-hermes-wasmtime-gate")]
+                {
+                    wasm_transition(wasmtime::CallHook::ReturningFromHost);
+                    work();
+                    wasm_transition(wasmtime::CallHook::ReturningFromWasm);
+                }
                 result.unwrap()
             },
             Some(task),
@@ -622,6 +878,10 @@ mod tests {
         assert_eq!(result.active_tasks, 0);
         assert!(result.handler.suspension.provider_nanos > 0);
         assert_eq!(result.handler.suspension.permit_nanos, 0);
+        assert_eq!(result.handler.resumed_polls, 1);
+        assert_eq!(result.handler.resumed_polls_without_wake, 0);
+        assert!(result.handler.wake_to_poll_nanos > 0);
+        assert!(result.handler.wake_to_poll_nanos <= result.handler.suspension.provider_nanos);
     }
 
     struct PendingWithCleanup(Arc<AtomicBool>);
@@ -701,5 +961,175 @@ mod tests {
         );
         assert_eq!(observer.snapshot().active_tasks, 0);
         assert!(current().is_none());
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    fn wasm_fixture(
+        trap: bool,
+        host_calls: usize,
+    ) -> (wasmtime::Store<()>, wasmtime::TypedFunc<(), ()>) {
+        let mut types = wasm_encoder::TypeSection::new();
+        types.ty().function([], []);
+        let mut imports = wasm_encoder::ImportSection::new();
+        if host_calls > 0 {
+            imports.import("env", "noop", wasm_encoder::EntityType::Function(0));
+        }
+        let mut functions = wasm_encoder::FunctionSection::new();
+        functions.function(0);
+        let mut exports = wasm_encoder::ExportSection::new();
+        exports.export(
+            "run",
+            wasm_encoder::ExportKind::Func,
+            u32::from(host_calls > 0),
+        );
+        let mut function = wasm_encoder::Function::new([]);
+        for _ in 0..host_calls {
+            function.instruction(&wasm_encoder::Instruction::Call(0));
+        }
+        if trap {
+            function.instruction(&wasm_encoder::Instruction::Unreachable);
+        }
+        function.instruction(&wasm_encoder::Instruction::End);
+        let mut code = wasm_encoder::CodeSection::new();
+        code.function(&function);
+        let mut module = wasm_encoder::Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&exports)
+            .section(&code);
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, module.finish()).unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let imports = if host_calls > 0 {
+            vec![wasmtime::Func::wrap(&mut store, || {}).into()]
+        } else {
+            vec![]
+        };
+        let instance =
+            block_on(wasmtime::Instance::new_async(&mut store, &module, &imports)).unwrap();
+        let run = instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .unwrap();
+        (store, run)
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    #[test]
+    fn reused_store_uses_the_current_invocation_collector() {
+        let (mut store, run) = wasm_fixture(false, 3);
+        assert!(!install_wasm_hook_if_observed(&mut store));
+        block_on(run.call_async(&mut store, ())).unwrap();
+        let first = ExecutionObserver::default();
+        block_on(observe(
+            async {
+                assert!(install_wasm_hook_if_observed(&mut store));
+                run.call_async(&mut store, ()).await
+            },
+            Some(first.task(TaskKind::Runtime)),
+        ))
+        .unwrap();
+        let retained = first.snapshot();
+        assert!(retained.preparation.guest.cpu_nanos > 0);
+        assert_eq!(retained.wasm_transitions, 8);
+        assert_eq!(retained.invalid, None);
+        let second = ExecutionObserver::default();
+        block_on(observe(
+            run.call_async(&mut store, ()),
+            Some(second.task(TaskKind::Runtime)),
+        ))
+        .unwrap();
+        block_on(run.call_async(&mut store, ())).unwrap();
+        assert_eq!(first.snapshot(), retained);
+        let result = second.snapshot();
+        assert!(result.preparation.guest.cpu_nanos > 0);
+        assert_eq!(result.runtime_tasks, 1);
+        assert_eq!(result.wasm_transitions, 8);
+        assert_eq!(result.invalid, None);
+        assert!(current().is_none());
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    #[test]
+    fn wasm_trap_balances_owners_without_changing_the_error() {
+        let (mut store, run) = wasm_fixture(true, 0);
+        let observer = ExecutionObserver::default();
+        let result = block_on(observe(
+            async {
+                assert!(install_wasm_hook_if_observed(&mut store));
+                run.call_async(&mut store, ()).await
+            },
+            Some(observer.task(TaskKind::Runtime)),
+        ));
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<wasmtime::Trap>(),
+            Some(wasmtime::Trap::UnreachableCodeReached)
+        ));
+        let result = observer.snapshot();
+        assert_eq!(result.invalid, None);
+        assert_eq!(result.completed_tasks, 1);
+        assert_eq!(result.active_tasks, 0);
+        assert!(current().is_none());
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    #[test]
+    #[ignore = "manual observer calibration; use --release --ignored --nocapture"]
+    fn wasm_import_observer_calibration() {
+        const IMPORTS_PER_CALL: usize = 1000;
+        const CALLS: usize = 500;
+        let (mut plain_store, plain_run) = wasm_fixture(false, IMPORTS_PER_CALL);
+        let (mut hooked_store, hooked_run) = wasm_fixture(false, IMPORTS_PER_CALL);
+        let warmup = ExecutionObserver::default();
+        block_on(observe(
+            async {
+                assert!(install_wasm_hook_if_observed(&mut hooked_store));
+                for _ in 0..100 {
+                    plain_run.call_async(&mut plain_store, ()).await.unwrap();
+                    hooked_run.call_async(&mut hooked_store, ()).await.unwrap();
+                }
+            },
+            Some(warmup.task(TaskKind::Runtime)),
+        ));
+        // Bracket both controls to expose drift. This compares no installed
+        // hook, installed but inactive, and collecting within the same
+        // call-hook-enabled binary; it does not measure the Cargo feature tax.
+        for mode in ["no_hook", "inactive", "collecting", "inactive", "no_hook"] {
+            let observer = ExecutionObserver::default();
+            let (store, run) = if mode == "no_hook" {
+                (&mut plain_store, &plain_run)
+            } else {
+                (&mut hooked_store, &hooked_run)
+            };
+            let task = (mode == "collecting").then(|| observer.task(TaskKind::Runtime));
+            let wall = Instant::now();
+            let cpu = thread_cpu().unwrap();
+            block_on(observe(
+                async {
+                    for _ in 0..CALLS {
+                        run.call_async(&mut *store, ()).await.unwrap();
+                    }
+                },
+                task,
+            ));
+            let cpu = thread_cpu().unwrap() - cpu;
+            let wall = nanos(wall.elapsed());
+            let result = observer.snapshot();
+            assert_eq!(result.invalid, None);
+            if mode == "collecting" {
+                assert_eq!(
+                    result.wasm_transitions,
+                    (CALLS * (IMPORTS_PER_CALL + 1) * 2) as u64,
+                );
+            }
+            println!(
+                "observer_calibration mode={mode} imports={} cpu_nanos={cpu} wall_nanos={wall} \
+                 accounting_flushes={} wasm_transitions={}",
+                CALLS * IMPORTS_PER_CALL,
+                result.accounting_flushes,
+                result.wasm_transitions,
+            );
+        }
     }
 }

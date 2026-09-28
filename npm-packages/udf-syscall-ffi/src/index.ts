@@ -38,7 +38,13 @@ export async function performAsyncSyscall(
   } catch (e: any) {
     // Rethrow the exception since the error coming from the async syscall layer
     // doesn't have a stack trace associated with it.
-    throw new Error(e.message);
+    const rethrown = new Error(e.message);
+    Object.defineProperty(rethrown, "cause", {
+      configurable: true,
+      value: e,
+      writable: true,
+    });
+    throw rethrown;
   }
   return JSON.parse(resultStr);
 }

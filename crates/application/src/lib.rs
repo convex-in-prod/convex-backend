@@ -1,3 +1,7 @@
+#![cfg_attr(
+    all(test, feature = "static-hermes-wasmtime-gate"),
+    recursion_limit = "256"
+)]
 #![feature(try_blocks)]
 #![feature(try_blocks_heterogeneous)]
 #![feature(stmt_expr_attributes)]
@@ -275,6 +279,7 @@ use model::{
         types::{
             ExternalDepsPackage,
             ExternalDepsPackageId,
+            ExternalDepsPackageSelection,
         },
         ExternalPackagesModel,
     },
@@ -310,6 +315,7 @@ use model::{
         ImportRequestor,
     },
     source_packages::{
+        runtime_content::runtime_content_sha256,
         types::{
             NodeVersion,
             PackageSize,
@@ -447,6 +453,7 @@ pub mod deploy_config;
 pub mod deployment_state;
 mod execute_query_timestamp;
 mod exports;
+mod external_deps;
 pub mod function_log;
 mod function_usage_metrics;
 pub mod log_streaming;
@@ -499,6 +506,7 @@ pub struct QueryReturn {
     pub log_lines: LogLines,
     pub token: Token,
     pub journal: QueryJournal,
+    pub(crate) host_operation_error: Option<udf::HostOperationErrorV1>,
 }
 
 #[derive(Debug)]
@@ -507,6 +515,7 @@ pub struct RedactedQueryReturn {
     pub log_lines: RedactedLogLines,
     pub token: Token,
     pub journal: SerializedQueryJournal,
+    pub(crate) host_operation_error: Option<udf::HostOperationErrorV1>,
 }
 
 #[derive(Debug)]
@@ -528,6 +537,7 @@ pub struct RedactedMutationReturn {
 pub struct MutationError {
     pub error: JsError,
     pub log_lines: LogLines,
+    pub(crate) host_operation_error: Option<udf::HostOperationErrorV1>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -535,6 +545,7 @@ pub struct MutationError {
 pub struct RedactedMutationError {
     pub error: RedactedJsError,
     pub log_lines: RedactedLogLines,
+    pub(crate) host_operation_error: Option<udf::HostOperationErrorV1>,
 }
 
 #[derive(Debug)]
@@ -769,6 +780,23 @@ impl<RT: Runtime> Application<RT> {
 
         let deployment_name = deployment.name.clone();
         let deployment_region = deployment.region.clone();
+        #[cfg(feature = "static-hermes-wasmtime-gate")]
+        let disable_background_function_executors =
+            match std::env::var("CONVEX_STATIC_HERMES_WASM_GATE_DISABLE_BACKGROUND_EXECUTORS")
+                .as_deref()
+            {
+                Ok("1") => true,
+                Ok("0") | Err(std::env::VarError::NotPresent) => false,
+                Ok(_) => panic!(
+                    "CONVEX_STATIC_HERMES_WASM_GATE_DISABLE_BACKGROUND_EXECUTORS must be 0 or 1"
+                ),
+                Err(error) => panic!(
+                    "failed to read CONVEX_STATIC_HERMES_WASM_GATE_DISABLE_BACKGROUND_EXECUTORS: \
+                     {error}"
+                ),
+            };
+        #[cfg(not(feature = "static-hermes-wasmtime-gate"))]
+        let disable_background_function_executors = false;
         let default_system_env_vars = btreemap! {
             CONVEX_ORIGIN.clone() => convex_origin.parse()?,
             CONVEX_SITE.clone() => convex_site.parse()?
@@ -911,21 +939,47 @@ impl<RT: Runtime> Application<RT> {
         ));
         function_runner.set_action_callbacks(runner.clone());
 
-        let scheduled_job_runner = ScheduledJobRunner::start(
+        #[cfg(feature = "static-hermes-wasmtime-gate")]
+        isolate::initialize_runtime_preparation(
             runtime.clone(),
-            deployment_name.clone(),
             database.clone(),
-            runner.clone(),
-            function_log.clone(),
-        );
+            default_system_env_vars.clone(),
+        )?;
 
-        let cron_job_executor_fut = CronJobExecutor::run(
-            runtime.clone(),
-            deployment_name.clone(),
-            database.clone(),
-            runner.clone(),
-            function_log.clone(),
-        );
+        let scheduled_job_runner = if disable_background_function_executors {
+            #[cfg(not(feature = "static-hermes-wasmtime-gate"))]
+            unreachable!("background function executors can only be disabled in the gate build");
+            #[cfg(feature = "static-hermes-wasmtime-gate")]
+            ScheduledJobRunner::disabled(runtime.clone())
+        } else {
+            ScheduledJobRunner::start(
+                runtime.clone(),
+                deployment_name.clone(),
+                database.clone(),
+                runner.clone(),
+                function_log.clone(),
+            )
+        };
+
+        let cron_runtime = runtime.clone();
+        let cron_deployment_name = deployment_name.clone();
+        let cron_database = database.clone();
+        let cron_runner = runner.clone();
+        let cron_function_log = function_log.clone();
+        let cron_job_executor_fut = async move {
+            if disable_background_function_executors {
+                std::future::pending().await
+            } else {
+                CronJobExecutor::run(
+                    cron_runtime,
+                    cron_deployment_name,
+                    cron_database,
+                    cron_runner,
+                    cron_function_log,
+                )
+                .await
+            }
+        };
         let cron_job_executor = Arc::new(Mutex::new(
             runtime.spawn("cron_job_executor", cron_job_executor_fut),
         ));
@@ -1458,6 +1512,7 @@ impl<RT: Runtime> Application<RT> {
                 journal: self
                     .key_broker
                     .encrypt_query_journal(&query_return.journal, persistence_version),
+                host_operation_error: query_return.host_operation_error,
             },
             Err(e) if e.is_deterministic_user_error() => RedactedQueryReturn {
                 result: Err(RedactedJsError::from_js_error(
@@ -1472,6 +1527,7 @@ impl<RT: Runtime> Application<RT> {
                 journal: self
                     .key_broker
                     .encrypt_query_journal(&QueryJournal::new(), persistence_version),
+                host_operation_error: None,
             },
             Err(e) => anyhow::bail!(e),
         };
@@ -1555,6 +1611,7 @@ impl<RT: Runtime> Application<RT> {
                     mutation_error.log_lines,
                     block_logging,
                 ),
+                host_operation_error: mutation_error.host_operation_error,
             }),
             Err(e) if e.is_deterministic_user_error() => Err(RedactedMutationError {
                 error: RedactedJsError::from_js_error(
@@ -1563,6 +1620,7 @@ impl<RT: Runtime> Application<RT> {
                     request_id,
                 ),
                 log_lines: RedactedLogLines::empty(),
+                host_operation_error: None,
             }),
             Err(e) => anyhow::bail!(e),
         };
@@ -2489,14 +2547,41 @@ impl<RT: Runtime> Application<RT> {
         request_metadata: RequestMetadata,
         apply_config_args: ApplyConfigArgs,
     ) -> anyhow::Result<(ConfigMetadataAndSchema, OccRetryStats, Timestamp)> {
+        // The caller's publication task owns the native and Node reservations
+        // as well as this commit. Detaching only this helper would release those
+        // other owners while a cancelled caller's source write could still win.
         let runner = self.runner.clone();
-        self.execute_with_audit_log_events_and_occ_retries_reporting_stats(
-            identity,
-            request_metadata,
-            "apply_config",
-            |tx| Self::_apply_config(runner.clone(), tx, apply_config_args.clone()).into(),
-        )
-        .await
+        let ((config, _publication), stats, timestamp) = self
+            .execute_with_audit_log_events_and_occ_retries_with_timestamp(
+                identity,
+                request_metadata,
+                "apply_config",
+                MAX_OCC_FAILURES,
+                |tx| {
+                    let runner = runner.clone();
+                    let args = apply_config_args.clone();
+                    async move {
+                        let (config, events) = Self::_apply_config(runner, tx, args).await?;
+                        // Auth evaluation and transaction reads happen first.
+                        // The existing OCC loop owns the gate through this
+                        // attempt's commit and releases it before retry backoff.
+                        #[cfg(feature = "static-hermes-wasmtime-gate")]
+                        let publication = common::wasm_runtime_policy::runtime_policy_store()
+                            .lock_publication()
+                            .await;
+                        #[cfg(not(feature = "static-hermes-wasmtime-gate"))]
+                        let publication = ();
+                        Ok(((config, publication), events))
+                    }
+                    .into()
+                },
+                |_, _timestamp| {
+                    #[cfg(feature = "static-hermes-wasmtime-gate")]
+                    isolate::source_keyed_runtime_unpaired_committed(_timestamp);
+                },
+            )
+            .await?;
+        Ok((config, stats, timestamp))
     }
 
     #[fastrace::trace]
@@ -2609,6 +2694,7 @@ impl<RT: Runtime> Application<RT> {
         Vec<ModuleConfig>,
     )> {
         let upload = upload
+            || config.external_deps_package.is_some()
             || !config.node_dependencies.is_empty()
             || config
                 .app_definition
@@ -2626,13 +2712,23 @@ impl<RT: Runtime> Application<RT> {
                     .iter()
                     .any(|module| module.environment == ModuleEnvironment::Node)
             });
+        let selected_external_deps = match &config.external_deps_package {
+            Some(selection) => {
+                let package = self.get_external_node_deps(selection).await?;
+                package.validate_dependencies(&config.node_dependencies)?;
+                Some((selection.id.clone(), package))
+            },
+            None => None,
+        };
         let upload_limit = Arc::new(Semaphore::new(*APPLICATION_MAX_CONCURRENT_UPLOADS));
 
         let mut app_functions: Vec<ModuleConfig> =
             config.app_definition.changed_runtime_modules.clone();
         let root_future = async {
             let permit = upload_limit.acquire().await?;
-            let external_deps_id_and_pkg = if !config.node_dependencies.is_empty() {
+            let external_deps_id_and_pkg = if let Some(selected) = selected_external_deps {
+                Some(selected)
+            } else if !config.node_dependencies.is_empty() {
                 let deps = self
                     .build_external_node_deps(config.node_dependencies.clone())
                     .await?;
@@ -3024,6 +3120,8 @@ impl<RT: Runtime> Application<RT> {
             Some((id, pkg)) => (Some(id), Some(pkg)),
             _ => (None, None),
         };
+        let runtime_content_sha256 =
+            runtime_content_sha256(modules, external_deps_pkg.as_ref(), node_version)?;
         let (storage_key, sha256, package_size) = upload_package(
             package,
             self.application_storage.modules_storage.clone(),
@@ -3038,7 +3136,9 @@ impl<RT: Runtime> Application<RT> {
         Ok(SourcePackage {
             storage_key,
             sha256,
+            runtime_content_sha256: Some(runtime_content_sha256),
             native_resident: None,
+            runtime_generation: None,
             external_deps_package_id,
             package_size,
             node_version,
@@ -3281,6 +3381,34 @@ impl<RT: Runtime> Application<RT> {
         // Write package to system table
         let id = self._upload_external_deps_package(pkg.clone()).await?;
         Ok((id, pkg))
+    }
+
+    pub async fn get_external_node_deps(
+        &self,
+        selection: &ExternalDepsPackageSelection,
+    ) -> anyhow::Result<ExternalDepsPackage> {
+        let mut tx = self.begin(Identity::system()).await?;
+        ExternalPackagesModel::new(&mut tx)
+            .get_selected(selection)
+            .await
+    }
+
+    pub async fn download_external_node_deps(
+        &self,
+        selection: &ExternalDepsPackageSelection,
+    ) -> anyhow::Result<StorageGetStream> {
+        let package = self.get_external_node_deps(selection).await?;
+        package.package_size.verify_size()?;
+        let result = self
+            .modules_storage()
+            .get(&package.storage_key)
+            .await?
+            .context("Selected external dependency archive is missing")?;
+        anyhow::ensure!(
+            usize::try_from(result.content_length)? == package.package_size.zipped_size_bytes,
+            "Selected external dependency archive size does not match its package"
+        );
+        Ok(result)
     }
 
     #[fastrace::trace]
@@ -3798,12 +3926,14 @@ impl<RT: Runtime> Application<RT> {
         .map(|(t, ..)| t)
     }
 
-    pub async fn execute_with_audit_log_events_and_occ_retries_reporting_stats<'a, F, T>(
+    pub async fn execute_with_audit_log_events_and_occ_retries_with_timestamp<'a, F, T>(
         &self,
         identity: Identity,
         request_metadata: RequestMetadata,
         write_source: impl Into<WriteSource>,
+        max_occ_failures: u32,
         f: F,
+        on_commit: impl FnOnce(&T, Timestamp) + Send,
     ) -> anyhow::Result<(T, OccRetryStats, Timestamp)>
     where
         F: Send + Sync,
@@ -3813,33 +3943,8 @@ impl<RT: Runtime> Application<RT> {
         )
             -> ShortBoxFuture<'b, 'a, anyhow::Result<(T, Vec<DeploymentAuditLogEvent>)>>,
     {
-        self.execute_with_audit_log_events_and_occ_retries_with_pause_client(
-            identity,
-            request_metadata,
-            write_source,
-            f,
-        )
-        .await
-    }
-
-    pub async fn execute_with_audit_log_events_and_occ_retries_with_timestamp<'a, F, T>(
-        &self,
-        identity: Identity,
-        request_metadata: RequestMetadata,
-        write_source: impl Into<WriteSource>,
-        max_occ_failures: u32,
-        f: F,
-    ) -> anyhow::Result<(T, Timestamp)>
-    where
-        F: Send + Sync,
-        T: Send + 'static,
-        F: for<'b> Fn(
-            &'b mut Transaction<RT>,
-        )
-            -> ShortBoxFuture<'b, 'a, anyhow::Result<(T, Vec<DeploymentAuditLogEvent>)>>,
-    {
         let db = self.database.clone();
-        let (ts, (t, events), _stats) = db
+        let (ts, (t, events), stats) = db
             .execute_with_occ_retries(
                 identity,
                 FunctionUsageTracker::new(),
@@ -3851,6 +3956,9 @@ impl<RT: Runtime> Application<RT> {
                 },
             )
             .await?;
+        // Transfer publication ownership before fallible audit conversion.
+        // A logging failure after commit cannot revoke prepared capacity.
+        on_commit(&t, ts);
         // Send deployment audit logs
         let logs = events
             .into_iter()
@@ -3860,7 +3968,7 @@ impl<RT: Runtime> Application<RT> {
             .try_collect()?;
 
         self.log_manager_client.send_logs(logs);
-        Ok((t, ts))
+        Ok((t, stats, ts))
     }
 
     pub async fn execute_with_audit_log_events_and_occ_retries_with_pause_client<'a, F, T>(
@@ -3878,30 +3986,15 @@ impl<RT: Runtime> Application<RT> {
         )
             -> ShortBoxFuture<'b, 'a, anyhow::Result<(T, Vec<DeploymentAuditLogEvent>)>>,
     {
-        let db = self.database.clone();
-        let (ts, (t, events), stats) = db
-            .execute_with_occ_retries(
-                identity,
-                FunctionUsageTracker::new(),
-                MAX_OCC_FAILURES,
-                write_source,
-                |tx| {
-                    Self::insert_deployment_audit_log_events(tx, &f, request_metadata.clone())
-                        .into()
-                },
-            )
-            .await?;
-        // Send deployment audit logs
-        // TODO CX-5139 Remove this when audit logs are being processed in LogManager.
-        let logs = events
-            .into_iter()
-            .map(|event| {
-                DeploymentAuditLogEvent::to_log_event(event, UnixTimestamp::from_nanos(ts.into()))
-            })
-            .try_collect()?;
-
-        self.log_manager_client.send_logs(logs);
-        Ok((t, stats, ts))
+        self.execute_with_audit_log_events_and_occ_retries_with_timestamp(
+            identity,
+            request_metadata,
+            write_source,
+            MAX_OCC_FAILURES,
+            f,
+            |_, _| {},
+        )
+        .await
     }
 
     pub async fn execute_with_occ_retries<'a, T, F>(

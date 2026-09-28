@@ -830,9 +830,8 @@ impl<'a, RT: Runtime> IndexModel<'a, RT> {
             ))
         } else if self
             .tx
-            .table_mapping()
-            .namespace(namespace)
-            .name_exists(index_name.table())
+            .resolve_table_name(namespace, index_name.table())?
+            .is_some()
         {
             match table_filter {
                 TableFilter::IncludePrivateSystemTables => Ok(StableIndexName::Physical(
@@ -858,13 +857,13 @@ impl<'a, RT: Runtime> IndexModel<'a, RT> {
         namespace: TableNamespace,
         index_name: &IndexName,
     ) -> anyhow::Result<TabletIndexName> {
-        index_name.clone().map_table(
-            &self
-                .tx
-                .table_mapping()
-                .namespace(namespace)
-                .name_to_tablet(),
-        )
+        let tablet = self
+            .tx
+            .resolve_table_name(namespace, index_name.table())?
+            .with_context(|| format!("cannot find table {}", index_name.table()))?
+            .tablet_id;
+        let Ok(index_name) = index_name.clone().map_table(&|_| Ok::<_, !>(tablet));
+        Ok(index_name)
     }
 
     /// Returns by_id indexes for *all tablets*, including hidden ones.

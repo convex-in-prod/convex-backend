@@ -6,8 +6,9 @@ use tokio::sync::{
     TryAcquireError,
 };
 
-/// One application-scoped capacity gate shared by degradable query leaders
-/// and isolate module analysis.
+/// A capacity gate shared by degradable queries and isolate module analysis.
+/// The application bounds leaders across engines; a separate V8 dispatch gate
+/// protects worker capacity without limiting Wasm demand to the V8 pool size.
 ///
 /// Degradable queries require an immediate decision so the sync protocol can
 /// retain stale results instead of adding a waiter. Analysis waits fairly for
@@ -344,14 +345,12 @@ mod tests {
             .await
             .unwrap();
         let (release, finish) = tokio::sync::oneshot::channel();
-        let child = DEPLOYMENT_ANALYSIS_JOB
-            .scope(permit, async {
-                let lease = DEPLOYMENT_ANALYSIS_JOB.with(Clone::clone);
-                tokio::spawn(DEPLOYMENT_ANALYSIS_JOB.scope(lease, async move {
-                    finish.await.unwrap();
-                }))
-            })
-            .await;
+        let child = DEPLOYMENT_ANALYSIS_JOB.sync_scope(permit, || {
+            let lease = DEPLOYMENT_ANALYSIS_JOB.with(Clone::clone);
+            tokio::spawn(DEPLOYMENT_ANALYSIS_JOB.scope(lease, async move {
+                finish.await.unwrap();
+            }))
+        });
         let mut next = Box::pin(gate.acquire(DeploymentAnalysisKind::Deploy, 2048));
         // The parent scope is gone and the child has not been polled yet.
         assert!(futures::poll!(&mut next).is_pending());

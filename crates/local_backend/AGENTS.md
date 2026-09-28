@@ -25,3 +25,14 @@ UPDATE_API_SPECS=1 scripts/run_cargo.sh test -p local_backend --lib test_public_
 Without `UPDATE_API_SPECS`, the same test checks that the generated public spec
 matches the checked-in file. This checkout does not define the
 `just generate-api-specs` recipe referenced by some package scripts.
+
+For the dashboard spec, include the optional runtime routes when exporting:
+
+```sh
+UPDATE_API_SPECS=1 scripts/run_cargo.sh test -p local_backend --lib \
+  --features static-hermes-wasmtime-gate test_dashboard_api_spec_matches
+npm --prefix npm-packages/dashboard run generateDeploymentApiSpec
+```
+
+This exports the same common-plus-local router composition as the served
+dashboard document. Without `UPDATE_API_SPECS`, the test checks the retained spec.

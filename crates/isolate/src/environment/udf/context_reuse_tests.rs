@@ -14,6 +14,7 @@ use common::{
         CanonicalizedComponentModulePath,
         ComponentId,
         ComponentPath,
+        PublicFunctionPath,
     },
     document::ParsedDocument,
     execution_context::ExecutionContext,
@@ -26,6 +27,7 @@ use common::{
     schemas::validator::Validator,
     shutdown::ShutdownSignal,
     types::{
+        AllowedVisibility,
         ConvexOrigin,
         DeploymentClass,
         DeploymentMetadata,
@@ -38,7 +40,11 @@ use common::{
     RequestContext,
     RequestId,
 };
-use database::Database;
+use database::{
+    Database,
+    Token,
+    UserFacingModel,
+};
 use file_storage::TransactionalFileStorage;
 use indexing::index_cache::IndexCache;
 use keybroker::{
@@ -48,9 +54,15 @@ use keybroker::{
 use model::{
     initialize_application_system_tables,
     modules::{
-        function_validators::ReturnsValidator,
+        function_validators::{
+            ArgsValidator,
+            ReturnsValidator,
+        },
         module_versions::{
+            AnalyzedFunction,
             AnalyzedModule,
+            ContextInitializationModule,
+            ContextReusePolicy,
             FullModuleSource,
             ModuleSource,
         },
@@ -62,6 +74,7 @@ use model::{
             PackageSize,
             SourcePackage,
             SourcePackageId,
+            SourcePackageRuntimeGeneration,
         },
         SourcePackageModel,
     },
@@ -118,7 +131,10 @@ use crate::{
 const INITIALIZER: &str = "_deps/context_init_000000000000000000000000000000000000000000000000.js";
 
 #[derive(Default)]
-struct TestModules(RwLock<BTreeMap<String, Arc<V8ModuleSource>>>);
+struct TestModules {
+    current: RwLock<BTreeMap<String, Arc<V8ModuleSource>>>,
+    versions: RwLock<BTreeMap<(String, String), Arc<V8ModuleSource>>>,
+}
 
 #[async_trait]
 impl ModuleCache<ProdRuntime> for TestModules {
@@ -127,9 +143,9 @@ impl ModuleCache<ProdRuntime> for TestModules {
         metadata: &ParsedDocument<ModuleMetadata>,
         _source_package: &ParsedDocument<SourcePackage>,
     ) -> anyhow::Result<Arc<V8ModuleSource>> {
-        self.0
+        self.versions
             .read()
-            .get(metadata.path.as_str())
+            .get(&(metadata.path.as_str().to_owned(), metadata.sha256.as_hex()))
             .cloned()
             .context("Missing test source")
     }
@@ -182,7 +198,9 @@ impl Fixture {
             .put(SourcePackage {
                 storage_key: ObjectKey::try_from("context-reuse-test")?,
                 sha256: Sha256Digest::from([0; 32]),
+                runtime_content_sha256: None,
                 native_resident: None,
+                runtime_generation: None,
                 external_deps_package_id: None,
                 package_size: PackageSize::default(),
                 node_version: None,
@@ -209,6 +227,21 @@ impl Fixture {
     }
 
     async fn put(&self, path: &str, source: &str) -> anyhow::Result<()> {
+        let module_path: sync_types::CanonicalizedModulePath = path.parse()?;
+        self.put_analyzed(
+            path,
+            source,
+            (!module_path.is_deps()).then(AnalyzedModule::default),
+        )
+        .await
+    }
+
+    async fn put_analyzed(
+        &self,
+        path: &str,
+        source: &str,
+        analyzed: Option<AnalyzedModule>,
+    ) -> anyhow::Result<()> {
         let mut tx = self.database.begin_system().await?;
         let path = CanonicalizedComponentModulePath {
             component: ComponentId::Root,
@@ -222,7 +255,7 @@ impl Fixture {
                 ModuleSource::from(source),
                 self.package,
                 None,
-                Some(AnalyzedModule::default()),
+                analyzed,
                 ModuleEnvironment::Isolate,
                 None,
             )
@@ -230,13 +263,77 @@ impl Fixture {
         self.database
             .commit_with_write_source(tx, "context_reuse_test")
             .await?;
-        self.modules.0.write().insert(
-            path.module_path.as_str().to_owned(),
-            Arc::new(V8ModuleSource::new(FullModuleSource {
-                source: ModuleSource::from(source),
-                source_map: None,
-            })),
+        let module_source = Arc::new(V8ModuleSource::new(FullModuleSource {
+            source: ModuleSource::from(source),
+            source_map: None,
+        }));
+        self.modules
+            .current
+            .write()
+            .insert(path.module_path.as_str().to_owned(), module_source.clone());
+        self.modules.versions.write().insert(
+            (
+                path.module_path.as_str().to_owned(),
+                model::modules::hash_module_source(&ModuleSource::from(source), None).as_hex(),
+            ),
+            module_source,
         );
+        Ok(())
+    }
+
+    async fn republish(&mut self, generation: u8) -> anyhow::Result<()> {
+        let mut tx = self.database.begin_system().await?;
+        let previous = SourcePackageModel::new(&mut tx, TableNamespace::Global)
+            .get(self.package)
+            .await?;
+        let mut package = (**previous).clone();
+        package.node_version = Some(model::source_packages::types::NodeVersion::V24x);
+        package.runtime_generation = Some(SourcePackageRuntimeGeneration {
+            deployment_sha256: Sha256Digest::from([generation; 32]),
+            generation_manifest_sha256: Sha256Digest::from([generation; 32]),
+            generation_sha256: Sha256Digest::from([generation; 32]),
+        });
+        package.native_resident = Some(model::source_packages::native::NativeResidentDescriptor {
+            artifact_sha256: Sha256Digest::from([generation; 32]).as_hex(),
+            configuration_sha256: Sha256Digest::from([generation; 32]).as_hex(),
+            lifecycle_protocol: 1,
+            application_contract: "fixture-v1".to_owned(),
+        });
+        let package = SourcePackageModel::new(&mut tx, TableNamespace::Global)
+            .put(package)
+            .await?;
+        let modules = self
+            .modules
+            .current
+            .read()
+            .iter()
+            .map(|(path, source)| {
+                Ok(model::config::types::ModuleConfig {
+                    path: path.parse()?,
+                    source: ModuleSource::new(&source.source().to_source_string()),
+                    source_map: source.source_map().cloned(),
+                    environment: ModuleEnvironment::Isolate,
+                    node_pool: None,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let analyzed = modules
+            .iter()
+            .filter(|module| !module.path.clone().canonicalize().is_deps())
+            .map(|module| {
+                (
+                    module.path.clone().canonicalize(),
+                    AnalyzedModule::default(),
+                )
+            })
+            .collect();
+        ModuleModel::new(&mut tx)
+            .apply(ComponentId::Root, modules, Some(package), analyzed)
+            .await?;
+        self.database
+            .commit_with_write_source(tx, "context_reuse_test")
+            .await?;
+        self.package = package;
         Ok(())
     }
 
@@ -251,6 +348,8 @@ impl Fixture {
                 region: None,
                 class: DeploymentClass::S16,
             },
+            #[cfg(feature = "static-hermes-wasmtime-gate")]
+            host_secret_values: Some(BTreeMap::new()),
         }
     }
 
@@ -298,6 +397,14 @@ impl Fixture {
         options: ActionOptions,
     ) -> anyhow::Result<(Result<JsonValue, common::errors::JsError>, bool)> {
         let request = self.action_request(path, argument, &options).await?;
+        self.run_action_request(request, options).await
+    }
+
+    async fn run_action_request(
+        &mut self,
+        request: ActionRequest<ProdRuntime>,
+        options: ActionOptions,
+    ) -> anyhow::Result<(Result<JsonValue, common::errors::JsError>, bool)> {
         let (log_sender, _log_receiver) = tokio::sync::mpsc::unbounded_channel();
         let environment = crate::environment::action::ActionEnvironment::new(
             self.rt.clone(),
@@ -341,7 +448,43 @@ impl Fixture {
         Ok((outcome.result.map(|value| value.json_value()), retained))
     }
 
+    async fn validated_path(
+        &self,
+        path: &str,
+        kind: UdfType,
+    ) -> anyhow::Result<ValidatedPathAndArgs> {
+        let mut tx = self.database.begin_system().await?;
+        let validated = ValidatedPathAndArgs::new(
+            AllowedVisibility::All,
+            &mut tx,
+            PublicFunctionPath::RootExport(path.parse()?),
+            SerializedArgs::from_args(vec![json!(0)])?,
+            kind,
+        )
+        .await??;
+        // Exercise the same protocol boundary as a remote function runner.
+        ValidatedPathAndArgs::from_proto(validated.try_into()?)
+    }
+
+    async fn run_analyzed_action(&mut self, path: &str) -> anyhow::Result<JsonValue> {
+        let options = ActionOptions::default();
+        let mut request = self.action_request(path, json!(0), &options).await?;
+        request.params.path_and_args = self.validated_path(path, UdfType::Action).await?;
+        let (value, retained) = self.run_action_request(request, options).await?;
+        assert!(retained);
+        Ok(value?)
+    }
+
     async fn run(&mut self, entry: &str, arg: i64, reuse: bool) -> anyhow::Result<JsonValue> {
+        Ok(self.run_with_token(entry, json!(arg), reuse).await?.0)
+    }
+
+    async fn run_with_token(
+        &mut self,
+        entry: &str,
+        arg: JsonValue,
+        reuse: bool,
+    ) -> anyhow::Result<(JsonValue, Token)> {
         let path_and_args = ValidatedPathAndArgs::from_proto(pb::common::ValidatedPathAndArgs {
             path: Some(format!("{entry}:run")),
             args: Some(SerializedArgs::from_args(vec![json!(arg)])?.into_bytes()),
@@ -350,6 +493,13 @@ impl Fixture {
             context_initialization_module: Some(INITIALIZER.to_owned()),
             ..Default::default()
         })?;
+        self.run_validated(path_and_args).await
+    }
+
+    async fn run_validated(
+        &mut self,
+        path_and_args: ValidatedPathAndArgs,
+    ) -> anyhow::Result<(JsonValue, Token)> {
         let (environment, args) = DatabaseUdfEnvironment::new(
             self.rt.clone(),
             UdfRequest {
@@ -364,6 +514,10 @@ impl Fixture {
                     &FunctionCaller::Cron,
                 ),
                 environment_data: self.environment_data(),
+                trace_host_operations: false,
+                capture_handler_reads: false,
+                #[cfg(feature = "static-hermes-wasmtime-gate")]
+                shadow_work_guard: None,
             },
             0,
             "context_reuse_test".to_owned(),
@@ -373,7 +527,7 @@ impl Fixture {
             .acquire(Arc::new("context_reuse_test".to_owned()), false)
             .await;
         let mut clean = false;
-        let (_tx, outcome) = Box::pin(environment.run(
+        let (tx, outcome) = Box::pin(environment.run(
             &mut self.isolate,
             &mut self.contexts,
             permit,
@@ -388,7 +542,7 @@ impl Fixture {
         let FunctionOutcome::Query(outcome) = outcome else {
             anyhow::bail!("Expected query outcome");
         };
-        Ok(outcome.result?.json_value())
+        Ok((outcome.result?.json_value(), tx.into_token()?))
     }
 }
 
@@ -1349,4 +1503,334 @@ fn grouped_action_worker_publishes_only_after_uncancelled_delivery() -> anyhow::
         })?
         .join()
         .expect("context-reuse worker test panicked")
+}
+
+#[test]
+fn selective_publication_preserves_v8_context_and_query_dependencies() -> anyhow::Result<()> {
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+        crate::client::initialize_v8();
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(Box::pin(async {
+            let mut fixture = Fixture::new(rt).await?;
+            let mut tx = fixture.database.begin_system().await?;
+            let id = UserFacingModel::new(&mut tx, TableNamespace::root_component())
+                .insert("reuseData".parse()?, value::obj!("marker" => "before")?).await?;
+            fixture.database.commit_with_write_source(tx, "context_reuse_test").await?;
+            let source = r#"
+                let calls = 0;
+                export const run = { isQuery: true, invokeQuery: async args => {
+                    const doc = JSON.parse(await Convex.asyncSyscall("1.0/get", JSON.stringify({id: JSON.parse(args)[0]})));
+                    return JSON.stringify([++calls, doc.marker]);
+                }};
+            "#;
+            fixture.put("_deps/shared.js", source).await?;
+            fixture.put("a.js", "export { run } from './_deps/shared.js';").await?;
+            fixture.put(INITIALIZER, "import '../a.js';").await?;
+            let arg = json!(id.encode());
+            let (value, token) = fixture.run_with_token("a.js", arg.clone(), true).await?;
+            assert_eq!(value, json!([1.0, "before"]));
+            let subscription = fixture.database.subscribe(token.clone()).await?;
+
+            fixture.republish(1).await?;
+            fixture.put("unrelated.js", "export const value = 1;").await?;
+            let tx = fixture.database.begin_system().await?;
+            assert!(fixture.database.refresh_token(token.clone(), *tx.begin_timestamp())
+                .await?.is_ok());
+            drop(tx);
+            let (value, token) = fixture.run_with_token("a.js", arg.clone(), true).await?;
+            assert_eq!(value, json!([2.0, "before"]));
+
+            let mut tx = fixture.database.begin_system().await?;
+            UserFacingModel::new(&mut tx, TableNamespace::root_component())
+                .replace(id, value::obj!("marker" => "after")?).await?;
+            let data_ts = fixture.database.commit_with_write_source(tx, "context_reuse_test").await?;
+            assert!(fixture.database.refresh_token(token, data_ts).await?.is_err());
+            let invalidated = tokio::time::timeout(Duration::from_secs(5),
+                subscription.wait_for_invalidation()).await?;
+            assert_eq!(invalidated, Some(data_ts));
+            let (value, token) = fixture.run_with_token("a.js", arg.clone(), true).await?;
+            // Data invalidates the result, but is not an initialization input.
+            assert_eq!(value, json!([3.0, "after"]));
+
+            fixture.put("_deps/shared.js", &source.replace("++calls", "100 + ++calls")).await?;
+            let tx = fixture.database.begin_system().await?;
+            assert!(fixture.database.refresh_token(token, *tx.begin_timestamp()).await?.is_err());
+            drop(tx);
+            let (value, token) = fixture.run_with_token("a.js", arg.clone(), true).await?;
+            assert_eq!(value, json!([101.0, "after"]));
+            let mut tx = fixture.database.begin_system().await?;
+            let imported = ModuleModel::new(&mut tx).get_metadata(CanonicalizedComponentModulePath {
+                component: ComponentId::Root, module_path: "_deps/shared.js".parse()?,
+            }).await?.context("imported module missing")?;
+            ModuleModel::new(&mut tx).delete(ComponentId::Root, imported.id()).await?;
+            let deleted_ts = fixture.database.commit_with_write_source(tx, "context_reuse_test").await?;
+            assert!(fixture.database.refresh_token(token, deleted_ts).await?.is_err());
+            assert!(fixture.run_with_token("a.js", arg.clone(), true).await.is_err());
+            fixture.put("_deps/shared.js", source).await?;
+            let (value, _) = fixture.run_with_token("a.js", arg, true).await?;
+            assert_eq!(value, json!([1.0, "after"]));
+            Ok(())
+        }))
+    })?.join().expect("selective publication test panicked")
+}
+
+#[test]
+fn action_initialization_tracks_imports_and_observed_environment() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            crate::client::initialize_v8();
+            let tokio = ProdRuntime::init_tokio()?;
+            let rt = ProdRuntime::new(&tokio);
+            tokio.block_on(Box::pin(async {
+                let mut fixture = Fixture::new(rt).await?;
+                fixture
+                    .put(
+                        "_deps/shared.js",
+                        r#"
+                let calls = 0;
+                const initialized = process.env.INIT_VALUE ?? null;
+                export const run = { isAction: true, invokeAction: async (_id, args) => {
+                    const lazy = JSON.parse(args)[0] ? (await import('./lazy.js')).value : null;
+                    return JSON.stringify([++calls, initialized, lazy]);
+                }};
+            "#,
+                    )
+                    .await?;
+                fixture
+                    .put("_deps/lazy.js", "export const value = 17;")
+                    .await?;
+                fixture
+                    .put("a.js", "export { run } from './_deps/shared.js';")
+                    .await?;
+                fixture.put(INITIALIZER, "import '../a.js';").await?;
+                let (value, retained) = fixture
+                    .run_action("a.js:run", json!(false), ActionOptions::default())
+                    .await?;
+                assert!(retained);
+                assert_eq!(value?, json!([1.0, null, null]));
+                fixture.republish(2).await?;
+                fixture
+                    .put("unrelated.js", "export const value = 2;")
+                    .await?;
+                let mut tx = fixture.database.begin_system().await?;
+                model::environment_variables::EnvironmentVariablesModel::new(&mut tx)
+                    .create(
+                        common::types::EnvironmentVariable {
+                            name: "UNUSED_VALUE".parse()?,
+                            value: "unused".parse()?,
+                        },
+                        &Default::default(),
+                    )
+                    .await?;
+                fixture
+                    .database
+                    .commit_with_write_source(tx, "context_reuse_test")
+                    .await?;
+                let (value, retained) = fixture
+                    .run_action("a.js:run", json!(false), ActionOptions::default())
+                    .await?;
+                assert!(retained);
+                assert_eq!(value?, json!([2.0, null, null]));
+
+                let mut tx = fixture.database.begin_system().await?;
+                model::environment_variables::EnvironmentVariablesModel::new(&mut tx)
+                    .create(
+                        common::types::EnvironmentVariable {
+                            name: "INIT_VALUE".parse()?,
+                            value: "present".parse()?,
+                        },
+                        &Default::default(),
+                    )
+                    .await?;
+                fixture
+                    .database
+                    .commit_with_write_source(tx, "context_reuse_test")
+                    .await?;
+                let (value, retained) = fixture
+                    .run_action("a.js:run", json!(false), ActionOptions::default())
+                    .await?;
+                assert!(retained);
+                assert_eq!(value?, json!([1.0, "present", null]));
+
+                // A lazy import can expand a warm context. The old initialization
+                // reads cannot authorize retaining the newly evaluated module.
+                let (value, retained) = fixture
+                    .run_action("a.js:run", json!(true), ActionOptions::default())
+                    .await?;
+                assert_eq!(value?, json!([2.0, "present", 17.0]));
+                assert!(!retained);
+                fixture
+                    .put("_deps/lazy.js", "export const value = 18;")
+                    .await?;
+                let (value, retained) = fixture
+                    .run_action("a.js:run", json!(true), ActionOptions::default())
+                    .await?;
+                assert_eq!(value?, json!([1.0, "present", 18.0]));
+                assert!(!retained);
+                let (value, retained) = fixture
+                    .run_action("a.js:run", json!(false), ActionOptions::default())
+                    .await?;
+                assert_eq!(value?, json!([1.0, "present", null]));
+                assert!(retained);
+                let mut tx = fixture.database.begin_system().await?;
+                model::environment_variables::EnvironmentVariablesModel::new(&mut tx)
+                    .delete(&"INIT_VALUE".parse()?)
+                    .await?;
+                fixture
+                    .database
+                    .commit_with_write_source(tx, "context_reuse_test")
+                    .await?;
+                let (value, retained) = fixture
+                    .run_action("a.js:run", json!(false), ActionOptions::default())
+                    .await?;
+                assert_eq!(value?, json!([1.0, null, null]));
+                assert!(retained);
+
+                let mut tx = fixture.database.begin_system().await?;
+                let mut config = (**UdfConfigModel::new(&mut tx, TableNamespace::Global)
+                    .get()
+                    .await?
+                    .context("config missing")?)
+                .clone();
+                config.import_phase_rng_seed = [8; 32];
+                config.import_phase_unix_timestamp = fixture.rt.unix_timestamp();
+                UdfConfigModel::new(&mut tx, TableNamespace::Global)
+                    .set(config)
+                    .await?;
+                fixture
+                    .database
+                    .commit_with_write_source(tx, "context_reuse_test")
+                    .await?;
+                let (value, retained) = fixture
+                    .run_action("a.js:run", json!(false), ActionOptions::default())
+                    .await?;
+                assert_eq!(value?, json!([1.0, null, null]));
+                assert!(retained);
+                Ok(())
+            }))
+        })?
+        .join()
+        .expect("action initialization test panicked")
+}
+
+#[test]
+fn action_publication_race_uses_the_initialization_snapshot() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            crate::client::initialize_v8();
+            let tokio = ProdRuntime::init_tokio()?;
+            let rt = ProdRuntime::new(&tokio);
+            tokio.block_on(Box::pin(async {
+                let mut fixture = Fixture::new(rt).await?;
+                let source = r#"
+                    let calls = 0;
+                    export const run = { isAction: true, invokeAction: async () =>
+                        JSON.stringify(["old", ++calls]) };
+                "#;
+                fixture.put("a.js", source).await?;
+                fixture.put(INITIALIZER, "import '../a.js';").await?;
+                let request = fixture
+                    .action_request("a.js:run", json!(0), &ActionOptions::default())
+                    .await?;
+                fixture.put("a.js", &source.replace("old", "new")).await?;
+                let (value, retained) = fixture
+                    .run_action_request(request, ActionOptions::default())
+                    .await?;
+                assert_eq!(value?, json!(["old", 1.0]));
+                assert!(retained);
+                let (value, retained) = fixture
+                    .run_action("a.js:run", json!(0), ActionOptions::default())
+                    .await?;
+                assert_eq!(value?, json!(["new", 1.0]));
+                assert!(retained);
+                Ok(())
+            }))
+        })?
+        .join()
+        .expect("action publication race test panicked")
+}
+
+#[test]
+fn split_initializers_share_and_invalidate_loaded_graphs() -> anyhow::Result<()> {
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+        crate::client::initialize_v8();
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(Box::pin(async {
+            let mut fixture = Fixture::new(rt).await?;
+            fixture.put("_deps/shared.js", r#"
+                let calls = 0;
+                export const run = { isQuery: true, invokeQuery: async () => JSON.stringify(++calls) };
+                const action = name => ({ isAction: true, invokeAction: async requestId => {
+                    await Convex.asyncSyscall("1.0/getUserIdentity", JSON.stringify({ requestId }));
+                    return JSON.stringify([name, ++calls]);
+                }});
+                export const act = action("first");
+                export const other = action("second");
+            "#).await?;
+            let initializer = ContextInitializationModule::separate(
+                2, Some("_deps/db.js"), Some("_deps/actions.js"),
+            )?;
+            let mut mixed = AnalyzedModule {
+                context_reuse: ContextReusePolicy {
+                    actions: true, ..ContextReusePolicy::database()
+                },
+                context_initialization_module: Some(initializer),
+                functions: [("run", UdfType::Query), ("act", UdfType::Action), ("other", UdfType::Action)]
+                    .into_iter().map(|(name, kind)| AnalyzedFunction::new(
+                        name.parse()?, None, kind, None,
+                        ArgsValidator::Unvalidated, ReturnsValidator::Unvalidated,
+                    )).collect::<anyhow::Result<Vec<_>>>()?.into(),
+                ..Default::default()
+            };
+            let database_only = AnalyzedModule {
+                context_reuse: ContextReusePolicy::database(),
+                context_initialization_module: Some(ContextInitializationModule::separate(2, Some("_deps/db.js"), None)?),
+                functions: vec![AnalyzedFunction::new("run".parse()?, None, UdfType::Query, None,
+                    ArgsValidator::Unvalidated, ReturnsValidator::Unvalidated)?].into(),
+                ..Default::default()
+            };
+            let mixed_source = "export { run, act, other } from './_deps/shared.js';";
+            fixture.put_analyzed("a.js", mixed_source, Some(mixed.clone())).await?;
+            fixture.put_analyzed("c.js", mixed_source, Some(mixed.clone())).await?;
+            fixture.put_analyzed("b.js", "export { run } from './_deps/shared.js';", Some(database_only.clone())).await?;
+            fixture.put("_deps/db.js", "import '../a.js'; import '../b.js'; import '../c.js';").await?;
+            fixture.put("_deps/actions.js", "import '../a.js'; import '../c.js';").await?;
+
+            for (entry, count) in [("a.js:run", 1.0), ("b.js:run", 2.0), ("c.js:run", 3.0)] {
+                let validated = fixture.validated_path(entry, UdfType::Query).await?;
+                assert_eq!(validated.context_initialization_module(UdfType::Query).unwrap().as_str(), "_deps/db.js");
+                assert_eq!(fixture.run_validated(validated).await?.0, json!(count));
+            }
+            assert_eq!(fixture.run_analyzed_action("a.js:act").await?, json!(["first", 1.0]));
+            assert_eq!(fixture.run_analyzed_action("a.js:other").await?, json!(["second", 2.0]));
+            assert_eq!(fixture.run_analyzed_action("c.js:act").await?, json!(["first", 3.0]));
+
+            // A database-only member is absent from the action initialization
+            // reads, even though both groups execute the same dependency chunk.
+            fixture.put_analyzed("b.js", "export { run } from './_deps/shared.js'; // changed", Some(database_only)).await?;
+            assert_eq!(fixture.run_analyzed_action("a.js:other").await?, json!(["second", 4.0]));
+            let validated = fixture.validated_path("a.js:run", UdfType::Query).await?;
+            let (value, token) = fixture.run_validated(validated).await?;
+            assert_eq!(value, json!(1.0));
+
+            // A policy-only change must participate in module compatibility,
+            // despite identical JavaScript and stable package identity.
+            mixed.context_initialization_module = Some(ContextInitializationModule::separate(2, Some("_deps/db.js"), None)?);
+            fixture.put_analyzed("c.js", mixed_source, Some(mixed)).await?;
+            let tx = fixture.database.begin_system().await?;
+            assert!(fixture.database.refresh_token(token, *tx.begin_timestamp()).await?.is_err());
+            drop(tx);
+            assert_eq!(fixture.run_analyzed_action("a.js:act").await?, json!(["first", 1.0]));
+            let validated = fixture.validated_path("a.js:run", UdfType::Query).await?;
+            assert_eq!(fixture.run_validated(validated).await?.0, json!(1.0));
+            // The omitted action root means per-entry reuse, never database fallback.
+            assert_eq!(fixture.run_analyzed_action("c.js:act").await?, json!(["first", 1.0]));
+            assert_eq!(fixture.run_analyzed_action("c.js:other").await?, json!(["second", 2.0]));
+            Ok(())
+        }))
+    })?.join().expect("split initialization test panicked")
 }

@@ -108,8 +108,20 @@ work already accepted by the server. An operation ID alone grants no authority.
 
 Submitting the same ID and input returns the current status. Different input
 returns `DeploymentOperationInputMismatch`. Identity compares JSON with sorted
-object keys; omitted defaults and explicit defaults remain distinct. Credentials
-are excluded from the digest. Status is `running`, `completed` with `result`,
+object keys at every depth and JavaScript-compatible finite floating-point
+number spelling. Integer values decoded as `i64` or `u64` retain their exact
+values; distinct integers above JavaScript's exact range are not rounded
+together by hashing. This does not add arbitrary-precision JSON support:
+numeric tokens outside those integer ranges use `f64` decoding, which rejects
+non-finite results.
+A client that rounds a retained integer into a different value cannot reuse
+its identity. Bare negative zero remains distinct from zero; server-owned
+Convex values and schema literals use the existing `$float` encoding to preserve
+its sign across JavaScript JSON.
+Nested JSON fields and array order remain part of identity. Submitted
+configuration is compared before typed defaults, so omitted defaults and
+explicit defaults remain distinct. Credentials are excluded from the digest.
+Status is `running`, `completed` with `result`,
 or `failed` with `code` and, where available, an authenticated error message.
 Status does not yet report individual root progress.
 
@@ -172,26 +184,107 @@ checks alone cannot provide this exclusion: a duplicate that entered cutover
 admission before the first commit could otherwise force the first owner's
 draining Node generation to stop or wait unnecessarily for its capacity.
 
-Finish identity includes `dryRun`, `message`, `forceNodeCutover` and the exact
-source-keyed activation selector. It excludes credentials and the operation ID.
+Finish identity includes the complete typed `startPush`, `dryRun`, `message`,
+`forceNodeCutover`, the native selection and the exact source-keyed activation
+selector, including expected prior and target generation. Typed deserialization
+restores optional defaults before comparison; arbitrary JSON-valued fields are
+compared in full. It excludes credentials, the operation ID and the session ID.
+The operation ID keys the receipt; the session ID gates access to process-local
+preparation. An old session can read an exact durable receipt after restart but
+cannot acquire preparation from the new session.
 Dry-run finishes still require retained preparation with unchanged generation
 and canonical URL authority, and check for conflicting activation receipts;
 they create no activation receipt. Cancellation before finish acquires retained
 sources prevents activation. An already acquired
 finish may commit, and cancellation cannot undo pending schema preparation.
 
-An activation and its receipt commit in the same transaction. A full bounded
-receipt-table read participates in OCC, preventing concurrent retries from
-activating twice. The `_deployment_receipts` system table is initialized by the
-normal system-table initializer. It holds at most 16 live receipts with a
-128 KiB activation diff each. A full table rejects before activation; expired
-receipts are pruned transactionally. Expired operation IDs cannot be reused.
+An activation and its receipt commit in the same transaction. Receipt lookup
+uses an operation index; the bounded retention scan also participates in OCC,
+preventing concurrent retries from activating twice or exceeding capacity. The
+`_deployment_receipts` system table and index use the normal initializer. During
+an existing table's index backfill, lookup scans the bounded table instead of
+mistaking an unavailable index for a missing receipt. Retention scans keep only
+metadata and fetch one document at a time; they never decode unrelated results.
+At most 16 receipts are retained. Each insertion can reclaim one expired
+receipt transactionally; a full table with no expired receipts rejects the
+activation transaction. Expired operation IDs cannot be reused. Expiry is
+rechecked after retention cleanup. An already admitted finish keeps its
+ownership until its transaction and publication work terminate, even if expiry
+or loss of the HTTP waiter occurs meanwhile.
+
+The finish diff includes complete previous and next schemas, module paths,
+indexes and authentication changes. It is not a small summary. New receipts
+stream the exact serialized result into zlib at the fast compression level.
+`resultZlib` is a Convex byte value containing a four-byte little-endian JSON
+length followed by one zlib stream; `resultJson` contains the non-JSON marker
+`zlib-json-v1`. This storage format does not change the HTTP response. Both the
+encoded bytes and JSON serialization are bounded while writing. Replay checks
+the declared size before allocating and requires the exact decoded size, a valid
+checksum, complete consumption of the stream, valid UTF-8 and a valid typed
+finish result. Unsupported, malformed, truncated or trailing data is an error,
+never a missing receipt that permits another activation.
+
+The decoded JSON limit is 256 MiB. It bounds codec work and allocation separately
+from storage. The existing 32 MiB audit-document bound covers component and
+authentication diffs before outer JSON escaping, which can expand a string by up
+to six times. Definition paths are additional: removed definitions may come
+from a legacy deployment and are not bounded by the new operation's 32 MiB
+preparation-response limit. The 256 MiB cap leaves room beyond audit-data
+escaping but is an independent supported-size boundary, not a proof that every
+otherwise admitted finish result fits. The complete persisted receipt, including
+its field names, identity and system fields, must still fit the ordinary 32 MiB
+Convex system-value limit. Poorly
+compressible results can reach that limit first. The encoder reserves the
+receipt envelope using Convex's size calculation, including the length header
+and the longest system document ID; it cannot consume those bytes as payload.
+Compression does not eliminate the supported-size boundary. The receipt, audit
+event and activation writes also share the ordinary system-transaction budget
+(128 MiB and 40,000 writes by default). Any encoding or storage failure aborts
+that transaction. There is no
+truncation, omitted receipt or substituted diff.
+
+Sixteen maximum-size receipt documents account for at most 512 MiB of logical
+live values. Persistence serialization and database version retention are
+additional: JSON persistence represents the compressed bytes as base64, adding
+roughly one third to that field's size. System reads do not use the user read-byte
+limit. Ordinary indexed replay reads only its matching receipt; insertion and
+the temporary upgrade fallback can read all 16 documents, but do not hold or
+decode all their JSON results together. The transaction cache can retain encoded
+documents up to its ordinary byte limit plus one document. Cleanup deletes at
+most one receipt per insertion because the write set retains the previous
+document until commit; deleting all expired receipts together could retain
+512 MiB of encoded values. Decode allocation is bounded per replay; these
+logical limits are not a process memory reservation.
+
+New backends read both legacy plain `resultJson` receipts and the new encoded
+receipts. On rollback, an older backend can still read retention metadata and
+prune expired encoded receipts, but its JSON parser explicitly rejects their
+marker on replay. It cannot return the recorded result for those receipts.
+Its full-table reader also retains all receipt documents at once; the new
+one-document-at-a-time retention bound does not apply to that older code.
+Complete or reconcile outstanding operations before rollback during their
+ten-minute lifetime. A rejected replay does not establish that activation
+failed; use authenticated committed-state inspection and the maintained client
+publication recovery. No compatibility path converts an unsupported receipt
+into a cache miss or new activation authority.
 
 Replaying an already committed finish returns its original commit timestamp and
 diff, even after restart or a newer deployment, without activating old code.
+Replay still requires an unexpired operation ID; a receipt left in the table
+after that deadline does not extend the public replay window.
 `activationReplay.nodeCutoverCompletion` is `unverified`: the receipt proves
 historical activation, not current deployment or completion of the original
 Node cutover. Without a receipt or retained preparation, finish fails explicitly.
+
+Receipt replay across a backend upgrade requires the same request-digest
+algorithm. This change to JavaScript-compatible number spelling does not migrate
+receipts written with the previous algorithm; an otherwise unchanged request
+can fail comparison during the remaining ten-minute operation lifetime. Complete
+or reconcile outstanding deployments before replacing the backend. If a finish
+response was lost, use authenticated committed-state inspection and the client's
+publication recovery before starting another operation; a rejected replay does
+not prove that the original activation failed. No old-digest fallback grants
+preparation or publication authority.
 
 ## Preflight packaging
 
