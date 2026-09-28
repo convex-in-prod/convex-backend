@@ -50,6 +50,7 @@ pub(crate) fn log_context_reuse_decision(udf_type: UdfType, reuse_context_enable
         UdfType::Mutation => "mutation",
         UdfType::Action => "action",
         UdfType::HttpAction => "http_action",
+        UdfType::Init => "init",
     };
     log_counter_with_labels(
         &CONTEXT_REUSE_DECISION_TOTAL,

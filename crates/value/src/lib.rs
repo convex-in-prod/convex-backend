@@ -27,6 +27,7 @@ mod string;
 mod table_mapping;
 mod table_name;
 pub mod walk;
+pub mod wasm_abi;
 
 // Helper modules we'll eventually factor out.
 pub mod heap_size;

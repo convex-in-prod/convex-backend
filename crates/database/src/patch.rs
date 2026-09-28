@@ -9,6 +9,10 @@ use serde_json::{
     Value as JsonValue,
 };
 use value::{
+    heap_size::{
+        estimate_btree_heap_size,
+        HeapSize,
+    },
     ConvexObject,
     PendingValue,
 };
@@ -20,7 +24,22 @@ pub struct PatchValue {
     fields: BTreeMap<FieldName, Option<PendingValue>>,
 }
 
+impl HeapSize for PatchValue {
+    fn heap_size(&self) -> usize {
+        estimate_btree_heap_size::<FieldName, Option<PendingValue>>(self.fields.len())
+            + self
+                .fields
+                .iter()
+                .map(|(field, value)| field.heap_size() + value.heap_size())
+                .sum::<usize>()
+    }
+}
+
 impl PatchValue {
+    pub fn from_pending_fields(fields: BTreeMap<FieldName, Option<PendingValue>>) -> Self {
+        Self { fields }
+    }
+
     /// Merge into the original document body, which may itself contain
     /// unresolved commit timestamps that the patch leaves in place.
     pub fn apply(self, original: PendingValue) -> anyhow::Result<PendingValue> {

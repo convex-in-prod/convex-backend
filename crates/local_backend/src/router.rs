@@ -57,6 +57,14 @@ use utoipa::{
 };
 use utoipa_axum::router::OpenApiRouter;
 
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use crate::app_metrics::{
+    control_execution_observation,
+    execution_observation_status,
+    generated_wasm_memory_inspection,
+    generated_wasm_memory_statistics,
+    query_shadow_evidence,
+};
 use crate::{
     app_metrics::{
         cache_hit_percentage,
@@ -274,6 +282,7 @@ struct PublicApiDoc;
 
 #[derive(OpenApi)]
 #[openapi(
+    modifiers(&SecurityAddon),
     info(
         title = "Convex Dashboard HTTP routes",
         version = "1.0.0",
@@ -338,6 +347,14 @@ pub fn router(st: LocalAppState) -> Router {
         .route(
             "/deploy2/operations/cancel",
             post(crate::deployment_operations::cancel),
+        )
+        .route(
+            "/deploy2/prepare_external_deps",
+            post(deploy_config2::prepare_external_deps),
+        )
+        .route(
+            "/deploy2/download_external_deps",
+            post(deploy_config2::download_external_deps),
         )
         .route(
             "/deploy2/evaluate_push",
@@ -528,7 +545,7 @@ where
     LocalAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
 {
-    Router::new()
+    let routes = Router::new()
         .route("/stream_udf_execution", get(stream_udf_execution))
         .route("/stream_function_logs", get(stream_function_logs))
         .route("/udf_rate", get(udf_rate))
@@ -546,7 +563,23 @@ where
         .route("/table_rate", get(table_rate))
         .route("/latency_percentiles", get(latency_percentiles))
         .route("/scheduled_job_lag", get(scheduled_job_lag))
-        .route("/function_concurrency", get(function_concurrency))
+        .route("/function_concurrency", get(function_concurrency));
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    let routes = routes
+        .route("/query_shadow_evidence", get(query_shadow_evidence))
+        .route(
+            "/execution_observation",
+            get(execution_observation_status).post(control_execution_observation),
+        )
+        .route(
+            "/generated_wasm_memory_statistics",
+            get(generated_wasm_memory_statistics),
+        )
+        .route(
+            "/generated_wasm_memory_inspection",
+            get(generated_wasm_memory_inspection),
+        );
+    routes
 }
 
 // Routes with the same handlers for the local backend + closed source backend
@@ -678,6 +711,38 @@ mod public_api_spec_tests {
             expected,
             "Regenerate with UPDATE_API_SPECS=1 cargo test -p local_backend --lib \
              test_public_api_spec_matches"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "static-hermes-wasmtime-gate"))]
+mod dashboard_api_spec_tests {
+    use super::*;
+
+    #[test]
+    fn test_dashboard_api_spec_matches() -> anyhow::Result<()> {
+        // Match the served common-plus-local document. Export with the optional
+        // runtime feature enabled so its routes remain visible to client generation.
+        let (_, mut actual) =
+            OpenApiRouter::<LocalAppState>::with_openapi(DashboardApiDoc::openapi())
+                .merge(common_dashboard_api_router())
+                .split_for_parts();
+        let (_, local) = OpenApiRouter::<LocalAppState>::with_openapi(DashboardApiDoc::openapi())
+            .merge(local_only_dashboard_router())
+            .split_for_parts();
+        actual.merge(local);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../npm-packages/dashboard/dashboard-deployment-openapi.json");
+        if std::env::var_os("UPDATE_API_SPECS").is_some() {
+            std::fs::write(&path, format!("{}\n", actual.to_pretty_json()?))?;
+        }
+        let expected: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        assert_eq!(
+            serde_json::to_value(actual)?,
+            expected,
+            "Regenerate with UPDATE_API_SPECS=1 cargo test -p local_backend --lib --features \
+             static-hermes-wasmtime-gate test_dashboard_api_spec_matches"
         );
         Ok(())
     }

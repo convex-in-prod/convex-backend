@@ -122,6 +122,98 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/wasm_runtime_policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the live primary engine and opposite-engine shadow sampling policy. */
+        get: operations["get_runtime_policy"];
+        put?: never;
+        /**
+         * Persist and select the runtime policy for newly dispatched invocations.
+         * @description Existing invocations keep their captured engine. Artifact admission and
+         *     route quarantines remain authoritative; selecting Wasm does not create a
+         *     pair or promote a shadow-only generation. Zero sampling selects primary
+         *     only.
+         */
+        post: operations["update_runtime_policy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/static_hermes_wasmtime_quarantine": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Apply a subtractive Wasm route quarantine.
+         * @description The durable policy is atomically replaced and an immutable snapshot is
+         *     published for newly resolved invocations. Selectors are exact module paths
+         *     with an optional exact export name. This handler is mounted only in the
+         *     local dashboard/admin router and authenticates a deployment key before
+         *     applying a change.
+         */
+        post: operations["update_static_hermes_wasmtime_quarantine"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/source_keyed_runtime_active_pair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Return the database-committed source package and its load-verified runtime
+         *     generation. The source package is read from one database snapshot, and the
+         *     source-keyed registry ensures the exact immutable generation bound to that
+         *     runtime-content digest before reporting the pair. */
+        get: operations["source_keyed_runtime_active_pair"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/source_keyed_runtime_readiness": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Return whether an exact source/generation pair has a retained,
+         *     authenticated generation with fully initialized runtime capacity.
+         * @description This endpoint does not change the committed source selection. It prepares
+         *     only the requested exact generation; the point-in-time response grants no
+         *     activation authority or reservation and exposes no registry paths or loader
+         *     details. Pending responses may include sanitized capacity observations.
+         */
+        post: operations["source_keyed_runtime_readiness"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -139,6 +231,132 @@ export interface components {
         GetIndexesResponse: {
             indexes: Record<string, never>[];
         };
+        InFlightInvocationsResponse: {
+            existingInvocationsRetainCapturedEngine: boolean;
+            /** @description Aggregate isolate-worker visibility is unavailable at this control
+             *     boundary, so no drain count is claimed. */
+            aggregateIsolateWorkers?: number | null;
+            staticHermesRouteSpecific: boolean;
+            drainWaitSupported: boolean;
+            observabilityGap: string;
+        };
+        /** @enum {string} */
+        PrimaryRuntime: "v8" | "wasm";
+        /** @enum {string} */
+        QuarantineAction: "quarantine" | "clear" | "initialize";
+        QuarantineEntryResponse: {
+            modulePath: string;
+            functionName?: string | null;
+        };
+        RuntimeMode: {
+            primary: components["schemas"]["PrimaryRuntime"];
+            /** Format: int32 */
+            shadowBps: number;
+        };
+        RuntimePolicy: {
+            query: components["schemas"]["RuntimeMode"];
+            mutation: components["schemas"]["RuntimeMode"];
+        };
+        RuntimePolicyResponse: {
+            snapshot: components["schemas"]["RuntimePolicySnapshot"];
+            durable: boolean;
+            /** @description Quarantines still override this policy. A mode update never clears them. */
+            quarantinedSelectors: number;
+            /** @description An uninitialized or ambiguous quarantine store blocks all Wasm routes. */
+            quarantineInitialized: boolean;
+            population?: components["schemas"]["SourceKeyedRuntimeGroupPopulation"][];
+            /** Format: double */
+            preparationElapsedMs?: number | null;
+        };
+        RuntimePolicySnapshot: {
+            /** Format: int64 */
+            revision: number;
+            policy: components["schemas"]["RuntimePolicy"];
+        };
+        SourceKeyedRuntimeActiveGeneration: {
+            deploymentSha256: string;
+            generationManifestSha256: string;
+            generationSha256: string;
+        };
+        SourceKeyedRuntimeActivePairResponse: {
+            kind: string;
+            generation?: null | components["schemas"]["SourceKeyedRuntimeActiveGeneration"];
+            source?: null | components["schemas"]["SourceKeyedRuntimeActiveSource"];
+            status: components["schemas"]["SourceKeyedRuntimeActivePairStatus"];
+        };
+        /** @enum {string} */
+        SourceKeyedRuntimeActivePairStatus: "paired" | "notPaired";
+        SourceKeyedRuntimeActiveSource: {
+            sourcePackageId: string;
+            sourcePackageRuntimeContentSha256?: string | null;
+            sourcePackageSha256: string;
+        };
+        SourceKeyedRuntimeCapacity: {
+            reason: string;
+            projectedBytes: number;
+            softBudgetBytes: number;
+            hardBudgetBytes: number;
+            instances: number;
+            instanceLimit: number;
+            cgroupHeadroomBytes?: number | null;
+        };
+        SourceKeyedRuntimeGroupPopulation: {
+            group: string;
+            target: number;
+            prepared: number;
+            active: number;
+            inProgress: number;
+            shortfall?: string | null;
+        };
+        SourceKeyedRuntimeReadinessRequest: {
+            deploymentSha256: string;
+            generationManifestSha256: string;
+            generationSha256: string;
+            sourcePackageRuntimeContentSha256: string;
+        };
+        SourceKeyedRuntimeReadinessResponse: {
+            deploymentSha256: string;
+            generationManifestSha256: string;
+            generationSha256: string;
+            kind: string;
+            sourcePackageRuntimeContentSha256: string;
+            status: components["schemas"]["SourceKeyedRuntimeReadinessStatus"];
+            capacity?: null | components["schemas"]["SourceKeyedRuntimeCapacity"];
+            population?: components["schemas"]["SourceKeyedRuntimeGroupPopulation"][];
+            /** Format: double */
+            preparationElapsedMs: number;
+        };
+        /** @enum {string} */
+        SourceKeyedRuntimeReadinessStatus: "ready" | "capacityUnavailable" | "notStaged";
+        UpdateRuntimePolicyRequest: {
+            /** Format: int64 */
+            expectedRevision: number;
+            policy: components["schemas"]["RuntimePolicy"];
+        };
+        UpdateStaticHermesWasmtimeQuarantineRequest: {
+            /** @description `quarantine` adds a sticky selector; `clear` removes only that exact
+             *     selector; `initialize` repairs a missing or ambiguous policy as an
+             *     empty valid snapshot. */
+            action: components["schemas"]["QuarantineAction"];
+            /** @description Required for `quarantine` and `clear`; omitted for `initialize`. */
+            modulePath?: string | null;
+            functionName?: string | null;
+            /** @description Required operator-supplied change rationale. It is bounded and stored
+             *     as policy evidence, not emitted with application values. */
+            reason: string;
+            /** @description Required bounded operator/change reference for audit correlation. */
+            operatorReference: string;
+        };
+        UpdateStaticHermesWasmtimeQuarantineResponse: {
+            action: string;
+            changed: boolean;
+            /** Format: int64 */
+            snapshotVersion: number;
+            entries: components["schemas"]["QuarantineEntryResponse"][];
+            /** @description Route resolution is invocation-scoped. This update does not reroute or
+             *     interrupt invocations that already captured their engine choice. */
+            inFlightInvocations: components["schemas"]["InFlightInvocationsResponse"];
+        };
     };
     responses: never;
     parameters: never;
@@ -150,6 +368,26 @@ export type DeleteComponentArgs = components['schemas']['DeleteComponentArgs'];
 export type DeleteScheduledFunctionsTableRequest = components['schemas']['DeleteScheduledFunctionsTableRequest'];
 export type DeleteTableArgs = components['schemas']['DeleteTableArgs'];
 export type GetIndexesResponse = components['schemas']['GetIndexesResponse'];
+export type InFlightInvocationsResponse = components['schemas']['InFlightInvocationsResponse'];
+export type PrimaryRuntime = components['schemas']['PrimaryRuntime'];
+export type QuarantineAction = components['schemas']['QuarantineAction'];
+export type QuarantineEntryResponse = components['schemas']['QuarantineEntryResponse'];
+export type RuntimeMode = components['schemas']['RuntimeMode'];
+export type RuntimePolicy = components['schemas']['RuntimePolicy'];
+export type RuntimePolicyResponse = components['schemas']['RuntimePolicyResponse'];
+export type RuntimePolicySnapshot = components['schemas']['RuntimePolicySnapshot'];
+export type SourceKeyedRuntimeActiveGeneration = components['schemas']['SourceKeyedRuntimeActiveGeneration'];
+export type SourceKeyedRuntimeActivePairResponse = components['schemas']['SourceKeyedRuntimeActivePairResponse'];
+export type SourceKeyedRuntimeActivePairStatus = components['schemas']['SourceKeyedRuntimeActivePairStatus'];
+export type SourceKeyedRuntimeActiveSource = components['schemas']['SourceKeyedRuntimeActiveSource'];
+export type SourceKeyedRuntimeCapacity = components['schemas']['SourceKeyedRuntimeCapacity'];
+export type SourceKeyedRuntimeGroupPopulation = components['schemas']['SourceKeyedRuntimeGroupPopulation'];
+export type SourceKeyedRuntimeReadinessRequest = components['schemas']['SourceKeyedRuntimeReadinessRequest'];
+export type SourceKeyedRuntimeReadinessResponse = components['schemas']['SourceKeyedRuntimeReadinessResponse'];
+export type SourceKeyedRuntimeReadinessStatus = components['schemas']['SourceKeyedRuntimeReadinessStatus'];
+export type UpdateRuntimePolicyRequest = components['schemas']['UpdateRuntimePolicyRequest'];
+export type UpdateStaticHermesWasmtimeQuarantineRequest = components['schemas']['UpdateStaticHermesWasmtimeQuarantineRequest'];
+export type UpdateStaticHermesWasmtimeQuarantineResponse = components['schemas']['UpdateStaticHermesWasmtimeQuarantineResponse'];
 export type $defs = Record<string, never>;
 export interface operations {
     check_admin_key: {
@@ -275,6 +513,169 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    get_runtime_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimePolicyResponse"];
+                };
+            };
+            /** @description Invalid deployment key header */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Deployment key authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Deploy permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_runtime_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRuntimePolicyRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimePolicyResponse"];
+                };
+            };
+            /** @description Invalid runtime policy or deployment key header */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Deployment key authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Deploy permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Stale source or policy, unavailable staging or baseline capacity, changed initialization dependencies, validation timeout, or unavailable durable storage */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Update failed; read status before another update */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_static_hermes_wasmtime_quarantine: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateStaticHermesWasmtimeQuarantineRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateStaticHermesWasmtimeQuarantineResponse"];
+                };
+            };
+        };
+    };
+    source_keyed_runtime_active_pair: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceKeyedRuntimeActivePairResponse"];
+                };
+            };
+        };
+    };
+    source_keyed_runtime_readiness: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceKeyedRuntimeReadinessRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceKeyedRuntimeReadinessResponse"];
+                };
             };
         };
     };

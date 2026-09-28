@@ -87,7 +87,13 @@ export async function performAsyncSyscall(
     // Rethrow the exception to attach stack trace starting from here.
     // If the error came from JS it will include its own stack trace.
     // If it came from Rust it won't.
-    throw new Error(e.message);
+    const rethrown = new Error(e.message);
+    Object.defineProperty(rethrown, "cause", {
+      configurable: true,
+      value: e,
+      writable: true,
+    });
+    throw rethrown;
   }
   return JSON.parse(resultStr);
 }

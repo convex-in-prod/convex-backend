@@ -147,9 +147,9 @@ impl IsolateQueueEligibility {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IsolateQueueConfig {
     target: Duration,
-    interval: Duration,
-    shed_threshold: Duration,
-    hard_max_age: Duration,
+    pub(crate) interval: Duration,
+    pub(crate) shed_threshold: Duration,
+    pub(crate) hard_max_age: Duration,
     control_plane_hard_max_age: Duration,
     pub(crate) control_plane_capacity: usize,
     pub(crate) control_plane_reserved_capacity: usize,
@@ -220,7 +220,7 @@ impl IsolateQueueConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ControllerTransitions {
+pub(crate) struct ControllerTransitions {
     entered: bool,
     cleared: bool,
 }
@@ -233,15 +233,15 @@ impl ControllerTransitions {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct LaneDelayController {
+pub(crate) struct LaneDelayController {
     interval_end: tokio::time::Instant,
     min_sojourn: Option<Duration>,
     sample_count: usize,
-    overloaded: bool,
+    pub(crate) overloaded: bool,
 }
 
 impl LaneDelayController {
-    fn new(now: tokio::time::Instant, interval: Duration) -> Self {
+    pub(crate) fn new(now: tokio::time::Instant, interval: Duration) -> Self {
         Self {
             interval_end: now + interval,
             min_sojourn: None,
@@ -250,7 +250,7 @@ impl LaneDelayController {
         }
     }
 
-    fn observe(
+    pub(crate) fn observe(
         &mut self,
         now: tokio::time::Instant,
         sojourn: Duration,

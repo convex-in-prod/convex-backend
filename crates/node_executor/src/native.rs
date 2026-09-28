@@ -159,7 +159,7 @@ pub struct NativeResidentSupervisor {
     status: watch::Receiver<NativeResidentStatus>,
     task: Shared<BoxFuture<'static, Result<(), Arc<anyhow::Error>>>>,
     staging: Mutex<()>,
-    publication: Mutex<()>,
+    publication: Arc<Mutex<()>>,
     cleanup: TaskTracker,
 }
 
@@ -216,7 +216,7 @@ impl NativeResidentSupervisor {
             .boxed()
             .shared(),
             staging: Mutex::new(()),
-            publication: Mutex::new(()),
+            publication: Arc::new(Mutex::new(())),
             cleanup,
         }))
     }
@@ -227,8 +227,8 @@ impl NativeResidentSupervisor {
 
     /// Serialize the live-process compatibility check with publication. The
     /// caller refreshes committed selection under this guard before checking.
-    pub async fn publication_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.publication.lock().await
+    pub async fn publication_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.publication).lock_owned().await
     }
 
     pub fn validate_publication_contract(&self, contract: Option<&str>) -> anyhow::Result<()> {

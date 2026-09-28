@@ -146,6 +146,9 @@ pub struct LocalConfig {
 
 #[derive(ClapSubcommand, Clone)]
 pub enum Subcommand {
+    /// Print compile-time backend capabilities without starting the server.
+    Capabilities,
+
     /// Generate keys without starting the server.
     Keygen {
         #[clap(subcommand)]
@@ -254,5 +257,4 @@ impl LocalConfig {
             }
         }
     }
-
 }
