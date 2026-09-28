@@ -30,7 +30,9 @@ use application::{
         RedactedLogLines,
     },
     RedactedActionError,
+    RedactedActionReturn,
     RedactedMutationError,
+    RedactedMutationReturn,
 };
 use common::{
     backoff::Backoff,
@@ -94,6 +96,7 @@ use futures::{
 use keybroker::Identity;
 use model::session_requests::types::SessionRequestIdentifier;
 use sync_types::{
+    types::ErrorPayload,
     AuthenticationToken,
     ClientMessage,
     DegradableQueryPressureEpoch,
@@ -106,6 +109,7 @@ use sync_types::{
     SerializedQueryJournal,
     ServerPressure,
     SessionId,
+    SessionRequestSeqNumber,
     StateModification,
     StateVersion,
     Timestamp,
@@ -972,7 +976,7 @@ impl<RT: Runtime> SyncWorker<RT> {
                                     Some(mutation_queue_size),
                                 )
                                 .in_span(root)
-                                .await?
+                                .await
                             },
                             Some(ref p) => {
                                 let path =
@@ -988,26 +992,10 @@ impl<RT: Runtime> SyncWorker<RT> {
                                     Some(mutation_queue_size),
                                 )
                                 .in_span(root)
-                                .await?
+                                .await
                             },
                         };
-                        let response = match result {
-                            Ok(udf_return) => ServerMessage::MutationResponse {
-                                request_id,
-                                result: Ok(udf_return.value),
-                                ts: Some(udf_return.ts),
-                                log_lines: udf_return.log_lines.into(),
-                            },
-                            Err(RedactedMutationError { error, log_lines }) => {
-                                ServerMessage::MutationResponse {
-                                    request_id,
-                                    result: Err(error.into_error_payload()),
-                                    ts: None,
-                                    log_lines: log_lines.into(),
-                                }
-                            },
-                        };
-                        Ok(response)
+                        mutation_response(request_id, result)
                     })
                     .await
                 }
@@ -1036,6 +1024,21 @@ impl<RT: Runtime> SyncWorker<RT> {
             } => {
                 log_action_args_size(args.get().len());
                 let identity = self.revalidate_identity().await?;
+                if self.action_futures.len() >= OPERATION_QUEUE_BUFFER_SIZE {
+                    self.tx.send((
+                        action_response(
+                            request_id,
+                            Err(ErrorMetadata::rate_limited(
+                                "TooManyInflightActionsForSingleClient",
+                                "Too many pending actions on this connection",
+                            )
+                            .into()),
+                        )?,
+                        self.rt.monotonic_now(),
+                    ))?;
+                    timer.finish();
+                    return Ok(());
+                }
 
                 let api = self.api.clone();
                 let host = self.host.clone();
@@ -1066,7 +1069,7 @@ impl<RT: Runtime> SyncWorker<RT> {
                                 caller,
                             )
                             .in_span(root)
-                            .await?
+                            .await
                         },
                         Some(ref p) => {
                             let path = Self::parse_admin_component_path(p, &udf_path, &identity)?;
@@ -1079,36 +1082,12 @@ impl<RT: Runtime> SyncWorker<RT> {
                                 caller,
                             )
                             .in_span(root)
-                            .await?
+                            .await
                         },
                     };
-                    let response = match result {
-                        Ok(udf_return) => ServerMessage::ActionResponse {
-                            request_id,
-                            result: Ok(udf_return.value),
-                            log_lines: udf_return.log_lines.into(),
-                        },
-                        Err(RedactedActionError { error, log_lines }) => {
-                            ServerMessage::ActionResponse {
-                                request_id,
-                                result: Err(error.into_error_payload()),
-                                log_lines: log_lines.into(),
-                            }
-                        },
-                    };
-                    Ok(response)
+                    action_response(request_id, result)
                 }
                 .boxed();
-                anyhow::ensure!(
-                    self.action_futures.len() <= OPERATION_QUEUE_BUFFER_SIZE,
-                    ErrorMetadata::rate_limited(
-                        "TooManyInflightActionsForSingleClient",
-                        format!(
-                            "Inflight actions overloaded for a single client, max concurrency: \
-                             {OPERATION_QUEUE_BUFFER_SIZE}"
-                        )
-                    )
-                );
                 self.action_futures.push(future);
             },
             ClientMessage::Authenticate {
@@ -1691,6 +1670,83 @@ impl<RT: Runtime> SyncWorker<RT> {
     }
 }
 
+fn action_response(
+    request_id: SessionRequestSeqNumber,
+    result: anyhow::Result<Result<RedactedActionReturn, RedactedActionError>>,
+) -> anyhow::Result<ServerMessage> {
+    let (result, log_lines) = match result {
+        Ok(Ok(udf_return)) => (Ok(udf_return.value), udf_return.log_lines),
+        Ok(Err(RedactedActionError { error, log_lines })) => {
+            (Err(error.into_error_payload()), log_lines)
+        },
+        Err(error)
+            if error.is_rejected_before_execution()
+                || (error.is_rate_limited()
+                    && matches!(
+                        error.short_msg(),
+                        "TooManyConcurrentRequests" | "TooManyInflightActionsForSingleClient"
+                    )) =>
+        {
+            // Admission failure belongs to this request, not the sync session.
+            // Closing the socket would interrupt subscriptions and other actions
+            // and replay pending mutations. Do not expose internal diagnostics or
+            // promise retry safety: a nested call may have failed after side effects.
+            // See patches/terminal_occ/README.md, "Behavior".
+            (
+                Err(ErrorPayload::Message(
+                    "Action admission failed: insufficient execution capacity. Try again later."
+                        .to_owned(),
+                )),
+                RedactedLogLines::empty(),
+            )
+        },
+        Err(error) => return Err(error),
+    };
+    Ok(ServerMessage::ActionResponse {
+        request_id,
+        result,
+        log_lines: log_lines.into(),
+    })
+}
+
+fn mutation_response(
+    request_id: SessionRequestSeqNumber,
+    result: anyhow::Result<Result<RedactedMutationReturn, RedactedMutationError>>,
+) -> anyhow::Result<ServerMessage> {
+    let (result, ts, log_lines) = match result {
+        Ok(Ok(udf_return)) => (
+            Ok(udf_return.value),
+            Some(udf_return.ts),
+            udf_return.log_lines,
+        ),
+        Ok(Err(RedactedMutationError {
+            error, log_lines, ..
+        })) => (Err(error.into_error_payload()), None, log_lines),
+        Err(error) if error.is_occ() => {
+            // The executor has exhausted this mutation's retry budget without a
+            // commit. Closing the socket would replay unrelated pending writes
+            // and restart that budget. Return an identified terminal result;
+            // omit diagnostic table/document details regardless of log visibility.
+            (
+                Err(ErrorPayload::Message(format!(
+                    "{}: {}",
+                    errors::OCC_ERROR,
+                    errors::OCC_ERROR_MSG,
+                ))),
+                None,
+                RedactedLogLines::empty(),
+            )
+        },
+        Err(error) => return Err(error),
+    };
+    Ok(ServerMessage::MutationResponse {
+        request_id,
+        result,
+        ts,
+        log_lines: log_lines.into(),
+    })
+}
+
 fn is_retriable_sync_worker_error(err: &anyhow::Error) -> bool {
     err.is_misdirected_request()
         || err.is_operational_internal_server_error()
@@ -1708,6 +1764,10 @@ pub(crate) fn authentication_update_error(error: anyhow::Error) -> anyhow::Error
     }
     ErrorMetadata::auth_update_failed(error.short_msg().to_string(), error.msg().to_string()).into()
 }
+
+#[cfg(test)]
+#[path = "occ_tests.rs"]
+mod occ_tests;
 
 #[cfg(test)]
 mod tests {

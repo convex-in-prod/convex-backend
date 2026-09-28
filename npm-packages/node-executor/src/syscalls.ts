@@ -25,6 +25,13 @@ const CALLBACK_INITIAL_BACKOFF_MS = process.env.CALLBACK_INITIAL_BACKOFF_MS
   ? parseInt(process.env.CALLBACK_INITIAL_BACKOFF_MS)
   : 1000;
 const CALLBACK_MAX_BACKOFF_MS = 20000;
+const CALLBACK_ERROR_BODY_MAX_BYTES = 64 * 1024;
+const CALLBACK_ERROR_BODY_TIMEOUT_MS = 1000;
+
+const callbackOccError = z.object({
+  code: z.literal("OptimisticConcurrencyControlFailure"),
+  message: z.string(),
+});
 
 type CachedServiceToken = {
   token: string;
@@ -97,10 +104,70 @@ async function parkIfAborted<T>(
 }
 
 // A 5xx status other than STATUS_CODE_UDF_FAILED (which represents a real
-// error thrown by the called function) is a transient backend/proxy failure
-// that is safe to retry.
+// error thrown by the called function) may be a transient backend/proxy failure.
+// An exhausted OCC error is identified separately from its response body.
 function isTransientStatus(status: number): boolean {
   return status >= 500 && status < 600 && status !== STATUS_CODE_UDF_FAILED;
+}
+
+async function readCallbackOccError(
+  response: Response,
+  signal: AbortSignal,
+): Promise<string | null> {
+  if (response.status !== 503 || response.body === null) {
+    return null;
+  }
+  // These intermediate error bodies would otherwise be discarded. Bound both
+  // buffering and waiting so a large or stalled proxy response cannot delay
+  // the existing transient retry loop indefinitely. Read the original stream:
+  // cloning it would leave an unread tee buffering the same response.
+  const reader = response.body.getReader();
+  const readBody = async (): Promise<string | null> => {
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        return new TextDecoder().decode(Buffer.concat(chunks, bytes));
+      }
+      bytes += value.byteLength;
+      if (bytes > CALLBACK_ERROR_BODY_MAX_BYTES) {
+        return null;
+      }
+      if (value.byteLength > 0) {
+        chunks.push(value);
+      }
+    }
+  };
+  let stopInspection!: () => void;
+  const stopped = new Promise<null>((resolve) => {
+    stopInspection = () => resolve(null);
+  });
+  const timer = setTimeout(stopInspection, CALLBACK_ERROR_BODY_TIMEOUT_MS);
+  signal.addEventListener("abort", stopInspection, { once: true });
+  try {
+    if (signal.aborted) {
+      return null;
+    }
+    const text = await Promise.race([readBody(), stopped]);
+    if (
+      text === null ||
+      !callbackOccError.safeParse(JSON.parse(text)).success
+    ) {
+      return null;
+    }
+    return text;
+  } catch {
+    // An incomplete body or non-JSON proxy error does not identify an OCC
+    // failure, so retain the existing transient retry behavior.
+    return null;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", stopInspection);
+    // Cleanup must not wait for a stalled stream or mask the callback outcome.
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
 }
 
 // Failures during connection establishment: no bytes were sent, so the
@@ -358,6 +425,14 @@ export class SyscallsImpl {
       if (!isTransientStatus(response.status) || attempt >= maxAttempts) {
         break;
       }
+      const occError = await readCallbackOccError(response, signal);
+      if (occError !== null) {
+        // The backend owns OCC retries and has already exhausted its budget.
+        // Replaying this callback would restart it. Preserve the raw error for
+        // the existing handler so the caller can decide whether to retry.
+        response = new Response(occError, response);
+        break;
+      }
       await abortableSleep(callbackBackoffMs(attempt - 1), signal);
       // The action settled while we were backing off; stop retrying a dangling
       // call rather than holding it open (and out of the next invocation).
@@ -367,11 +442,10 @@ export class SyscallsImpl {
     }
     const errorHandler =
       args.handleResponseErrorCode ?? defaultHandleResponseError;
-    // Reading the response body (here and in `response.json()` below) is tied to
-    // the same abort signal as the fetch, so a `dispose()` mid-read rejects with
-    // an `AbortError`. On a dangling call whose action already settled, never
-    // settle instead — otherwise that rejection would leak into a later,
-    // unrelated invocation just like an aborted fetch would.
+    // Reading a network response body (here and in `response.json()` below) is
+    // tied to the fetch abort signal, so a `dispose()` mid-read rejects with an
+    // `AbortError`. Park any error on a dangling call, including an OCC error
+    // from the buffered response, so it cannot leak into a later invocation.
     try {
       // errorHandler is a no-op
       await errorHandler(response, args.operationName);
