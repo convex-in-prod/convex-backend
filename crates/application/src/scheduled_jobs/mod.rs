@@ -171,6 +171,21 @@ pub struct ScheduledJobRunner {
 }
 
 impl ScheduledJobRunner {
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub fn disabled<RT: Runtime>(rt: RT) -> Self {
+        let executor = Arc::new(Mutex::new(
+            rt.spawn("scheduled_job_executor_disabled", std::future::pending()),
+        ));
+        let garbage_collector = Arc::new(Mutex::new(rt.spawn(
+            "scheduled_job_garbage_collector_disabled",
+            std::future::pending(),
+        )));
+        Self {
+            executor,
+            garbage_collector,
+        }
+    }
+
     pub fn start<RT: Runtime>(
         rt: RT,
         deployment_name: String,
@@ -1052,15 +1067,10 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                         .replace(job_id, updated_job.clone())
                         .await?;
                     self.database
-                        .commit_with_write_source(tx, "scheduled_job_progress")
+                        .commit(tx, "scheduled_job_progress")
                         .await?;
                     Ok(Some(updated_job))
                 };
-                SchedulerModel::new(&mut tx, namespace)
-                    .replace(job_id, updated_job.clone())
-                    .await?;
-                self.database.commit(tx, "scheduled_job_progress").await?;
-
                 // The action holds its environment-specific admission while `claim`
                 // verifies Pending and commits InProgress. For V8 this includes an
                 // eligible worker and active execution permit. User code cannot start

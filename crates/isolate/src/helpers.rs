@@ -192,9 +192,8 @@ pub fn deserialize_udf_custom_error(
 fn deserialize_udf_custom_error_data(
     result_str: &str,
 ) -> anyhow::Result<Result<ConvexValue, JsError>> {
-    let result_v: serde_json::Value = serde_json::from_str(result_str).context(format!(
-        "Unable to deserialize udf error data: {result_str}"
-    ))?;
+    let result_v: serde_json::Value =
+        serde_json::from_str(result_str).context("Unable to deserialize udf error data")?;
     let result = match ConvexValue::try_from(result_v) {
         Ok(value) => Ok(value),
         Err(e) if e.is_deterministic_user_error() => {

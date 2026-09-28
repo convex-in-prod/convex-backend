@@ -47,9 +47,20 @@ export async function performAsyncSyscall(
     if (e.data !== undefined) {
       const rethrown = new ConvexError(e.message);
       rethrown.data = jsonToConvex(e.data);
+      Object.defineProperty(rethrown, "cause", {
+        configurable: true,
+        value: e,
+        writable: true,
+      });
       throw rethrown;
     }
-    throw new Error(e.message);
+    const rethrown = new Error(e.message);
+    Object.defineProperty(rethrown, "cause", {
+      configurable: true,
+      value: e,
+      writable: true,
+    });
+    throw rethrown;
   }
   return JSON.parse(resultStr);
 }

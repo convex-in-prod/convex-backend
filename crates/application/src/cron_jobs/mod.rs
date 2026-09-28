@@ -711,16 +711,9 @@ impl<RT: Runtime> CronJobContext<RT> {
                     CronModel::new(&mut tx, component)
                         .update_job_state(updated_job.cron_next_run())
                         .await?;
-                    self.database
-                        .commit_with_write_source(tx, "cron_in_progress")
-                        .await?;
+                    self.database.commit(tx, "cron_in_progress").await?;
                     Ok(Some(updated_job))
                 };
-                CronModel::new(&mut tx, component)
-                    .update_job_state(updated_job.cron_next_run())
-                    .await?;
-                self.database.commit(tx, "cron_in_progress").await?;
-
                 // Reserve the runtime before making the at-most-once claim visible.
                 let path = CanonicalizedComponentFunctionPath {
                     component: component_path,

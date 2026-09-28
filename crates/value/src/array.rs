@@ -25,7 +25,7 @@ use crate::{
     MAX_SIZE,
 };
 
-const MAX_ARRAY_LEN: usize = 8192;
+pub(crate) const MAX_ARRAY_LEN: usize = 8192;
 
 /// Wrapper on `Vec<ConvexValue>` that enforces size limits.
 #[derive(Clone)]

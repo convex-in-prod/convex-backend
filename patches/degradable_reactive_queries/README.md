@@ -537,8 +537,9 @@ The degradable class should remain separate from
 the other describes a liveness dependency established by the runtime. Combining
 them into one Boolean would make precedence and metrics ambiguous.
 
-The degradable-query patch does not add an isolate queue lane. The leader cap
-remains strictly below application and isolate-worker shared-base capacity.
+The degradable-query patch does not add an isolate queue lane. The application
+leader cap remains below application shared-base capacity; the separate V8
+query/analysis cap remains below isolate-worker shared-base capacity.
 The active-JavaScript gate separately applies `Dependency`, `Protected`,
 `HighPriorityMutation`, `ControlPlane`, and `Degradable` classes. Only an actual admitted cache-miss
 leader receives `Degradable`; separately scheduled descendants override it
@@ -581,6 +582,7 @@ The backend exposes strictly parsed self-hosted settings:
 
 ```text
 APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS
+ISOLATE_DEGRADABLE_QUERY_ANALYSIS_CAPACITY
 FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN
 FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN
 ```
@@ -598,20 +600,22 @@ analysis waits fairly. With no active analysis, the complete configured value
 remains available to degradable leaders, so the integration adds no permanently
 reserved capacity.
 
-For the standard in-process self-hosted runner, startup requires the cap to be
-strictly below:
-
-- the query application's shared-base limit after dependency overflow;
-- the isolate scheduler shared base
-  (`MAX_ISOLATE_WORKERS - ISOLATE_DEPENDENCY_WORKER_RESERVE`).
+For the standard in-process self-hosted runner, startup requires the application
+cap to be strictly below the query application's shared-base limit after
+dependency overflow. The separate V8 query/analysis cap inherits the application
+cap when unset; it is strictly below the isolate scheduler shared base
+(`MAX_ISOLATE_WORKERS - ISOLATE_DEPENDENCY_WORKER_RESERVE`). V8 dispatch acquires
+that permit only for degradable requests or analysis, retaining it through worker
+cleanup and preparation for reuse even if the caller cancels. Wasm does not acquire
+a V8 permit.
 
 Both active-JavaScript minimums are zero or both are positive. Positive
-minimums require finite `FUNRUN_ISOLATE_ACTIVE_THREADS`, require the leader
+minimums require finite `FUNRUN_ISOLATE_ACTIVE_THREADS`, require the V8 query/analysis
 cap, cannot sum above active capacity, and cannot set the degradable minimum
-above the leader cap. With positive minimums the leader cap can exceed active
+above that cap. With positive minimums the V8 query/analysis cap can exceed active
 capacity because the cap bounds admitted tree lifetime while active capacity
 bounds instantaneous JavaScript execution. With zero minimums, any configured
-finite active capacity must exceed the leader cap, while `0` continues to mean
+finite active capacity must exceed the V8 query/analysis cap, while `0` continues to mean
 unlimited.
 
 If a custom runner does not expose equivalent capacity, it cannot claim the
