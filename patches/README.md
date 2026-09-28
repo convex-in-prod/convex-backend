@@ -52,6 +52,18 @@ adoption contract documented in the backend essay.
 - Activation: only through the privileged repair endpoint; dry-run is the default.
 - Rollback: do not execute a stale plan. There is no generic undo after destructive finalization.
 
+## Mutation error propagation
+
+### [Terminal OCC across transport layers](terminal_occ/README.md)
+
+- Purpose: return exhausted per-mutation optimistic concurrency control (OCC) to its caller without
+  restarting the mutation retry budget in a Node callback loop or by closing its sync socket.
+- Prerequisites: the existing application mutation runner and Node callback retry loop; no scheduler,
+  priority, or native-resident supervision changes.
+- Activation: automatic for identified exhausted OCC errors; no new configuration or wire message.
+- Rollback: restore the previous backend and Node executor together; exhausted sync mutations can
+  close the socket again, and exhausted callback mutations can receive additional retry cycles.
+
 ## Deployment and code generation
 
 ### [Non-committing codegen analysis](non_committing_codegen_analysis/README.md)
