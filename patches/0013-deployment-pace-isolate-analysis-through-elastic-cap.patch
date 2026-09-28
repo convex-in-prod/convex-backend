@@ -13,30 +13,50 @@ Transfer each reservation into the queued Analyze request and return it with the
 A queued analysis waiter receives released capacity before a later immediate degradable acquisition, providing deployment progress whenever existing permit holders and lower execution resources complete. Normal queries, dependencies, mutations, actions, Node analysis, configuration evaluation, worker eligibility, and dependency reserve remain unchanged.
 
 Expose analysis reservation occupancy and gate-wait metrics. Add focused fairness, capacity-transfer, caller-cancellation, and sibling-cancellation tests. Document patch composition, source evidence, per-call fan-out, sizing and telemetry limits, rollout, rollback, and a controlled deployment experiment.
+
+Reuse bounded compiled bytes and parsed source maps within immutable analysis snapshots while creating a fresh V8 context and evaluation per root. Preserve exact source identity, reject stale cache replacements, avoid unused serialization and retain bounded module and phase diagnostics.
+
+Add whole-job input and ownership reservations shared by preparation and detached workers. Carry execution-fenced cancellation through all configuration evaluators and keep reservation ownership until cleanup. Guard source-map ranges and source excerpts against malformed coordinates.
 ---
  .../src/application_function_runner/mod.rs    |  11 +-
  crates/application/src/cache/metrics.rs       |   2 +-
- crates/application/src/cache/mod.rs           |  83 ++--
- crates/common/src/knobs.rs                    |   9 +-
+ crates/application/src/cache/mod.rs           |  83 ++-
+ crates/common/src/errors.rs                   | 182 ++++-
+ crates/common/src/knobs.rs                    |  18 +-
  crates/common/src/lib.rs                      |   1 +
- crates/common/src/query_analysis_admission.rs | 112 +++++
+ crates/common/src/query_analysis_admission.rs | 403 +++++++++++
  .../src/in_process_function_runner.rs         |   3 +
  crates/function_runner/src/lib.rs             |   2 +
  crates/function_runner/src/server.rs          |  10 +-
- crates/isolate/src/client.rs                  | 403 ++++++++++++++++--
- crates/isolate/src/isolate_worker.rs          |   5 +-
- crates/isolate/src/metrics.rs                 |  27 ++
- patches/degradable_reactive_queries/README.md |  65 ++-
- patches/deployment_analysis_pacing/README.md  | 203 +++++++++
+ crates/isolate/src/client.rs                  | 562 +++++++++++++++-
+ crates/isolate/src/environment/action/mod.rs  |   3 +
+ crates/isolate/src/environment/analyze.rs     | 623 ++++++++++++++----
+ crates/isolate/src/environment/auth_config.rs |   6 +-
+ .../src/environment/component_definitions.rs  |  15 +-
+ crates/isolate/src/environment/mod.rs         |  19 +-
+ crates/isolate/src/environment/schema.rs      |   6 +-
+ crates/isolate/src/environment/udf/mod.rs     |   3 +
+ crates/isolate/src/error.rs                   | 127 +++-
+ crates/isolate/src/execution_observation.rs   |  27 +
+ crates/isolate/src/execution_scope.rs         | 113 +++-
+ crates/isolate/src/isolate_worker.rs          | 151 ++++-
+ crates/isolate/src/lib.rs                     |   1 +
+ crates/isolate/src/metrics.rs                 | 103 ++-
+ crates/isolate/src/module_cache.rs            | 477 +++++++++++++-
+ crates/isolate/src/module_diagnostics.rs      | 177 +++++
+ crates/isolate/src/termination.rs             |  46 ++
+ patches/degradable_reactive_queries/README.md |  65 +-
+ patches/deployment_analysis_pacing/README.md  | 274 ++++++++
  patches/isolate_queue_control/README.md       |  26 +-
- .../deployment_lane_design_reference.md       |  50 ++-
- self-hosted/advanced/knobs.md                 |  34 ++
- 17 files changed, 945 insertions(+), 101 deletions(-)
+ .../deployment_lane_design_reference.md       |  50 +-
+ self-hosted/advanced/knobs.md                 |  49 ++
+ 32 files changed, 3331 insertions(+), 307 deletions(-)
  create mode 100644 crates/common/src/query_analysis_admission.rs
+ create mode 100644 crates/isolate/src/module_diagnostics.rs
  create mode 100644 patches/deployment_analysis_pacing/README.md
 
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 7a77645d1969210e9ead0d51eae4d431652ebb0d..f803b72506daf862fe903dded11d2685d4bb2897 100644
+index cda84226453940ac5fe43a4d577e3e4a89718f8a..797b2cadf5a558c01ac4d744b09a94b2cbcfdaa7 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
 @@ -63,6 +63,7 @@ use common::{
@@ -47,7 +67,7 @@ index 7a77645d1969210e9ead0d51eae4d431652ebb0d..f803b72506daf862fe903dded11d2685
      query_journal::QueryJournal,
      runtime::{
          Runtime,
-@@ -703,6 +704,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
+@@ -751,6 +752,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
      audit_log_client: AuditLogClient,
  
      cache_manager: CacheManager<RT>,
@@ -55,7 +75,7 @@ index 7a77645d1969210e9ead0d51eae4d431652ebb0d..f803b72506daf862fe903dded11d2685
      default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
      node_action_limiter: Limiter<RT>,
      ai_gateway_jwt_minter: Option<Arc<dyn AiGatewayJwtMinter>>,
-@@ -733,6 +735,11 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -781,6 +783,11 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              default_system_env_vars.clone(),
              function_log.clone(),
          );
@@ -67,7 +87,7 @@ index 7a77645d1969210e9ead0d51eae4d431652ebb0d..f803b72506daf862fe903dded11d2685
          let cache_manager = CacheManager::new(
              runtime.clone(),
              database.clone(),
-@@ -740,7 +747,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -788,7 +795,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              function_log.clone(),
              audit_log_client.clone(),
              cache,
@@ -76,7 +96,7 @@ index 7a77645d1969210e9ead0d51eae4d431652ebb0d..f803b72506daf862fe903dded11d2685
          );
  
          let node_action_limiter = Limiter::new(
-@@ -764,6 +771,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -812,6 +819,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              function_log,
              audit_log_client,
              cache_manager,
@@ -84,7 +104,7 @@ index 7a77645d1969210e9ead0d51eae4d431652ebb0d..f803b72506daf862fe903dded11d2685
              default_system_env_vars,
              node_action_limiter,
              ai_gateway_jwt_minter,
-@@ -1861,6 +1869,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1988,6 +1996,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              udf_config,
              isolate_modules,
              environment_variables.clone(),
@@ -312,11 +332,230 @@ index 0436c7bb70db0bd5dd0f62e69920255f5c9f4468..b18d95ab6536e7092cd0ba51a7946388
          assert!(matches!(
              cache.inner.lock().cache.get(&stored_key),
              Some(CacheEntry::Ready(_))
+diff --git a/crates/common/src/errors.rs b/crates/common/src/errors.rs
+index 4e415a3a46d2a88063128802bb505e6fbb9806fb..709f93e9b5ea8b9b3ee185aa1175f7b8a75a26a8 100644
+--- a/crates/common/src/errors.rs
++++ b/crates/common/src/errors.rs
+@@ -38,7 +38,10 @@ use rand::Rng;
+ use regex::Regex;
+ use serde::Deserialize;
+ use serde_json::Value as JsonValue;
+-use sourcemap::SourceMap;
++use sourcemap::{
++    SourceMap,
++    Token,
++};
+ use url::Url;
+ use uuid::Uuid;
+ use value::{
+@@ -707,41 +710,47 @@ impl JsError {
+                 ..
+             } = frame
+             {
+-                let Ok(specifier) = Url::parse(f) else {
+-                    // We expect the file_name to be fully qualified URL but seems
+-                    // this is not always the case. Lets log warning here.
+-                    tracing::warn!("Skipping frame with invalid file_name: {f}");
+-                    continue;
+-                };
+-                let source_map = match source_maps.entry(specifier) {
+-                    Entry::Vacant(e) => {
+-                        let maybe_source_map = match lookup_source_map(e.key()) {
+-                            Ok(maybe_source_map) => maybe_source_map,
++                if let Ok(specifier) = Url::parse(f) {
++                    let source_map = match source_maps.entry(specifier) {
++                        Entry::Vacant(e) => match lookup_source_map(e.key()) {
++                            Ok(Some(source_map)) => Some(e.insert(source_map)),
++                            Ok(None) => {
++                                tracing::debug!("Missing source map for {}", e.key());
++                                None
++                            },
+                             Err(err) => {
+-                                // This is not expected so report an error.
++                                // This is not expected so report an error, but keep
++                                // the generated frame when mapping is unavailable.
+                                 let mut err = err
+                                     .context(ErrorMetadata::operational_internal_server_error())
+                                     .context("Failed to lookup source_map");
+                                 report_error_sync(&mut err);
+-                                continue;
++                                None
+                             },
+-                        };
+-                        let Some(source_map) = maybe_source_map else {
+-                            tracing::debug!("Missing source map for {}", e.key());
+-                            continue;
+-                        };
+-                        e.insert(source_map)
+-                    },
+-                    Entry::Occupied(e) => e.into_mut(),
+-                };
+-                if let Some(token) = source_map.lookup_token(l, c) {
+-                    if let Some(mapped_name) = token.get_source() {
+-                        frame.file_name = Some(mapped_name.to_string());
++                        },
++                        Entry::Occupied(e) => Some(e.into_mut()),
++                    };
++                    if let Some(source_map) = source_map {
++                        // V8 stack frames are one-based; source-map coordinates
++                        // are zero-based. Keep the frame's convention on output.
++                        if let Some(line) = l.checked_sub(1)
++                            && let Some(column) = c.checked_sub(1)
++                            && let Some(token) = lookup_source_map_token(source_map, line, column)
++                            && let Some(mapped_name) = token.get_source()
++                            && let Some(mapped_line) = token.get_src_line().checked_add(1)
++                            && let Some(mapped_column) = token.get_src_col().checked_add(1)
++                        {
++                            frame.file_name = Some(mapped_name.to_string());
++                            frame.line_number = Some(mapped_line);
++                            frame.column_number = Some(mapped_column);
++                        } else {
++                            tracing::debug!("Failed to find token for {f}:{l}:{c}");
++                        }
+                     }
+-                    frame.line_number = Some(token.get_src_line());
+-                    frame.column_number = Some(token.get_src_col());
+                 } else {
+-                    tracing::debug!("Failed to find token for {f}:{l}:{c}");
++                    // We expect the file_name to be fully qualified URL but seems
++                    // this is not always the case. Lets log warning here.
++                    tracing::warn!("Keeping generated frame with invalid file_name: {f}");
+                 }
+             } else {
+                 tracing::debug!("Skipping incomplete frame: {frame:?}");
+@@ -773,6 +782,43 @@ impl JsError {
+ 
+ }
+ 
++/// Look up a token only on the requested zero-based generated line.
++pub fn lookup_source_map_token(
++    source_map: &SourceMap,
++    line: u32,
++    column: u32,
++) -> Option<Token<'_>> {
++    // The library's closest-token lookup can cross a generated line boundary.
++    // Its range offset then subtracts unrelated columns and can underflow.
++    // Find the first token on this line before letting it apply that offset.
++    let mut left = 0;
++    let mut right = source_map.get_token_count() as usize;
++    while left < right {
++        let mid = left + (right - left) / 2;
++        let token = source_map
++            .get_token(mid)
++            .expect("source map token disappeared");
++        if token.get_dst_line() < line {
++            left = mid + 1;
++        } else {
++            right = mid;
++        }
++    }
++    let first = source_map.get_token(left)?;
++    if first.get_dst_line() != line || first.get_dst_col() > column {
++        return None;
++    }
++    let token = source_map.lookup_token(line, column)?;
++    if token.is_range() {
++        // Do not turn an overflowing original column into a saturated position.
++        token
++            .get_raw_token()
++            .src_col
++            .checked_add(column - token.get_dst_col())?;
++    }
++    Some(token)
++}
++
+ // Based on deno's `02_error.js:formatLocation`.
+ fn format_location(f: &mut fmt::Formatter<'_>, frame: &MappedFrame) -> fmt::Result {
+     if frame.is_native {
+@@ -859,3 +905,83 @@ pub fn is_transient_db_error(e: &anyhow::Error) -> bool {
+ }
+ 
+ pub const AUTH_ERROR: &str = "AuthError";
++
++#[cfg(test)]
++mod source_map_tests {
++    use super::*;
++
++    #[test]
++    fn source_map_ranges_only_offset_columns_on_their_generated_line() -> anyhow::Result<()> {
++        let map = SourceMap::from_slice(
++            br#"{"version":3,"sources":["root.ts"],"names":[],"mappings":"oGAAA;KAAA","rangeMappings":"B;B"}"#,
++        )?;
++        for (line, column, expected_column) in [
++            (0, 99, None),
++            (0, 100, Some(0)),
++            (0, 103, Some(3)),
++            (1, 0, None),
++            (1, 5, Some(0)),
++            (1, 8, Some(3)),
++            (2, 0, None),
++        ] {
++            assert_eq!(
++                lookup_source_map_token(&map, line, column).map(|token| token.get_src_col()),
++                expected_column,
++            );
++        }
++        let overflowing_column = SourceMap::from_slice(
++            br#"{"version":3,"sources":["root.ts"],"names":[],"mappings":"AAAC","rangeMappings":"B"}"#,
++        )?;
++        assert!(lookup_source_map_token(&overflowing_column, 0, u32::MAX).is_none());
++        Ok(())
++    }
++
++    #[test]
++    fn js_error_retains_generated_frames_when_mapping_is_unusable() -> anyhow::Result<()> {
++        let generated = FrameData {
++            file_name: Some("convex:/user/root.js".to_owned()),
++            line_number: Some(2),
++            column_number: Some(9),
++            ..FrameData::default()
++        };
++        for (mappings, range_mappings, expected) in [
++            ("oGAAA", "B", generated.clone()),
++            ("oGAAA;oGAAA", "B;B", generated.clone()),
++            ("A;A", "", generated.clone()),
++            (
++                "oGAAA;KAAA",
++                "B;B",
++                FrameData {
++                    file_name: Some("root.ts".to_owned()),
++                    line_number: Some(1),
++                    column_number: Some(4),
++                    ..generated.clone()
++                },
++            ),
++        ] {
++            let map = SourceMap::from_slice(&serde_json::to_vec(&serde_json::json!({
++                "version": 3,
++                "sources": ["root.ts"],
++                "names": [],
++                "mappings": mappings,
++                "rangeMappings": range_mappings,
++            }))?)?;
++            let error = JsError::from_frames(
++                "ordinary error".to_owned(),
++                vec![generated.clone()],
++                None,
++                |_| Ok(Some(map.clone())),
++            );
++            assert_eq!(error.message, "ordinary error");
++            assert_eq!(&error.frames.unwrap().0[..], &[expected]);
++        }
++        let error = JsError::from_frames(
++            "ordinary error".to_owned(),
++            vec![generated.clone()],
++            None,
++            |_| Ok(None),
++        );
++        assert_eq!(&error.frames.unwrap().0[..], &[generated]);
++        Ok(())
++    }
++}
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index d505974a00301eec7e967c880cf1ad65bb127173..8d2e201e7d0c2a20793ea4caa669845e6880d79c 100644
+index 6c9546d0d15d92d13a251eff8def1660009153b2..34c7fa00646fd24f5648f41a8cfcec014bdc2c6f 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -1600,10 +1600,11 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
+@@ -1610,10 +1610,11 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
      )
  });
  
@@ -332,6 +571,22 @@ index d505974a00301eec7e967c880cf1ad65bb127173..8d2e201e7d0c2a20793ea4caa669845e
  pub static APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS: LazyLock<Option<usize>> =
      LazyLock::new(|| {
          let capacity =
+@@ -1772,6 +1773,15 @@ pub static APPLICATION_MAX_CONCURRENT_UPLOADS: LazyLock<usize> =
+ pub static ANALYZE_CONCURRENCY: LazyLock<usize> =
+     LazyLock::new(|| env_config_usize_strict("ANALYZE_CONCURRENCY", 4));
+ 
++/// Logical retention budgets per immutable analysis snapshot. Zero disables
++/// retention without changing fresh-context analysis semantics.
++pub static ANALYZE_CODE_CACHE_MAX_BYTES: LazyLock<usize> =
++    LazyLock::new(|| env_config_usize_strict("ANALYZE_CODE_CACHE_MAX_BYTES", 32 << 20));
++/// Logical parsed-source-map retention budget per snapshot; zero disables
++/// retention.
++pub static ANALYZE_SOURCE_MAP_CACHE_MAX_BYTES: LazyLock<usize> =
++    LazyLock::new(|| env_config_usize_strict("ANALYZE_SOURCE_MAP_CACHE_MAX_BYTES", 32 << 20));
++
+ /// Set a 64MB limit on the heap size.
+ pub static ISOLATE_MAX_USER_HEAP_SIZE: LazyLock<usize> =
+     LazyLock::new(|| env_config("ISOLATE_MAX_USER_HEAP_SIZE", 1 << 26));
 diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
 index c3b71876e482c830894c070e5374352076a9a135..e9af810e3dde8a7e12ff351f3385d81a2de9b274 100644
 --- a/crates/common/src/lib.rs
@@ -346,10 +601,10 @@ index c3b71876e482c830894c070e5374352076a9a135..e9af810e3dde8a7e12ff351f3385d81a
  pub mod retriable_stream;
 diff --git a/crates/common/src/query_analysis_admission.rs b/crates/common/src/query_analysis_admission.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..772e94951a8780d5ef74e38a4885e96d1d4ec265
+index 0000000000000000000000000000000000000000..aaf2d9264a98eb3e260464e7b7617c00b1821eaa
 --- /dev/null
 +++ b/crates/common/src/query_analysis_admission.rs
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,403 @@
 +use std::sync::Arc;
 +
 +use tokio::sync::{
@@ -417,11 +672,302 @@ index 0000000000000000000000000000000000000000..772e94951a8780d5ef74e38a4885e96d
 +    }
 +}
 +
++tokio::task_local! {
++    pub static DEPLOYMENT_ANALYSIS_JOB: DeploymentAnalysisPermit;
++    // Only opt-in operations install this signal. Legacy subscriber loss keeps
++    // the existing Node invocation owner running to its terminal boundary.
++    pub static DEPLOYMENT_OPERATION_CANCELLATION: tokio::sync::watch::Receiver<bool>;
++}
++
++#[derive(Clone, Copy, Eq, PartialEq)]
++pub enum DeploymentAnalysisKind {
++    Deploy,
++    Preflight,
++}
++
++/// One whole analysis job per application, with a finite queue and retained
++/// source budget. Deployment wins queued preflight, with a four-job burst
++/// limit so repeated deployment cannot starve preflight indefinitely.
++#[derive(Clone, Default)]
++pub struct DeploymentAnalysisAdmission(Arc<DeploymentAnalysisState>);
++
++#[derive(Default)]
++struct DeploymentAnalysisState {
++    inner: parking_lot::Mutex<DeploymentAnalysisQueue>,
++    changed: tokio::sync::Notify,
++}
++
++#[derive(Default)]
++struct DeploymentAnalysisQueue {
++    next_id: u64,
++    waiting: std::collections::VecDeque<(u64, DeploymentAnalysisKind)>,
++    active: Option<u64>,
++    deploy_burst: usize,
++    retained_bytes: usize,
++}
++
++metrics::register_convex_gauge!(
++    DEPLOYMENT_ANALYSIS_JOBS_INFO,
++    "Whole analysis jobs, separate from root permits; one application per process",
++    &["state"]
++);
++metrics::register_convex_histogram!(
++    DEPLOYMENT_ANALYSIS_JOB_WAIT_SECONDS,
++    "Whole-job admission wait including immediate, rejected, timed-out and canceled attempts",
++    &["kind", "status"]
++);
++
++impl DeploymentAnalysisQueue {
++    fn publish_metrics(&self) {
++        for (state, count) in [
++            ("active", usize::from(self.active.is_some())),
++            ("waiting", self.waiting.len()),
++        ] {
++            metrics::log_gauge_with_labels(
++                &DEPLOYMENT_ANALYSIS_JOBS_INFO,
++                count as f64,
++                vec![metrics::StaticMetricLabel::new("state", state)],
++            );
++        }
++    }
++}
++
++#[derive(Clone)]
++pub struct DeploymentAnalysisPermit(Arc<DeploymentAnalysisOwner>);
++
++struct DeploymentAnalysisOwner {
++    state: Arc<DeploymentAnalysisState>,
++    id: u64,
++    bytes: usize,
++}
++
++impl Drop for DeploymentAnalysisOwner {
++    fn drop(&mut self) {
++        let mut inner = self.state.inner.lock();
++        inner.waiting.retain(|(id, _)| *id != self.id);
++        if inner.active == Some(self.id) {
++            inner.active = None;
++        }
++        inner.retained_bytes = inner
++            .retained_bytes
++            .checked_sub(self.bytes)
++            .expect("deployment analysis byte accounting underflow");
++        inner.publish_metrics();
++        drop(inner);
++        self.state.changed.notify_waiters();
++    }
++}
++
++impl DeploymentAnalysisAdmission {
++    pub async fn acquire(
++        &self,
++        kind: DeploymentAnalysisKind,
++        bytes: usize,
++    ) -> anyhow::Result<DeploymentAnalysisPermit> {
++        use errors::ErrorMetadata;
++        let mut timer = metrics::CancelableTimer::new(&DEPLOYMENT_ANALYSIS_JOB_WAIT_SECONDS);
++        timer.add_label(metrics::StaticMetricLabel::new(
++            "kind",
++            match kind {
++                DeploymentAnalysisKind::Deploy => "deploy",
++                DeploymentAnalysisKind::Preflight => "preflight",
++            },
++        ));
++        let owner = {
++            let mut inner = self.0.inner.lock();
++            inner.publish_metrics();
++            if inner.waiting.len() >= 4
++                || bytes > (768 * 1024 * 1024usize).saturating_sub(inner.retained_bytes)
++            {
++                timer.finish_with(if inner.waiting.len() >= 4 {
++                    "queue_full"
++                } else {
++                    "byte_budget"
++                });
++                anyhow::bail!(ErrorMetadata::overloaded(
++                    "DeploymentAnalysisBusy",
++                    "Deployment analysis capacity is full. Retry the request."
++                ));
++            }
++            let id = inner.next_id;
++            inner.next_id = id
++                .checked_add(1)
++                .expect("deployment analysis identity overflow");
++            inner.retained_bytes += bytes;
++            inner.waiting.push_back((id, kind));
++            inner.publish_metrics();
++            DeploymentAnalysisPermit(Arc::new(DeploymentAnalysisOwner {
++                state: self.0.clone(),
++                id,
++                bytes,
++            }))
++        };
++        let wait = async {
++            loop {
++                let changed = self.0.changed.notified();
++                tokio::pin!(changed);
++                changed.as_mut().enable();
++                {
++                    let mut inner = self.0.inner.lock();
++                    let preferred = if inner.deploy_burst >= 4 {
++                        DeploymentAnalysisKind::Preflight
++                    } else {
++                        DeploymentAnalysisKind::Deploy
++                    };
++                    let next = inner
++                        .waiting
++                        .iter()
++                        .find(|(_, kind)| *kind == preferred)
++                        .or_else(|| inner.waiting.front())
++                        .copied();
++                    if inner.active.is_none() && next.is_some_and(|(id, _)| id == owner.0.id) {
++                        inner.waiting.retain(|(id, _)| *id != owner.0.id);
++                        inner.active = Some(owner.0.id);
++                        inner.publish_metrics();
++                        inner.deploy_burst = if kind == DeploymentAnalysisKind::Deploy {
++                            inner.deploy_burst.saturating_add(1)
++                        } else {
++                            0
++                        };
++                        return;
++                    }
++                }
++                changed.await;
++            }
++        };
++        if tokio::time::timeout(std::time::Duration::from_secs(30), wait)
++            .await
++            .is_err()
++        {
++            timer.finish_with("timeout");
++            anyhow::bail!(ErrorMetadata::overloaded(
++                "DeploymentAnalysisBusy",
++                "Timed out waiting for deployment analysis capacity. Retry the request.",
++            ));
++        }
++        timer.finish(true);
++        Ok(owner)
++    }
++}
++
 +#[cfg(test)]
 +mod tests {
 +    use std::time::Duration;
 +
 +    use super::QueryAnalysisAdmission;
++
++    #[tokio::test]
++    async fn deployment_precedes_queued_preflight_and_cancellation_releases_ownership() {
++        use super::{
++            DeploymentAnalysisAdmission,
++            DeploymentAnalysisKind,
++        };
++        let gate = DeploymentAnalysisAdmission::default();
++        let active = gate
++            .acquire(DeploymentAnalysisKind::Preflight, 1024)
++            .await
++            .unwrap();
++        let dispatched_root = active.clone();
++        let mut preflight = Box::pin(gate.acquire(DeploymentAnalysisKind::Preflight, 2048));
++        let mut deployment = Box::pin(gate.acquire(DeploymentAnalysisKind::Deploy, 4096));
++        assert!(futures::poll!(&mut preflight).is_pending());
++        assert!(futures::poll!(&mut deployment).is_pending());
++        drop(active);
++        assert!(futures::poll!(&mut deployment).is_pending());
++        drop(dispatched_root);
++        assert!(futures::poll!(&mut preflight).is_pending());
++        let active = deployment.await.unwrap();
++        drop(preflight);
++        assert_eq!(gate.0.inner.lock().retained_bytes, 4096);
++        drop(active);
++        assert_eq!(gate.0.inner.lock().retained_bytes, 0);
++        assert!(gate.0.inner.lock().waiting.is_empty());
++    }
++
++    #[tokio::test]
++    async fn deployment_analysis_rejects_excess_bytes_without_leaking_waiters() {
++        use super::{
++            DeploymentAnalysisAdmission,
++            DeploymentAnalysisKind,
++        };
++        let gate = DeploymentAnalysisAdmission::default();
++        assert!(gate
++            .acquire(DeploymentAnalysisKind::Deploy, 769 * 1024 * 1024)
++            .await
++            .is_err());
++        let active = gate
++            .acquire(DeploymentAnalysisKind::Deploy, 768 * 1024 * 1024)
++            .await
++            .unwrap();
++        assert!(gate
++            .acquire(DeploymentAnalysisKind::Preflight, 1)
++            .await
++            .is_err());
++        assert!(gate.0.inner.lock().waiting.is_empty());
++        drop(active);
++        assert_eq!(gate.0.inner.lock().retained_bytes, 0);
++    }
++
++    #[tokio::test]
++    async fn queued_preflight_progresses_after_four_deployments() {
++        use super::{
++            DeploymentAnalysisAdmission,
++            DeploymentAnalysisKind,
++        };
++        let gate = DeploymentAnalysisAdmission::default();
++        let mut active = gate
++            .acquire(DeploymentAnalysisKind::Deploy, 1)
++            .await
++            .unwrap();
++        let mut preflight = Box::pin(gate.acquire(DeploymentAnalysisKind::Preflight, 1));
++        assert!(futures::poll!(&mut preflight).is_pending());
++        for _ in 0..3 {
++            let mut deployment = Box::pin(gate.acquire(DeploymentAnalysisKind::Deploy, 1));
++            assert!(futures::poll!(&mut deployment).is_pending());
++            drop(active);
++            assert!(futures::poll!(&mut preflight).is_pending());
++            active = deployment.await.unwrap();
++        }
++        let mut fifth = Box::pin(gate.acquire(DeploymentAnalysisKind::Deploy, 1));
++        assert!(futures::poll!(&mut fifth).is_pending());
++        drop(active);
++        assert!(futures::poll!(&mut fifth).is_pending());
++        let preflight = preflight.await.unwrap();
++        drop(preflight);
++        drop(fifth.await.unwrap());
++        assert_eq!(gate.0.inner.lock().retained_bytes, 0);
++    }
++
++    #[tokio::test]
++    async fn spawned_job_scope_keeps_admission_until_the_child_future_drops() {
++        use super::{
++            DeploymentAnalysisAdmission,
++            DeploymentAnalysisKind,
++            DEPLOYMENT_ANALYSIS_JOB,
++        };
++        let gate = DeploymentAnalysisAdmission::default();
++        let permit = gate
++            .acquire(DeploymentAnalysisKind::Deploy, 1024)
++            .await
++            .unwrap();
++        let (release, finish) = tokio::sync::oneshot::channel();
++        let child = DEPLOYMENT_ANALYSIS_JOB
++            .scope(permit, async {
++                let lease = DEPLOYMENT_ANALYSIS_JOB.with(Clone::clone);
++                tokio::spawn(DEPLOYMENT_ANALYSIS_JOB.scope(lease, async move {
++                    finish.await.unwrap();
++                }))
++            })
++            .await;
++        let mut next = Box::pin(gate.acquire(DeploymentAnalysisKind::Deploy, 2048));
++        // The parent scope is gone and the child has not been polled yet.
++        assert!(futures::poll!(&mut next).is_pending());
++        assert_eq!(gate.0.inner.lock().retained_bytes, 3072);
++        release.send(()).unwrap();
++        child.await.unwrap();
++        drop(next.await.unwrap());
++        assert_eq!(gate.0.inner.lock().retained_bytes, 0);
++    }
 +
 +    #[tokio::test]
 +    async fn analysis_borrows_from_degradable_capacity() {
@@ -546,10 +1092,23 @@ index 0605babc06f076e444baaa69efe3c203d2ffc200..9ef312a4aaa4c8a69e7bb14411dcac0f
      }
  
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c62340949 100644
+index 20cd503e92244ba1d78bdf353a434c96467eb545..9aea1011b93610a6fa3ff76d36c2785ef272fe42 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
-@@ -233,6 +233,82 @@ use crate::{
+@@ -226,13 +226,95 @@ use crate::{
+         SchedulerContextAffinityOutcome,
+     },
+     module_cache::{
++        AnalysisModuleSnapshot,
+         ModuleCache,
+         V8ModuleSource,
+     },
++    termination::{
++        ContextId,
++        ExecutionHandle,
++        IsolateTerminationReason,
++    },
+ };
  
  const ISOLATE_QUEUE_METRICS_LOG_FREQUENCY: Duration = Duration::from_secs(1);
  
@@ -632,17 +1191,143 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
  pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
  pub const PAUSE_REQUEST: &str = "pause_request";
  pub const NO_AVAILABLE_WORKERS: &str = "There are no available workers to process the request";
-@@ -1124,7 +1200,8 @@ pub enum RequestType<RT: Runtime> {
-         modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>>,
+@@ -250,6 +332,15 @@ pub struct CancellationSignal {
+ struct CancellationState {
+     cancelled: AtomicBool,
+     waker: AtomicWaker,
++    execution: parking_lot::Mutex<Option<(ExecutionHandle, ContextId)>>,
++}
++
++pub(crate) struct CancellationRegistration(CancellationSignal);
++
++impl Drop for CancellationRegistration {
++    fn drop(&mut self) {
++        self.0.inner.execution.lock().take();
++    }
+ }
+ 
+ impl CancellationSignal {
+@@ -258,15 +349,58 @@ impl CancellationSignal {
+             inner: Arc::new(CancellationState {
+                 cancelled: AtomicBool::new(false),
+                 waker: AtomicWaker::new(),
++                execution: parking_lot::Mutex::new(None),
+             }),
+         }
+     }
+ 
+-    fn cancel(&self) {
++    pub(crate) fn cancel(&self) {
+         self.inner.cancelled.store(true, Ordering::Release);
++        if let Some((handle, context)) = &*self.inner.execution.lock() {
++            handle.terminate_if_current(
++                context,
++                IsolateTerminationReason::SystemError(Some(
++                    ErrorMetadata::bad_request(
++                        "AnalysisCancelled",
++                        "Deployment analysis was cancelled",
++                    )
++                    .into(),
++                ))
++                .into(),
++            );
++        }
+         self.inner.waker.wake();
+     }
+ 
++    pub(crate) fn bind_analysis_execution(
++        &self,
++        handle: ExecutionHandle,
++        context: ContextId,
++    ) -> CancellationRegistration {
++        {
++            let mut execution = self.inner.execution.lock();
++            assert!(
++                execution.is_none(),
++                "cancellation signal already owns an execution"
++            );
++            *execution = Some((handle, context));
++        }
++        if self.is_cancelled() {
++            self.cancel();
++        }
++        CancellationRegistration(self.clone())
++    }
++
++    #[cfg(test)]
++    pub(crate) fn new_for_test() -> Self {
++        Self::new()
++    }
++
++    #[cfg(test)]
++    pub(crate) fn cancel_for_test(&self) {
++        self.cancel();
++    }
++
+     pub(crate) fn is_cancelled(&self) -> bool {
+         self.inner.cancelled.load(Ordering::Acquire)
+     }
+@@ -946,6 +1080,8 @@ pub struct Request<RT: Runtime> {
+     pub parent_trace: EncodedSpan,
+     pub scheduler_dependency: SchedulerDependencyClass,
+     pub active_javascript_class: ActiveJavascriptClass,
++    // Dispatched work retains whole-job admission after subscriber cancellation.
++    pub(crate) deployment_job: Option<common::query_analysis_admission::DeploymentAnalysisPermit>,
+ }
+ 
+ impl<RT: Runtime> Request<RT> {
+@@ -983,6 +1119,9 @@ impl<RT: Runtime> Request<RT> {
+         let active_javascript_class =
+             active_javascript_class.for_scheduler_dependency(scheduler_dependency);
+         let request = Self {
++            deployment_job: common::query_analysis_admission::DEPLOYMENT_ANALYSIS_JOB
++                .try_with(Clone::clone)
++                .ok(),
+             client_id,
+             inner,
+             parent_trace,
+@@ -1123,12 +1262,15 @@ pub enum RequestType<RT: Runtime> {
+     },
+     Analyze {
+         udf_config: UdfConfig,
+-        modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>>,
++        modules: Arc<AnalysisModuleSnapshot>,
          to_analyze: CanonicalizedModulePath,
          environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
 -        response: oneshot::Sender<anyhow::Result<Result<AnalyzedModule, JsError>>>,
++        cancellation: CancellationSignal,
 +        // This sender owns shared admission across queueing and execution.
 +        response: AnalyzeResponseSender,
      },
      EvaluateSchema {
++        cancellation: CancellationSignal,
          schema_bundle: ModuleSource,
-@@ -1263,7 +1340,7 @@ impl<RT: Runtime> Request<RT> {
+         source_map: Option<SourceMap>,
+         rng_seed: [u8; 32],
+@@ -1136,12 +1278,14 @@ pub enum RequestType<RT: Runtime> {
+         response: oneshot::Sender<anyhow::Result<DatabaseSchema>>,
+     },
+     EvaluateAuthConfig {
++        cancellation: CancellationSignal,
+         auth_config_bundle: ModuleSource,
+         source_map: Option<SourceMap>,
+         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
+         response: oneshot::Sender<anyhow::Result<AuthConfig>>,
+     },
+     EvaluateAppDefinitions {
++        cancellation: CancellationSignal,
+         app_definition: ModuleConfig,
+         component_definitions: BTreeMap<ComponentDefinitionPath, ModuleConfig>,
+         dependency_graph: BTreeSet<(ComponentDefinitionPath, ComponentDefinitionPath)>,
+@@ -1150,6 +1294,7 @@ pub enum RequestType<RT: Runtime> {
+         response: oneshot::Sender<anyhow::Result<EvaluateAppDefinitionsResult>>,
+     },
+     EvaluateComponentInitializer {
++        cancellation: CancellationSignal,
+         evaluated_definitions: BTreeMap<ComponentDefinitionPath, ComponentDefinitionMetadata>,
+         path: ComponentDefinitionPath,
+         definition: ModuleConfig,
+@@ -1265,7 +1410,7 @@ impl<RT: Runtime> Request<RT> {
                  let _ = response.send(Err(error));
              },
              RequestType::Analyze { response, .. } => {
@@ -651,7 +1336,7 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
              },
              RequestType::EvaluateSchema { response, .. } => {
                  let _ = response.send(Err(error));
-@@ -1755,6 +1832,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1764,6 +1909,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
          environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
          instance_name: String,
@@ -659,7 +1344,7 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
      ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
          anyhow::ensure!(
              modules
-@@ -1762,6 +1840,9 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1771,12 +1917,15 @@ impl<RT: Runtime> IsolateClient<RT> {
                  .all(|m| m.environment == ModuleEnvironment::Isolate),
              "Can only analyze Isolate modules"
          );
@@ -669,7 +1354,24 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
          let to_analyze: Vec<_> = modules
              .keys()
              .filter(|path| !path.is_deps())
-@@ -1787,20 +1868,36 @@ impl<RT: Runtime> IsolateClient<RT> {
+             .cloned()
+             .collect();
+-        let modules: Arc<BTreeMap<_, _>> = Arc::new(
++        let modules = Arc::new(AnalysisModuleSnapshot::from(
+             modules
+                 .into_iter()
+                 .map(|(path, module_config)| {
+@@ -1788,28 +1937,54 @@ impl<RT: Runtime> IsolateClient<RT> {
+                         })),
+                     )
+                 })
+-                .collect(),
+-        );
++                .collect::<BTreeMap<_, _>>(),
++        ));
+         let mut stream = pin!(stream::iter(to_analyze)
+             .map(|to_analyze| async {
+                 let mut backoff = Backoff::new(Duration::from_millis(500), Duration::from_secs(2));
                  let mut attempt = 1;
                  const MAX_ATTEMPTS: u32 = 3;
                  loop {
@@ -691,6 +1393,11 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
 +                                None
 +                            };
 +                        let (tx, rx) = oneshot::channel();
++                        let cancellation = CancellationSignal::new();
++                        let caller_cancellation = cancellation.clone();
++                        metrics::ISOLATE_ANALYSIS_ATTEMPTS_TOTAL
++                            .with_label_values(&[if attempt == 1 { "initial" } else { "retry" }])
++                            .inc();
 +                        let request = RequestType::Analyze {
 +                            modules: modules.clone(),
 +                            to_analyze: to_analyze.clone(),
@@ -699,15 +1406,20 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
 +                            response: AnalyzeResponseSender::new(tx, capacity_reservation),
 +                            udf_config: udf_config.clone(),
 +                            environment_variables: environment_variables.clone(),
++                            cancellation,
 +                        };
 +                        self.send_request(Request::new(
 +                            instance_name.clone(),
 +                            request,
 +                            EncodedSpan::from_parent(),
 +                        ))?;
-+                        IsolateClient::<RT>::receive_response(rx)
-+                            .await?
-+                            .into_result()
++                        let response = pin!(Self::receive_response(rx));
++                        // Publish cancellation before receiver closure can wake
++                        // the scheduler or race with worker response delivery.
++                        let cancel_on_drop = CancelExecutionOnDrop(Some(caller_cancellation));
++                        let result = response.await;
++                        cancel_on_drop.disarm();
++                        result?.into_result()
                      };
 -                    self.send_request(Request::new(
 -                        instance_name.clone(),
@@ -719,7 +1431,111 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
                          Ok(outcome) => return Ok((to_analyze, outcome)),
                          Err(e)
                              if attempt < MAX_ATTEMPTS
-@@ -3143,9 +3240,11 @@ mod tests {
+@@ -1861,7 +2036,10 @@ impl<RT: Runtime> IsolateClient<RT> {
+         const MAX_ATTEMPTS: u32 = 3;
+         loop {
+             let (tx, rx) = oneshot::channel();
++            let cancellation = CancellationSignal::new();
++            let caller_cancellation = cancellation.clone();
+             let request = RequestType::EvaluateAppDefinitions {
++                cancellation,
+                 app_definition: app_definition.clone(),
+                 component_definitions: component_definitions.clone(),
+                 dependency_graph: dependency_graph.clone(),
+@@ -1874,7 +2052,13 @@ impl<RT: Runtime> IsolateClient<RT> {
+                 request,
+                 EncodedSpan::from_parent(),
+             ))?;
+-            match IsolateClient::<RT>::receive_response(rx).await? {
++            let response = pin!(Self::receive_response(rx));
++            // Interrupt this execution before closing its response channel. The
++            // worker retains the job lease through V8 environment cleanup.
++            let cancel_on_drop = CancelExecutionOnDrop(Some(caller_cancellation));
++            let result = response.await;
++            cancel_on_drop.disarm();
++            match result? {
+                 Ok(outcome) => return Ok(outcome),
+                 Err(e)
+                     if attempt < MAX_ATTEMPTS
+@@ -1906,7 +2090,10 @@ impl<RT: Runtime> IsolateClient<RT> {
+         const MAX_ATTEMPTS: u32 = 3;
+         loop {
+             let (tx, rx) = oneshot::channel();
++            let cancellation = CancellationSignal::new();
++            let caller_cancellation = cancellation.clone();
+             let request = RequestType::EvaluateComponentInitializer {
++                cancellation,
+                 evaluated_definitions: evaluated_definitions.clone(),
+                 path: path.clone(),
+                 definition: definition.clone(),
+@@ -1919,7 +2106,13 @@ impl<RT: Runtime> IsolateClient<RT> {
+                 request,
+                 EncodedSpan::from_parent(),
+             ))?;
+-            match IsolateClient::<RT>::receive_response(rx).await? {
++            let response = pin!(Self::receive_response(rx));
++            // Interrupt this execution before closing its response channel. The
++            // worker retains the job lease through V8 environment cleanup.
++            let cancel_on_drop = CancelExecutionOnDrop(Some(caller_cancellation));
++            let result = response.await;
++            cancel_on_drop.disarm();
++            match result? {
+                 Ok(outcome) => return Ok(outcome),
+                 Err(e)
+                     if attempt < MAX_ATTEMPTS
+@@ -1952,7 +2145,10 @@ impl<RT: Runtime> IsolateClient<RT> {
+         const MAX_ATTEMPTS: u32 = 3;
+         loop {
+             let (tx, rx) = oneshot::channel();
++            let cancellation = CancellationSignal::new();
++            let caller_cancellation = cancellation.clone();
+             let request = RequestType::EvaluateSchema {
++                cancellation,
+                 schema_bundle: schema_bundle.clone(),
+                 source_map: source_map.clone(),
+                 rng_seed,
+@@ -1964,7 +2160,13 @@ impl<RT: Runtime> IsolateClient<RT> {
+                 request,
+                 EncodedSpan::from_parent(),
+             ))?;
+-            match IsolateClient::<RT>::receive_response(rx).await? {
++            let response = pin!(Self::receive_response(rx));
++            // Interrupt this execution before closing its response channel. The
++            // worker retains the job lease through V8 environment cleanup.
++            let cancel_on_drop = CancelExecutionOnDrop(Some(caller_cancellation));
++            let result = response.await;
++            cancel_on_drop.disarm();
++            match result? {
+                 Ok(outcome) => return Ok(outcome),
+                 Err(e)
+                     if attempt < MAX_ATTEMPTS
+@@ -1995,7 +2197,10 @@ impl<RT: Runtime> IsolateClient<RT> {
+         const MAX_ATTEMPTS: u32 = 3;
+         let result = loop {
+             let (tx, rx) = oneshot::channel();
++            let cancellation = CancellationSignal::new();
++            let caller_cancellation = cancellation.clone();
+             let request = RequestType::EvaluateAuthConfig {
++                cancellation,
+                 auth_config_bundle: auth_config_bundle.clone(),
+                 source_map: source_map.clone(),
+                 environment_variables: environment_variables.clone(),
+@@ -2006,7 +2211,13 @@ impl<RT: Runtime> IsolateClient<RT> {
+                 request,
+                 EncodedSpan::from_parent(),
+             ))?;
+-            match IsolateClient::<RT>::receive_response(rx).await? {
++            let response = pin!(Self::receive_response(rx));
++            // Interrupt this execution before closing its response channel. The
++            // worker retains the job lease through V8 environment cleanup.
++            let cancel_on_drop = CancelExecutionOnDrop(Some(caller_cancellation));
++            let result = response.await;
++            cancel_on_drop.disarm();
++            match result? {
+                 Ok(outcome) => return Ok(outcome),
+                 Err(e)
+                     if attempt < MAX_ATTEMPTS
+@@ -3235,9 +3446,11 @@ mod tests {
              ComponentId,
              ComponentName,
          },
@@ -731,7 +1547,7 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
          runtime::{
              shutdown_and_join,
              Runtime,
-@@ -3160,6 +3259,14 @@ mod tests {
+@@ -3252,6 +3465,14 @@ mod tests {
      };
      use errors::ErrorMetadataAnyhowExt as _;
      use futures::future::FusedFuture;
@@ -746,13 +1562,13 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
      use parking_lot::Mutex;
      use runtime::prod::ProdRuntime;
      use semver::Version;
-@@ -3180,12 +3287,14 @@ mod tests {
+@@ -3272,12 +3493,15 @@ mod tests {
          wait_for_external_permit,
          worker_rejection_reason,
          ActiveRequestCounts,
--		CancelExecutionOnDrop,
++        AnalysisModuleSnapshot,
 +        AnalyzeResponseSender,
-+        CancelExecutionOnDrop,
+         CancelExecutionOnDrop,
          CancellationSignal,
          ConcurrencyPermitPhase,
          ExternalPermitWaitOutcome,
@@ -762,7 +1578,7 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
          IsolateConfig,
          IsolateWorker,
          IsolateWorkerHandle,
-@@ -3222,6 +3331,8 @@ mod tests {
+@@ -3314,6 +3538,8 @@ mod tests {
  
      const SCHEDULER_TEST_TIMEOUT: Duration = Duration::from_secs(5);
  
@@ -771,7 +1587,7 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
      #[derive(Clone)]
      struct SchedulerTestRuntime {
          inner: ProdRuntime,
-@@ -3283,10 +3394,18 @@ mod tests {
+@@ -3375,10 +3601,18 @@ mod tests {
          }
      }
  
@@ -790,7 +1606,7 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
      }
  
      #[async_trait::async_trait(?Send)]
-@@ -3304,7 +3423,7 @@ mod tests {
+@@ -3396,7 +3630,7 @@ mod tests {
                  active_request_guard,
              }) = requests.recv().await
              {
@@ -799,7 +1615,7 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
                      RequestType::Test {
                          id,
                          can_block_on_descendant: _,
-@@ -3315,15 +3434,39 @@ mod tests {
+@@ -3407,15 +3641,39 @@ mod tests {
                          started,
                          completion,
                          response,
@@ -846,7 +1662,7 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
                  drop(permit);
                  drop(active_request_guard);
                  if done
-@@ -3356,6 +3499,55 @@ mod tests {
+@@ -3448,6 +3706,55 @@ mod tests {
          }
      }
  
@@ -902,19 +1718,71 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
      #[derive(Clone, Copy)]
      enum TestRequestKind {
          Dependency,
-@@ -3493,7 +3685,7 @@ mod tests {
-                 modules: Arc::new(BTreeMap::new()),
+@@ -3582,12 +3889,14 @@ mod tests {
+         vec![
+             RequestType::Analyze {
+                 udf_config,
+-                modules: Arc::new(BTreeMap::new()),
++                modules: Arc::new(AnalysisModuleSnapshot::from(BTreeMap::new())),
                  to_analyze: module_path,
                  environment_variables: BTreeMap::new(),
 -                response: analyze_response,
++                cancellation: CancellationSignal::new(),
 +                response: AnalyzeResponseSender::new(analyze_response, None),
              },
              RequestType::EvaluateSchema {
++                cancellation: CancellationSignal::new(),
                  schema_bundle: model::modules::module_versions::ModuleSource::new(""),
-@@ -3822,6 +4014,166 @@ mod tests {
+                 source_map: None,
+                 rng_seed: [0; 32],
+@@ -3595,12 +3904,14 @@ mod tests {
+                 response: schema_response,
+             },
+             RequestType::EvaluateAuthConfig {
++                cancellation: CancellationSignal::new(),
+                 auth_config_bundle: model::modules::module_versions::ModuleSource::new(""),
+                 source_map: None,
+                 environment_variables: BTreeMap::new(),
+                 response: auth_response,
+             },
+             RequestType::EvaluateAppDefinitions {
++                cancellation: CancellationSignal::new(),
+                 app_definition: module_config.clone(),
+                 component_definitions: BTreeMap::new(),
+                 dependency_graph: Default::default(),
+@@ -3609,6 +3920,7 @@ mod tests {
+                 response: app_definitions_response,
+             },
+             RequestType::EvaluateComponentInitializer {
++                cancellation: CancellationSignal::new(),
+                 evaluated_definitions: BTreeMap::new(),
+                 path: ComponentDefinitionPath::root(),
+                 definition: module_config,
+@@ -3914,6 +4226,187 @@ mod tests {
          assert!(nested_signal.is_cancelled());
      }
  
++    #[test]
++    fn analysis_cancellation_survives_binding_and_stops_at_unbinding() {
++        let early = CancellationSignal::new();
++        early.cancel();
++        let handle = crate::termination::ExecutionHandle::cooperative();
++        let context = handle.push_context(false);
++        let registration = early.bind_analysis_execution(handle.clone(), context);
++        assert!(handle.check_terminated().is_err());
++        drop(registration);
++
++        let late = CancellationSignal::new();
++        let handle = crate::termination::ExecutionHandle::cooperative();
++        let context = handle.push_context(false);
++        let registration = late.bind_analysis_execution(handle.clone(), context.clone());
++        drop(registration);
++        handle.pop_context(context).unwrap().unwrap();
++        handle.push_context(false);
++        late.cancel();
++        handle.check_terminated().unwrap();
++    }
++
 +    #[test]
 +    fn analysis_reservation_outlives_post_dispatch_caller_drop() {
 +        let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
@@ -1078,7 +1946,7 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
      #[test]
      fn dependency_and_descendant_capability_are_independent() {
          assert_eq!(properties(false, false, false).as_label(), "independent");
-@@ -4125,6 +4477,7 @@ mod tests {
+@@ -4217,6 +4710,7 @@ mod tests {
              TestIsolateWorker {
                  rt: scheduler_rt.clone(),
                  config: IsolateConfig::new("scheduler_test", ConcurrencyLimiter::unlimited()),
@@ -1086,27 +1954,1693 @@ index 2dd6bff24f2bcfa2eb2894be956aa6e57dce8031..98defab5daf5a337d03ce833943c154c
              },
              1,
              1,
+diff --git a/crates/isolate/src/environment/action/mod.rs b/crates/isolate/src/environment/action/mod.rs
+index eae0b5d8d7cbc61ec2152928cbf6cad978d4574a..75a30fc0172ebdd04d54781720971ac45420465f 100644
+--- a/crates/isolate/src/environment/action/mod.rs
++++ b/crates/isolate/src/environment/action/mod.rs
+@@ -1767,6 +1767,9 @@ impl<RT: Runtime> JsEnvironment<RT> for ActionEnvironment<RT> {
+     type AsyncResolver = v8::Global<v8::PromiseResolver>;
+     type SyscallProvider = Self;
+ 
++    const MODULE_REQUEST_KIND: crate::module_diagnostics::ModuleRequestKind =
++        crate::module_diagnostics::ModuleRequestKind::Runtime;
++
+     fn syscall_provider(&mut self) -> &mut Self::SyscallProvider {
+         self
+     }
+diff --git a/crates/isolate/src/environment/analyze.rs b/crates/isolate/src/environment/analyze.rs
+index fc465c27e37b34fcc6d94637553f0e58a632bad4..d78b7f5303b5e6d577e45dba0c77d32ce9a69e1d 100644
+--- a/crates/isolate/src/environment/analyze.rs
++++ b/crates/isolate/src/environment/analyze.rs
+@@ -1,6 +1,5 @@
+ use std::{
+     collections::{
+-        btree_map::Entry,
+         BTreeMap,
+         VecDeque,
+     },
+@@ -15,7 +14,10 @@ use anyhow::{
+     Context,
+ };
+ use common::{
+-    errors::JsError,
++    errors::{
++        lookup_source_map_token,
++        JsError,
++    },
+     json::JsonForm as _,
+     knobs::{
+         DATABASE_UDF_SYSTEM_TIMEOUT,
+@@ -87,6 +89,7 @@ use value::{
+ 
+ use super::ModuleCodeCacheResult;
+ use crate::{
++    client::CancellationSignal,
+     context_cache::ContextCache,
+     environment::{
+         helpers::{
+@@ -108,7 +111,6 @@ use crate::{
+     execution_scope::ExecutionScope,
+     helpers::{
+         self,
+-        source_map_from_slice,
+     },
+     isolate::Isolate,
+     metrics::{
+@@ -116,7 +118,16 @@ use crate::{
+         log_source_map_origin_in_separate_module,
+         log_source_map_token_lookup_failed,
+     },
+-    module_cache::V8ModuleSource,
++    module_cache::{
++        AnalysisModuleSnapshot,
++        V8ModuleSource,
++    },
++    module_diagnostics::{
++        AnalysisDiagnostic,
++        ModulePhase,
++        ModulePhaseGuard,
++        ModuleRequestKind,
++    },
+     request_scope::RequestScope,
+     strings::{
+         self,
+@@ -126,13 +137,8 @@ use crate::{
+ };
+ 
+ pub struct AnalyzeEnvironment {
+-    modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>>,
+-    // This is used to lazily cache the result of sourcemap::SourceMap::from_slice across
+-    // modules and functions. There are certain source maps whose source origin we don't
+-    // need to construct during analysis (i.e. if all of the UDFs it defines have function
+-    // bodies outside the current module), so keeping this mapping lazy allows for avoiding
+-    // unnecessary source map parsing.
+-    source_maps_cache: BTreeMap<CanonicalizedModulePath, Option<sourcemap::SourceMap>>,
++    diagnostic: AnalysisDiagnostic,
++    modules: Arc<AnalysisModuleSnapshot>,
+     rng: ChaCha12Rng,
+     unix_timestamp: UnixTimestamp,
+     environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
+@@ -140,6 +146,387 @@ pub struct AnalyzeEnvironment {
+     collected_logs: VecDeque<String>,
+ }
+ 
++#[cfg(test)]
++mod snapshot_tests {
++    use common::runtime::UnixTimestamp;
++    use errors::ErrorMetadataAnyhowExt;
++    use model::modules::module_versions::{
++        FullModuleSource,
++        ModuleSource,
++    };
++    use runtime::prod::ProdRuntime;
++
++    use super::*;
++    use crate::ConcurrencyLimiter;
++
++    #[test]
++    fn shared_compilation_preserves_fresh_globals_cycles_and_environment() -> anyhow::Result<()> {
++        use rand::Rng;
++        crate::client::initialize_v8();
++        let tokio = ProdRuntime::init_tokio()?;
++        let rt = ProdRuntime::new(&tokio);
++        tokio.block_on(async {
++            let root = "import { check } from './_deps/a.js'; check(); if (globalThis.seen) throw \
++                        new Error('shared globals'); globalThis.seen = true; if \
++                        (process.env.VALUE !== 'one') throw new Error('fresh environment'); if \
++                        (Date.now() !== 123456) throw new Error('import timestamp'); if \
++                        (Math.random().toString() !== process.env.RANDOM) throw new Error('random \
++                        stream was not reset');";
++            let expected_random = ChaCha12Rng::from_seed([7; 32]).random::<f64>().to_string();
++            let modules = Arc::new(AnalysisModuleSnapshot::from(
++                [
++                    ("root.js", root),
++                    ("second.js", root),
++                    ("invalid.js", "\nimport './_deps/unresolvable.js';"),
++                    ("_deps/unresolvable.js", "import 'bare_import';"),
++                    ("throw.js", "\nthrow new Error('source-map fallback');"),
++                    (
++                        "_deps/a.js",
++                        "import { id } from './b.js'; export const tag = 'fresh'; export function \
++                         check() { if (id() !== tag) throw new Error('cycle'); }",
++                    ),
++                    (
++                        "_deps/b.js",
++                        "import { tag } from './a.js'; export function id() { return tag; }",
++                    ),
++                ]
++                .into_iter()
++                .map(|(path, source)| {
++                    Ok((
++                        path.parse()?,
++                        Arc::new(V8ModuleSource::new(FullModuleSource {
++                            source: ModuleSource::new(source),
++                            source_map: matches!(path, "invalid.js" | "throw.js").then(|| {
++                                // The failing code is on line one before the
++                                // previous line's range; keep generated locations.
++                                serde_json::json!({
++                                    "version": 3,
++                                    "sources": ["original.ts"],
++                                    "sourcesContent": ["original"],
++                                    "names": [],
++                                    "mappings": "oGAAA",
++                                    "rangeMappings": "B",
++                                })
++                                .to_string()
++                            }),
++                        })),
++                    ))
++                })
++                .collect::<anyhow::Result<BTreeMap<_, _>>>()?,
++            ));
++            let mut isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
++            let mut contexts = ContextCache::new();
++            let limiter = ConcurrencyLimiter::unlimited();
++            for (path, environment, expected_error) in [
++                ("root.js", "one", None),
++                ("second.js", "one", None),
++                ("root.js", "two", Some("fresh environment")),
++                ("invalid.js", "one", Some("during registration")),
++                ("throw.js", "one", Some("source-map fallback")),
++            ] {
++                let permit = limiter
++                    .acquire(Arc::new("analysis_snapshot_test".to_owned()), false)
++                    .await;
++                let mut clean = false;
++                let result = AnalyzeEnvironment::analyze(
++                    &mut isolate,
++                    &mut contexts,
++                    permit,
++                    &mut clean,
++                    UdfConfig {
++                        server_version: semver::Version::new(1, 36, 0),
++                        import_phase_rng_seed: [7; 32],
++                        import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
++                    },
++                    modules.clone(),
++                    path.parse()?,
++                    BTreeMap::from([
++                        ("VALUE".parse()?, environment.parse()?),
++                        ("RANDOM".parse()?, expected_random.parse()?),
++                    ]),
++                    CancellationSignal::new_for_test(),
++                )
++                .await?;
++                if let Some(expected_error) = expected_error {
++                    let error = result.unwrap_err();
++                    assert!(error.message.contains(expected_error), "{}", error.message);
++                    if path == "invalid.js" {
++                        assert!(error.message.contains("Analysis of invalid.js"));
++                        assert!(error.message.contains("_deps/unresolvable.js"));
++                        assert!(error.message.contains("convex:/invalid.js:1:"));
++                        assert!(!error.message.contains("original.ts"));
++                    } else if path == "throw.js" {
++                        let frames = error.frames.as_ref().unwrap();
++                        let frame = frames.0.first().unwrap();
++                        assert_eq!(frame.file_name.as_deref(), Some("convex:/throw.js"));
++                        assert_eq!(frame.line_number, Some(2));
++                    }
++                } else {
++                    assert!(result.is_ok());
++                }
++                assert!(clean);
++                if path == "second.js" {
++                    let ModuleCodeCacheResult::Cached(_, replace) =
++                        modules.lookup(&"_deps/a.js".parse()?).unwrap().1
++                    else {
++                        anyhow::bail!("dependency compilation was not retained");
++                    };
++                    // V8 must reject corrupt bytes, compile the original source
++                    // and replace the cache without sharing evaluated globals.
++                    replace(Arc::from([1_u8, 2, 3]));
++                    // V8 checks its isolate-local cache before supplied bytes.
++                    // The first two roots test fresh contexts on one isolate;
++                    // a new isolate forces the third root to check the bytes.
++                    drop(contexts);
++                    drop(isolate);
++                    isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
++                    contexts = ContextCache::new();
++                }
++            }
++            let ModuleCodeCacheResult::Cached(data, _) =
++                modules.lookup(&"_deps/a.js".parse()?).unwrap().1
++            else {
++                anyhow::bail!("rejected cache data was not regenerated");
++            };
++            assert!(data.len() > 3);
++            anyhow::Ok(())
++        })
++    }
++
++    #[test]
++    fn source_mapped_exports_use_zero_based_generated_coordinates() -> anyhow::Result<()> {
++        crate::client::initialize_v8();
++        let tokio = ProdRuntime::init_tokio()?;
++        let rt = ProdRuntime::new(&tokio);
++        tokio.block_on(async {
++            let mut isolate = Isolate::new(rt, Some(Duration::from_secs(10)), 1 << 26);
++            let mut contexts = ContextCache::new();
++            let limiter = ConcurrencyLimiter::unlimited();
++            // Generated line zero maps to original line ten; line one maps to
++            // eleven. Unmapped lines and single-field segments have no position.
++            // A range on a prior line must not subtract its column from this
++            // handler's smaller column, even when this line has a later token.
++            for (prefix, mappings, range_mappings, start_lineno) in [
++                ("", "AAUA;AACA", "", Some(10)),
++                ("", "A;A", "", None),
++                ("\n", "oGAAA", "B", None),
++                ("\n", "oGAAA;oGAAA", "B;B", None),
++                ("\n", "AAAA", "", None),
++            ] {
++                let modules = Arc::new(AnalysisModuleSnapshot::from(BTreeMap::from([(
++                    "http.js".parse()?,
++                    Arc::new(V8ModuleSource::new(FullModuleSource {
++                        source: ModuleSource::new(&format!(
++                            "{prefix}export function run() {{}}\nrun.isQuery = true;\nexport \
++                             default {{ isRouter: true, getRoutes() {{ return [['/test', 'GET', \
++                             run]]; }} }};",
++                        )),
++                        source_map: Some(
++                            serde_json::json!({
++                                "version": 3,
++                                "sources": ["http.ts"],
++                                "sourcesContent": [""],
++                                "names": [],
++                                "mappings": mappings,
++                                "rangeMappings": range_mappings,
++                            })
++                            .to_string(),
++                        ),
++                    })),
++                )])));
++                let expected = start_lineno.map(|start_lineno| AnalyzedSourcePosition {
++                    path: "http.js".parse().unwrap(),
++                    start_lineno,
++                    start_col: 0,
++                });
++                for _ in 0..2 {
++                    let permit = limiter
++                        .acquire(Arc::new("analysis_source_map_test".to_owned()), false)
++                        .await;
++                    let mut clean = false;
++                    let analyzed = AnalyzeEnvironment::analyze(
++                        &mut isolate,
++                        &mut contexts,
++                        permit,
++                        &mut clean,
++                        UdfConfig {
++                            server_version: semver::Version::new(1, 36, 0),
++                            import_phase_rng_seed: [7; 32],
++                            import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
++                        },
++                        modules.clone(),
++                        "http.js".parse()?,
++                        BTreeMap::new(),
++                        CancellationSignal::new_for_test(),
++                    )
++                    .await??;
++                    assert!(clean);
++                    assert_eq!(analyzed.functions.len(), 1);
++                    assert_eq!(analyzed.functions[0].pos, expected);
++                    let routes = analyzed.http_routes.as_ref().unwrap();
++                    assert_eq!(routes.len(), 1);
++                    assert_eq!(routes[0].pos, expected);
++                    assert_eq!(analyzed.source_index, Some(0));
++                }
++            }
++            anyhow::Ok(())
++        })
++    }
++
++    #[test]
++    fn imported_http_handler_does_not_lookup_root_source_map() -> anyhow::Result<()> {
++        crate::client::initialize_v8();
++        let tokio = ProdRuntime::init_tokio()?;
++        let rt = ProdRuntime::new(&tokio);
++        tokio.block_on(async {
++            let mut isolate = Isolate::new(rt, Some(Duration::from_secs(10)), 1 << 26);
++            let mut contexts = ContextCache::new();
++            let limiter = ConcurrencyLimiter::unlimited();
++            let permit = limiter
++                .acquire(Arc::new("analysis_source_map_test".to_owned()), false)
++                .await;
++            // The root's range starts at column 100 on line zero. Looking up
++            // the imported handler on line one at a smaller column would
++            // underflow the source-map library's range offset.
++            let root = format!(
++                "import {{ run }} from './_deps/routes.js';{}\nexport default {{ isRouter: true, \
++                 getRoutes() {{ return [['/test', 'GET', run]]; }} }};",
++                " ".repeat(80),
++            );
++            let modules = Arc::new(AnalysisModuleSnapshot::from(BTreeMap::from([
++                (
++                    "http.js".parse()?,
++                    Arc::new(V8ModuleSource::new(FullModuleSource {
++                        source: ModuleSource::new(&root),
++                        source_map: Some(
++                            serde_json::json!({
++                                "version": 3,
++                                "sources": ["http.ts"],
++                                "names": [],
++                                "mappings": "oGAAA",
++                                "rangeMappings": "B",
++                            })
++                            .to_string(),
++                        ),
++                    })),
++                ),
++                (
++                    "_deps/routes.js".parse()?,
++                    Arc::new(V8ModuleSource::new(FullModuleSource {
++                        source: ModuleSource::new("\nexport function run() {}"),
++                        source_map: None,
++                    })),
++                ),
++            ])));
++            let mut clean = false;
++            let analyzed = AnalyzeEnvironment::analyze(
++                &mut isolate,
++                &mut contexts,
++                permit,
++                &mut clean,
++                UdfConfig {
++                    server_version: semver::Version::new(1, 36, 0),
++                    import_phase_rng_seed: [7; 32],
++                    import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
++                },
++                modules,
++                "http.js".parse()?,
++                BTreeMap::new(),
++                CancellationSignal::new_for_test(),
++            )
++            .await??;
++            assert!(clean);
++            let routes = analyzed.http_routes.as_ref().unwrap();
++            assert_eq!(routes.len(), 1);
++            assert_eq!(routes[0].pos, None);
++            anyhow::Ok(())
++        })
++    }
++
++    #[test]
++    fn analysis_termination_preserves_root_and_failing_phase() -> anyhow::Result<()> {
++        crate::client::initialize_v8();
++        let tokio = ProdRuntime::init_tokio()?;
++        let rt = ProdRuntime::new(&tokio);
++        tokio.block_on(async {
++            for (source, cancel_early, code, phase) in [
++                ("while (true) {}", true, "AnalysisCancelled", "evaluation"),
++                (
++                    "while (true) {}",
++                    false,
++                    "AnalysisExecutionTimeout",
++                    "evaluation",
++                ),
++                (
++                    "export function run() {} run.isQuery = true; run.exportArgs = () => { while \
++                     (true) {} };",
++                    false,
++                    "AnalysisExecutionTimeout",
++                    "export_inspection",
++                ),
++                (
++                    "export default { isRouter: true, getRoutes() { return { length: { valueOf() \
++                     { while (true) {} } } }; } };",
++                    true,
++                    "AnalysisCancelled",
++                    "export_inspection",
++                ),
++                (
++                    "export default { isRouter: true, getRoutes() { return []; } }; export const \
++                     experimental_reuseContext = { get queries() { while (true) {} } };",
++                    true,
++                    "AnalysisCancelled",
++                    "export_inspection",
++                ),
++            ] {
++                let mut isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
++                let mut contexts = ContextCache::new();
++                let limiter = ConcurrencyLimiter::unlimited();
++                let permit = limiter
++                    .acquire(Arc::new("analysis_cancellation_test".to_owned()), false)
++                    .await;
++                let modules = Arc::new(AnalysisModuleSnapshot::from(BTreeMap::from([(
++                    "http.js".parse()?,
++                    Arc::new(V8ModuleSource::new(FullModuleSource {
++                        source: ModuleSource::new(source),
++                        source_map: None,
++                    })),
++                )])));
++                let cancellation = CancellationSignal::new_for_test();
++                let cancel = cancellation.clone();
++                let cancel_task = tokio::spawn(async move {
++                    if cancel_early {
++                        tokio::time::sleep(Duration::from_millis(100)).await;
++                        cancel.cancel();
++                    }
++                });
++                let result = AnalyzeEnvironment::analyze(
++                    &mut isolate,
++                    &mut contexts,
++                    permit,
++                    &mut false,
++                    UdfConfig {
++                        server_version: semver::Version::new(1, 36, 0),
++                        import_phase_rng_seed: [7; 32],
++                        import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
++                    },
++                    modules,
++                    "http.js".parse()?,
++                    BTreeMap::new(),
++                    cancellation,
++                )
++                .await;
++                cancel_task.await?;
++                let error = result.unwrap_err();
++                assert_eq!(error.short_msg(), code);
++                assert!(format!("{error:#}").contains("http.js"));
++                assert!(format!("{error:#}").contains(phase), "{error:#}");
++            }
++            anyhow::Ok(())
++        })
++    }
++}
++
+ impl OpProvider for AnalyzeEnvironment {
+     fn trace(&mut self, _level: LogLevel, messages: Vec<String>) -> anyhow::Result<()> {
+         // These logs are only shown to the pusher on error.
+@@ -201,8 +588,7 @@ impl<RT: Runtime> SyscallProvider<RT> for AnalyzeEnvironment {
+         _timeout: &mut Timeout<RT>,
+     ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>> {
+         let p = ModulePath::from_str(path)?.canonicalize();
+-        let result = self.modules.get(&p).cloned();
+-        Ok(result.map(|m| (m, ModuleCodeCacheResult::noop())))
++        Ok(self.modules.lookup(&p))
+     }
+ 
+     fn syscall(&mut self, name: &str, _args: JsonValue) -> anyhow::Result<JsonValue> {
+@@ -224,6 +610,12 @@ impl<RT: Runtime> JsEnvironment<RT> for AnalyzeEnvironment {
+     type AsyncResolver = v8::Global<v8::PromiseResolver>;
+     type SyscallProvider = Self;
+ 
++    const MODULE_REQUEST_KIND: ModuleRequestKind = ModuleRequestKind::Analysis;
++
++    fn analysis_diagnostic(&self) -> Option<AnalysisDiagnostic> {
++        Some(self.diagnostic.clone())
++    }
++
+     fn syscall_provider(&mut self) -> &mut Self::SyscallProvider {
+         self
+     }
+@@ -276,16 +668,18 @@ impl AnalyzeEnvironment {
+         permit: ConcurrencyPermit,
+         isolate_clean: &mut bool,
+         udf_config: UdfConfig,
+-        modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>>,
++        modules: Arc<AnalysisModuleSnapshot>,
+         to_analyze: CanonicalizedModulePath,
+         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
++        cancellation: CancellationSignal,
+     ) -> anyhow::Result<Result<AnalyzedModule, JsError>> {
+         anyhow::ensure!(!to_analyze.is_deps());
+         let rng = ChaCha12Rng::from_seed(udf_config.import_phase_rng_seed);
+         let unix_timestamp = udf_config.import_phase_unix_timestamp;
++        let diagnostic = AnalysisDiagnostic::new(to_analyze.clone());
+         let environment = AnalyzeEnvironment {
++            diagnostic: diagnostic.clone(),
+             modules,
+-            source_maps_cache: BTreeMap::new(),
+             rng,
+             unix_timestamp,
+             environment_variables,
+@@ -294,6 +688,8 @@ impl AnalyzeEnvironment {
+         let (handle, state, mut timeout) = isolate
+             .start_request(context_cache, permit, environment)
+             .await?;
++        let _cancellation =
++            cancellation.bind_analysis_execution(handle.clone(), state.context_id.clone());
+         scope!(let handle_scope, isolate.isolate());
+         let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
+         let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
+@@ -304,7 +700,20 @@ impl AnalyzeEnvironment {
+         // Perform a microtask checkpoint one last time before taking the environment
+         // to ensure the microtask queue is empty. Otherwise, JS from this request may
+         // leak to a subsequent one on isolate reuse.
+-        isolate_context.checkpoint();
++        {
++            // Optional export reads can return None after termination while
++            // analysis still returns Ok. Preserve that earlier failing phase.
++            let diagnostic = (result.as_ref().is_ok_and(|result| result.is_ok())
++                && !handle.is_terminated())
++            .then(|| diagnostic.clone());
++            let _cleanup = ModulePhaseGuard::new(
++                ModuleRequestKind::Analysis,
++                ModulePhase::Cleanup,
++                diagnostic,
++                None,
++            );
++            isolate_context.checkpoint();
++        }
+         *isolate_clean = true;
+ 
+         let error_logs = if let Ok(Err(_)) = result {
+@@ -323,11 +732,27 @@ impl AnalyzeEnvironment {
+         drop(timeout);
+ 
+         // Suppress the original error if the isolate was forcibly terminated.
+-        if let Err(e) = handle.take_termination_error("analyze")? {
++        let user_timeout = matches!(
++            handle.is_not_clean(),
++            Some(crate::isolate::IsolateNotClean::UserTimeout)
++        );
++        if let Err(mut e) = handle
++            .take_termination_error("analyze")
++            .with_context(|| diagnostic.describe())?
++        {
++            e.message = format!("{}: {}", diagnostic.describe(), e.message);
++            if user_timeout {
++                return Err(
++                    ErrorMetadata::bad_request("AnalysisExecutionTimeout", e.message).into(),
++                );
++            }
+             return Ok(Err(e));
+         }
+ 
+         if let Ok(Err(mut js_error)) = result {
++            // Preserve the same root/module/phase descriptor for ordinary
++            // failures as for forced termination, after cleanup has finished.
++            js_error.message = format!("{}: {}", diagnostic.describe(), js_error.message);
+             if !error_logs.is_empty() {
+                 let logs_text = error_logs.iter().cloned().collect::<Vec<_>>().join("\n");
+                 js_error.message = format!("{}\n\n{}", js_error.message, logs_text);
+@@ -335,28 +760,7 @@ impl AnalyzeEnvironment {
+             return Ok(Err(js_error));
+         }
+ 
+-        result
+-    }
+-
+-    fn get_source_map(
+-        &mut self,
+-        path: &CanonicalizedModulePath,
+-    ) -> anyhow::Result<&Option<sourcemap::SourceMap>> {
+-        match self.source_maps_cache.entry(path.clone()) {
+-            Entry::Occupied(e) => Ok(e.into_mut()),
+-            Entry::Vacant(e) => {
+-                let module_config = self
+-                    .modules
+-                    .get(path)
+-                    .context("could not find module config in environment")?;
+-                let source_map = module_config
+-                    .source_map()
+-                    .and_then(|m| source_map_from_slice(m.as_bytes()));
+-
+-                // cache it
+-                Ok(e.insert(source_map))
+-            },
+-        }
++        result.with_context(|| diagnostic.describe())
+     }
+ 
+     async fn run_analyze<RT: Runtime>(
+@@ -381,14 +785,13 @@ impl AnalyzeEnvironment {
+         {
+             Ok(m) => m,
+             Err(e) => {
+-                if let Some(e) = e.downcast_ref::<ModuleNotFoundError>() {
+-                    return Ok(Err(JsError::from_message(format!("{e}"))));
+-                }
+-                if let Some(e) = e.downcast_ref::<ModuleResolutionError>() {
+-                    return Ok(Err(JsError::from_message(format!("{e}"))));
+-                }
+-                if let Some(e) = e.downcast_ref::<SystemModuleNotFoundError>() {
+-                    return Ok(Err(JsError::from_message(format!("{e}"))));
++                if e.is::<ModuleNotFoundError>()
++                    || e.is::<ModuleResolutionError>()
++                    || e.is::<SystemModuleNotFoundError>()
++                {
++                    // The import wrapper carries the generated location when
++                    // its source map is unusable. Keep it with the same error.
++                    return Ok(Err(JsError::from_message(e.to_string())));
+                 }
+                 match e.downcast::<JsError>() {
+                     Ok(e) => {
+@@ -404,14 +807,24 @@ impl AnalyzeEnvironment {
+         };
+ 
+         // Gather UDFs, HTTP action routes, and crons
+-        let functions = match udf_analyze(&mut scope, &module, &path)? {
++        let _inspection = ModulePhaseGuard::new(
++            ModuleRequestKind::Analysis,
++            ModulePhase::ExportInspection,
++            Some(scope.state()?.environment.diagnostic.clone()),
++            None,
++        );
++        // Keep at most one uncached map per root through inspection. A map
++        // refused by the shared budget must not be reparsed for every export.
++        // Positions from other modules are deliberately not emitted below.
++        let source_map = scope.state()?.environment.modules.source_map(&path)?;
++        let functions = match udf_analyze(&mut scope, &module, &path, source_map.as_deref())? {
+             Err(e) => return Ok(Err(e)),
+             Ok(funcs) => WithHeapSize::from(funcs),
+         };
+ 
+         let mut http_routes = None;
+         if path.is_http() {
+-            let routes = match http_analyze(&mut scope, &module, &path)? {
++            let routes = match http_analyze(&mut scope, &module, &path, source_map.as_deref())? {
+                 Err(err) => {
+                     return Ok(Err(err));
+                 },
+@@ -432,23 +845,17 @@ impl AnalyzeEnvironment {
+         }
+ 
+         // Get source_index of current module
+-        let source_index = scope
+-            .state_mut()?
+-            .environment
+-            .get_source_map(&path)?
+-            .as_ref()
+-            .and_then(|source_map| {
+-                for (i, filename) in source_map.sources().enumerate() {
+-                    if Path::new(filename).file_stem()
+-                        != Path::new(module_specifier.path()).file_stem()
+-                    {
+-                        continue;
+-                    }
+-
+-                    return source_map.get_source_contents(i as u32).map(|_| i as u32);
++        let source_index = source_map.as_ref().and_then(|source_map| {
++            for (i, filename) in source_map.sources().enumerate() {
++                if Path::new(filename).file_stem() != Path::new(module_specifier.path()).file_stem()
++                {
++                    continue;
+                 }
+-                None
+-            });
++
++                return source_map.get_source_contents(i as u32).map(|_| i as u32);
++            }
++            None
++        });
+ 
+         let module_namespace = module
+             .get_module_namespace()
+@@ -603,11 +1010,13 @@ fn parse_returns_validator<'s, RT: Runtime>(
+     };
+     Ok(Ok(returns))
+ }
++
+ #[fastrace::trace]
+ fn udf_analyze<RT: Runtime>(
+     scope: &mut ExecutionScope<RT, AnalyzeEnvironment>,
+     module: &v8::Local<v8::Module>,
+     module_path: &CanonicalizedModulePath,
++    source_map: Option<&sourcemap::SourceMap>,
+ ) -> anyhow::Result<Result<Vec<AnalyzedFunction>, JsError>> {
+     let namespace = module
+         .get_module_namespace()
+@@ -701,38 +1110,33 @@ fn udf_analyze<RT: Runtime>(
+             },
+         };
+ 
+-        // These are originally zero-indexed, so we just add 1
++        // V8 and source-map lookup both use zero-based generated coordinates.
+         let lineno = handler
+             .get_script_line_number()
+-            .ok_or_else(|| anyhow!("Failed to get function line number"))?
+-            + 1;
++            .ok_or_else(|| anyhow!("Failed to get function line number"))?;
+         let linecol = handler
+             .get_script_column_number()
+-            .ok_or_else(|| anyhow!("Failed to get function column number"))?
+-            + 1;
++            .ok_or_else(|| anyhow!("Failed to get function column number"))?;
+ 
+-        // Get the appropriate source map to look in
+-        let (fn_source_map, fn_canon_path) = {
++        let fn_canon_path = {
+             let resource_name_val = handler
+                 .get_script_origin(scope)
+                 .resource_name()
+                 .context("resource_name was None")?;
+             let resource_name = resource_name_val.to_rust_string_lossy(scope);
+             let resource_url = module_specifier_from_str(&resource_name)?;
+-            let canon_path = path_from_module_specifier(&resource_url)?;
+-            (
+-                scope.state_mut()?.environment.get_source_map(&canon_path)?,
+-                canon_path,
+-            )
++            path_from_module_specifier(&resource_url)?
+         };
+ 
+         let canonicalized_name: FunctionName = property_name
+             .parse()
+             .map_err(|e| invalid_function_name_error(module_path, &e))?;
+-        if let Some(Some(token)) = fn_source_map.as_ref().map(|sm| sm.lookup_token(lineno, linecol))
+-            // This condition is in place so that we don't have to jump to source in source mappings
+-            // to get back to the original source. This logic gets complicated and is not strictly necessary now
+-            && fn_canon_path.as_str() == module_path.as_str()
++        if fn_canon_path == *module_path
++            && let Some(token) =
++                source_map.and_then(|sm| lookup_source_map_token(sm, lineno, linecol))
++            // Single-field segments explicitly mark generated code as unmapped.
++            // Their inherited source coordinates do not identify a source position.
++            && token.has_source()
+         {
+             // Source map is valid; proceed with mapping in original source map
+             functions.push(AnalyzedFunction::new(
+@@ -761,7 +1165,7 @@ fn udf_analyze<RT: Runtime>(
+             // Log reason for fallback
+             if fn_canon_path.as_str() != module_path.as_str() {
+                 log_source_map_origin_in_separate_module();
+-            } else if fn_source_map.is_none() {
++            } else if source_map.is_none() {
+                 log_source_map_missing();
+             } else {
+                 log_source_map_token_lookup_failed();
+@@ -788,6 +1192,7 @@ fn http_analyze<RT: Runtime>(
+     scope: &mut ExecutionScope<RT, AnalyzeEnvironment>,
+     module: &v8::Local<v8::Module>,
+     module_path: &CanonicalizedModulePath,
++    source_map: Option<&sourcemap::SourceMap>,
+ ) -> anyhow::Result<Result<AnalyzedHttpRoutes, JsError>> {
+     let mut http_routes: Vec<AnalyzedHttpRoute> = vec![];
+ 
+@@ -880,11 +1285,14 @@ fn http_analyze<RT: Runtime>(
+     let Some(len): Option<v8::Local<v8::Value>> = routes_arr.get(scope, length_str) else {
+         return routes_error("return value is not an array");
+     };
+-    let len = len
++    // Numeric conversion can execute user code and be interrupted by
++    // cancellation. Let analysis cleanup report termination instead of panicking.
++    let Some(len) = len
+         .int32_value(scope)
+-        .expect("length could not be converted to i32")
+-        .try_into()
+-        .expect("length could not be converted to u32");
++        .and_then(|len| u32::try_from(len).ok())
++    else {
++        return routes_error("array length is not a nonnegative integer");
++    };
+ 
+     for i in 0..len {
+         let Some(entry) = routes_arr.get_index(scope, i) else {
+@@ -949,43 +1357,38 @@ fn http_analyze<RT: Runtime>(
+             },
+         };
+ 
+-        // These are originally zero-indexed, so we just add 1
++        // V8 and source-map lookup both use zero-based generated coordinates.
+         let lineno = handler
+             .get_script_line_number()
+-            .ok_or_else(|| anyhow!("Failed to get function line number"))?
+-            + 1;
++            .ok_or_else(|| anyhow!("Failed to get function line number"))?;
+         let linecol = handler
+             .get_script_column_number()
+-            .ok_or_else(|| anyhow!("Failed to get function column number"))?
+-            + 1;
++            .ok_or_else(|| anyhow!("Failed to get function column number"))?;
+ 
+-        // Get the appropriate source map to look in
+-        let (fn_source_map, fn_canon_path) = {
++        let fn_canon_path = {
+             let resource_name_val = handler
+                 .get_script_origin(scope)
+                 .resource_name()
+                 .context("resource_name was None")?;
+             let resource_name = resource_name_val.to_rust_string_lossy(scope);
+             let resource_url = module_specifier_from_str(&resource_name)?;
+-            let canon_path = path_from_module_specifier(&resource_url)?;
+-            let source_map = scope.state_mut()?.environment.get_source_map(&canon_path)?;
+-            (source_map, canon_path)
++            path_from_module_specifier(&resource_url)?
+         };
+ 
+-        let source_pos = fn_source_map
+-            .as_ref()
+-            .and_then(|sm| sm.lookup_token(lineno, linecol))
+-            .and_then(|token| {
+-                if fn_canon_path.as_str() == module_path.as_str() {
+-                    Some(AnalyzedSourcePosition {
+-                        path: fn_canon_path,
+-                        start_lineno: token.get_src_line(),
+-                        start_col: token.get_src_col(),
+-                    })
+-                } else {
+-                    None
+-                }
+-            });
++        // This map describes only the root. A dependency's coordinates must
++        // not reach its range lookup, even when the position will be omitted.
++        let source_pos = if fn_canon_path == *module_path {
++            source_map
++                .and_then(|sm| lookup_source_map_token(sm, lineno, linecol))
++                .filter(|token| token.has_source())
++                .map(|token| AnalyzedSourcePosition {
++                    path: fn_canon_path,
++                    start_lineno: token.get_src_line(),
++                    start_col: token.get_src_col(),
++                })
++        } else {
++            None
++        };
+         if source_pos.is_none() {
+             tracing::warn!("Failed to resolve {module_path:?}:{path}");
+         }
+diff --git a/crates/isolate/src/environment/auth_config.rs b/crates/isolate/src/environment/auth_config.rs
+index 6136ee9bee4d8075c9da32ea663359e43a6a3ac4..6dac80c5dbbc10a5ce00bfe5f1270eb2f286c90a 100644
+--- a/crates/isolate/src/environment/auth_config.rs
++++ b/crates/isolate/src/environment/auth_config.rs
+@@ -47,6 +47,7 @@ use value::NamespacedTableMapping;
+ 
+ use super::ModuleCodeCacheResult;
+ use crate::{
++    client::CancellationSignal,
+     context_cache::ContextCache,
+     environment::{
+         helpers::syscall_error::{
+@@ -165,7 +166,7 @@ impl<RT: Runtime> SyscallProvider<RT> for AuthConfigEnvironment {
+                 source: self.auth_config_bundle.clone(),
+                 source_map: self.source_map.clone(),
+             })),
+-            ModuleCodeCacheResult::noop(),
++            ModuleCodeCacheResult::Disabled,
+         )))
+     }
+ 
+@@ -231,6 +232,7 @@ impl AuthConfigEnvironment {
+         auth_config_bundle: ModuleSource,
+         source_map: Option<SourceMap>,
+         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
++        cancellation: CancellationSignal,
+     ) -> anyhow::Result<AuthConfig> {
+         let environment = Self {
+             auth_config_bundle,
+@@ -240,6 +242,8 @@ impl AuthConfigEnvironment {
+         let (handle, state, mut timeout) = isolate
+             .start_request(context_cache, permit, environment)
+             .await?;
++        let _cancellation =
++            cancellation.bind_analysis_execution(handle.clone(), state.context_id.clone());
+         scope!(let handle_scope, isolate.isolate());
+         let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
+         let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
+diff --git a/crates/isolate/src/environment/component_definitions.rs b/crates/isolate/src/environment/component_definitions.rs
+index 032f4c0f4f15616081d48ef07ffe46f4e857e7b7..3b3f5d8470683d08d6986bda749b859b3e2ecc38 100644
+--- a/crates/isolate/src/environment/component_definitions.rs
++++ b/crates/isolate/src/environment/component_definitions.rs
+@@ -70,6 +70,7 @@ use super::{
+     SyscallProvider,
+ };
+ use crate::{
++    client::CancellationSignal,
+     context_cache::ContextCache,
+     environment::{
+         helpers::syscall_error::{
+@@ -121,6 +122,7 @@ impl AppDefinitionEvaluator {
+         context_cache: &mut ContextCache,
+         mut permit: ConcurrencyPermit,
+         isolate: &mut Isolate<RT>,
++        cancellation: CancellationSignal,
+     ) -> anyhow::Result<EvaluateAppDefinitionsResult> {
+         let mut in_progress = BTreeSet::new();
+         enum TraversalState {
+@@ -181,6 +183,7 @@ impl AppDefinitionEvaluator {
+                             &definitions,
+                             filename,
+                             Arc::new(source),
++                            &cancellation,
+                         )
+                         .await?;
+                     permit = permit_;
+@@ -201,6 +204,7 @@ impl AppDefinitionEvaluator {
+         evaluated_components: &BTreeMap<ComponentDefinitionPath, ComponentDefinitionMetadata>,
+         filename: &str,
+         source: Arc<V8ModuleSource>,
++        cancellation: &CancellationSignal,
+     ) -> anyhow::Result<(ComponentDefinitionMetadata, ConcurrencyPermit)> {
+         let environment_variables = if path.is_root() {
+             let mut env_vars = self.system_env_vars.clone();
+@@ -218,6 +222,10 @@ impl AppDefinitionEvaluator {
+ 
+         let (handle, state, mut timeout) =
+             isolate.start_request(context_cache, permit, env).await?;
++        // Rebind for each definition: one canceled traversal must stop its
++        // next context too, without retaining authority over a later request.
++        let _cancellation =
++            cancellation.bind_analysis_execution(handle.clone(), state.context_id.clone());
+         scope!(let handle_scope, isolate.isolate());
+         let v8_context = v8::Context::new(handle_scope, v8::ContextOptions::default());
+         let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
+@@ -366,6 +374,7 @@ impl ComponentInitializerEvaluator {
+         context_cache: &mut ContextCache,
+         permit: ConcurrencyPermit,
+         isolate: &mut Isolate<RT>,
++        cancellation: CancellationSignal,
+     ) -> anyhow::Result<BTreeMap<Identifier, Resource>> {
+         let filename = COMPONENT_CONFIG_FILE_NAME.to_string();
+         let env = DefinitionEnvironment {
+@@ -379,6 +388,8 @@ impl ComponentInitializerEvaluator {
+         };
+         let (handle, state, mut timeout) =
+             isolate.start_request(context_cache, permit, env).await?;
++        let _cancellation =
++            cancellation.bind_analysis_execution(handle.clone(), state.context_id.clone());
+         scope!(let handle_scope, isolate.isolate());
+         let v8_context = v8::Context::new(handle_scope, v8::ContextOptions::default());
+         let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
+@@ -564,7 +575,7 @@ impl<RT: Runtime> SyscallProvider<RT> for DefinitionEnvironment {
+         _timeout: &mut Timeout<RT>,
+     ) -> anyhow::Result<Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)>> {
+         if path == &self.expected_filename {
+-            return Ok(Some((self.source.clone(), ModuleCodeCacheResult::noop())));
++            return Ok(Some((self.source.clone(), ModuleCodeCacheResult::Disabled)));
+         }
+         if let Some(remainder) = path.strip_prefix("_componentDeps/") {
+             let r: anyhow::Result<_> = try_anyhow!({
+@@ -598,7 +609,7 @@ impl<RT: Runtime> SyscallProvider<RT> for DefinitionEnvironment {
+             });
+             return Ok(Some((
+                 Arc::new(synthetic_module),
+-                ModuleCodeCacheResult::noop(),
++                ModuleCodeCacheResult::Disabled,
+             )));
+         }
+         anyhow::bail!(ErrorMetadata::bad_request(
+diff --git a/crates/isolate/src/environment/mod.rs b/crates/isolate/src/environment/mod.rs
+index dfa14f56bd408c8c8da5b7adce12300cb8af4c63..19da0e43ca66583df63e33b49d6db097d3ed0405 100644
+--- a/crates/isolate/src/environment/mod.rs
++++ b/crates/isolate/src/environment/mod.rs
+@@ -57,6 +57,13 @@ use crate::{
+ /// `ErrorMetadata::bad_request` to signal a user-visible error that will be
+ /// turned into a JavaScript exception.
+ pub trait JsEnvironment<RT: Runtime>: 'static {
++    const MODULE_REQUEST_KIND: crate::module_diagnostics::ModuleRequestKind =
++        crate::module_diagnostics::ModuleRequestKind::Configuration;
++
++    fn analysis_diagnostic(&self) -> Option<crate::module_diagnostics::AnalysisDiagnostic> {
++        None
++    }
++
+     /// Handle the environment uses to complete an async syscall or op that it
+     /// started.
+     type AsyncResolver;
+@@ -141,14 +148,12 @@ pub struct UncatchableDeveloperError {
+ }
+ 
+ pub enum ModuleCodeCacheResult {
+-    Cached(Arc<[u8]>),
++    /// No consumer will retain compiled data, so do not serialize it.
++    Disabled,
++    /// Supplied bytes may be rejected by V8. Populate a replacement only after
++    /// successful source compilation when V8 rejects this data.
++    Cached(Arc<[u8]>, Box<dyn FnOnce(Arc<[u8]>)>),
+     /// The module isn't cached; it can be populated by calling the callback
+     /// with the generated CachedData.
+     Uncached(Box<dyn FnOnce(Arc<[u8]>)>),
+ }
+-
+-impl ModuleCodeCacheResult {
+-    pub fn noop() -> Self {
+-        ModuleCodeCacheResult::Uncached(Box::new(|_| ()))
+-    }
+-}
+diff --git a/crates/isolate/src/environment/schema.rs b/crates/isolate/src/environment/schema.rs
+index 1457c928d45ba62bebb1a1d0f69764fffdecfdb1..36ed754f4b054926f663f3cdaac8076cc1d89aef 100644
+--- a/crates/isolate/src/environment/schema.rs
++++ b/crates/isolate/src/environment/schema.rs
+@@ -51,6 +51,7 @@ use value::NamespacedTableMapping;
+ 
+ use super::ModuleCodeCacheResult;
+ use crate::{
++    client::CancellationSignal,
+     context_cache::ContextCache,
+     environment::{
+         helpers::syscall_error::{
+@@ -148,7 +149,7 @@ impl<RT: Runtime> SyscallProvider<RT> for SchemaEnvironment {
+                 source: self.schema_bundle.clone(),
+                 source_map: self.source_map.clone(),
+             })),
+-            ModuleCodeCacheResult::noop(),
++            ModuleCodeCacheResult::Disabled,
+         )))
+     }
+ 
+@@ -215,6 +216,7 @@ impl SchemaEnvironment {
+         source_map: Option<SourceMap>,
+         rng_seed: [u8; 32],
+         unix_timestamp: UnixTimestamp,
++        cancellation: CancellationSignal,
+     ) -> anyhow::Result<DatabaseSchema> {
+         let rng = ChaCha12Rng::from_seed(rng_seed);
+         let environment = Self {
+@@ -226,6 +228,8 @@ impl SchemaEnvironment {
+         let (handle, state, mut timeout) = isolate
+             .start_request(context_cache, permit, environment)
+             .await?;
++        let _cancellation =
++            cancellation.bind_analysis_execution(handle.clone(), state.context_id.clone());
+         scope!(let handle_scope, isolate.isolate());
+         let v8_context = context_cache.get_or_create_fresh_context(handle_scope);
+         let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
+diff --git a/crates/isolate/src/environment/udf/mod.rs b/crates/isolate/src/environment/udf/mod.rs
+index aaa2c2912d482a4743bc59bded9204fa5305749e..c4e4a78aefdb2663fc89d83f67635d2504717d90 100644
+--- a/crates/isolate/src/environment/udf/mod.rs
++++ b/crates/isolate/src/environment/udf/mod.rs
+@@ -334,6 +334,9 @@ impl<RT: Runtime, S: DatabaseUdfInnerProvider<RT>> JsEnvironment<RT>
+     type AsyncResolver = v8::Global<v8::PromiseResolver>;
+     type SyscallProvider = S;
+ 
++    const MODULE_REQUEST_KIND: crate::module_diagnostics::ModuleRequestKind =
++        crate::module_diagnostics::ModuleRequestKind::Runtime;
++
+     fn syscall_provider(&mut self) -> &mut Self::SyscallProvider {
+         &mut self.syscall_provider
+     }
+diff --git a/crates/isolate/src/error.rs b/crates/isolate/src/error.rs
+index 37b181b3aaf8490403dad7ed5fab3fb1e676f0d4..37e36ba2cfc7491d067a7e4b2ea87507165a675b 100644
+--- a/crates/isolate/src/error.rs
++++ b/crates/isolate/src/error.rs
+@@ -1,5 +1,6 @@
+ use common::{
+     errors::{
++        lookup_source_map_token,
+         FrameData,
+         JsError,
+     },
+@@ -83,25 +84,62 @@ impl<RT: Runtime, E: V8IsolateEnvironment<RT>> ExecutionScope<'_, '_, '_, RT, E>
+         let source_map = self.lookup_source_map(name)?;
+         let orig_line = location.get_line_number();
+         let orig_col = location.get_column_number();
+-        if let Some(ref source_map) = source_map
+-            && let Some(token) = source_map.lookup_token(orig_line as u32, orig_col as u32)
+-            && let (line, col) = token.get_src()
+-            && let Some(source_view) = token.get_source_view()
+-            && let Some(ctx) = source_view.get_line(line)
+-        {
+-            Err(e.wrap_error_message(|m| {
+-                format!(
+-                    "{name}:{line}:{col}: {m}\n\n{ctx}\n{}{}",
+-                    " ".repeat(col as usize),
+-                    "~".repeat(ctx.len() - col as usize)
+-                )
+-            }))
+-        } else {
+-            Err(e.wrap_error_message(|m| format!("{name}:{orig_line}:{orig_col}: {m}")))
+-        }
++        Err(e.wrap_error_message(|m| {
++            format_error_source_location(name, orig_line, orig_col, source_map.as_ref(), &m)
++        }))
+     }
+ }
+ 
++fn format_error_source_location(
++    name: &ModuleSpecifier,
++    generated_line: i32,
++    generated_column: i32,
++    source_map: Option<&SourceMap>,
++    message: &str,
++) -> String {
++    // Minified lines and source-map columns are untrusted. Bound both the copied
++    // excerpt and its marker before allocating diagnostic output.
++    const MAX_SOURCE_EXCERPT_BYTES: usize = 4096;
++    source_map
++        .and_then(|source_map| {
++            let token = lookup_source_map_token(
++                source_map,
++                generated_line.try_into().ok()?,
++                generated_column.try_into().ok()?,
++            )?;
++            token.get_source()?;
++            let (line, column) = token.get_src();
++            let ctx = token.get_source_view()?.get_line(line)?;
++            if ctx.len() > MAX_SOURCE_EXCERPT_BYTES || column as usize > ctx.len() {
++                return None;
++            }
++
++            // Source-map columns count UTF-16 code units, not UTF-8 bytes. Only
++            // accept a character boundary, including the end of the source line.
++            let mut utf16_column = 0;
++            let mut byte_column = 0;
++            let mut padding = 0;
++            for ch in ctx.chars() {
++                if utf16_column >= column {
++                    break;
++                }
++                utf16_column += ch.len_utf16() as u32;
++                byte_column += ch.len_utf8();
++                padding += 1;
++            }
++            if utf16_column != column {
++                return None;
++            }
++            let underline = ctx.get(byte_column..)?.chars().count().max(1);
++            Some(format!(
++                "{name}:{line}:{column}: {message}\n\n{ctx}\n{}{}",
++                " ".repeat(padding),
++                "~".repeat(underline),
++            ))
++        })
++        .unwrap_or_else(|| format!("{name}:{generated_line}:{generated_column}: {message}"))
++}
++
+ /// The source-mapped frames of a stack trace, rendered the way
+ /// `JsError::to_string` renders them. Both runtimes answer the `error/stack`
+ /// op through this, so their stacks stay formatted alike.
+@@ -179,3 +217,60 @@ pub fn extract_source_mapped_error(
+     let (message, custom_data) = deserialize_udf_custom_error(message, custom_data)?;
+     Ok((message, frame_data, custom_data))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn error_excerpt_preserves_valid_ranges_and_generated_fallback() -> anyhow::Result<()> {
++        let name = ModuleSpecifier::parse("convex:/user/root.js")?;
++        let map = SourceMap::from_slice(
++            br#"{"version":3,"sources":["root.ts"],"sourcesContent":["hello"],"names":[],"mappings":"oGAAA;KAAA","rangeMappings":"B;B"}"#,
++        )?;
++        for (line, column) in [(0, 99), (1, 0), (2, 0), (0, 106), (0, i32::MAX)] {
++            assert_eq!(
++                format_error_source_location(&name, line, column, Some(&map), "invalid import"),
++                format!("{name}:{line}:{column}: invalid import"),
++            );
++        }
++        assert_eq!(
++            format_error_source_location(&name, 0, 102, Some(&map), "invalid import"),
++            format!("{name}:0:2: invalid import\n\nhello\n  ~~~"),
++        );
++        assert_eq!(
++            format_error_source_location(&name, 1, 10, Some(&map), "invalid import"),
++            format!("{name}:0:5: invalid import\n\nhello\n     ~"),
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn error_excerpt_validates_utf16_columns_and_limits_output() -> anyhow::Result<()> {
++        let name = ModuleSpecifier::parse("convex:/user/root.js")?;
++        for (content, column, excerpt) in [
++            ("é😀x".to_owned(), 3, Some("é😀x\n  ~")),
++            ("é😀x".to_owned(), 2, None),
++            ("é😀x".to_owned(), 5, None),
++            ("x".repeat(4097), 0, None),
++        ] {
++            let map = SourceMap::from_slice(&serde_json::to_vec(&serde_json::json!({
++                "version": 3,
++                "sources": ["root.ts"],
++                "sourcesContent": [content],
++                "names": [],
++                "mappings": "oGAAA",
++                "rangeMappings": "B",
++            }))?)?;
++            let expected = match excerpt {
++                Some(excerpt) => format!("{name}:0:{column}: invalid import\n\n{excerpt}"),
++                None => format!("{name}:0:{}: invalid import", 100 + column),
++            };
++            assert_eq!(
++                format_error_source_location(&name, 0, 100 + column, Some(&map), "invalid import"),
++                expected,
++            );
++        }
++        Ok(())
++    }
++}
+diff --git a/crates/isolate/src/execution_observation.rs b/crates/isolate/src/execution_observation.rs
+index 33c668fdb8fbd9ccb1e7ec1652247ec9139b7aa6..5d6d928259bcaba00a996c640c72fcc91d72f085 100644
+--- a/crates/isolate/src/execution_observation.rs
++++ b/crates/isolate/src/execution_observation.rs
+@@ -135,6 +135,33 @@ pub(crate) fn is_observed() -> bool {
+     ACTIVE.with_borrow(|active| active.is_some())
+ }
+ 
++pub(crate) fn record_module_phase(
++    phase: crate::module_diagnostics::ModulePhase,
++    wall: std::time::Duration,
++    cpu: Option<u64>,
++) {
++    use crate::module_diagnostics::ModulePhase;
++    ACTIVE.with_borrow_mut(|active| {
++        if let Some(frame) = active {
++            let module = &mut frame.local.module_initialization;
++            let time = match phase {
++                ModulePhase::Registration | ModulePhase::Cleanup => return,
++                ModulePhase::Compilation => &mut module.compilation,
++                ModulePhase::Serialization => &mut module.serialization,
++                ModulePhase::Instantiation => &mut module.instantiation,
++                ModulePhase::Evaluation => &mut module.evaluation,
++                ModulePhase::ExportInspection => &mut module.export_inspection,
++            };
++            time.poll_wall_nanos += nanos(wall);
++            if let Some(cpu) = cpu {
++                time.cpu_nanos += cpu;
++            } else {
++                frame.local.invalid = Some(ExecutionObservationInvalid::CpuClockUnavailable);
++            }
++        }
++    });
++}
++
+ impl Frame {
+     fn phase(
+         phase: Phase,
+diff --git a/crates/isolate/src/execution_scope.rs b/crates/isolate/src/execution_scope.rs
+index 867f7427f60268e407ddcc7286d955c6cfd6a716..cf744a80dda397f47a26c50df2c826fed903e940 100644
+--- a/crates/isolate/src/execution_scope.rs
++++ b/crates/isolate/src/execution_scope.rs
+@@ -343,7 +343,19 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
+         // These first two steps of registering and then instantiating the module
+         // correspond to `JsRuntime::load_module`. This function is idempotent,
+         // so it's safe to rerun.
+-        let id = self.register_module(name, timeout).await?;
++        let registration_start = std::time::Instant::now();
++        let diagnostic = self.state()?.environment.analysis_diagnostic();
++        let registration = self.register_module(name, timeout).await;
++        metrics::log_module_phase(
++            E::MODULE_REQUEST_KIND,
++            crate::module_diagnostics::ModulePhase::Registration,
++            registration_start.elapsed(),
++            None,
++        );
++        if let Some(diagnostic) = diagnostic {
++            diagnostic.registration_finished(registration_start.elapsed());
++        }
++        let id = registration?;
+ 
+         // NB: This part is separate from `self.register_module()` since module
+         // registration is recursive, compiling and registering dependencies,
+@@ -372,8 +384,21 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
+             }
+         }
+         let (id, import_specifiers) = {
++            if let Some(diagnostic) = self.state()?.environment.analysis_diagnostic() {
++                diagnostic.begin(
++                    crate::module_diagnostics::ModulePhase::Registration,
++                    Some(name.as_str()),
++                );
++            }
+             let (module_source, code_cache) = self.lookup_source(name, timeout).await?;
+ 
++            let compilation_phase = crate::module_diagnostics::ModulePhaseGuard::new(
++                E::MODULE_REQUEST_KIND,
++                crate::module_diagnostics::ModulePhase::Compilation,
++                self.state()?.environment.analysis_diagnostic(),
++                Some(name.as_str()),
++            );
++
+             // Step 1: Compile the module and discover its imports.
+             let timer = metrics::compile_module_timer(matches!(
+                 &code_cache,
+@@ -393,7 +418,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
+ 
+             let origin = helpers::module_origin(&scope, name_str);
+             let (mut v8_source, options) = match &code_cache {
+-                ModuleCodeCacheResult::Cached(data) => (
++                ModuleCodeCacheResult::Cached(data, _) => (
+                     v8::script_compiler::Source::new_with_cached_data(
+                         source_str,
+                         Some(&origin),
+@@ -401,7 +426,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
+                     ),
+                     v8::script_compiler::CompileOptions::ConsumeCodeCache,
+                 ),
+-                ModuleCodeCacheResult::Uncached(_) => (
++                ModuleCodeCacheResult::Disabled | ModuleCodeCacheResult::Uncached(_) => (
+                     v8::script_compiler::Source::new(source_str, Some(&origin)),
+                     v8::script_compiler::CompileOptions::NoCompileOptions,
+                 ),
+@@ -417,27 +442,63 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
+                     )
+                 })??
+                 .ok_or_else(|| anyhow!("Unexpected module compilation error"))?;
+-
+-            match code_cache {
+-                ModuleCodeCacheResult::Cached(data) => {
+-                    // N.B.: this is not reflected in rusty-v8's lifetimes,
+-                    // but the pointer behind the `v8::CachedData` passed to
+-                    // `v8::Source` must stay alive through the call to
+-                    // `compile_module2`.
+-                    // At this point however it's already been deserialized and
+-                    // is safe to drop.
+-                    let _: Arc<[u8]> = data;
++            drop(compilation_phase);
++
++            let populate = match code_cache {
++                ModuleCodeCacheResult::Disabled => {
++                    metrics::log_module_code_cache_outcome(
++                        metrics::ModuleCodeCacheOutcome::Disabled,
++                    );
++                    None
++                },
++                ModuleCodeCacheResult::Cached(data, populate) => {
++                    let rejected = v8_source
++                        .get_cached_data()
++                        .expect("compiler source lost supplied cached data")
++                        .rejected();
++                    metrics::log_module_code_cache_outcome(if rejected {
++                        metrics::ModuleCodeCacheOutcome::Rejected
++                    } else {
++                        metrics::ModuleCodeCacheOutcome::Accepted
++                    });
++                    // Source owns CachedData, which borrows these bytes until
++                    // destruction, even after compilation has completed. The
++                    // binding does not express this lifetime in its type.
++                    drop(v8_source);
++                    drop(data);
++                    rejected.then_some(populate)
+                 },
+                 ModuleCodeCacheResult::Uncached(callback) => {
+-                    let timer = metrics::create_code_cache_timer();
+-                    let module_script = module.get_unbound_module_script(&scope);
+-                    if let Some(cached_data) = module_script.create_code_cache() {
+-                        callback(cached_data[..].into());
+-                        timer.finish();
+-                    }
++                    metrics::log_module_code_cache_outcome(metrics::ModuleCodeCacheOutcome::Absent);
++                    Some(callback)
+                 },
++            };
++            if let Some(populate) = populate {
++                let _serialization = crate::module_diagnostics::ModulePhaseGuard::new(
++                    E::MODULE_REQUEST_KIND,
++                    crate::module_diagnostics::ModulePhase::Serialization,
++                    scope.state()?.environment.analysis_diagnostic(),
++                    Some(name.as_str()),
++                );
++                let timer = metrics::create_code_cache_timer();
++                let module_script = module.get_unbound_module_script(&scope);
++                if let Some(cached_data) = module_script.create_code_cache() {
++                    populate(cached_data[..].into());
++                    metrics::log_module_code_cache_outcome(
++                        metrics::ModuleCodeCacheOutcome::Generated,
++                    );
++                    timer.finish();
++                }
+             }
+ 
++            // Successful compilation/serialization returns to registration.
++            // Import resolution failures belong to this module, not the last subphase.
++            if let Some(diagnostic) = scope.state()?.environment.analysis_diagnostic() {
++                diagnostic.begin(
++                    crate::module_diagnostics::ModulePhase::Registration,
++                    Some(name.as_str()),
++                );
++            }
+             assert_eq!(module.get_status(), v8::ModuleStatus::Uninstantiated);
+             let mut import_specifiers = vec![];
+             let module_requests = module.get_module_requests();
+@@ -537,7 +598,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
+             });
+             timer.finish();
+             // TODO: should we code-cache system UDFs?
+-            return Ok((Arc::new(result), ModuleCodeCacheResult::noop()));
++            return Ok((Arc::new(result), ModuleCodeCacheResult::Disabled));
+         }
+ 
+         let state = self.state_mut()?;
+@@ -572,6 +633,12 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
+         // Instantiate the module, loading its dependencies.
+         {
+             let timer = metrics::instantiate_module_timer();
++            let _phase = crate::module_diagnostics::ModulePhaseGuard::new(
++                E::MODULE_REQUEST_KIND,
++                crate::module_diagnostics::ModulePhase::Instantiation,
++                self.state()?.environment.analysis_diagnostic(),
++                None,
++            );
+             let result = self.with_try_catch(|s| {
+                 module.instantiate_module(s, Self::module_resolve_callback)
+             })??;
+@@ -584,6 +651,12 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
+ 
+         let value = {
+             let timer = metrics::evaluate_module_timer();
++            let _phase = crate::module_diagnostics::ModulePhaseGuard::new(
++                E::MODULE_REQUEST_KIND,
++                crate::module_diagnostics::ModulePhase::Evaluation,
++                self.state()?.environment.analysis_diagnostic(),
++                None,
++            );
+             let result = self
+                 .with_try_catch(|s| module.evaluate(s))??
+                 .ok_or_else(|| anyhow!("Missing result from successful module evaluation"))?;
 diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
-index 50017a1826d7176373827362d7da201153757616..a8d381fabf15651331036eb9865b746f94717afb 100644
+index 726f91183c39186d7ac109113c09e47b521af714..a321f06433dca8d2d8ba5963a561a690bb19bfc5 100644
 --- a/crates/isolate/src/isolate_worker.rs
 +++ b/crates/isolate/src/isolate_worker.rs
-@@ -214,7 +214,10 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -62,6 +62,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+         isolate: &mut Isolate<RT>,
+         context_cache: &mut ContextCache,
+         Request {
++            deployment_job: _deployment_job,
+             client_id,
+             inner,
+             parent_trace: _,
+@@ -211,8 +212,10 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+                 modules,
+                 to_analyze,
+                 environment_variables,
++                cancellation,
+                 response,
+             } => {
++                let description = format!("Analyze {}", to_analyze.as_str());
+                 let r = AnalyzeEnvironment::analyze::<RT>(
+                     isolate,
+                     context_cache,
+@@ -222,10 +225,14 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+                     modules,
+                     to_analyze,
                      environment_variables,
++                    cancellation,
                  )
                  .await;
 -                let _ = response.send(r);
+-                "Analyze".to_string()
 +                // This transfers the shared reservation into the response. If
 +                // the caller disappeared, failed delivery drops it here only
 +                // after V8 analysis has finished.
 +                response.send(r);
-                 "Analyze".to_string()
++                description
              },
              RequestType::HttpAction {
+                 request,
+@@ -297,6 +304,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+                 log_string
+             },
+             RequestType::EvaluateSchema {
++                cancellation,
+                 schema_bundle,
+                 source_map,
+                 rng_seed,
+@@ -311,6 +319,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+                     source_map,
+                     rng_seed,
+                     unix_timestamp,
++                    cancellation,
+                 )
+                 .await;
+ 
+@@ -318,6 +327,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+                 "EvaluateSchema".to_string()
+             },
+             RequestType::EvaluateAuthConfig {
++                cancellation,
+                 auth_config_bundle,
+                 source_map,
+                 environment_variables,
+@@ -330,12 +340,14 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+                     auth_config_bundle,
+                     source_map,
+                     environment_variables,
++                    cancellation,
+                 )
+                 .await;
+                 let _ = response.send(r);
+                 "EvaluateAuthConfig".to_string()
+             },
+             RequestType::EvaluateAppDefinitions {
++                cancellation,
+                 app_definition,
+                 component_definitions,
+                 dependency_graph,
+@@ -354,11 +366,14 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+                     user_environment_variables,
+                     system_env_vars,
+                 );
+-                let r = env.evaluate(context_cache, permit, isolate).await;
++                let r = env
++                    .evaluate(context_cache, permit, isolate, cancellation)
++                    .await;
+                 let _ = response.send(r);
+                 "EvaluateAppDefinitions".to_string()
+             },
+             RequestType::EvaluateComponentInitializer {
++                cancellation,
+                 evaluated_definitions,
+                 path,
+                 definition,
+@@ -373,7 +388,9 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+                     args,
+                     name,
+                 );
+-                let r = env.evaluate(context_cache, permit, isolate).await;
++                let r = env
++                    .evaluate(context_cache, permit, isolate, cancellation)
++                    .await;
+                 let _ = response.send(r);
+                 "EvaluateComponentInitializer".to_string()
+             },
+@@ -396,3 +413,129 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+         &self.rt
+     }
+ }
++
++#[cfg(test)]
++mod configuration_cancellation_tests {
++    use std::{
++        collections::BTreeMap,
++        sync::Arc,
++        time::Duration,
++    };
++
++    use common::{
++        components::{
++            ComponentDefinitionPath,
++            ComponentName,
++        },
++        fastrace_helpers::EncodedSpan,
++        runtime::UnixTimestamp,
++    };
++    use model::{
++        config::types::ModuleConfig,
++        modules::module_versions::ModuleSource,
++    };
++    use runtime::prod::ProdRuntime;
++
++    use super::*;
++    use crate::{
++        client::CancellationSignal,
++        isolate::IsolateNotClean,
++        ConcurrencyLimiter,
++    };
++
++    #[test]
++    fn cancellation_interrupts_every_configuration_stage() -> anyhow::Result<()> {
++        crate::client::initialize_v8();
++        let tokio = ProdRuntime::init_tokio()?;
++        let rt = ProdRuntime::new(&tokio);
++        tokio.block_on(async {
++            enum Stage {
++                Schema,
++                AuthConfig,
++                AppDefinitions,
++                ComponentInitializer,
++            }
++            for stage in [
++                Stage::Schema,
++                Stage::AuthConfig,
++                Stage::AppDefinitions,
++                Stage::ComponentInitializer,
++            ] {
++                let limiter = ConcurrencyLimiter::unlimited();
++                let worker = FunctionRunnerIsolateWorker::new(
++                    rt.clone(),
++                    IsolateConfig::new("configuration_cancellation_test", limiter.clone()),
++                );
++                let mut isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
++                let mut contexts = ContextCache::new();
++                let permit = limiter
++                    .acquire(Arc::new("configuration_test".to_owned()), false)
++                    .await;
++                let cancellation = CancellationSignal::new_for_test();
++                let cancel = cancellation.clone();
++                let source = ModuleSource::new("while (true) {}");
++                let definition = ModuleConfig {
++                    path: "convex.config.js".parse()?,
++                    source: source.clone(),
++                    source_map: None,
++                    environment: common::types::ModuleEnvironment::Isolate,
++                };
++                let inner = match stage {
++                    Stage::Schema => RequestType::EvaluateSchema {
++                        cancellation,
++                        schema_bundle: source,
++                        source_map: None,
++                        rng_seed: [0; 32],
++                        unix_timestamp: UnixTimestamp::from_nanos(0),
++                        response: oneshot::channel().0,
++                    },
++                    Stage::AuthConfig => RequestType::EvaluateAuthConfig {
++                        cancellation,
++                        auth_config_bundle: source,
++                        source_map: None,
++                        environment_variables: BTreeMap::new(),
++                        response: oneshot::channel().0,
++                    },
++                    Stage::AppDefinitions => RequestType::EvaluateAppDefinitions {
++                        cancellation,
++                        app_definition: definition,
++                        component_definitions: BTreeMap::new(),
++                        dependency_graph: Default::default(),
++                        user_environment_variables: BTreeMap::new(),
++                        system_env_vars: BTreeMap::new(),
++                        response: oneshot::channel().0,
++                    },
++                    Stage::ComponentInitializer => RequestType::EvaluateComponentInitializer {
++                        cancellation,
++                        evaluated_definitions: BTreeMap::new(),
++                        path: ComponentDefinitionPath::root(),
++                        definition,
++                        args: BTreeMap::new(),
++                        name: ComponentName::min(),
++                        response: oneshot::channel().0,
++                    },
++                };
++                let cancel_task = tokio::spawn(async move {
++                    tokio::time::sleep(Duration::from_millis(50)).await;
++                    cancel.cancel_for_test();
++                });
++                worker
++                    .handle_request_inner(
++                        &mut isolate,
++                        &mut contexts,
++                        Request::new("configuration_test".to_owned(), inner, EncodedSpan::empty()),
++                        permit,
++                    )
++                    .await;
++                cancel_task.await?;
++                // A timeout also stops the loop, so require the cancellation
++                // termination reason rather than merely observing completion.
++                assert!(matches!(
++                    isolate.check_isolate_clean(&mut contexts),
++                    Err(IsolateNotClean::SystemError)
++                ));
++            }
++            anyhow::Ok(())
++        })
++    }
++}
+diff --git a/crates/isolate/src/lib.rs b/crates/isolate/src/lib.rs
+index 790b02d4e89a90ff72fc5b450294fa27cd8b94ce..98cfb8c6d65f93b6f642ca16d70d339b36272344 100644
+--- a/crates/isolate/src/lib.rs
++++ b/crates/isolate/src/lib.rs
+@@ -31,6 +31,7 @@ mod isolate_queue;
+ pub mod isolate_worker;
+ pub mod metrics;
+ pub mod module_cache;
++pub mod module_diagnostics;
+ pub mod module_map;
+ pub mod ops;
+ mod request_scope;
 diff --git a/crates/isolate/src/metrics.rs b/crates/isolate/src/metrics.rs
-index 78e01f434d22c391a50cfa85dc62f2040e611ed6..d8b3a85dff6e341d7517c272f369a9cedfaf25f8 100644
+index 3672e0022058ded494ca2de631ca62b1c7f878fc..e679080a4d153b7d9036d1f8a075e59f21e07e0c 100644
 --- a/crates/isolate/src/metrics.rs
 +++ b/crates/isolate/src/metrics.rs
-@@ -123,6 +123,33 @@ pub fn log_pool_max(name: &'static str, count: usize) {
+@@ -157,6 +157,39 @@ pub fn log_pool_max(name: &'static str, count: usize) {
      );
  }
  
@@ -1117,6 +3651,12 @@ index 78e01f434d22c391a50cfa85dc62f2040e611ed6..d8b3a85dff6e341d7517c272f369a9ce
 +register_convex_histogram!(
 +    ISOLATE_ANALYSIS_CAPACITY_WAIT_SECONDS,
 +    "Time isolate module analysis waits to borrow shared degradable-query capacity"
++);
++register_convex_counter!(
++    pub(crate) ISOLATE_ANALYSIS_ATTEMPTS_TOTAL,
++    "Root analysis submissions after shared-capacity admission; retry repeats an existing root",
++    &["attempt"],
++    Duration::MAX,
 +);
 +
 +pub fn initialize_analysis_reservation_metrics() {
@@ -1140,6 +3680,851 @@ index 78e01f434d22c391a50cfa85dc62f2040e611ed6..d8b3a85dff6e341d7517c272f369a9ce
  fn scheduler_class_labels(
      name: &'static str,
      scheduler_class: &'static str,
+@@ -900,9 +933,77 @@ pub fn lookup_source_timer(is_system: bool) -> StatusTimer {
+ 
+ register_convex_histogram!(
+     UDF_ISOLATE_COMPILE_MODULE_SECONDS,
+-    "Time to compile a single module's source",
++    "Time to compile a single module's source; cached means data was supplied, not necessarily \
++     accepted",
+     &["status", "cached"],
+ );
++
++pub(crate) enum ModuleCodeCacheOutcome {
++    Disabled,
++    Absent,
++    Accepted,
++    Rejected,
++    Generated,
++    BudgetRefused,
++}
++
++register_convex_counter!(
++    UDF_ISOLATE_CODE_CACHE_OUTCOMES_TOTAL,
++    "Compilation cache events; accepted means supplied data was not rejected, including when V8's \
++     internal cache bypasses deserialization",
++    &["outcome"],
++);
++
++pub(crate) fn log_module_code_cache_outcome(outcome: ModuleCodeCacheOutcome) {
++    let outcome = match outcome {
++        ModuleCodeCacheOutcome::Disabled => "disabled",
++        ModuleCodeCacheOutcome::Absent => "absent",
++        ModuleCodeCacheOutcome::Accepted => "accepted",
++        ModuleCodeCacheOutcome::Rejected => "rejected",
++        ModuleCodeCacheOutcome::Generated => "generated",
++        ModuleCodeCacheOutcome::BudgetRefused => "budget_refused",
++    };
++    log_counter_with_labels(
++        &UDF_ISOLATE_CODE_CACHE_OUTCOMES_TOTAL,
++        1,
++        vec![StaticMetricLabel::new("outcome", outcome)],
++    );
++}
++
++register_convex_histogram!(
++    UDF_ISOLATE_MODULE_PHASE_SECONDS,
++    "Module phases; registration wall includes waits and child phases, thread CPU measures \
++     synchronous work in analysis and observed runtime polls",
++    &["request_kind", "phase", "clock"],
++);
++
++pub(crate) fn log_module_phase(
++    kind: crate::module_diagnostics::ModuleRequestKind,
++    phase: crate::module_diagnostics::ModulePhase,
++    wall: Duration,
++    cpu_nanos: Option<u64>,
++) {
++    let labels = vec![
++        StaticMetricLabel::new("request_kind", kind.label()),
++        StaticMetricLabel::new("phase", phase.label()),
++    ];
++    let mut wall_labels = labels.clone();
++    wall_labels.push(StaticMetricLabel::new("clock", "wall"));
++    log_distribution_with_labels(
++        &UDF_ISOLATE_MODULE_PHASE_SECONDS,
++        wall.as_secs_f64(),
++        wall_labels,
++    );
++    if let Some(cpu_nanos) = cpu_nanos {
++        let mut cpu_labels = labels;
++        cpu_labels.push(StaticMetricLabel::new("clock", "thread_cpu"));
++        log_distribution_with_labels(
++            &UDF_ISOLATE_MODULE_PHASE_SECONDS,
++            cpu_nanos as f64 / 1e9,
++            cpu_labels,
++        );
++    }
++}
+ pub fn compile_module_timer(cached: bool) -> StatusTimer {
+     let mut timer = StatusTimer::new(&UDF_ISOLATE_COMPILE_MODULE_SECONDS);
+     timer.add_label(MetricLabel::new("cached", cached.as_label()));
+diff --git a/crates/isolate/src/module_cache.rs b/crates/isolate/src/module_cache.rs
+index 480495df60046d7c94afec74413e813c4fb1c218..ecb352b8cd623adb27649eb79820d78ee97740b3 100644
+--- a/crates/isolate/src/module_cache.rs
++++ b/crates/isolate/src/module_cache.rs
+@@ -1,5 +1,8 @@
+ use std::{
++    borrow::Cow,
++    collections::BTreeMap,
+     ffi::c_char,
++    num::Saturating,
+     sync::Arc,
+ };
+ 
+@@ -7,6 +10,10 @@ use async_lru::async_lru::SizedValue;
+ use async_trait::async_trait;
+ use common::{
+     document::ParsedDocument,
++    knobs::{
++        ANALYZE_CODE_CACHE_MAX_BYTES,
++        ANALYZE_SOURCE_MAP_CACHE_MAX_BYTES,
++    },
+     runtime::Runtime,
+ };
+ use deno_core::v8;
+@@ -20,9 +27,461 @@ use model::{
+     },
+     source_packages::types::SourcePackage,
+ };
++use parking_lot::Mutex;
++use sync_types::CanonicalizedModulePath;
+ use value::heap_size::HeapSize;
+ 
+-use crate::environment::ModuleCodeCacheResult;
++use crate::{
++    environment::ModuleCodeCacheResult,
++    helpers::source_map_from_slice,
++    metrics::{
++        log_module_code_cache_outcome,
++        ModuleCodeCacheOutcome,
++    },
++};
++
++/// Owns exact source inputs for one analysis. Only immutable acceleration data
++/// is shared across roots: each root still creates and evaluates fresh modules.
++pub struct AnalysisModuleSnapshot {
++    modules: BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>,
++    code_limit: usize,
++    source_map_limit: usize,
++    cache: Mutex<AnalysisCache>,
++}
++
++#[derive(Default)]
++struct AnalysisCache {
++    code: BTreeMap<CanonicalizedModulePath, Arc<[u8]>>,
++    code_bytes: usize,
++    code_budget_refused: bool,
++    source_maps: BTreeMap<CanonicalizedModulePath, Option<Arc<sourcemap::SourceMap>>>,
++    source_map_bytes: usize,
++}
++
++impl From<BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>> for AnalysisModuleSnapshot {
++    fn from(modules: BTreeMap<CanonicalizedModulePath, Arc<V8ModuleSource>>) -> Self {
++        Self {
++            modules,
++            code_limit: *ANALYZE_CODE_CACHE_MAX_BYTES,
++            source_map_limit: *ANALYZE_SOURCE_MAP_CACHE_MAX_BYTES,
++            cache: Mutex::default(),
++        }
++    }
++}
++
++impl AnalysisModuleSnapshot {
++    pub fn lookup(
++        self: &Arc<Self>,
++        path: &CanonicalizedModulePath,
++    ) -> Option<(Arc<V8ModuleSource>, ModuleCodeCacheResult)> {
++        let source = self.modules.get(path)?.clone();
++        let cache = self.cache.lock();
++        let cached = cache.code.get(path).cloned();
++        if self.code_limit == 0
++            || (cached.is_none()
++                && (cache.code_budget_refused || cache.code_bytes >= self.code_limit))
++        {
++            return Some((source, ModuleCodeCacheResult::Disabled));
++        }
++        drop(cache);
++        let snapshot = self.clone();
++        let path = path.clone();
++        let previous = cached.clone();
++        let populate = Box::new(move |data| snapshot.put_code(path, previous, data));
++        let outcome = match cached {
++            Some(data) => ModuleCodeCacheResult::Cached(data, populate),
++            None => ModuleCodeCacheResult::Uncached(populate),
++        };
++        Some((source, outcome))
++    }
++
++    fn put_code(
++        &self,
++        path: CanonicalizedModulePath,
++        rejected: Option<Arc<[u8]>>,
++        data: Arc<[u8]>,
++    ) {
++        // Compilation happens without this lock. Concurrent first misses are
++        // allowed, but replacing a winner cannot exceed the retention budget.
++        let mut cache = self.cache.lock();
++        if let Some(current) = cache.code.get(&path) {
++            if !rejected
++                .as_ref()
++                .is_some_and(|old| Arc::ptr_eq(old, current))
++            {
++                return;
++            }
++        }
++        let previous = cache.code.get(&path).map_or(0, |old| {
++            old.len()
++                .checked_add(path.as_str().len())
++                .and_then(|bytes| bytes.checked_add(128))
++                .expect("retained code entry charge overflowed")
++        });
++        let without_previous = cache
++            .code_bytes
++            .checked_sub(previous)
++            .expect("retained code bytes do not include replaced entry");
++        let next = without_previous
++            .checked_add(data.len())
++            .and_then(|bytes| bytes.checked_add(path.as_str().len()))
++            .and_then(|bytes| bytes.checked_add(128))
++            .filter(|bytes| *bytes <= self.code_limit);
++        let Some(next) = next else {
++            // Stop generating new entries for this snapshot once its measured
++            // budget refuses one. Existing hits remain usable; later roots
++            // cannot repeatedly serialize the same oversized dependency.
++            cache.code_budget_refused = true;
++            // A rejected entry is no longer useful. Removing it also prevents
++            // every later root from repeatedly offering the same rejected bytes.
++            if cache.code.remove(&path).is_some() {
++                cache.code_bytes = without_previous;
++            }
++            log_module_code_cache_outcome(ModuleCodeCacheOutcome::BudgetRefused);
++            return;
++        };
++        cache.code.insert(path, data);
++        cache.code_bytes = next;
++    }
++
++    pub fn source_map(
++        &self,
++        path: &CanonicalizedModulePath,
++    ) -> anyhow::Result<Option<Arc<sourcemap::SourceMap>>> {
++        use anyhow::Context;
++
++        if let Some(source_map) = self.cache.lock().source_maps.get(path) {
++            return Ok(source_map.clone());
++        }
++        let module = self
++            .modules
++            .get(path)
++            .context("analysis source map has no module")?;
++        let source_map = module
++            .source_map()
++            .and_then(|source| source_map_from_slice(source.as_bytes()))
++            .map(Arc::new);
++        if self.source_map_limit == 0 {
++            return Ok(source_map);
++        }
++        // Charge owned text, tokens, collection capacity and entry metadata.
++        // This is a logical cache budget, not a claim about allocator RSS.
++        let map_bytes = if let Some(map) = &source_map {
++            #[derive(serde::Deserialize)]
++            struct MapStorage<'a> {
++                #[serde(rename = "sourcesContent")]
++                contents: Option<Vec<serde::de::IgnoredAny>>,
++                #[serde(borrow, default)]
++                mappings: Cow<'a, str>,
++            }
++            // The parser retains excess sourcesContent slots, including nulls,
++            // but source_contents() stops at sources.len(). This second JSON
++            // scan counts slots without retaining content: IgnoredAny is
++            // zero-sized. Unescaped mappings borrow the existing JSON text.
++            // If all retained slots cannot be inspected, use the parsed map
++            // without caching it. This also preserves tolerated header formats.
++            let Ok(storage) = serde_json::from_str::<MapStorage<'_>>(
++                module.source_map().expect("parsed map lost source"),
++            ) else {
++                return Ok(source_map);
++            };
++            if storage.contents.map_or(0, |contents| contents.len())
++                > map.get_source_count() as usize
++            {
++                return Ok(source_map);
++            }
++            // sourcemap::decode_regular reserves one token per separator plus
++            // ten, including empty segments which produce no decoded tokens.
++            // Counting only get_token_count() undercharges sparse maps.
++            let token_capacity = Saturating(
++                storage
++                    .mappings
++                    .bytes()
++                    .filter(|&b| matches!(b, b',' | b';'))
++                    .count(),
++            ) + Saturating(10);
++            let token_bytes =
++                token_capacity * Saturating(std::mem::size_of::<sourcemap::RawToken>());
++            let text_bytes = map
++                .get_file()
++                .into_iter()
++                .chain(map.get_source_root())
++                .chain(map.sources())
++                .chain(map.sources())
++                .chain(map.names())
++                .chain(map.source_contents().flatten())
++                .fold(Saturating(0), |bytes, text| bytes + Saturating(text.len()));
++            let entries = Saturating(map.get_source_count() as usize)
++                + Saturating(map.get_name_count() as usize)
++                + Saturating(map.ignore_list().count());
++            // SourceView lazily retains a slice for every line it traverses.
++            // Reserve for that eventual growth, not just today's parsed text.
++            let line_bytes =
++                map.source_contents()
++                    .flatten()
++                    .fold(Saturating(0), |bytes, source| {
++                        // SourceView also splits bare CR; str::lines does not.
++                        let separators = source
++                            .bytes()
++                            .filter(|&b| matches!(b, b'\r' | b'\n'))
++                            .count();
++                        bytes
++                            + (Saturating(separators) + Saturating(1))
++                                * Saturating(std::mem::size_of::<&str>())
++                    });
++            let payload_bytes = text_bytes + line_bytes + entries * Saturating(128);
++            (Saturating(std::mem::size_of::<sourcemap::SourceMap>())
++                + token_bytes
++                + Saturating(2) * payload_bytes)
++                .0
++        } else {
++            0
++        };
++        let charge = path
++            .as_str()
++            .len()
++            .saturating_add(128)
++            .saturating_add(map_bytes);
++        let mut cache = self.cache.lock();
++        if let Some(existing) = cache.source_maps.get(path) {
++            return Ok(existing.clone());
++        }
++        // A saturated estimate always refuses retention, including at a
++        // configured usize::MAX limit. Parsing remains an optional aid.
++        if charge < usize::MAX
++            && charge <= self.source_map_limit.saturating_sub(cache.source_map_bytes)
++        {
++            cache.source_maps.insert(path.clone(), source_map.clone());
++            cache.source_map_bytes += charge;
++        }
++        Ok(source_map)
++    }
++}
++
++#[cfg(test)]
++mod analysis_tests {
++    use model::modules::module_versions::ModuleSource;
++
++    use super::*;
++
++    fn snapshot(
++        code_limit: usize,
++        source_map_limit: usize,
++        source: &str,
++    ) -> Arc<AnalysisModuleSnapshot> {
++        let source_map = r#"{"version":3,"sources":["root.ts"],"names":[],"mappings":"AAAA"}"#;
++        let mut snapshot = AnalysisModuleSnapshot::from(BTreeMap::from([(
++            "root.js".parse().unwrap(),
++            Arc::new(V8ModuleSource::new(FullModuleSource {
++                source: ModuleSource::new(source),
++                source_map: Some(source_map.to_owned()),
++            })),
++        )]));
++        snapshot.code_limit = code_limit;
++        snapshot.source_map_limit = source_map_limit;
++        Arc::new(snapshot)
++    }
++
++    #[test]
++    fn disabled_analysis_cache_has_no_population_callback() {
++        let snapshot = snapshot(0, 0, "export const value = 1;");
++        assert!(matches!(
++            snapshot.lookup(&"root.js".parse().unwrap()).unwrap().1,
++            ModuleCodeCacheResult::Disabled
++        ));
++    }
++
++    #[test]
++    fn compiled_data_is_shared_only_within_exact_snapshot() {
++        let path = "root.js".parse().unwrap();
++        let first = snapshot(1024, 1024, "export const value = 1;");
++        let ModuleCodeCacheResult::Uncached(populate) = first.lookup(&path).unwrap().1 else {
++            panic!("first lookup must miss");
++        };
++        populate(Arc::from([1_u8, 2, 3]));
++        let ModuleCodeCacheResult::Cached(data, _) = first.lookup(&path).unwrap().1 else {
++            panic!("later root must see compiled bytes");
++        };
++        assert_eq!(&*data, &[1, 2, 3]);
++        let second = snapshot(1024, 1024, "export const value = 2;");
++        assert!(matches!(
++            second.lookup(&path).unwrap().1,
++            ModuleCodeCacheResult::Uncached(_)
++        ));
++    }
++
++    #[test]
++    fn rejected_data_replaced_without_overwriting_concurrent_winner() {
++        let snapshot = snapshot(1024, 1024, "export const value = 1;");
++        let path = "root.js".parse().unwrap();
++        let ModuleCodeCacheResult::Uncached(populate) = snapshot.lookup(&path).unwrap().1 else {
++            panic!("first lookup must miss");
++        };
++        populate(Arc::from([1_u8]));
++        let ModuleCodeCacheResult::Cached(_, first) = snapshot.lookup(&path).unwrap().1 else {
++            panic!("cache entry missing");
++        };
++        let ModuleCodeCacheResult::Cached(_, late) = snapshot.lookup(&path).unwrap().1 else {
++            panic!("cache entry missing");
++        };
++        first(Arc::from([2_u8]));
++        late(Arc::from([3_u8]));
++        let ModuleCodeCacheResult::Cached(data, _) = snapshot.lookup(&path).unwrap().1 else {
++            panic!("replacement missing");
++        };
++        assert_eq!(&*data, &[2]);
++        assert!(snapshot.cache.lock().code_bytes <= snapshot.code_limit);
++    }
++
++    #[test]
++    fn budgets_include_keys_and_oversized_replacement_removes_rejected_data() {
++        let snapshot = snapshot(140, 0, "export const value = 1;");
++        let path = "root.js".parse().unwrap();
++        let ModuleCodeCacheResult::Uncached(populate) = snapshot.lookup(&path).unwrap().1 else {
++            panic!("first lookup must miss");
++        };
++        populate(Arc::from([1_u8]));
++        let ModuleCodeCacheResult::Cached(_, replace) = snapshot.lookup(&path).unwrap().1 else {
++            panic!("small entry should fit");
++        };
++        replace(Arc::from([0_u8; 140]));
++        assert!(snapshot.cache.lock().code.is_empty());
++        assert_eq!(snapshot.cache.lock().code_bytes, 0);
++        assert!(matches!(
++            snapshot.lookup(&path).unwrap().1,
++            ModuleCodeCacheResult::Disabled
++        ));
++        assert!(snapshot.source_map(&path).unwrap().is_some());
++        assert!(snapshot.cache.lock().source_maps.is_empty());
++    }
++
++    #[test]
++    fn late_population_after_budget_refusal_preserves_useful_winners() {
++        let snapshot = snapshot(140, 0, "export const value = 1;");
++        let path = "root.js".parse().unwrap();
++        let ModuleCodeCacheResult::Uncached(oversized) = snapshot.lookup(&path).unwrap().1 else {
++            panic!("first lookup must miss");
++        };
++        let ModuleCodeCacheResult::Uncached(winner) = snapshot.lookup(&path).unwrap().1 else {
++            panic!("concurrent lookup must miss");
++        };
++        let ModuleCodeCacheResult::Uncached(late) = snapshot.lookup(&path).unwrap().1 else {
++            panic!("concurrent lookup must miss");
++        };
++        oversized(Arc::from([0_u8; 140]));
++        assert!(snapshot.cache.lock().code_budget_refused);
++        // Bytes already produced by an in-flight compilation may still fit.
++        winner(Arc::from([1_u8]));
++        late(Arc::from([0_u8; 140]));
++        let ModuleCodeCacheResult::Cached(data, oversized) = snapshot.lookup(&path).unwrap().1
++        else {
++            panic!("late callback must not remove the useful winner");
++        };
++        assert_eq!(&*data, &[1]);
++        let ModuleCodeCacheResult::Cached(_, late) = snapshot.lookup(&path).unwrap().1 else {
++            panic!("budget refusal must preserve existing hits");
++        };
++        oversized(Arc::from([0_u8; 140]));
++        assert_eq!(snapshot.cache.lock().code_bytes, 0);
++        late(Arc::from([2_u8]));
++        let ModuleCodeCacheResult::Cached(data, _) = snapshot.lookup(&path).unwrap().1 else {
++            panic!("in-flight replacement should fit after rejected data removal");
++        };
++        assert_eq!(&*data, &[2]);
++        assert_eq!(snapshot.cache.lock().code_bytes, 136);
++    }
++
++    #[test]
++    fn source_map_budget_charges_contents_not_exposed_by_iterator() {
++        let mut snapshot = AnalysisModuleSnapshot::from(BTreeMap::from([(
++            "root.js".parse().unwrap(),
++            Arc::new(V8ModuleSource::new(FullModuleSource {
++                source: ModuleSource::new("export const value = 1;"),
++                // The parser accepts these contents, although sources() and
++                // source_contents() expose none of their retained storage.
++                source_map: Some(
++                    serde_json::json!({
++                        "version": 3,
++                        "sources": [],
++                        "sourcesContent": [null, "x".repeat(4096)],
++                        "names": [],
++                        "mappings": "",
++                    })
++                    .to_string(),
++                ),
++            })),
++        )]));
++        snapshot.source_map_limit = 1024;
++        let map = snapshot
++            .source_map(&"root.js".parse().unwrap())
++            .unwrap()
++            .unwrap();
++        assert_eq!(map.source_contents().count(), 0);
++        assert_eq!(map.get_source_contents(1).unwrap().len(), 4096);
++        assert!(snapshot.cache.lock().source_maps.is_empty());
++        assert_eq!(snapshot.cache.lock().source_map_bytes, 0);
++    }
++
++    #[test]
++    fn ordinary_source_map_retains_default_budget_capacity() {
++        let source_map = serde_json::json!({
++            "version": 3,
++            "sources": ["root.ts"],
++            "sourcesContent": ["const value = 1;\r".repeat(1 << 16)],
++            "names": [],
++            "mappings": "AAAA",
++            "ignoreList": [0],
++        })
++        .to_string();
++        assert!(source_map.len() > 1 << 20);
++        let mut snapshot = AnalysisModuleSnapshot::from(BTreeMap::from([(
++            "root.js".parse().unwrap(),
++            Arc::new(V8ModuleSource::new(FullModuleSource {
++                source: ModuleSource::new("export const value = 1;"),
++                source_map: Some(source_map),
++            })),
++        )]));
++        snapshot.source_map_limit = 32 << 20;
++        let path = "root.js".parse().unwrap();
++        let first = snapshot.source_map(&path).unwrap().unwrap();
++        let second = snapshot.source_map(&path).unwrap().unwrap();
++        assert!(Arc::ptr_eq(&first, &second));
++        assert!(snapshot.cache.lock().source_map_bytes <= snapshot.source_map_limit);
++    }
++
++    #[test]
++    fn source_map_budget_charges_empty_mapping_segments() {
++        for mappings in [";".repeat(4096), ",".repeat(4096), "\\u003b".repeat(4096)] {
++            let mut snapshot = AnalysisModuleSnapshot::from(BTreeMap::from([(
++                "root.js".parse().unwrap(),
++                Arc::new(V8ModuleSource::new(FullModuleSource {
++                    source: ModuleSource::new("export const value = 1;"),
++                    source_map: Some(format!(
++                        r#"{{"version":3,"sources":[],"names":[],"mappings":"{mappings}"}}"#,
++                    )),
++                })),
++            )]));
++            snapshot.source_map_limit = 4096;
++            let map = snapshot
++                .source_map(&"root.js".parse().unwrap())
++                .unwrap()
++                .unwrap();
++            assert_eq!(map.get_token_count(), 0);
++            assert!(snapshot.cache.lock().source_maps.is_empty());
++            assert_eq!(snapshot.cache.lock().source_map_bytes, 0);
++        }
++    }
++
++    #[test]
++    fn parsed_source_maps_are_shared_without_v8_state() {
++        let snapshot = snapshot(0, 4096, "export const value = 1;");
++        let path = "root.js".parse().unwrap();
++        let first = snapshot.source_map(&path).unwrap().unwrap();
++        let second = snapshot.source_map(&path).unwrap().unwrap();
++        assert!(Arc::ptr_eq(&first, &second));
++        assert!(snapshot.cache.lock().source_map_bytes <= snapshot.source_map_limit);
++    }
++}
+ 
+ /// A `ModuleLoader` that also has the ability to store V8 code caches.
+ #[async_trait]
+@@ -43,15 +502,17 @@ pub trait ModuleCache<RT: Runtime>: Sync + Send + 'static {
+ impl<RT: Runtime> dyn ModuleCache<RT> {
+     pub fn code_cache_result(
+         self: Arc<Self>,
+-        module_metadata: &ModuleMetadata,
++        module_metadata: &Arc<ParsedDocument<ModuleMetadata>>,
+     ) -> ModuleCodeCacheResult {
+-        if let Some(cached_data) = self.get_cached_code(module_metadata) {
+-            ModuleCodeCacheResult::Cached(cached_data)
++        let cached_data = self.get_cached_code(module_metadata);
++        let module_metadata = module_metadata.clone();
++        let populate = Box::new(move |cached_data| {
++            self.put_cached_code(&module_metadata, cached_data);
++        });
++        if let Some(cached_data) = cached_data {
++            ModuleCodeCacheResult::Cached(cached_data, populate)
+         } else {
+-            let module_metadata = module_metadata.clone();
+-            ModuleCodeCacheResult::Uncached(Box::new(move |cached_data| {
+-                self.put_cached_code(&module_metadata, cached_data);
+-            }))
++            ModuleCodeCacheResult::Uncached(populate)
+         }
+     }
+ }
+diff --git a/crates/isolate/src/module_diagnostics.rs b/crates/isolate/src/module_diagnostics.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0648ef671817f9e40a52828290155fae2d744c5a
+--- /dev/null
++++ b/crates/isolate/src/module_diagnostics.rs
+@@ -0,0 +1,177 @@
++use std::{
++    sync::Arc,
++    time::{
++        Duration,
++        Instant,
++    },
++};
++
++use parking_lot::Mutex;
++use sync_types::CanonicalizedModulePath;
++
++use crate::{
++    execution_observation,
++    metrics,
++};
++
++#[derive(Clone, Copy)]
++pub enum ModuleRequestKind {
++    Analysis,
++    Runtime,
++    Configuration,
++}
++
++impl ModuleRequestKind {
++    pub(crate) fn label(self) -> &'static str {
++        match self {
++            Self::Analysis => "analysis",
++            Self::Runtime => "runtime",
++            Self::Configuration => "configuration",
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug)]
++pub enum ModulePhase {
++    Registration,
++    Compilation,
++    Serialization,
++    Instantiation,
++    Evaluation,
++    ExportInspection,
++    Cleanup,
++}
++
++impl ModulePhase {
++    pub(crate) fn label(self) -> &'static str {
++        match self {
++            Self::Registration => "registration",
++            Self::Compilation => "compilation",
++            Self::Serialization => "serialization",
++            Self::Instantiation => "instantiation",
++            Self::Evaluation => "evaluation",
++            Self::ExportInspection => "export_inspection",
++            Self::Cleanup => "cleanup",
++        }
++    }
++}
++
++#[derive(Clone)]
++pub struct AnalysisDiagnostic(Arc<Mutex<AnalysisDiagnosticState>>);
++
++struct AnalysisDiagnosticState {
++    root: CanonicalizedModulePath,
++    phase: ModulePhase,
++    module: Option<String>,
++    registration: Duration,
++    compilation: Duration,
++    evaluation: Duration,
++    measured_cpu: Option<Duration>,
++}
++
++impl AnalysisDiagnostic {
++    pub(crate) fn new(root: CanonicalizedModulePath) -> Self {
++        Self(Arc::new(Mutex::new(AnalysisDiagnosticState {
++            root,
++            phase: ModulePhase::Registration,
++            module: None,
++            registration: Duration::ZERO,
++            compilation: Duration::ZERO,
++            evaluation: Duration::ZERO,
++            measured_cpu: execution_observation::thread_cpu().map(|_| Duration::ZERO),
++        })))
++    }
++
++    pub(crate) fn begin(&self, phase: ModulePhase, module: Option<&str>) {
++        let mut state = self.0.lock();
++        state.phase = phase;
++        state.module = module.map(str::to_owned);
++    }
++
++    pub(crate) fn registration_finished(&self, elapsed: Duration) {
++        self.0.lock().registration = elapsed;
++    }
++
++    pub(crate) fn describe(&self) -> String {
++        let state = self.0.lock();
++        let module = state
++            .module
++            .as_ref()
++            .map(|module| format!(", module {module}"))
++            .unwrap_or_default();
++        format!(
++            "Analysis of {} during {}{} (wall: registration {:?}, compilation {:?}, evaluation \
++             {:?}; measured synchronous CPU {})",
++            state.root.as_str(),
++            state.phase.label(),
++            module,
++            state.registration,
++            state.compilation,
++            state.evaluation,
++            state
++                .measured_cpu
++                .map(|cpu| format!("{cpu:?}"))
++                .unwrap_or_else(|| "unavailable".to_owned()),
++        )
++    }
++}
++
++/// Synchronous phases only: this guard never crosses an await, so its thread
++/// CPU delta cannot accidentally include work on a different executor thread.
++pub(crate) struct ModulePhaseGuard {
++    kind: ModuleRequestKind,
++    phase: ModulePhase,
++    diagnostic: Option<AnalysisDiagnostic>,
++    start: Instant,
++    cpu: Option<u64>,
++}
++
++impl ModulePhaseGuard {
++    pub(crate) fn new(
++        kind: ModuleRequestKind,
++        phase: ModulePhase,
++        diagnostic: Option<AnalysisDiagnostic>,
++        module: Option<&str>,
++    ) -> Self {
++        if let Some(diagnostic) = &diagnostic {
++            diagnostic.begin(phase, module);
++        }
++        let cpu = (diagnostic.is_some() || execution_observation::is_observed())
++            .then(execution_observation::thread_cpu)
++            .flatten();
++        Self {
++            kind,
++            phase,
++            diagnostic,
++            start: Instant::now(),
++            cpu,
++        }
++    }
++}
++
++impl Drop for ModulePhaseGuard {
++    fn drop(&mut self) {
++        let wall = self.start.elapsed();
++        let cpu = self
++            .cpu
++            .and_then(|start| execution_observation::thread_cpu()?.checked_sub(start));
++        metrics::log_module_phase(self.kind, self.phase, wall, cpu);
++        execution_observation::record_module_phase(self.phase, wall, cpu);
++        if let Some(diagnostic) = &self.diagnostic {
++            let mut state = diagnostic.0.lock();
++            state.measured_cpu = state
++                .measured_cpu
++                .zip(cpu)
++                .map(|(total, cpu)| total + Duration::from_nanos(cpu));
++            match self.phase {
++                ModulePhase::Compilation => state.compilation += wall,
++                ModulePhase::Evaluation => state.evaluation += wall,
++                ModulePhase::Registration
++                | ModulePhase::Serialization
++                | ModulePhase::Instantiation
++                | ModulePhase::ExportInspection
++                | ModulePhase::Cleanup => (),
++            }
++        }
++    }
++}
+diff --git a/crates/isolate/src/termination.rs b/crates/isolate/src/termination.rs
+index 148805ff09836fccecb7cd7f444ab41e4625da5a..110f010e4d4f36a4da3a9d258c2b5f5042c16415 100644
+--- a/crates/isolate/src/termination.rs
++++ b/crates/isolate/src/termination.rs
+@@ -168,6 +168,25 @@ impl ExecutionHandle {
+     /// the stack.
+     pub fn terminate(&self, reason: TerminationReason) {
+         let mut inner = self.inner.lock();
++        self.terminate_locked(&mut inner, reason);
++    }
++
++    /// Cancellation belongs to one request, even if its sender outlives that
++    /// request and the worker has already accepted another one.
++    pub(crate) fn terminate_if_current(
++        &self,
++        context: &ContextId,
++        reason: TerminationReason,
++    ) -> bool {
++        let mut inner = self.inner.lock();
++        if !inner.context_stack.contains(&context.context_id) || inner.reason.is_some() {
++            return false;
++        }
++        self.terminate_locked(&mut inner, reason);
++        true
++    }
++
++    fn terminate_locked(&self, inner: &mut ExecutionHandleInner, reason: TerminationReason) {
+         // N.B.: call terminate_execution under the lock to synchronize with
+         // cancel_terminate_execution in `pop_context`
+         self.interrupt.interrupt();
+@@ -200,6 +219,10 @@ impl ExecutionHandle {
+         }
+     }
+ 
++    pub(crate) fn is_terminated(&self) -> bool {
++        self.inner.lock().reason.is_some()
++    }
++
+     pub fn check_terminated(&self) -> anyhow::Result<()> {
+         let inner = self.inner.lock();
+         if let Some(e) = &inner.reason {
+@@ -340,6 +363,29 @@ impl ExecutionHandle {
+     }
+ }
+ 
++#[cfg(test)]
++mod cancellation_tests {
++    use super::*;
++
++    #[test]
++    fn late_cancellation_cannot_terminate_a_replacement_request() {
++        let handle = ExecutionHandle::cooperative();
++        let previous = handle.push_context(false);
++        handle.pop_context(previous.clone()).unwrap().unwrap();
++        let current = handle.push_context(false);
++        assert!(!handle.terminate_if_current(
++            &previous,
++            IsolateTerminationReason::UserTimeout(Duration::ZERO).into()
++        ));
++        handle.check_terminated().unwrap();
++        assert!(handle.terminate_if_current(
++            &current,
++            IsolateTerminationReason::UserTimeout(Duration::ZERO).into()
++        ));
++        assert!(handle.check_terminated().is_err());
++    }
++}
++
+ #[derive(Clone)]
+ pub struct ContextId {
+     context_id: u64,
 diff --git a/patches/degradable_reactive_queries/README.md b/patches/degradable_reactive_queries/README.md
 index 7a26345046576db73e3377958c7251a7970f19f9..0d5a291ccd16a8832ea5c3c933e22b837e76ddd1 100644
 --- a/patches/degradable_reactive_queries/README.md
@@ -1274,10 +4659,10 @@ index 7a26345046576db73e3377958c7251a7970f19f9..0d5a291ccd16a8832ea5c3c933e22b83
  reconnection resets the connection-local epoch. The frontend also bounds its
 diff --git a/patches/deployment_analysis_pacing/README.md b/patches/deployment_analysis_pacing/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..c9bc3f9fdfab1b81ab96bba6b967c1399ab84dc2
+index 0000000000000000000000000000000000000000..14bce41fbc3f1895c5f845f3506672887bb762a3
 --- /dev/null
 +++ b/patches/deployment_analysis_pacing/README.md
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,274 @@
 +# Pace Isolate Module Analysis Through Elastic Query Capacity
 +
 +This integration patch prevents a function push from adding its complete isolate-module analysis
@@ -1291,7 +4676,12 @@ index 0000000000000000000000000000000000000000..c9bc3f9fdfab1b81ab96bba6b967c139
 +The gate remains work-conserving. Degradable leaders can use the full capacity when no analysis is
 +running. One analysis call can use up to the smaller of the configured capacity, its number of
 +modules, and `ANALYZE_CONCURRENCY` when degradable leaders are absent. Concurrent calls share the
-+gate but each retains that per-call fan-out. No worker is kept idle for a deployment.
++gate but each retains that per-call fan-out. Whole-job admission bounds concurrent
++submissions separately. When the control-plane queue is enabled, a configurable
++worker reserve now preserves deployment capacity within the existing maximum;
++its queue capacity is reserved within the existing queue maximum, and a distinct
++JavaScript queue fairly shares protected grants with ordinary work. These
++allowances do not increase root-analysis or active-JavaScript concurrency.
 +
 +## Patch placement and prerequisites
 +
@@ -1389,8 +4779,9 @@ index 0000000000000000000000000000000000000000..c9bc3f9fdfab1b81ab96bba6b967c139
 +gate is 32, and analysis concurrency is 4. Before this integration, 32 degradable leaders and four
 +analysis attempts could directly present 36 roots to lower execution gates. With this integration,
 +four analysis reservations leave at most 28 root-work permits for degradable leaders. The active
-+gate independently guarantees protected and degradable progress through its configured service
-+floors; analysis uses the protected class.
++gate independently applies non-preemptive protected and degradable service floors under
++two-group contention; analysis shares the protected group through its fair
++control-plane queue when enabled.
 +
 +This is intentionally not a mathematical bound on physical workers. One admitted query leader can
 +spawn separately scheduled dependencies, and dependency work retains its existing reserve. Normal
@@ -1400,11 +4791,12 @@ index 0000000000000000000000000000000000000000..c9bc3f9fdfab1b81ab96bba6b967c139
 +active capacity because these gates bound different resources. Without service floors, startup
 +still requires finite active capacity to exceed the cap.
 +
-+The patch does not add an analysis-specific scheduler reservation. Analysis can still wait after
-+gate admission when protected work or dependencies occupy workers, when active-JavaScript permits
-+are full, or when CPU is saturated. Protected active admission gives analysis access to the shared
-+protected floor without prioritizing deployment work over other protected requests. A dedicated
-+analysis reservation requires separate evidence and policy.
++Root pacing creates no additional worker or CPU capacity. The enabled
++deployment lane reserves queue and worker space within the existing base and
++alternates configuration grants with ordinary protected work. Analysis can
++still wait for existing JavaScript holders, dependency demand, or external
++resources. Those holders must return capacity before the non-preemptive share
++can take effect.
 +
 +## Metrics and controlled validation
 +
@@ -1476,11 +4868,75 @@ index 0000000000000000000000000000000000000000..c9bc3f9fdfab1b81ab96bba6b967c139
 +
 +## Deliberately excluded alternatives
 +
-+This patch does not add a dedicated worker pool, permanently idle worker, strict deployment
-+priority, dependency-reserve borrowing, deployment-wide query shutdown, module allowlist, larger
-+queue, longer deadline, or automatic `ANALYZE_CONCURRENCY` formula. Those choices either leave the
-+additive demand unchanged, weaken dependency liveness, introduce idle capacity, or require more
-+scheduler state than the current evidence justifies.
++Root pacing does not create a separate worker pool, shut down live queries, add
++a module allowlist, enlarge queues or lengthen JavaScript timeouts. The bounded
++whole-job and worker allowances are described in
++[deployment operations](../non_committing_codegen_analysis/deployment_operations.md).
++
++## Analysis snapshots and phase diagnostics
++
++Each analysis owns immutable source inputs. Its roots and retries share compiled
++bytes and have access to the same parsed-map cache for export inspection. V8
++modules, contexts, globals and evaluation are fresh for each root. Cache entries
++never cross snapshots.
++`ANALYZE_CODE_CACHE_MAX_BYTES` and `ANALYZE_SOURCE_MAP_CACHE_MAX_BYTES` default to
++32 MiB each; zero disables retention. Budgets include keys and estimated retained
++metadata. No cache lock crosses compilation, parsing or evaluation.
++
++Export inspection keeps one root map alive even when retention is disabled or
++the map does not fit, so it is parsed once per root rather than once per export.
++Each root only consults its own map; successful sibling roots do not reuse that
++parsed map. Shared map retention can only benefit a later lookup of the same
++root, and is not evidence of a saving across roots.
++Positions originating in another module remain omitted without parsing that
++module's map. Missing and unusable maps retain the existing position fallback.
++Explicitly unmapped segments and generated positions before the first mapping
++on their line omit the position. A mapping on an earlier line cannot supply a
++range offset for the current line. Error-stack mapping continues through the
++existing request-local path.
++The map estimate includes parsed tokens, text, lazy line storage, ignored-source
++indices and collection capacity. A second JSON scan counts `sourcesContent` slots
++without retaining their values and counts mapping separators, including empty
++segments that reserve token storage without producing tokens. Maps with more
++content slots than sources, or formats that this retention scan cannot inspect,
++remain usable without caching;
++their unexposed storage cannot escape the budget. Simultaneous parses and
++in-flight V8 serialization allocate outside the retained-byte estimates; these
++settings are not RSS limits.
++
++Disabled caches do not serialize unused code. Non-rejected V8 data avoids generation;
++rejected data is recompiled and replaced with a concurrent-winner check. After a
++byte-budget refusal, new code generation stops for that snapshot while existing
++hits remain usable. This can leave spare bytes unused rather than repeatedly
++serializing a dependency that does not fit. Already in-flight callbacks can still
++retain useful bytes that fit, including after removal of rejected data.
++
++`udf_isolate_code_cache_outcomes_total` separates `disabled`, `absent`, `accepted`,
++`rejected`, `generated` and `budget_refused`. The older compile histogram's
++`cached` label still means data was supplied. `accepted` means V8 did not reject
++supplied bytes; its isolate-local compilation cache can bypass deserialization.
++This counter therefore does not prove a serialized-cache hit. These are events,
++not a request partition: rejection, generation and budget refusal can occur in
++one compilation.
++`udf_isolate_module_phase_seconds` records request kind, phase and clock. Module
++paths appear in authenticated errors or bounded diagnostic records, never labels.
++Registration wall time includes recursive compilation; do not add those spans.
++Synchronous phase CPU is current-thread CPU and excludes background V8 work.
++
++Timeouts return `AnalysisExecutionTimeout` with root and current phase. During
++registration the current module is retained; evaluation identifies its root
++unless a stack establishes a dependency. An identical timed-out root is not
++automatically retried. Cancellation uses the execution ID and leaves dispatched
++reservation ownership with the worker until cleanup finishes.
++
++
++`deployment_analysis_jobs_info{state="active|waiting"}` separates whole-job
++ownership from root permits. It is initialized on the first admission attempt.
++`deployment_analysis_job_wait_seconds{kind="deploy|preflight",status}` includes
++immediate success, cancellation, timeout, queue-full and byte-budget refusal.
++`isolate_analysis_attempts_total{attempt="initial|retry"}` counts root submissions
++after root-capacity admission; retry means another submission of the same root,
++not a new whole job. These metrics carry no paths or operation identities.
 diff --git a/patches/isolate_queue_control/README.md b/patches/isolate_queue_control/README.md
 index 6da2fb50709838ec8cf54654e279bd26d1e6e903..d6692aaf50241a5d939cd739ccc6be4910b646bc 100644
 --- a/patches/isolate_queue_control/README.md
@@ -1647,10 +5103,10 @@ index a8eeefb775d1791e95e7ab44ada46a36ca368945..0113722fb1931a39583ed988a12e4bc4
  
  The immediate rollback is:
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 28d855da3f564660a85d111f1fad47eada5c7313..11e7d89e3b82218f3d1d77e6cdcb29428e9a1341 100644
+index 6b497e77ecae7702e803fd7024eba86361f99b9c..886d4e81019f1d5e5d49c230b8cb02f62a8daec7 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
-@@ -246,6 +246,40 @@ retaining an isolate worker may raise occupancy above that base. Nested Node
+@@ -246,6 +246,55 @@ retaining an isolate worker may raise occupancy above that base. Nested Node
  actions receive the same treatment at the Node action limit because their
  parent retains a permit from that limit.
  
@@ -1687,6 +5143,21 @@ index 28d855da3f564660a85d111f1fad47eada5c7313..11e7d89e3b82218f3d1d77e6cdcb2942
 +Unset the knob to preserve the original unpaced analysis behavior. See
 +[`patches/deployment_analysis_pacing/README.md`](../../patches/deployment_analysis_pacing/README.md)
 +for sizing, telemetry, and rollout guidance.
++
++## Analysis compilation and source-map caches
++
++`ANALYZE_CODE_CACHE_MAX_BYTES` and `ANALYZE_SOURCE_MAP_CACHE_MAX_BYTES` each
++default to 33554432 bytes (32 MiB). They independently bound retained compiled
++data and parsed source maps within one immutable analysis snapshot. Zero disables
++the corresponding retention; zero for compiled data also avoids serialization.
++The supplied Compose template passes both settings through to the backend.
++
++Every analysis root still gets fresh modules, globals and evaluation. Budgets
++include keys and estimated retained metadata, but concurrent parsing and V8
++serialization allocate outside these estimates. These settings are not RSS limits.
++After a compiled-data budget refusal, existing hits remain usable but new misses
++stop generating data for that snapshot. See the
++[analysis snapshot contract](../../patches/deployment_analysis_pacing/README.md#analysis-snapshots-and-phase-diagnostics).
 +
  ## Isolate worker and queue knobs
  

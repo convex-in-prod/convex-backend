@@ -17,12 +17,12 @@ Add bounded admission and claim metrics, focused barrier coverage, patch-train i
  crates/function_runner/src/lib.rs             |   2 +
  crates/function_runner/src/server.rs          | 123 +++++
  crates/isolate/src/client.rs                  |   3 +
- crates/isolate/src/isolate_worker.rs          | 166 +++++--
+ crates/isolate/src/isolate_worker.rs          | 170 ++++---
  patches/README.md                             |  34 +-
  patches/dependency_capacity/README.md         |   5 +
  patches/isolate_queue_control/README.md       |  21 +-
  patches/scheduled_action_admission/README.md  | 455 ++++++++++++++++++
- 13 files changed, 1043 insertions(+), 119 deletions(-)
+ 13 files changed, 1045 insertions(+), 121 deletions(-)
  create mode 100644 patches/scheduled_action_admission/README.md
 
 diff --git a/crates/application/src/application_function_runner/metrics.rs b/crates/application/src/application_function_runner/metrics.rs
@@ -86,7 +86,7 @@ index b2334260ae062c0b8adff91e3da8714f4c8601b2..40c30df2e9b1d04fa8f7aceab1b1f0bd
      UDF_EXECUTOR_RESULT_TOTAL,
      "Number of queries against the module cache",
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e81dcbe382 100644
+index 797b2cadf5a558c01ac4d744b09a94b2cbcfdaa7..1a127e009c26e45537a536ce74357cf911628d9c 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
 @@ -99,6 +99,8 @@ use errors::{
@@ -109,7 +109,7 @@ index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e8
      function_waiter_timer,
      log_occ_retries,
      log_outstanding_functions,
-@@ -343,6 +348,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -347,6 +352,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                      active_javascript_class,
                  }),
                  None,
@@ -117,7 +117,7 @@ index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e8
                  scheduler_dependency,
                  false,
              )
-@@ -360,6 +366,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -364,6 +370,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          log_line_sender: mpsc::UnboundedSender<LogLine>,
          context: ExecutionContext,
          wait_for_permit: bool,
@@ -125,7 +125,7 @@ index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e8
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let (_, outcome) = self
-@@ -374,6 +381,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -378,6 +385,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                      active_javascript_class: ActiveJavascriptClass::Protected,
                  }),
                  None,
@@ -133,7 +133,7 @@ index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e8
                  scheduler_dependency,
                  wait_for_permit,
              )
-@@ -403,6 +411,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -407,6 +415,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  Some(log_line_sender),
                  None,
                  Some(http_action_metadata),
@@ -141,7 +141,7 @@ index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e8
                  SchedulerDependencyClass::Independent,
                  false,
              )
-@@ -433,6 +442,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -437,6 +446,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
          function_metadata: Option<FunctionMetadata>,
          http_action_metadata: Option<HttpActionMetadata>,
@@ -149,15 +149,15 @@ index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e8
          scheduler_dependency: SchedulerDependencyClass,
          wait_for_permit: bool,
      ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
-@@ -474,6 +484,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -499,6 +509,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  self.default_system_env_vars.clone(),
                  in_memory_index_last_modified,
                  context,
 +                function_execution_start,
                  scheduler_dependency,
-             )
-             .await?;
-@@ -1432,6 +1443,140 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+             ),
+             diagnostic.as_ref().map(RuntimeDiagnostic::task),
+@@ -1548,6 +1559,140 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          context: ExecutionContext,
          wait_for_permit: bool,
          scheduler_dependency: SchedulerDependencyClass,
@@ -296,17 +296,17 @@ index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e8
 +        function_execution_start: Option<FunctionExecutionStartGate>,
 +        scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
-         let result = self
-             .run_action_inner(
-@@ -1442,6 +1587,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+         let mut diagnostic =
+             RuntimeDiagnostic::start(&context, UdfType::Action, 0, || format!("{path:?}"));
+@@ -1560,6 +1705,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  usage_tracking,
                  context,
                  wait_for_permit,
 +                function_execution_start,
                  scheduler_dependency,
-             )
-             .await;
-@@ -1475,6 +1621,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+             ),
+             diagnostic.as_ref().map(RuntimeDiagnostic::task),
+@@ -1602,6 +1748,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          usage_tracking: FunctionUsageTracker,
          context: ExecutionContext,
          wait_for_permit: bool,
@@ -314,7 +314,7 @@ index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e8
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
          if path.is_system() && !(identity.is_admin() || identity.is_system()) {
-@@ -1503,6 +1650,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1630,6 +1777,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  (path_and_args, returns_validator)
              },
              Err(js_error) => {
@@ -324,7 +324,7 @@ index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e8
                  return Ok(ActionCompletion {
                      outcome: ValidatedActionOutcome::from_error(
                          js_error,
-@@ -1551,6 +1701,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1678,6 +1828,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          log_line_sender,
                          context.clone(),
                          wait_for_permit,
@@ -332,7 +332,7 @@ index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e8
                          scheduler_dependency,
                      )
                      .boxed();
-@@ -1681,6 +1832,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1808,6 +1959,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                      encoded_parent_trace: EncodedSpan::from_parent().0,
                  };
  
@@ -343,7 +343,7 @@ index f803b72506daf862fe903dded11d2685d4bb2897..f56285e6517e5f03575d3d1d05ce61e8
                  let node_outcome_future = self
                      .node_actions
                      .execute(request, log_line_sender, source_maps_callback)
-@@ -1745,6 +1900,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1872,6 +2027,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  })
              },
              ModuleEnvironment::Invalid => {
@@ -839,10 +839,10 @@ index 9ef312a4aaa4c8a69e7bb14411dcac0f6d9cfe20..ed1a415039c7bcab9eea0780d13fd13a
 +    }
 +}
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 98defab5daf5a337d03ce833943c154c62340949..2190e915d2af0592446f5ea403217b5da387777d 100644
+index 9aea1011b93610a6fa3ff76d36c2785ef272fe42..4699afc8e0770eaa75efd6afba6391fec5a4b0e8 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
-@@ -1184,6 +1184,7 @@ pub enum RequestType<RT: Runtime> {
+@@ -1249,6 +1249,7 @@ pub enum RequestType<RT: Runtime> {
          fetch_client: Arc<dyn FetchClient>,
          log_line_sender: mpsc::UnboundedSender<LogLine>,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -850,7 +850,7 @@ index 98defab5daf5a337d03ce833943c154c62340949..2190e915d2af0592446f5ea403217b5d
      },
      HttpAction {
          request: HttpActionRequest<RT>,
-@@ -1734,6 +1735,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1809,6 +1810,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          environment_data: EnvironmentData<RT>,
          instance_name: String,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -858,7 +858,7 @@ index 98defab5daf5a337d03ce833943c154c62340949..2190e915d2af0592446f5ea403217b5d
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
-@@ -1754,6 +1756,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1831,6 +1833,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              fetch_client,
              log_line_sender,
              function_started_sender,
@@ -867,7 +867,7 @@ index 98defab5daf5a337d03ce833943c154c62340949..2190e915d2af0592446f5ea403217b5d
          self.send_request(Request::new_with_scheduler_dependency(
              instance_name,
 diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
-index a8d381fabf15651331036eb9865b746f94717afb..904e571c042f77be1c9160f67493699bc980d8b0 100644
+index a321f06433dca8d2d8ba5963a561a690bb19bfc5..4cd599a507784fc76aa4e134d6798916ddb4bae1 100644
 --- a/crates/isolate/src/isolate_worker.rs
 +++ b/crates/isolate/src/isolate_worker.rs
 @@ -1,9 +1,11 @@
@@ -903,7 +903,7 @@ index a8d381fabf15651331036eb9865b746f94717afb..904e571c042f77be1c9160f67493699b
  #[async_trait(?Send)]
  impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
      async fn handle_request_inner(
-@@ -133,66 +149,76 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -142,68 +158,78 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                  fetch_client,
                  log_line_sender,
                  function_started_sender,
@@ -931,8 +931,8 @@ index a8d381fabf15651331036eb9865b746f94717afb..904e571c042f77be1c9160f67493699b
 -                    None,
 -                    request.context,
 -                );
--                let r = environment
--                    .run_action(
+-                let r = crate::execution_observation::observe(
+-                    environment.run_action(
 -                        isolate,
 -                        context_cache,
 -                        permit,
@@ -940,8 +940,10 @@ index a8d381fabf15651331036eb9865b746f94717afb..904e571c042f77be1c9160f67493699b
 -                        request.params.clone(),
 -                        cancellation,
 -                        function_started_sender,
--                    )
--                    .await;
+-                    ),
+-                    execution_observation,
+-                )
+-                .await;
 +                if let Err(error) =
 +                    wait_for_function_execution_start(function_execution_start).await
 +                {
@@ -966,8 +968,8 @@ index a8d381fabf15651331036eb9865b746f94717afb..904e571c042f77be1c9160f67493699b
 +                        None,
 +                        request.context,
 +                    );
-+                    let r = environment
-+                        .run_action(
++                    let r = crate::execution_observation::observe(
++                        environment.run_action(
 +                            isolate,
 +                            context_cache,
 +                            permit,
@@ -975,8 +977,10 @@ index a8d381fabf15651331036eb9865b746f94717afb..904e571c042f77be1c9160f67493699b
 +                            request.params.clone(),
 +                            cancellation,
 +                            function_started_sender,
-+                        )
-+                        .await;
++                        ),
++                        execution_observation,
++                    )
++                    .await;
  
 -                let status = match &r {
 -                    Ok((outcome, _)) => {
@@ -1032,11 +1036,10 @@ index a8d381fabf15651331036eb9865b746f94717afb..904e571c042f77be1c9160f67493699b
                  }
                  log_string
              },
-@@ -389,3 +415,39 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
-         &self.rt
+@@ -414,6 +440,42 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
      }
  }
-+
+ 
 +#[cfg(test)]
 +mod execution_start_tests {
 +    use super::wait_for_function_execution_start;
@@ -1072,6 +1075,10 @@ index a8d381fabf15651331036eb9865b746f94717afb..904e571c042f77be1c9160f67493699b
 +        assert!(error.to_string().contains("dropped before release"));
 +    }
 +}
++
+ #[cfg(test)]
+ mod configuration_cancellation_tests {
+     use std::{
 diff --git a/patches/README.md b/patches/README.md
 index 2a56c0635f2fe81271428035aa33b40cb5a5289c..8245065d094e817bf68d4858953613b1adb15151 100644
 --- a/patches/README.md
