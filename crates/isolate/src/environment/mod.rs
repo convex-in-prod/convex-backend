@@ -112,6 +112,11 @@ pub trait JsEnvironment<RT: Runtime>: 'static {
 pub trait OpProvider {
     fn trace(&mut self, level: LogLevel, messages: Vec<String>) -> anyhow::Result<()>;
     fn rng(&mut self) -> anyhow::Result<&mut ChaCha12Rng>;
+    // Only paired database invocations collect this evidence. Actions and
+    // import phases have no identity-comparison consumer.
+    fn record_generated_uuid(&mut self, _uuid: [u8; 16]) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn crypto_rng(&mut self) -> anyhow::Result<CryptoRng>;
     fn unix_timestamp(&mut self) -> anyhow::Result<UnixTimestamp>;
     fn performance_now(&mut self) -> anyhow::Result<Duration>;

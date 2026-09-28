@@ -48,12 +48,13 @@ cold; cache mounts never change the resulting image.
 The manual
 [Build patched backend image](../../.github/workflows/build_patched_backend.yml)
 workflow builds an optimized Linux amd64 image on `ubuntu-24.04`, checks its
-runtime tools and SQLite startup, and publishes
+capabilities and SQLite startup, and publishes
 `ghcr.io/<owner>/<repository>:backend-build-<run-id>-<attempt>`. Before pushing,
 it creates the matching Git tag so the exact source remains reachable after
 rebasing the patch train. Tags are never moved; a failed image push can leave a
 source tag without an image. Rerunning uses a new attempt number.
 
+The image includes the Wasm runtime gate and source-package authority helper.
 The job summary supplies the source tag and image digest for downstream
 Dockerfiles. No registry account beyond GitHub is required; the workflow uses
 `GITHUB_TOKEN` with contents and package write permission. Pin consumers to the
@@ -67,9 +68,17 @@ must also finish within GitHub's six-hour job limit.
 
 After publication, the same job builds the `rust-tests` Docker target. Set
 `publish_image=false` on dispatch to run the tests alone without building and
-publishing another runtime image. The tests cover deployment receipts and replay
-and Node action-tree admission across environment changes. A regression failure
-marks the workflow failed but does not remove the already-published image.
+publishing another runtime image. The tests cover deployment receipts and replay,
+source-generation ordering, and Node action-tree admission across environment
+changes. The job also runs the isolate library's Wasm, module-registry and
+host-error-attribution tests,
+then repeats preparation and module-cache tests with one worker and with
+CPU-derived parallelism. The initial run uses four workers. Libtest runs tests
+serially because they share process-wide runtime state; concurrency within a
+test remains enabled. Ignored tests requiring external compiler fixtures and
+the rest of the backend workspace are not part of this suite. A regression
+failure marks the workflow failed but does not remove the already-published
+image; the capability and SQLite startup checks still gate publication.
 
 Tests reuse the builder, installed tools, JavaScript dependencies and Cargo,
 download and sccache mounts. They use the test profile without debug symbols or
@@ -133,6 +142,30 @@ docker build \
   -f self-hosted/docker-build/Dockerfile.backend \
   .
 ```
+
+To include the source-package authority helper, set
+`BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY=true` together with
+`LOCAL_BACKEND_FEATURES=static-hermes-wasmtime-gate`. The default is `false`.
+The helper is built from the same source and Cargo profile into the existing
+artifact directory, then included as
+`/convex/source_package_preactivation_authority` in the final image. Its
+application gate feature is explicit, including when parallel frontend flags
+require a separate backend-binary invocation. Existing Cargo and native
+dependency cache mounts are reused.
+
+Extract it from a stopped container without starting the backend:
+
+```sh
+docker create --name source-authority-export convex-backend
+docker cp source-authority-export:/convex/source_package_preactivation_authority ./source_package_preactivation_authority
+docker rm source-authority-export
+```
+
+Use a new container name and output path, retain the image and binary digests,
+and run the extracted binary only on a compatible Linux runtime. The additional
+binary needs compilation/linking and artifact/image-export space; cache reuse
+does not make that cost zero. An image without this option does not supply the
+helper, and adding it does not change the backend entrypoint.
 
 Ordinary optimized images retain available function symbols in
 `/convex/convex-local-backend.debug` before packaging strips the executable.

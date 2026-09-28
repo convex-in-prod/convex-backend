@@ -120,7 +120,7 @@ pub(crate) struct DeploymentOperations {
     // before expiry may still be draining when the client loses its response.
     expired_finishes: Arc<Mutex<VecDeque<(String, ExecutionId)>>>,
     clock: Arc<Mutex<SystemTime>>,
-    session_id: String,
+    pub(crate) session_id: String,
 }
 
 impl Default for DeploymentOperations {
@@ -249,12 +249,37 @@ fn encode_result(value: &Value) -> Option<Bytes> {
     Some(Bytes::from(writer.bytes))
 }
 
+struct OperationJsonFormatter;
+
+impl serde_json::ser::Formatter for OperationJsonFormatter {
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        // A bare negative zero cannot survive JavaScript JSON.stringify. Keep
+        // it distinct so losing its sign cannot acquire preparation authority;
+        // server-owned Convex values and schema literals use {$float: ...}.
+        if value::numeric::is_negative_zero(value) {
+            return writer.write_all(b"-0");
+        }
+        // Values contain only finite floats. Match JavaScript number spelling,
+        // including integral floats, without rounding exact integer tokens.
+        writer.write_all(ryu_js::Buffer::new().format_finite(value).as_bytes())
+    }
+}
+
 pub(crate) fn normalized_digest(value: &mut Value) -> anyhow::Result<Sha256Digest> {
     value.sort_all_objects();
+    // Leave integer serialization exact: converting every number to f64 would
+    // let distinct integers above 2^53 acquire the same preparation or receipt.
     // Hash directly: an oversized analysis response must not allocate an
     // unbounded encoded copy before the bounded response writer sees it.
     let mut hash = Sha256::new();
-    serde_json::to_writer(&mut hash, value)?;
+    value.serialize(&mut serde_json::Serializer::with_formatter(
+        &mut hash,
+        OperationJsonFormatter,
+    ))?;
     Ok(hash.finalize())
 }
 
@@ -848,6 +873,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn operation_json_identity_preserves_values_across_javascript_number_spelling() {
+        for (original, echo) in [
+            (
+                r#"{"z":[{"b":1.0,"a":0.0}],"a":null}"#,
+                r#"{"a":null,"z":[{"a":0,"b":1}]}"#,
+            ),
+            ("-0.0", "-0"),
+            ("12.5", "1.25e1"),
+            ("1e-6", "0.000001"),
+            ("1e-7", "0.0000001"),
+            ("9007199254740992.0", "9007199254740992"),
+            // JavaScript uses the shortest round-tripping decimal, which need
+            // not be the exact integer represented by the binary float.
+            ("1.0000000000000001e18", "1000000000000000100"),
+            ("-1.0000000000000001e18", "-1000000000000000100"),
+            ("1e20", "100000000000000000000"),
+        ] {
+            let mut original: Value = serde_json::from_str(original).unwrap();
+            let mut echo: Value = serde_json::from_str(echo).unwrap();
+            assert_eq!(
+                normalized_digest(&mut original).unwrap(),
+                normalized_digest(&mut echo).unwrap()
+            );
+        }
+        for (original, changed) in [
+            ("-0.0", "0"),
+            ("9007199254740992", "9007199254740993"),
+            ("-9007199254740992", "-9007199254740993"),
+            ("18446744073709551615", "18446744073709551614"),
+            ("-9223372036854775808", "-9223372036854775807"),
+            ("1000000000000000100", "1000000000000000128"),
+            ("1.25", "1.2500000000000002"),
+            (r#"{"nested":[{"value":1}]}"#, r#"{"nested":[{"value":2}]}"#),
+            (r#"{"nested":[{}]}"#, r#"{"nested":[{"added":null}]}"#),
+            ("[1,2]", "[2,1]"),
+        ] {
+            let mut original: Value = serde_json::from_str(original).unwrap();
+            let mut changed: Value = serde_json::from_str(changed).unwrap();
+            assert_ne!(
+                normalized_digest(&mut original).unwrap(),
+                normalized_digest(&mut changed).unwrap()
+            );
+        }
+        let mut signed_zero = Value::from(value::ConvexValue::from(-0.0));
+        assert!(signed_zero.get("$float").is_some());
+        assert_ne!(
+            normalized_digest(&mut signed_zero).unwrap(),
+            normalized_digest(&mut json!(0)).unwrap()
+        );
+        assert!(serde_json::from_str::<Value>("1e400").is_err());
+    }
+
+    #[test]
     fn expiry_stays_final_after_clock_corrections() {
         let owner = DeploymentOperations::default();
         let wall = owner.now();
@@ -924,7 +1002,7 @@ mod tests {
                 "{}:0123456789abcdef0123456789abcdef",
                 now.duration_since(UNIX_EPOCH).unwrap().as_secs()
             );
-            let mut response = json!({"prepared":true});
+            let mut response = json!({"prepared":1.0});
             let sources = Arc::new(PreparedPush::default());
             let weak_sources = Arc::downgrade(&sources);
             owner.operations.lock().insert(
@@ -945,6 +1023,8 @@ mod tests {
                     completed_finish_attempt: None,
                 },
             );
+            // The ordinary JavaScript echo must acquire the same source lease.
+            let response = json!({"prepared":1});
             assert_eq!(
                 owner
                     .publication_control(&id, &owner.session_id, false)

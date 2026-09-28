@@ -15,6 +15,11 @@ The leader gate and the active-JavaScript gate control different resources:
 - `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` bounds the lifetime of
   admitted degradable cache-miss leaders together with paced isolate analysis.
   A leader retains this permit across database and other asynchronous waits.
+- `ISOLATE_DEGRADABLE_QUERY_ANALYSIS_CAPACITY` bounds V8 degradable requests and
+  analysis from dispatch through worker completion. It inherits the application
+  cap when unset. A separate value allows Wasm demand to exceed the V8 pool's
+  protected-capacity bound. Caller cancellation does not release a running
+  worker's reservation.
 - `FUNRUN_ISOLATE_ACTIVE_THREADS` bounds isolates that are executing JavaScript
   at one instant. An execution releases this permit around supported
   asynchronous waits and reacquires it before running JavaScript again.
@@ -27,7 +32,8 @@ that coupling while retaining a finite CPU gate.
 
 The active gate has five classes:
 
-- `Dependency` is work whose completion releases an isolate-holding ancestor.
+- `Dependency` is work whose completion releases an ancestor retaining runtime
+  resources, including a V8 worker or a Wasm instance.
 - `Protected` is ordinary root work, actions, and every other request without a
   narrower classification.
 - `HighPriorityMutation` is a mutation carrying the per-call high hint. It shares
@@ -128,23 +134,24 @@ queued continue to expire through the non-consuming expiry receiver.
 Positive values require all of the following:
 
 - finite positive `FUNRUN_ISOLATE_ACTIVE_THREADS`;
-- configured `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS`;
+- configured `ISOLATE_DEGRADABLE_QUERY_ANALYSIS_CAPACITY`, or its inherited
+  `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` value;
 - `P + G <= A` without integer overflow;
-- `G` no larger than the degradable leader cap.
+- `G` no larger than the V8 query/analysis cap.
 
 When both minimums are zero and the control-plane lane is disabled, service-floor
 and dependency-class admission are disabled. Dependencies and degradable execution
 use ordinary active admission for their phase. High mutations retain their separate
 class with bounded preference; resumptions precede initial starts within each
-effective class. In that mode the leader cap remains strictly below
+effective class. In that mode the V8 query/analysis cap remains strictly below
 any configured finite active capacity; `0` continues to mean unlimited. With
-positive minimums, the leader cap can exceed `A` because `G` supplies admitted
+positive minimums, the V8 query/analysis cap can exceed `A` because `G` supplies admitted
 degradable execution progress.
 
-The leader cap remains strictly below the application query shared base and
-the isolate worker shared base. Active admission does not replace lifetime and
-worker bounds, and one admitted root can still create separately scheduled
-dependencies.
+The application leader cap remains strictly below the application query shared
+base. The separate V8 query/analysis cap remains below the isolate worker shared
+base. Active admission does not replace lifetime and worker bounds, and one
+admitted root can still create separately scheduled dependencies.
 
 The enabled control-plane lane retains separate fair admission even with zero
 class minimums. Its grants alternate with combined ordinary/high-mutation demand; dependencies retain

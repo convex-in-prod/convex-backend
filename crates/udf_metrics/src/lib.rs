@@ -44,7 +44,10 @@ use std::{
 };
 
 use anyhow::Context;
-use hdrhistogram::Histogram;
+use hdrhistogram::{
+    Counter,
+    Histogram,
+};
 use imbl::{
     hashmap,
     ordmap,
@@ -96,20 +99,26 @@ impl CounterBucket {
 }
 
 #[derive(Clone)]
-pub struct HistogramBucket {
+pub struct HistogramBucket<C: Counter = u8> {
     pub index: BucketIndex,
-    pub histogram: Histogram<u8>,
+    pub histogram: Histogram<C>,
+    /// Sum of original samples, before histogram clamping or quantization.
+    pub duration_sum: Duration,
 }
 
-impl HistogramBucket {
+impl<C: Counter> HistogramBucket<C> {
     fn new(config: &MetricStoreConfig, index: BucketIndex) -> Result<Self, UdfMetricsError> {
-        let histogram = Histogram::new_with_bounds(
+        let histogram = Histogram::<C>::new_with_bounds(
             config.histogram_min_duration.as_millis() as u64,
             config.histogram_max_duration.as_millis() as u64,
             config.histogram_significant_figures,
         )
         .map_err(UdfMetricsError::InvalidHistogram)?;
-        Ok(Self { index, histogram })
+        Ok(Self {
+            index,
+            histogram,
+            duration_sum: Duration::ZERO,
+        })
     }
 
     fn record(
@@ -117,11 +126,23 @@ impl HistogramBucket {
         config: &MetricStoreConfig,
         duration: Duration,
     ) -> Result<(), UdfMetricsError> {
-        let millis = (duration.as_millis() as u64)
-            .clamp(1, config.histogram_max_duration.as_millis() as u64);
+        let sum = self
+            .duration_sum
+            .checked_add(duration)
+            .context("Histogram duration sum overflow")?;
+        let millis = duration
+            .as_millis()
+            .clamp(1, config.histogram_max_duration.as_millis()) as u64;
         self.histogram.record(millis)?;
+        self.duration_sum = sum;
         Ok(())
     }
+}
+
+enum MetricSample {
+    Counter(f32),
+    Gauge(f32),
+    Histogram(Duration),
 }
 
 #[derive(Clone)]
@@ -147,7 +168,7 @@ pub struct MetricStoreConfig {
 }
 
 #[derive(Clone)]
-pub struct MetricStore {
+pub struct MetricStore<C: Counter = u8> {
     base_ts: SystemTime,
     config: MetricStoreConfig,
 
@@ -155,7 +176,7 @@ pub struct MetricStore {
     metrics_by_name: HashMap<MetricName, MetricKey>,
 
     counter_buckets: Slab<CounterBucket>,
-    histogram_buckets: Slab<HistogramBucket>,
+    histogram_buckets: Slab<HistogramBucket<C>>,
     gauge_buckets: Slab<GaugeBucket>,
 
     // Bucket keys in both indexes point into the slab selected by the metric's type.
@@ -163,7 +184,7 @@ pub struct MetricStore {
     bucket_by_metric: OrdMap<(MetricKey, BucketIndex), BucketKey>,
 }
 
-impl MetricStore {
+impl<C: Counter> MetricStore<C> {
     pub fn new(base_ts: SystemTime, config: MetricStoreConfig) -> Self {
         Self {
             base_ts,
@@ -190,7 +211,7 @@ impl MetricStore {
         ts: SystemTime,
         value: f32,
     ) -> Result<(), UdfMetricsError> {
-        self.add(MetricType::Counter, metric_name, ts, value)
+        self.add(metric_name, ts, MetricSample::Counter(value))
     }
 
     /// Add a sample to a histogram metric. Similar to `add_counter`, this
@@ -202,7 +223,7 @@ impl MetricStore {
         ts: SystemTime,
         value: Duration,
     ) -> Result<(), UdfMetricsError> {
-        self.add(MetricType::Histogram, metric_name, ts, value.as_secs_f32())
+        self.add(metric_name, ts, MetricSample::Histogram(value))
     }
 
     /// Add a sample to a gauge metric, allocating the metric if it doesn't
@@ -213,7 +234,7 @@ impl MetricStore {
         ts: SystemTime,
         value: f32,
     ) -> Result<(), UdfMetricsError> {
-        self.add(MetricType::Gauge, metric_name, ts, value)
+        self.add(metric_name, ts, MetricSample::Gauge(value))
     }
 
     /// Add a sample to a gauge metric, but only update if the new value is
@@ -321,56 +342,60 @@ impl MetricStore {
 
     fn add(
         &mut self,
-        metric_type: MetricType,
         metric_name: &str,
         ts: SystemTime,
-        value: f32,
+        sample: MetricSample,
     ) -> Result<(), UdfMetricsError> {
+        let metric_type = match sample {
+            MetricSample::Counter(_) => MetricType::Counter,
+            MetricSample::Gauge(_) => MetricType::Gauge,
+            MetricSample::Histogram(_) => MetricType::Histogram,
+        };
         let bucket_index = self.validate_and_get_bucket_index(ts)?;
         let metric_key = self.get_or_create_metric(metric_name, metric_type)?;
 
         let inserted = match self.bucket_by_metric.entry((metric_key, bucket_index)) {
             // Try to log into the desired bucket if it exists.
             ordmap::Entry::Occupied(bucket_key) => {
-                match metric_type {
-                    MetricType::Counter => {
+                match sample {
+                    MetricSample::Counter(value) => {
                         let bucket = self
                             .counter_buckets
                             .get_mut(*bucket_key.get())
                             .context("Invalid bucket key")?;
                         bucket.value += value;
                     },
-                    MetricType::Gauge => {
+                    MetricSample::Gauge(value) => {
                         let bucket = self
                             .gauge_buckets
                             .get_mut(*bucket_key.get())
                             .context("Invalid bucket key")?;
                         bucket.value = value;
                     },
-                    MetricType::Histogram => {
+                    MetricSample::Histogram(value) => {
                         let bucket = self
                             .histogram_buckets
                             .get_mut(*bucket_key.get())
                             .context("Invalid bucket key")?;
-                        bucket.record(&self.config, Duration::from_secs_f32(value))?;
+                        bucket.record(&self.config, value)?;
                     },
                 }
                 false
             },
             // Otherwise, create a new bucket.
             ordmap::Entry::Vacant(entry) => {
-                let new_bucket_key = match metric_type {
-                    MetricType::Counter => {
+                let new_bucket_key = match sample {
+                    MetricSample::Counter(value) => {
                         let new_bucket = CounterBucket::new(bucket_index, value);
                         self.counter_buckets.alloc(new_bucket)
                     },
-                    MetricType::Gauge => {
+                    MetricSample::Gauge(value) => {
                         let new_bucket = GaugeBucket::new(bucket_index, value);
                         self.gauge_buckets.alloc(new_bucket)
                     },
-                    MetricType::Histogram => {
+                    MetricSample::Histogram(value) => {
                         let mut new_bucket = HistogramBucket::new(&self.config, bucket_index)?;
-                        new_bucket.record(&self.config, Duration::from_secs_f32(value))?;
+                        new_bucket.record(&self.config, value)?;
                         self.histogram_buckets.alloc(new_bucket)
                     },
                 };
@@ -505,7 +530,7 @@ impl MetricStore {
         &self,
         metric_name: &str,
         range: Range<SystemTime>,
-    ) -> Result<Vec<&HistogramBucket>, UdfMetricsError> {
+    ) -> Result<Vec<&HistogramBucket<C>>, UdfMetricsError> {
         if range.end <= range.start {
             return Err(UdfMetricsError::InvalidTimeRange {
                 start: range.start,
@@ -727,9 +752,9 @@ impl MetricsWindow {
 
     /// Resample a (potentially sparse) counter timeseries into the desired
     /// `MetricsWindow`.
-    pub fn resample_counters(
+    pub fn resample_counters<C: Counter>(
         &self,
-        metrics: &MetricStore,
+        metrics: &MetricStore<C>,
         buckets: Vec<&CounterBucket>,
         is_rate: bool,
     ) -> anyhow::Result<Timeseries> {
@@ -777,9 +802,9 @@ impl MetricsWindow {
         Ok(result)
     }
 
-    pub fn resample_gauges(
+    pub fn resample_gauges<C: Counter>(
         &self,
-        metrics: &MetricStore,
+        metrics: &MetricStore<C>,
         buckets: Vec<&GaugeBucket>,
     ) -> anyhow::Result<Timeseries> {
         // Start by filling out the output buckets with unknown values.
@@ -833,10 +858,10 @@ impl MetricsWindow {
         Ok(result)
     }
 
-    pub fn resample_histograms(
+    pub fn resample_histograms<C: Counter>(
         &self,
-        metrics: &MetricStore,
-        buckets: Vec<&HistogramBucket>,
+        metrics: &MetricStore<C>,
+        buckets: Vec<&HistogramBucket<C>>,
         percentiles: &[Percentile],
     ) -> anyhow::Result<BTreeMap<Percentile, Timeseries>> {
         if percentiles.len() > 5 {
@@ -867,7 +892,7 @@ impl MetricsWindow {
             let bucket_start = metrics.bucket_start(bucket_index);
             if (self.start..self.end).contains(&bucket_start) {
                 let (_, value) = &mut histograms[self.bucket_index(bucket_start)?];
-                let histogram = Histogram::new_with_bounds(
+                let histogram = Histogram::<C>::new_with_bounds(
                     metrics.config.histogram_min_duration.as_millis() as u64,
                     metrics.config.histogram_max_duration.as_millis() as u64,
                     metrics.config.histogram_significant_figures,
@@ -915,3 +940,85 @@ pub type Timeseries = Vec<(SystemTime, Option<f64>)>;
 
 /// Integer in [0, 100].
 pub type Percentile = usize;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u32_histograms_preserve_percentiles_after_more_than_255_samples_in_one_bin() {
+        let base_ts = SystemTime::UNIX_EPOCH;
+        let mut metrics = MetricStore::<u32>::new(
+            base_ts,
+            MetricStoreConfig {
+                bucket_width: Duration::from_secs(60),
+                max_buckets: 1,
+                histogram_min_duration: Duration::from_millis(1),
+                histogram_max_duration: Duration::from_secs(1),
+                histogram_significant_figures: 3,
+            },
+        );
+        let sample_ts = base_ts + Duration::from_secs(1);
+        for _ in 0..300 {
+            metrics
+                .add_histogram("latency", sample_ts, Duration::from_millis(10))
+                .unwrap();
+        }
+        metrics
+            .add_histogram("latency", sample_ts, Duration::from_secs(1))
+            .unwrap();
+
+        let window = MetricsWindow {
+            start: base_ts,
+            end: base_ts + Duration::from_secs(60),
+            num_buckets: 1,
+        };
+        let buckets = metrics
+            .query_histogram("latency", window.start..window.end)
+            .unwrap();
+        assert_eq!(buckets[0].histogram.len(), 301);
+        assert_eq!(buckets[0].duration_sum, Duration::from_secs(4));
+
+        let percentiles = window
+            .resample_histograms(&metrics, buckets, &[90])
+            .unwrap();
+        assert_eq!(percentiles[&90][0], (base_ts, Some(0.01)));
+    }
+
+    #[test]
+    fn histogram_sums_preserve_original_durations_and_bucket_retention() {
+        let start = SystemTime::UNIX_EPOCH;
+        let mut metrics = MetricStore::<u32>::new(
+            start,
+            MetricStoreConfig {
+                bucket_width: Duration::from_secs(60),
+                max_buckets: 1,
+                histogram_min_duration: Duration::from_millis(1),
+                histogram_max_duration: Duration::from_secs(1),
+                histogram_significant_figures: 3,
+            },
+        );
+        for duration in [
+            Duration::ZERO,
+            Duration::from_nanos(123456789),
+            Duration::from_secs(2),
+        ] {
+            metrics.add_histogram("latency", start, duration).unwrap();
+        }
+        let buckets = metrics
+            .query_histogram("latency", start..start + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(buckets[0].histogram.len(), 3);
+        assert_eq!(buckets[0].duration_sum.as_nanos(), 2123456789);
+        let next = start + Duration::from_secs(60);
+        metrics
+            .add_histogram("latency", next, Duration::from_nanos(1))
+            .unwrap();
+        let buckets = metrics
+            .query_histogram("latency", start..next + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].histogram.len(), 1);
+        assert_eq!(buckets[0].duration_sum, Duration::from_nanos(1));
+    }
+}

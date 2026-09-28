@@ -130,9 +130,32 @@ pub struct IndexRangeResponse {
     pub cursor: CursorPosition,
 }
 
+/// Keep ordinary query documents packed until a consumer needs an owned value.
+#[derive(Debug)]
+pub enum QueryDocument {
+    Packed(PackedDocument),
+    Materialized(DeveloperDocument),
+}
+
+impl QueryDocument {
+    pub fn size(&self) -> usize {
+        match self {
+            Self::Packed(document) => document.size(),
+            Self::Materialized(document) => document.size(),
+        }
+    }
+
+    pub fn into_developer(self) -> DeveloperDocument {
+        match self {
+            Self::Packed(document) => document.unpack().to_developer(),
+            Self::Materialized(document) => document,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum QueryStreamNext {
-    Ready(Option<(DeveloperDocument, WriteTimestamp)>),
+    Ready(Option<(QueryDocument, WriteTimestamp)>),
     WaitingOn(IndexRangeRequest),
 }
 
@@ -525,6 +548,17 @@ impl<RT: Runtime> DeveloperQuery<RT> {
             .context("batch_key missing")?
     }
 
+    pub async fn next_document_with_ts(
+        &mut self,
+        tx: &mut Transaction<RT>,
+        prefetch_hint: Option<usize>,
+    ) -> anyhow::Result<Option<(QueryDocument, WriteTimestamp)>> {
+        query_batch_next_document(btreemap! {0 => (self, prefetch_hint)}, tx)
+            .await
+            .remove(&0)
+            .context("batch_key missing")?
+    }
+
     pub fn printable_index_name(&self) -> &IndexName {
         self.root.printable_index_name()
     }
@@ -574,13 +608,34 @@ pub fn query_batch_next<'a, RT: Runtime>(
     tx: &'a mut Transaction<RT>,
 ) -> BoxFuture<'a, BTreeMap<BatchKey, anyhow::Result<Option<(DeveloperDocument, WriteTimestamp)>>>>
 {
-    query_batch_next_(batch, tx).boxed()
+    async move {
+        query_batch_next_document(batch, tx)
+            .await
+            .into_iter()
+            .map(|(key, result)| {
+                (
+                    key,
+                    result.map(|document| {
+                        document.map(|(document, timestamp)| (document.into_developer(), timestamp))
+                    }),
+                )
+            })
+            .collect()
+    }
+    .boxed()
 }
 
-pub async fn query_batch_next_<RT: Runtime>(
+pub fn query_batch_next_document<'a, RT: Runtime>(
+    batch: BTreeMap<BatchKey, (&'a mut DeveloperQuery<RT>, Option<usize>)>,
+    tx: &'a mut Transaction<RT>,
+) -> BoxFuture<'a, BTreeMap<BatchKey, anyhow::Result<Option<(QueryDocument, WriteTimestamp)>>>> {
+    query_batch_next_document_(batch, tx).boxed()
+}
+
+async fn query_batch_next_document_<RT: Runtime>(
     mut batch: BTreeMap<BatchKey, (&mut DeveloperQuery<RT>, Option<usize>)>,
     tx: &mut Transaction<RT>,
-) -> BTreeMap<BatchKey, anyhow::Result<Option<(DeveloperDocument, WriteTimestamp)>>> {
+) -> BTreeMap<BatchKey, anyhow::Result<Option<(QueryDocument, WriteTimestamp)>>> {
     let batch_size = batch.len();
     // Algorithm overview:
     // Call `next` on every query.

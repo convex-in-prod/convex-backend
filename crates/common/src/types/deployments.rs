@@ -104,5 +104,4 @@ pub struct DeploymentMetadata {
     pub class: DeploymentClass,
 }
 
-impl DeploymentMetadata {
-}
+impl DeploymentMetadata {}

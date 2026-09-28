@@ -17,6 +17,12 @@ The later [HTTP mutation priority contract](../../crates/isolate/README.md#http-
 adds a separate high-mutation class with bounded preference, including when
 service floors and the control-plane lane are disabled.
 
+The optional [Wasm runtime](../static_hermes_wasm_udfs/operations.md) also uses
+the existing internal V8 dependency path for nested UDFs. A Wasm parent retains
+its instance, memory charge and transaction while releasing its CPU permit.
+That retained runtime ownership grants the child dependency service even when
+no ancestor holds a V8 worker. Detached verifier roots remain independent.
+
 This document covers two patches that can be applied independently:
 
 - the runtime admission patch makes the self-hosted HTTP gates configurable,
@@ -195,6 +201,7 @@ The stock self-hosted Compose file passes through `MAX_ISOLATE_WORKERS`,
 `MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION`,
 `ISOLATE_QUEUE_SIZE`, `FUNRUN_ISOLATE_ACTIVE_THREADS`,
 `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS`,
+`ISOLATE_DEGRADABLE_QUERY_ANALYSIS_CAPACITY`,
 `FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN`, and
 `FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN`. Unset values continue to use
 backend defaults.
@@ -204,7 +211,7 @@ backend defaults.
 The scheduler records three independent request properties:
 
 - `unblocks_ancestor`: this request was submitted by a function that is still
-  retaining an isolate worker;
+  retaining runtime resources, such as a V8 worker or a Wasm instance;
 - `can_block_on_descendant`: this request can submit another separately
   scheduled function while retaining its own worker;
 - `is_isolate_action`: this is a V8 or HTTP action subject to the independent
@@ -608,8 +615,12 @@ points at admission pressure before the scheduler can choose a worker.
 after an isolate worker or worker channel failed. New sends after the receiver
 closes increment this reason. Requests already queued are dropped so their
 callers receive a shutdown error rather than hanging, but those drops are not
-individually added to the rejection counter. These five reason values and the
-five scheduler classes below are closed metric-label contracts.
+individually added to the rejection counter.
+`reason="degradable_query_analysis_capacity"` means a degradable V8 request
+could not acquire the V8 query/analysis reservation before entering the queue.
+It returns the existing degradable-capacity outcome; dependency work is exempt.
+These six reason values and the five scheduler classes below are closed
+metric-label contracts.
 
 Use
 `isolate_scheduler_active_requests_info{pool_name,scheduler_class,is_isolate_action}`
@@ -624,8 +635,11 @@ paired increments and decrements so concurrent worker completions cannot publish
 an older absolute count after a newer one.
 
 Use `isolate_scheduler_capacity_info{pool_name,capacity_kind}` to confirm the
-resolved `physical`, `base`, `independent_action`, and `independent_action_per_function` capacities. This is
-the fastest way to detect a missing or stale deployment knob.
+resolved `physical`, `base`, `independent_action`, and
+`independent_action_per_function` capacities. When configured,
+`degradable_query_analysis` reports the V8 reservation cap, independently of
+the application leader bound. This is the fastest way to detect a missing or
+stale deployment knob.
 
 Use `scheduled_job_execution_parallelism_info` to confirm the resolved
 `SCHEDULED_JOB_EXECUTION_PARALLELISM` value without depending on process startup

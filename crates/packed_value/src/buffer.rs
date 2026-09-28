@@ -24,31 +24,40 @@ use serde::{
 };
 use value::heap_size::HeapSize;
 
+use crate::memory::PACKED_BUFFER_MEMORY;
+
 scoped_thread_local!(pub(crate) static PARENT_BUFFER: Bytes);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct ByteBuffer {
     pub(crate) inner: Bytes,
+    backing_len: usize,
 }
 
-impl<B> From<B> for ByteBuffer
-where
-    Bytes: From<B>,
-{
-    fn from(buf: B) -> Self {
-        Self::new(Bytes::from(buf))
+impl PartialEq for ByteBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl From<Vec<u8>> for ByteBuffer {
+    fn from(buf: Vec<u8>) -> Self {
+        Self {
+            backing_len: buf.len(),
+            inner: PACKED_BUFFER_MEMORY.track(buf),
+        }
     }
 }
 
 impl ByteBuffer {
-    pub fn new(inner: Bytes) -> Self {
-        Self { inner }
-    }
-
     pub fn shrink(self) -> Self {
-        let mut buf = Vec::from(self.inner);
-        buf.shrink_to_fit();
-        Self::new(buf.into())
+        if self.inner.len() == self.backing_len {
+            self
+        } else {
+            // Only a slice needs detaching. Whole buffers were tightened before
+            // tracking; copying them here would defeat zero-copy cache sharing.
+            self.inner.to_vec().into()
+        }
     }
 }
 
@@ -69,12 +78,14 @@ impl Buffer for ByteBuffer {
         }
         Some(Self {
             inner: self.inner.slice(range),
+            backing_len: self.backing_len,
         })
     }
 
     fn empty() -> Self {
         Self {
             inner: Bytes::new(),
+            backing_len: 0,
         }
     }
 
@@ -88,6 +99,7 @@ impl Buffer for ByteBuffer {
     fn shallow_copy(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            backing_len: self.backing_len,
         }
     }
 
@@ -159,7 +171,7 @@ impl<'de> Deserialize<'de> for StringBuffer {
                     return Ok(StringBuffer { inner: v });
                 }
                 Ok(StringBuffer {
-                    inner: v.as_bytes().to_owned().into(),
+                    inner: PACKED_BUFFER_MEMORY.track(v.as_bytes().to_owned()),
                 })
             }
 
@@ -177,7 +189,7 @@ impl<'de> Deserialize<'de> for StringBuffer {
 impl StringBuffer {
     pub fn new(s: String) -> StringBuffer {
         StringBuffer {
-            inner: s.into_bytes().into(),
+            inner: PACKED_BUFFER_MEMORY.track(s.into_bytes()),
         }
     }
 }
@@ -185,5 +197,59 @@ impl StringBuffer {
 impl HeapSize for StringBuffer {
     fn heap_size(&self) -> usize {
         self.inner.heap_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::BufferMemory;
+
+    #[test]
+    fn backing_charge_survives_cache_eviction_and_all_slice_paths() {
+        static MEMORY: BufferMemory = BufferMemory::new();
+        let mut data = Vec::with_capacity(1024);
+        data.extend_from_slice(b"abcdef");
+        let cached = ByteBuffer {
+            backing_len: data.len(),
+            inner: MEMORY.track(data),
+        };
+        assert_eq!(MEMORY.bytes(), 6);
+        let reader = cached.clone();
+        let shallow = cached.shallow_copy();
+        let slice = cached.slice(1..4).unwrap();
+        let string = slice.buffer_str().unwrap();
+        let parsed = PARENT_BUFFER.set(&cached.inner, || {
+            StringBuffer::deserialize(
+                serde::de::value::StrDeserializer::<serde::de::value::Error>::new(
+                    &reader.buffer_str().unwrap()[2..5],
+                ),
+            )
+            .unwrap()
+        });
+        drop(cached);
+        drop(reader);
+        drop(shallow);
+        drop(slice);
+        assert_eq!(MEMORY.bytes(), 6);
+        assert_eq!(&*string, "bcd");
+        assert_eq!(&*parsed, "cde");
+        drop(string);
+        assert_eq!(MEMORY.bytes(), 6);
+        std::thread::spawn(move || drop(parsed)).join().unwrap();
+        assert_eq!(MEMORY.bytes(), 0);
+    }
+
+    #[test]
+    fn shrink_reuses_whole_backing_and_detaches_slices() {
+        let whole = ByteBuffer::from(b"abcdef".to_vec());
+        let pointer = whole.as_ptr();
+        let slice = whole.slice(1..4).unwrap();
+        let whole = whole.shrink();
+        assert_eq!(whole.as_ptr(), pointer);
+        let compact = slice.clone().shrink();
+        assert_eq!(compact, slice);
+        assert_eq!(compact.backing_len, 3);
+        assert_ne!(compact.as_ptr(), slice.as_ptr());
     }
 }

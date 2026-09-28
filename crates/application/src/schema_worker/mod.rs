@@ -473,7 +473,7 @@ impl<RT: Runtime> SchemaWorker<RT> {
                 .await?;
             if deleted > 0 {
                 self.database
-                    .commit_with_write_source(tx, "schema_validation_attempt_cleanup")
+                    .commit(tx, "schema_validation_attempt_cleanup")
                     .await?;
             }
         }

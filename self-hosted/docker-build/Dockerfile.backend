@@ -152,6 +152,7 @@ ARG NATIVE_PREBUILD_PACKAGES=
 ARG RUSTC_PARALLEL_FRONTEND_THREADS=
 ARG SCCACHE_CACHE_SIZE=
 ARG SERIALIZE_LOCAL_BACKEND_CODEGEN=false
+ARG BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY=false
 ARG TARGETARCH
 # Keep the final Cargo graph concurrency independent from an optional native
 # dependency prebuild. The prebuild uses Cargo's own job count so build scripts
@@ -285,6 +286,41 @@ feature_args=()
 if [[ -n "$LOCAL_BACKEND_FEATURES" ]]; then
   feature_args=(--features "$LOCAL_BACKEND_FEATURES")
 fi
+# The authenticated AOT contract is pinned to x86_64-unknown-linux-gnu. Reject
+# an unsupported image target before spending time on a native prebuild.
+static_hermes_wasmtime_gate_selected=false
+read -r -a local_backend_features <<< "${LOCAL_BACKEND_FEATURES//,/ }"
+for feature in "${local_backend_features[@]}"; do
+  case "$feature" in
+    static-hermes-wasmtime-gate|local_backend/static-hermes-wasmtime-gate)
+      static_hermes_wasmtime_gate_selected=true
+      ;;
+  esac
+done
+if [[ "$static_hermes_wasmtime_gate_selected" == true && "$TARGETARCH" != amd64 ]]; then
+  echo "static-hermes-wasmtime-gate requires Docker target architecture amd64" >&2
+  exit 1
+fi
+helper_cargo_args=()
+helper_parallel_args=()
+case "$BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY" in
+  true)
+    if [[ "$static_hermes_wasmtime_gate_selected" != true ]]; then
+      echo "BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY requires static-hermes-wasmtime-gate" >&2
+      exit 1
+    fi
+    helper_cargo_args=(-p application --bin source_package_preactivation_authority
+      --features application/static-hermes-wasmtime-gate)
+    # Keep the backend's feature selection in the helper/key-generator graph even when
+    # target-only rustc flags require compiling the backend binary separately.
+    helper_parallel_args=(-p local_backend "${feature_args[@]}" "${helper_cargo_args[@]}")
+    ;;
+  false) ;;
+  *)
+    echo "BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY must be true or false" >&2
+    exit 1
+    ;;
+esac
 # Build selected native dependency packages with a wider Cargo jobserver before
 # the constrained final graph. Matching profile arguments and the shared target
 # directory make these artifacts reusable by the final build.
@@ -316,7 +352,8 @@ if [[ -z "$RUSTC_PARALLEL_FRONTEND_THREADS" ]]; then
     -p keybroker \
     "${feature_args[@]}" \
     --bin convex-local-backend \
-    --bin generate_key
+    --bin generate_key \
+    "${helper_cargo_args[@]}"
 else
   # `cargo rustc` accepts extra compiler arguments for only one selected target.
   # Build keybroker separately, then apply parallel front-end threads only to
@@ -327,7 +364,8 @@ else
     --artifact-dir "$artifact_dir" \
     --profile "$CARGO_BUILD_PROFILE" \
     -p keybroker \
-    --bin generate_key
+    --bin generate_key \
+    "${helper_parallel_args[@]}"
   cargo "${cargo_profile_args[@]}" rustc \
     --locked \
     --profile "$CARGO_BUILD_PROFILE" \
@@ -347,6 +385,9 @@ else
 fi
 test -x "$artifact_dir/convex-local-backend"
 test -x "$artifact_dir/generate_key"
+if [[ "$BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY" == true ]]; then
+  test -x "$artifact_dir/source_package_preactivation_authority"
+fi
 EOF
 ARG debug
 RUN <<EOF
@@ -375,6 +416,9 @@ if [[ -z "${debug:-}" &&
     ""|false|0|none)
       strip convex-local-backend
       strip generate_key
+      if [[ "$BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY" == true ]]; then
+        strip source_package_preactivation_authority
+      fi
       ;;
   esac
 fi
@@ -389,8 +433,11 @@ EOF
 # CI tests share the build environment and cache mounts, but never enter the
 # runtime image. Test-only features and unwinding require a separate Rust graph.
 FROM build-source AS rust-tests
+# The unoptimized Wasm executor futures are polled on the libtest thread.
+# Its default 2 MiB stack can abort the harness before it reports results.
 ENV CARGO_PROFILE_TEST_DEBUG=0 \
     CARGO_INCREMENTAL=0 \
+    FUNRUN_ISOLATE_ACTIVE_THREADS=4 \
     RUST_MIN_STACK=16777216 \
     RUST_BACKTRACE=1
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
@@ -413,8 +460,25 @@ fi
 export SCCACHE_IDLE_TIMEOUT=0
 sccache --start-server
 trap 'sccache --stop-server' EXIT
-cargo test --locked --profile test --lib --no-fail-fast -p application -p node_executor -- \
-  deployment_receipt_tests:: action_tree::tests:: --test-threads=1
+test_args=(test --locked --profile test --lib)
+# Libtest runs serially because these tests share process-wide runtime state.
+# Individual tests still exercise concurrent loads, Stores and waiters.
+status=0
+cargo "${test_args[@]}" --no-fail-fast -p application -p node_executor \
+  --features application/static-hermes-wasmtime-gate -- \
+  deployment_receipt_tests:: source_keyed_finish_push_persists_exact_generation_and_fences_both_commit_orders \
+  action_tree::tests:: --test-threads=1 || status=$?
+isolate_args=("${test_args[@]}" -p isolate --features static-hermes-wasmtime-gate)
+cargo "${isolate_args[@]}" -- wasm module_graph_registry host_operation_error_cause --test-threads=1 || status=$?
+# Each Cargo invocation starts a fresh test process, so cached worker settings
+# cannot hide the single-worker or CPU-derived configuration.
+for workers in 1 0; do
+  FUNRUN_ISOLATE_ACTIVE_THREADS="$workers" cargo "${isolate_args[@]}" -- \
+    routing_runtime::preparation::tests \
+    graph_leaf_cache_reuses_published_module_and_reconstructs_missing_aot \
+    --test-threads=1 || status=$?
+done
+exit "$status"
 EOF
 
 # Final stage: Creates minimal runtime image with only necessary components

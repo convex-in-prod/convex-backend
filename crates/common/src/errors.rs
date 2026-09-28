@@ -779,7 +779,6 @@ impl JsError {
             frames: Some(JsFrames(mapped_frames.into())),
         }
     }
-
 }
 
 /// Look up a token only on the requested zero-based generated line.
