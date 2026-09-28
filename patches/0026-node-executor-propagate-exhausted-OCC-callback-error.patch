@@ -1,0 +1,566 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Tue, 29 Sep 2026 04:02:39 +0800
+Subject: [PATCH 26/26] node-executor: propagate exhausted OCC callback errors
+
+The mutation runner already applies its bounded OCC retry policy before
+returning OptimisticConcurrencyControlFailure as HTTP 503. Treating that
+response as a generic transient failure in the Node callback loop restarts
+the whole mutation budget up to five times.
+
+Inspect intermediate 503 bodies for the structured OCC code and propagate
+a positively identified error through the existing caller error handler.
+Keep ordinary 5xx and transport retries, including the stable mutation
+identifier used to deduplicate committed results.
+
+Bound body inspection by size and time, consume the original stream rather
+than cloning it, and honor action disposal without waiting for cancellation
+to finish. Unclassifiable responses retain the transient retry policy.
+
+Cover OCC propagation, retry budgets and identifiers, malformed and stalled
+bodies, UTF-8 boundaries, and action disposal with focused regression tests.
+---
+ .../node-executor/src/syscalls.test.ts        | 404 +++++++++++++++++-
+ npm-packages/node-executor/src/syscalls.ts    |  88 +++-
+ 2 files changed, 484 insertions(+), 8 deletions(-)
+
+diff --git a/npm-packages/node-executor/src/syscalls.test.ts b/npm-packages/node-executor/src/syscalls.test.ts
+index 115c4b6691d6f31c4b50db6ebae830cd81944002..3bd1fa282ef67f2b46d235e7fcb60f73ac248bd3 100644
+--- a/npm-packages/node-executor/src/syscalls.test.ts
++++ b/npm-packages/node-executor/src/syscalls.test.ts
+@@ -1,4 +1,5 @@
+-import { expect, test } from "vitest";
++import { getEventListeners } from "node:events";
++import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+ 
+ import { SyscallsImpl } from "./syscalls";
+ 
+@@ -34,3 +35,404 @@ test("action callbacks propagate isolate-worker ancestry", () => {
+     "Convex-Isolate-Worker-Ancestor",
+   );
+ });
++
++describe("action callback retries", () => {
++  const fetchMock = vi.fn<typeof fetch>();
++  const syscallArgs = JSON.stringify({
++    requestId: "lambda-execute-id",
++    name: "functions:run",
++    args: [{ input: "value" }],
++    version: "1.0",
++  });
++  const occBody = JSON.stringify(
++    {
++      code: "OptimisticConcurrencyControlFailure",
++      message: "Documents changed on every retry: café.",
++    },
++    null,
++    2,
++  );
++
++  beforeEach(() => {
++    vi.useFakeTimers();
++    vi.spyOn(Math, "random").mockReturnValue(0.5);
++    fetchMock.mockReset();
++    fetchMock.mockImplementation(
++      async () =>
++        new Response(
++          JSON.stringify({ status: "success", value: { result: "ok" } }),
++        ),
++    );
++    vi.stubGlobal("fetch", fetchMock);
++  });
++
++  afterEach(() => {
++    vi.useRealTimers();
++    vi.restoreAllMocks();
++    vi.unstubAllGlobals();
++  });
++
++  test.each(["query", "mutation"])(
++    "%s forwards exhausted OCC without restarting the backend retry budget",
++    async (operation) => {
++      fetchMock.mockResolvedValueOnce(new Response(occBody, { status: 503 }));
++      const syscalls = makeSyscalls(false);
++
++      await expect(
++        syscalls.asyncSyscall(`1.0/actions/${operation}`, syscallArgs),
++      ).rejects.toEqual(new Error(occBody));
++
++      expect(fetchMock).toHaveBeenCalledTimes(1);
++      expect(vi.getTimerCount()).toBe(0);
++      expect(syscalls.pendingSyscallCount[`1.0/actions/${operation}`]).toBe(0);
++    },
++  );
++
++  test.each([500, 502, 503, 504, 599])(
++    "retries HTTP %i and preserves the mutation result and deduplication identifier",
++    async (status) => {
++      fetchMock.mockResolvedValueOnce(
++        new Response(
++          JSON.stringify({ code: "Overloaded", message: "Try again" }),
++          { status },
++        ),
++      );
++      fetchMock.mockRejectedValueOnce(
++        new TypeError("fetch failed", { cause: { code: "ECONNRESET" } }),
++      );
++      const syscalls = makeSyscalls(false);
++      const result = expect(
++        syscalls.asyncSyscall("1.0/actions/mutation", syscallArgs),
++      ).resolves.toBe(JSON.stringify({ result: "ok" }));
++      await vi.runAllTimersAsync();
++      await result;
++
++      await expect(
++        syscalls.asyncSyscall("1.0/actions/mutation", syscallArgs),
++      ).resolves.toBe(JSON.stringify({ result: "ok" }));
++      expect(fetchMock).toHaveBeenCalledTimes(4);
++      const requests: unknown[] = fetchMock.mock.calls.map(([url, init]) => {
++        expect(String(url)).toBe("http://127.0.0.1:3210/api/actions/mutation");
++        expect(init?.signal).toBe(syscalls.abortController.signal);
++        expect(typeof init?.body).toBe("string");
++        return JSON.parse(init!.body as string);
++      });
++      expect(requests[0]).toEqual({
++        path: "functions:run",
++        args: [{ input: "value" }],
++        mutationIdentifier: {
++          sessionId: syscalls.mutationSessionId,
++          requestId: 0,
++        },
++      });
++      expect(requests[1]).toEqual(requests[0]);
++      expect(requests[2]).toEqual(requests[0]);
++      expect(requests[3]).toMatchObject({
++        mutationIdentifier: {
++          sessionId: syscalls.mutationSessionId,
++          requestId: 1,
++        },
++      });
++    },
++  );
++
++  test("queries retry ordinary 503 responses without mutation identifiers", async () => {
++    fetchMock.mockResolvedValueOnce(
++      new Response("Unavailable", { status: 503 }),
++    );
++    const result = expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/query", syscallArgs),
++    ).resolves.toBe(JSON.stringify({ result: "ok" }));
++    await vi.runAllTimersAsync();
++    await result;
++
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    for (const [url, init] of fetchMock.mock.calls) {
++      expect(String(url)).toBe("http://127.0.0.1:3210/api/actions/query");
++      expect(JSON.parse(init!.body as string)).not.toHaveProperty(
++        "mutationIdentifier",
++      );
++    }
++  });
++
++  test("ordinary 503 failures retain the five-attempt limit and final error body", async () => {
++    fetchMock.mockImplementation(
++      async () => new Response("Proxy unavailable", { status: 503 }),
++    );
++    const result = expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).rejects.toEqual(new Error("Proxy unavailable"));
++    await vi.runAllTimersAsync();
++    await result;
++
++    expect(fetchMock).toHaveBeenCalledTimes(5);
++    expect(vi.getTimerCount()).toBe(0);
++  });
++
++  test.each([
++    ["empty body", null],
++    ["HTML", "<html>Service unavailable</html>"],
++    ["plain OCC text", "OptimisticConcurrencyControlFailure"],
++    ["truncated JSON", '{"code":"OptimisticConcurrencyControlFailure",'],
++    ["JSON null", "null"],
++    ["JSON string", JSON.stringify("OptimisticConcurrencyControlFailure")],
++    ["array", `[${occBody}]`],
++    ["nested code", JSON.stringify({ error: JSON.parse(occBody) })],
++    ["missing message", '{"code":"OptimisticConcurrencyControlFailure"}'],
++    [
++      "nonstring message",
++      '{"code":"OptimisticConcurrencyControlFailure","message":null}',
++    ],
++    ["nonstring code", '{"code":503,"message":"Unavailable"}'],
++    [
++      "code suffix",
++      '{"code":"OptimisticConcurrencyControlFailureExtra","message":"Unavailable"}',
++    ],
++    [
++      "wrong code case",
++      '{"code":"optimisticConcurrencyControlFailure","message":"Unavailable"}',
++    ],
++    [
++      "OCC mentioned in another error",
++      '{"code":"Overloaded","message":"OptimisticConcurrencyControlFailure"}',
++    ],
++  ])("retries a 503 with %s", async (_description, body) => {
++    fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++    const result = expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).resolves.toBe(JSON.stringify({ result: "ok" }));
++    await vi.runAllTimersAsync();
++    await result;
++
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  test("does not infer OCC from its code on a different HTTP status", async () => {
++    fetchMock.mockResolvedValueOnce(new Response(occBody, { status: 502 }));
++    const result = expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).resolves.toBe(JSON.stringify({ result: "ok" }));
++    await vi.runAllTimersAsync();
++    await result;
++
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  test("forwards OCC after a transient failure and permits a separate caller retry", async () => {
++    fetchMock.mockResolvedValueOnce(
++      new Response("Unavailable", { status: 503 }),
++    );
++    fetchMock.mockResolvedValueOnce(new Response(occBody, { status: 503 }));
++    const syscalls = makeSyscalls(false);
++    const result = expect(
++      syscalls.asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).rejects.toEqual(new Error(occBody));
++    await vi.runAllTimersAsync();
++    await result;
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    expect(fetchMock.mock.calls[0][1]?.body).toBe(
++      fetchMock.mock.calls[1][1]?.body,
++    );
++
++    await expect(
++      syscalls.asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).resolves.toBe(JSON.stringify({ result: "ok" }));
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++    expect(
++      JSON.parse(fetchMock.mock.calls[2][1]!.body as string),
++    ).toMatchObject({
++      mutationIdentifier: {
++        sessionId: syscalls.mutationSessionId,
++        requestId: 1,
++      },
++    });
++  });
++
++  test.each(["query", "mutation", "action"])(
++    "%s preserves structured UDF errors without retrying",
++    async (operation) => {
++      fetchMock.mockResolvedValueOnce(
++        new Response(
++          JSON.stringify({ status: "error", errorMessage: "Function failed" }),
++          { status: 560 },
++        ),
++      );
++      await expect(
++        makeSyscalls(false).asyncSyscall(
++          `1.0/actions/${operation}`,
++          syscallArgs,
++        ),
++      ).rejects.toEqual(new Error("Function failed"));
++      expect(fetchMock).toHaveBeenCalledTimes(1);
++    },
++  );
++
++  test("does not retry non-idempotent action 503 responses", async () => {
++    fetchMock.mockResolvedValueOnce(
++      new Response("Unavailable", { status: 503 }),
++    );
++    await expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/action", syscallArgs),
++    ).rejects.toEqual(new Error("Unavailable"));
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++  });
++
++  test("accepts an OCC error split across response chunks", async () => {
++    const bytes = new TextEncoder().encode("\uFEFF" + occBody);
++    const body = new ReadableStream<Uint8Array>({
++      start(controller) {
++        for (const byte of bytes) {
++          controller.enqueue(Uint8Array.of(byte));
++        }
++        controller.close();
++      },
++    });
++    fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++    await expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).rejects.toEqual(new Error(occBody));
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++  });
++
++  test("retries after a response stream fails during OCC inspection", async () => {
++    const body = new ReadableStream<Uint8Array>({
++      start(controller) {
++        controller.enqueue(new TextEncoder().encode(occBody));
++      },
++      pull(controller) {
++        controller.error(
++          new Error("Connection reset before response completed"),
++        );
++      },
++    });
++    fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++    const result = expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).resolves.toBe(JSON.stringify({ result: "ok" }));
++    await vi.runAllTimersAsync();
++    await result;
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  test.each(["oversized", "stalled"])(
++    "bounds inspection and cancels an %s 503 response before retrying",
++    async (kind) => {
++      const cancel = vi.fn(() => new Promise<void>(() => {}));
++      const body = new ReadableStream<Uint8Array>({
++        start(controller) {
++          const text =
++            kind === "oversized" ? occBody + " ".repeat(128 * 1024) : occBody;
++          controller.enqueue(new TextEncoder().encode(text));
++        },
++        cancel,
++      });
++      fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++      const result = expect(
++        makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++      ).resolves.toBe(JSON.stringify({ result: "ok" }));
++      await vi.advanceTimersByTimeAsync(0);
++      expect(cancel).toHaveBeenCalledTimes(kind === "oversized" ? 1 : 0);
++      expect(fetchMock).toHaveBeenCalledTimes(1);
++      await vi.runAllTimersAsync();
++      await result;
++      expect(cancel).toHaveBeenCalledTimes(1);
++      expect(body.locked).toBe(false);
++      expect(fetchMock).toHaveBeenCalledTimes(2);
++      expect(vi.getTimerCount()).toBe(0);
++    },
++  );
++
++  test("disposing during OCC inspection parks the callback and cancels its stream", async () => {
++    const cancel = vi.fn();
++    const body = new ReadableStream<Uint8Array>({
++      start(controller) {
++        controller.enqueue(new TextEncoder().encode(occBody));
++      },
++      cancel,
++    });
++    fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++    const syscalls = makeSyscalls(false);
++    const settled = vi.fn();
++    void syscalls
++      .asyncSyscall("1.0/actions/mutation", syscallArgs)
++      .then(settled, settled);
++    await vi.advanceTimersByTimeAsync(0);
++    expect(body.locked).toBe(true);
++
++    syscalls.dispose();
++    await vi.runAllTimersAsync();
++
++    expect(cancel).toHaveBeenCalledTimes(1);
++    expect(body.locked).toBe(false);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(settled).not.toHaveBeenCalled();
++    expect(vi.getTimerCount()).toBe(0);
++  });
++
++  test("disposing during backoff stops retries and parks the callback", async () => {
++    fetchMock.mockResolvedValueOnce(
++      new Response("Unavailable", { status: 503 }),
++    );
++    const syscalls = makeSyscalls(false);
++    const settled = vi.fn();
++    void syscalls
++      .asyncSyscall("1.0/actions/mutation", syscallArgs)
++      .then(settled, settled);
++    await vi.advanceTimersByTimeAsync(0);
++
++    syscalls.dispose();
++    await vi.runAllTimersAsync();
++
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(settled).not.toHaveBeenCalled();
++    expect(vi.getTimerCount()).toBe(0);
++  });
++
++  test.each(["timeout", "dispose"])(
++    "handles a late stream cancellation failure after inspection ends by %s",
++    async (stop) => {
++      let rejectCancellation!: (reason: Error) => void;
++      const cancellation = new Promise<void>((_resolve, reject) => {
++        rejectCancellation = reject;
++      });
++      const cancel = vi.fn(() => cancellation);
++      const body = new ReadableStream<Uint8Array>({
++        start(controller) {
++          controller.enqueue(new TextEncoder().encode(occBody));
++        },
++        cancel,
++      });
++      fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++      const syscalls = makeSyscalls(false);
++      const settled = vi.fn();
++      void syscalls
++        .asyncSyscall("1.0/actions/mutation", syscallArgs)
++        .then(settled, settled);
++      await vi.advanceTimersByTimeAsync(0);
++      expect(body.locked).toBe(true);
++
++      if (stop === "dispose") {
++        syscalls.dispose();
++      }
++      await vi.runAllTimersAsync();
++      expect(settled).toHaveBeenCalledTimes(stop === "timeout" ? 1 : 0);
++      expect(cancel).toHaveBeenCalledTimes(1);
++      expect(body.locked).toBe(false);
++      expect(
++        getEventListeners(syscalls.abortController.signal, "abort"),
++      ).toEqual([]);
++
++      syscalls.dispose();
++      // Rejection must remain observed after the inspection race and action end,
++      // when an unhandled rejection could affect another invocation.
++      rejectCancellation(new Error("Response cancellation failed"));
++      await vi.runAllTimersAsync();
++      await expect(
++        makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++      ).resolves.toBe(JSON.stringify({ result: "ok" }));
++      expect(settled).toHaveBeenCalledTimes(stop === "timeout" ? 1 : 0);
++      expect(fetchMock).toHaveBeenCalledTimes(stop === "timeout" ? 3 : 2);
++      expect(vi.getTimerCount()).toBe(0);
++    },
++  );
++});
+diff --git a/npm-packages/node-executor/src/syscalls.ts b/npm-packages/node-executor/src/syscalls.ts
+index 661b9a077fe625adee5e4c6185cb4f184724d02e..eae3cf5b78653bc1c48515560e873bb5b8ce547e 100644
+--- a/npm-packages/node-executor/src/syscalls.ts
++++ b/npm-packages/node-executor/src/syscalls.ts
+@@ -25,6 +25,13 @@ const CALLBACK_INITIAL_BACKOFF_MS = process.env.CALLBACK_INITIAL_BACKOFF_MS
+   ? parseInt(process.env.CALLBACK_INITIAL_BACKOFF_MS)
+   : 1000;
+ const CALLBACK_MAX_BACKOFF_MS = 20000;
++const CALLBACK_ERROR_BODY_MAX_BYTES = 64 * 1024;
++const CALLBACK_ERROR_BODY_TIMEOUT_MS = 1000;
++
++const callbackOccError = z.object({
++  code: z.literal("OptimisticConcurrencyControlFailure"),
++  message: z.string(),
++});
+ 
+ type CachedServiceToken = {
+   token: string;
+@@ -97,12 +104,72 @@ async function parkIfAborted<T>(
+ }
+ 
+ // A 5xx status other than STATUS_CODE_UDF_FAILED (which represents a real
+-// error thrown by the called function) is a transient backend/proxy failure
+-// that is safe to retry.
++// error thrown by the called function) may be a transient backend/proxy failure.
++// An exhausted OCC error is identified separately from its response body.
+ function isTransientStatus(status: number): boolean {
+   return status >= 500 && status < 600 && status !== STATUS_CODE_UDF_FAILED;
+ }
+ 
++async function readCallbackOccError(
++  response: Response,
++  signal: AbortSignal,
++): Promise<string | null> {
++  if (response.status !== 503 || response.body === null) {
++    return null;
++  }
++  // These intermediate error bodies would otherwise be discarded. Bound both
++  // buffering and waiting so a large or stalled proxy response cannot delay
++  // the existing transient retry loop indefinitely. Read the original stream:
++  // cloning it would leave an unread tee buffering the same response.
++  const reader = response.body.getReader();
++  const readBody = async (): Promise<string | null> => {
++    const chunks: Uint8Array[] = [];
++    let bytes = 0;
++    for (;;) {
++      const { done, value } = await reader.read();
++      if (done) {
++        return new TextDecoder().decode(Buffer.concat(chunks, bytes));
++      }
++      bytes += value.byteLength;
++      if (bytes > CALLBACK_ERROR_BODY_MAX_BYTES) {
++        return null;
++      }
++      if (value.byteLength > 0) {
++        chunks.push(value);
++      }
++    }
++  };
++  let stopInspection!: () => void;
++  const stopped = new Promise<null>((resolve) => {
++    stopInspection = () => resolve(null);
++  });
++  const timer = setTimeout(stopInspection, CALLBACK_ERROR_BODY_TIMEOUT_MS);
++  signal.addEventListener("abort", stopInspection, { once: true });
++  try {
++    if (signal.aborted) {
++      return null;
++    }
++    const text = await Promise.race([readBody(), stopped]);
++    if (
++      text === null ||
++      !callbackOccError.safeParse(JSON.parse(text)).success
++    ) {
++      return null;
++    }
++    return text;
++  } catch {
++    // An incomplete body or non-JSON proxy error does not identify an OCC
++    // failure, so retain the existing transient retry behavior.
++    return null;
++  } finally {
++    clearTimeout(timer);
++    signal.removeEventListener("abort", stopInspection);
++    // Cleanup must not wait for a stalled stream or mask the callback outcome.
++    void reader.cancel().catch(() => {});
++    reader.releaseLock();
++  }
++}
++
+ // Failures during connection establishment: no bytes were sent, so the
+ // request provably never ran and even a non-idempotent callback is safe to
+ // retry. Mid-flight codes (ECONNRESET, EPIPE, ...) stay non-retryable here
+@@ -358,6 +425,14 @@ export class SyscallsImpl {
+       if (!isTransientStatus(response.status) || attempt >= maxAttempts) {
+         break;
+       }
++      const occError = await readCallbackOccError(response, signal);
++      if (occError !== null) {
++        // The backend owns OCC retries and has already exhausted its budget.
++        // Replaying this callback would restart it. Preserve the raw error for
++        // the existing handler so the caller can decide whether to retry.
++        response = new Response(occError, response);
++        break;
++      }
+       await abortableSleep(callbackBackoffMs(attempt - 1), signal);
+       // The action settled while we were backing off; stop retrying a dangling
+       // call rather than holding it open (and out of the next invocation).
+@@ -367,11 +442,10 @@ export class SyscallsImpl {
+     }
+     const errorHandler =
+       args.handleResponseErrorCode ?? defaultHandleResponseError;
+-    // Reading the response body (here and in `response.json()` below) is tied to
+-    // the same abort signal as the fetch, so a `dispose()` mid-read rejects with
+-    // an `AbortError`. On a dangling call whose action already settled, never
+-    // settle instead — otherwise that rejection would leak into a later,
+-    // unrelated invocation just like an aborted fetch would.
++    // Reading a network response body (here and in `response.json()` below) is
++    // tied to the fetch abort signal, so a `dispose()` mid-read rejects with an
++    // `AbortError`. Park any error on a dangling call, including an OCC error
++    // from the buffered response, so it cannot leak into a later invocation.
+     try {
+       // errorHandler is a no-op
+       await errorHandler(response, args.operationName);
