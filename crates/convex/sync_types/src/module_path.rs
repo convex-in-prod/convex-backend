@@ -388,7 +388,6 @@ impl CanonicalizedModulePath {
             is_cron,
         }
     }
-
 }
 
 impl FromStr for CanonicalizedModulePath {

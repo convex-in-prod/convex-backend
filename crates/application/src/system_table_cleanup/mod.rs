@@ -580,6 +580,7 @@ mod tests {
     use model::{
         initialize_application_system_tables,
         source_packages::{
+            runtime_content::runtime_content_sha256,
             types::{
                 PackageSize,
                 SourcePackage,
@@ -624,6 +625,7 @@ mod tests {
         database: &Database<ProdRuntime>,
         storage_key: &str,
         sha256_byte: u8,
+        runtime_content_sha256: Sha256Digest,
         native_resident: Option<model::source_packages::native::NativeResidentDescriptor>,
     ) -> anyhow::Result<SourcePackageId> {
         let mut tx = database.begin_system().await?;
@@ -631,7 +633,9 @@ mod tests {
             .put(SourcePackage {
                 storage_key: ObjectKey::try_from(storage_key)?,
                 sha256: Sha256Digest::from([sha256_byte; 32]),
+                runtime_content_sha256: Some(runtime_content_sha256),
                 native_resident,
+                runtime_generation: None,
                 external_deps_package_id: None,
                 package_size: PackageSize::default(),
                 node_version: None,
@@ -657,6 +661,7 @@ mod tests {
                 &database,
                 "source-package-cleanup-old",
                 1,
+                Sha256Digest::from([1; 32]),
                 None,
             )
             .await?;
@@ -666,10 +671,12 @@ mod tests {
                 lifecycle_protocol: 1,
                 application_contract: "example-v1".into(),
             };
+            let empty_runtime_content_sha256 = runtime_content_sha256(&[], None, None)?;
             let empty_source_package_id = insert_source_package(
                 &database,
                 "source-package-cleanup-empty",
                 2,
+                empty_runtime_content_sha256.clone(),
                 Some(native_resident.clone()),
             )
             .await?;
@@ -712,6 +719,10 @@ mod tests {
                 SourcePackageModel::new(&mut after_cleanup, TableNamespace::root_component())
                     .get(empty_source_package_id)
                     .await?;
+            assert_eq!(
+                retained_source_package.runtime_content_sha256,
+                Some(empty_runtime_content_sha256)
+            );
             assert_eq!(
                 retained_source_package.native_resident.as_ref(),
                 Some(&native_resident)

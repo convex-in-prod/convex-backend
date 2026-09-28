@@ -21,6 +21,10 @@ pub struct PatchValue {
 }
 
 impl PatchValue {
+    pub fn from_pending_fields(fields: BTreeMap<FieldName, Option<PendingValue>>) -> Self {
+        Self { fields }
+    }
+
     /// Merge into the original document body, which may itself contain
     /// unresolved commit timestamps that the patch leaves in place.
     pub fn apply(self, original: PendingValue) -> anyhow::Result<PendingValue> {

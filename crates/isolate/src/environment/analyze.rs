@@ -162,6 +162,66 @@ mod snapshot_tests {
     use crate::ConcurrencyLimiter;
 
     #[test]
+    fn grouped_context_policy_is_analyzed_and_persisted() -> anyhow::Result<()> {
+        crate::client::initialize_v8();
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let modules = Arc::new(AnalysisModuleSnapshot::from(BTreeMap::from([(
+                "entry.js".parse()?,
+                Arc::new(V8ModuleSource::new(FullModuleSource {
+                    source: ModuleSource::from(
+                        r#"
+                        export const experimental_reuseContext = {
+                            queries: true, mutations: true,
+                            initializationModule: "_deps/context_init.js"
+                        };
+                    "#,
+                    ),
+                    source_map: None,
+                })),
+            )])));
+            let mut isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
+            let mut contexts = ContextCache::new();
+            let permit = ConcurrencyLimiter::unlimited()
+                .acquire(Arc::new("analysis_test".to_owned()), false)
+                .await;
+            let mut clean = false;
+            let analyzed = AnalyzeEnvironment::analyze(
+                &mut isolate,
+                &mut contexts,
+                permit,
+                &mut clean,
+                UdfConfig {
+                    server_version: semver::Version::new(1, 36, 0),
+                    import_phase_rng_seed: [7; 32],
+                    import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
+                },
+                modules,
+                "entry.js".parse()?,
+                BTreeMap::new(),
+                CancellationSignal::new_for_test(),
+            )
+            .await??;
+            let serialized =
+                model::modules::module_versions::SerializedAnalyzedModule::try_from(analyzed)?;
+            let persisted: model::modules::module_versions::SerializedAnalyzedModule =
+                serde_json::from_value(serde_json::to_value(serialized)?)?;
+            let decoded = AnalyzedModule::try_from(persisted)?;
+            assert_eq!(decoded.context_reuse, ContextReusePolicy::database());
+            assert_eq!(
+                decoded
+                    .context_initialization_module
+                    .as_ref()
+                    .map(|p| p.as_str()),
+                Some("_deps/context_init.js")
+            );
+            assert!(clean);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn shared_compilation_preserves_fresh_globals_cycles_and_environment() -> anyhow::Result<()> {
         use rand::Rng;
         crate::client::initialize_v8();
@@ -1535,75 +1595,4 @@ fn cron_analyze<RT: Runtime>(
     }
 
     Ok(Ok(cron_specs))
-}
-
-#[cfg(test)]
-mod context_reuse_tests {
-    use model::modules::module_versions::{
-        FullModuleSource,
-        ModuleSource,
-    };
-    use runtime::prod::ProdRuntime;
-
-    use super::*;
-    use crate::ConcurrencyLimiter;
-
-    #[test]
-    fn grouped_context_policy_is_analyzed_and_persisted() -> anyhow::Result<()> {
-        crate::client::initialize_v8();
-        let tokio = ProdRuntime::init_tokio()?;
-        let rt = ProdRuntime::new(&tokio);
-        tokio.block_on(async {
-            let modules = Arc::new(BTreeMap::from([(
-                "entry.js".parse()?,
-                Arc::new(V8ModuleSource::new(FullModuleSource {
-                    source: ModuleSource::from(
-                        r#"
-                        export const experimental_reuseContext = {
-                            queries: true, mutations: true,
-                            initializationModule: "_deps/context_init.js"
-                        };
-                    "#,
-                    ),
-                    source_map: None,
-                })),
-            )]));
-            let mut isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
-            let mut contexts = ContextCache::new();
-            let permit = ConcurrencyLimiter::unlimited()
-                .acquire(Arc::new("analysis_test".to_owned()), false)
-                .await;
-            let mut clean = false;
-            let analyzed = AnalyzeEnvironment::analyze(
-                &mut isolate,
-                &mut contexts,
-                permit,
-                &mut clean,
-                UdfConfig {
-                    server_version: semver::Version::new(1, 36, 0),
-                    import_phase_rng_seed: [7; 32],
-                    import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
-                },
-                modules,
-                "entry.js".parse()?,
-                BTreeMap::new(),
-            )
-            .await??;
-            let serialized =
-                model::modules::module_versions::SerializedAnalyzedModule::try_from(analyzed)?;
-            let persisted: model::modules::module_versions::SerializedAnalyzedModule =
-                serde_json::from_value(serde_json::to_value(serialized)?)?;
-            let decoded = AnalyzedModule::try_from(persisted)?;
-            assert_eq!(decoded.context_reuse, ContextReusePolicy::database());
-            assert_eq!(
-                decoded
-                    .context_initialization_module
-                    .as_ref()
-                    .map(|p| p.as_str()),
-                Some("_deps/context_init.js")
-            );
-            assert!(clean);
-            Ok(())
-        })
-    }
 }

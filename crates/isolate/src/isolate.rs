@@ -470,6 +470,7 @@ extern "C" fn gc_prologue_callback(
     gc_flags: v8::GCCallbackFlags,
     _data: *mut c_void,
 ) {
+    crate::execution_observation::begin_v8_gc();
     GC_SPAN.set(Some(
         Span::enter_with_local_parent("v8_collect_garbage")
             .with_property(|| {
@@ -528,5 +529,6 @@ extern "C" fn gc_epilogue_callback(
     _gc_flags: v8::GCCallbackFlags,
     _data: *mut c_void,
 ) {
+    crate::execution_observation::end_v8_gc();
     GC_SPAN.take(); // drop the span to finish recording it
 }

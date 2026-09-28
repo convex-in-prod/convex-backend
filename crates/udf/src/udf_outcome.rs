@@ -36,6 +36,8 @@ use value::{
 
 use crate::{
     validation::ValidatedPathAndArgs,
+    HostOperationErrorV1,
+    HostOperationTrace,
     SyscallTrace,
 };
 
@@ -63,6 +65,10 @@ pub struct UdfOutcome {
     // queries should be concrete.
     pub result: Result<JsonPackedValue<PendingValue>, JsError>,
 
+    pub host_operation_error: Option<HostOperationErrorV1>,
+
+    pub host_operation_trace: HostOperationTrace,
+
     pub syscall_trace: SyscallTrace,
 
     pub udf_server_version: Option<semver::Version>,
@@ -79,6 +85,7 @@ impl HeapSize for UdfOutcome {
             + self.log_lines.heap_size()
             + self.journal.heap_size()
             + self.result.heap_size()
+            + self.host_operation_trace.heap_size()
             + self.syscall_trace.heap_size()
     }
 }
@@ -92,6 +99,13 @@ pub struct NestedUdfOutcome {
     pub audit_log_lines: AuditLogLines,
     pub journal: QueryJournal,
     pub result: Result<PendingValue, JsError>,
+    /// Structured evidence for a terminal host rejection in the nested UDF.
+    ///
+    /// The parent reattaches this only to the corresponding `runUdf` promise
+    /// rejection, so a parent catch, wrapper, or later failure cannot inherit
+    /// the child error's classification.
+    pub host_operation_error: Option<HostOperationErrorV1>,
+    pub host_operation_trace: HostOperationTrace,
     pub syscall_trace: SyscallTrace,
 }
 
@@ -112,6 +126,8 @@ impl TryFrom<UdfOutcome> for UdfOutcomeProto {
             audit_log_lines,
             journal,
             result,
+            host_operation_error,
+            host_operation_trace: _,
             syscall_trace,
             udf_server_version: _,
             memory_in_mb,
@@ -133,6 +149,7 @@ impl TryFrom<UdfOutcome> for UdfOutcomeProto {
             result: Some(FunctionResultProto {
                 result: Some(result),
             }),
+            host_operation_error: host_operation_error.map(TryInto::try_into).transpose()?,
             syscall_trace: Some(syscall_trace.try_into()?),
             observed_identity: Some(observed_identity),
             memory_in_mb,
@@ -164,6 +181,8 @@ impl UdfOutcome {
             audit_log_lines: vec![].into(),
             journal: QueryJournal::new(),
             result: Err(js_error),
+            host_operation_error: None,
+            host_operation_trace: HostOperationTrace::default(),
             syscall_trace: SyscallTrace::new(),
             udf_server_version,
             observed_identity: false,
@@ -186,6 +205,7 @@ impl UdfOutcome {
             observed_identity,
             memory_in_mb,
             user_execution_time,
+            host_operation_error,
         }: UdfOutcomeProto,
         path_and_args: ValidatedPathAndArgs,
         identity: InertIdentity,
@@ -223,6 +243,10 @@ impl UdfOutcome {
             audit_log_lines,
             journal: journal.context("Missing journal")?.try_into()?,
             result,
+            host_operation_error: host_operation_error.map(TryInto::try_into).transpose()?,
+            // Query-shadow host-operation traces are process-local evidence.
+            // UDF-server RPCs do not need to carry them.
+            host_operation_trace: HostOperationTrace::default(),
             syscall_trace: syscall_trace.context("Missing syscall_trace")?.try_into()?,
             udf_server_version,
             observed_identity: observed_identity.context("Missing identity")?,

@@ -69,9 +69,9 @@ impl TransactionIdGenerator {
         )
     }
 
-    /// Clone the TransactionIdGenerator to pass into the transaction for a
-    /// snapshot query. The resulting generator should not be used.
-    pub(crate) fn clone_for_snapshot_query(&self) -> Self {
+    /// Copy allocation state for a snapshot query or non-committing replay.
+    /// Only the original transaction may publish documents using these IDs.
+    pub(crate) fn clone_for_replay(&self) -> Self {
         TransactionIdGenerator {
             rng: self.rng.clone(),
             day_bytes: self.day_bytes,

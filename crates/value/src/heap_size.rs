@@ -49,8 +49,55 @@ use sync_types::{
 };
 use tokio::sync::oneshot;
 
+use crate::{
+    ConvexValue,
+    FieldName,
+    PendingValue,
+};
+
 pub trait HeapSize {
     fn heap_size(&self) -> usize;
+}
+
+impl HeapSize for ConvexValue {
+    fn heap_size(&self) -> usize {
+        match self {
+            Self::Null | Self::Int64(_) | Self::Float64(_) | Self::Boolean(_) => 0,
+            Self::String(value) => value.heap_size(),
+            Self::Bytes(value) => value.heap_size(),
+            Self::Array(values) => {
+                values.len() * size_of::<ConvexValue>()
+                    + values.iter().map(HeapSize::heap_size).sum::<usize>()
+            },
+            Self::Object(fields) => {
+                estimate_btree_heap_size::<FieldName, ConvexValue>(fields.len())
+                    + fields
+                        .iter()
+                        .map(|(name, value)| name.heap_size() + value.heap_size())
+                        .sum::<usize>()
+            },
+        }
+    }
+}
+
+impl HeapSize for PendingValue {
+    fn heap_size(&self) -> usize {
+        match self {
+            Self::Concrete(value) => value.heap_size(),
+            Self::CommitTs => 0,
+            Self::Array { values, .. } => {
+                values.capacity() * size_of::<PendingValue>()
+                    + values.iter().map(HeapSize::heap_size).sum::<usize>()
+            },
+            Self::Object { fields, .. } => {
+                estimate_btree_heap_size::<FieldName, PendingValue>(fields.len())
+                    + fields
+                        .iter()
+                        .map(|(name, value)| name.heap_size() + value.heap_size())
+                        .sum::<usize>()
+            },
+        }
+    }
 }
 
 pub trait ElementsHeapSize {
@@ -174,8 +221,7 @@ where
     }
 }
 
-impl<T: ElementsHeapSize> WithHeapSize<T> {
-}
+impl<T: ElementsHeapSize> WithHeapSize<T> {}
 
 // HeapSize for Vec<u8> can be implemented in constant time.
 impl HeapSize for Vec<u8> {

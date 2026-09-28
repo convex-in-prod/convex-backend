@@ -37,6 +37,8 @@ import { ConvexError, JSONValue } from "convex/values";
 import { log, logDebug, logDurationMs } from "./log";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { countEgressBytes } from "./bytesCounter";
+import { nodePoolRetirement } from "./retirement";
+import type { NodePoolRetirementHandler } from "convex/server";
 
 // Small hack to detect if we're running in the dynamic or static lambda.
 const AWS_LAMBDA_EXECUTOR_TYPE = (
@@ -840,6 +842,11 @@ export const globalConsoleState = new AsyncLocalStorage<ConsoleState>();
 export const globalDevConsole = new AsyncLocalStorage<Console>();
 
 (globalThis as any).Convex = {
+  onNodePoolRetirement: (callback: NodePoolRetirementHandler) => {
+    if (!globalSyscalls.getStore())
+      throw new Error("Node pool retirement registration requires an action.");
+    nodePoolRetirement.register(callback);
+  },
   syscall: (op: string, jsonArgs: string) => {
     const syscalls = globalSyscalls.getStore();
     if (!syscalls) {

@@ -166,7 +166,9 @@ impl Fixture {
             .put(SourcePackage {
                 storage_key: ObjectKey::try_from("context-reuse-test")?,
                 sha256: Sha256Digest::from([0; 32]),
+                runtime_content_sha256: None,
                 native_resident: None,
+                runtime_generation: None,
                 external_deps_package_id: None,
                 package_size: PackageSize::default(),
                 node_version: None,
@@ -254,7 +256,13 @@ impl Fixture {
                         region: None,
                         class: DeploymentClass::S16,
                     },
+                    #[cfg(feature = "static-hermes-wasmtime-gate")]
+                    host_secret_values: Some(BTreeMap::new()),
                 },
+                trace_host_operations: false,
+                capture_handler_reads: false,
+                #[cfg(feature = "static-hermes-wasmtime-gate")]
+                shadow_work_guard: None,
             },
             0,
             "context_reuse_test".to_owned(),

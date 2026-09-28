@@ -8,6 +8,8 @@ pub mod environment;
 pub mod execution_observation;
 mod function_outcome;
 pub mod helpers;
+mod host_operation_error;
+mod host_operation_trace;
 mod http_action;
 pub mod metrics;
 mod syscall_stats;
@@ -15,6 +17,7 @@ mod syscall_trace;
 mod udf_outcome;
 pub mod validation;
 pub mod warnings;
+pub mod wasm_memory;
 
 pub use crate::{
     action_callbacks::ActionCallbacks,
@@ -28,6 +31,17 @@ pub use crate::{
         FunctionResult,
     },
     function_outcome::FunctionOutcome,
+    host_operation_error::{
+        HostOperation,
+        HostOperationErrorV1,
+    },
+    host_operation_trace::{
+        HostOperationTrace,
+        HostOperationTraceEntry,
+        HostOperationTraceEntryHandle,
+        LogicalHostOperation,
+        LogicalHostOperationStatus,
+    },
     http_action::{
         HttpActionRequest,
         HttpActionRequestHead,

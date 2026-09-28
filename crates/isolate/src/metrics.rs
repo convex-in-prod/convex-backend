@@ -2007,3 +2007,27 @@ mod tests {
         );
     }
 }
+
+register_convex_counter!(
+    WASM_OBJECT_LAYOUT_HITS_TOTAL,
+    "Native object layout cache hits"
+);
+register_convex_counter!(
+    WASM_OBJECT_LAYOUT_MISSES_TOTAL,
+    "Native object layout cache misses"
+);
+register_convex_counter!(
+    WASM_OBJECT_LAYOUT_EVICTIONS_TOTAL,
+    "Native object layout cache evictions"
+);
+register_convex_counter!(
+    WASM_OBJECT_LAYOUT_FALLBACKS_TOTAL,
+    "Native object constructions using generic property definition"
+);
+
+pub fn log_wasm_object_layouts([hits, misses, evictions, fallbacks]: [u64; 4]) {
+    log_counter(&WASM_OBJECT_LAYOUT_HITS_TOTAL, hits);
+    log_counter(&WASM_OBJECT_LAYOUT_MISSES_TOTAL, misses);
+    log_counter(&WASM_OBJECT_LAYOUT_EVICTIONS_TOTAL, evictions);
+    log_counter(&WASM_OBJECT_LAYOUT_FALLBACKS_TOTAL, fallbacks);
+}
