@@ -16,6 +16,7 @@ use common::{
         DatabaseIndexWrite,
         TextIndexWrite,
     },
+    index::IndexKey,
     interval::{
         Interval,
         IntervalSet,
@@ -25,6 +26,7 @@ use common::{
         TabletIndexName,
         Timestamp,
     },
+    value::ResolvedDocumentId,
     virtual_system_mapping::VirtualSystemMapping,
 };
 use errors::ErrorMetadata;
@@ -99,6 +101,48 @@ pub struct ReadSet {
     search: WithHeapSize<BTreeMap<TabletIndexName, SearchQueryReads>>,
 }
 
+/// Data-free structural differences between two read sets for local tests.
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadSetComparisonDiagnostic {
+    pub indexed: Vec<IndexedReadComparisonDiagnostic>,
+    pub primary_search_count: usize,
+    pub shadow_search_count: usize,
+    pub search_matches: bool,
+}
+
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexedReadComparisonDiagnostic {
+    pub index_descriptor: String,
+    pub primary_present: bool,
+    pub shadow_present: bool,
+    pub fields_match: bool,
+    pub intervals_match: bool,
+    pub primary_interval_count: usize,
+    pub shadow_interval_count: usize,
+}
+
+fn remove_lane_local_insert_id_intervals(
+    index_name: &TabletIndexName,
+    intervals: &IntervalSet,
+    document_ids: impl Iterator<Item = ResolvedDocumentId>,
+) -> IntervalSet {
+    let lane_local_intervals = document_ids
+        .filter(|document_id| index_name == &TabletIndexName::by_id(document_id.tablet_id))
+        .map(|document_id| {
+            Interval::prefix(IndexKey::new(vec![], document_id.into()).to_bytes().into())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut normalized = IntervalSet::new();
+    for interval in intervals.iter() {
+        if !lane_local_intervals.contains(&interval) {
+            normalized.add(interval);
+        }
+    }
+    normalized
+}
+
 impl HeapSize for ReadSet {
     fn heap_size(&self) -> usize {
         self.indexed.heap_size() + self.search.heap_size()
@@ -106,6 +150,88 @@ impl HeapSize for ReadSet {
 }
 
 impl ReadSet {
+    fn num_intervals(&self) -> usize {
+        self.indexed
+            .values()
+            .map(|reads| reads.intervals.len())
+            .sum()
+    }
+
+    /// Compare transaction dependencies while ignoring optional diagnostic
+    /// stack traces attached to indexed reads.
+    pub fn has_same_read_dependencies(&self, other: &Self) -> bool {
+        self.indexed.len() == other.indexed.len()
+            && self.indexed.iter().all(|(index_name, reads)| {
+                other.indexed.get(index_name).is_some_and(|other_reads| {
+                    reads.fields == other_reads.fields && reads.intervals == other_reads.intervals
+                })
+            })
+            && self.search == other.search
+    }
+
+    /// Compare transaction dependencies after removing only the by-id
+    /// singleton reads used to establish independently allocated insert IDs.
+    pub fn has_same_read_dependencies_with_lane_local_insert_ids(
+        &self,
+        other: &Self,
+        inserted_id_mapping: &BTreeMap<ResolvedDocumentId, ResolvedDocumentId>,
+    ) -> bool {
+        self.indexed.len() == other.indexed.len()
+            && self.indexed.iter().all(|(index_name, reads)| {
+                other.indexed.get(index_name).is_some_and(|other_reads| {
+                    reads.fields == other_reads.fields
+                        && remove_lane_local_insert_id_intervals(
+                            index_name,
+                            &reads.intervals,
+                            inserted_id_mapping.keys().copied(),
+                        ) == remove_lane_local_insert_id_intervals(
+                            index_name,
+                            &other_reads.intervals,
+                            inserted_id_mapping.values().copied(),
+                        )
+                })
+            })
+            && self.search == other.search
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn comparison_diagnostic(&self, other: &Self) -> ReadSetComparisonDiagnostic {
+        let index_names = self
+            .indexed
+            .keys()
+            .chain(other.indexed.keys())
+            .collect::<std::collections::BTreeSet<_>>();
+        let indexed = index_names
+            .into_iter()
+            .map(|index_name| {
+                let primary = self.indexed.get(index_name);
+                let shadow = other.indexed.get(index_name);
+                let (fields_match, intervals_match) = match (primary, shadow) {
+                    (Some(primary), Some(shadow)) => (
+                        primary.fields == shadow.fields,
+                        primary.intervals == shadow.intervals,
+                    ),
+                    _ => (false, false),
+                };
+                IndexedReadComparisonDiagnostic {
+                    index_descriptor: index_name.descriptor().to_string(),
+                    primary_present: primary.is_some(),
+                    shadow_present: shadow.is_some(),
+                    fields_match,
+                    intervals_match,
+                    primary_interval_count: primary.map_or(0, |reads| reads.intervals.len()),
+                    shadow_interval_count: shadow.map_or(0, |reads| reads.intervals.len()),
+                }
+            })
+            .collect();
+        ReadSetComparisonDiagnostic {
+            indexed,
+            primary_search_count: self.search.len(),
+            shadow_search_count: other.search.len(),
+            search_matches: self.search == other.search,
+        }
+    }
+
     pub fn empty() -> Self {
         Self {
             indexed: WithHeapSize::default(),
@@ -243,6 +369,10 @@ fn iter_indexes_for_table<T>(
 pub struct TransactionReadSet {
     read_set: ReadSet,
 
+    // During handler snooping, this tracks the complete read set for limit
+    // accounting while `read_set` contains only the handler segment.
+    limit_read_set: Option<Box<ReadSet>>,
+
     // Pre-computed sum of all of the `IntervalSet`'s sizes.
     num_intervals: usize,
 
@@ -258,15 +388,67 @@ pub struct TransactionReadSize {
     pub total_document_count: usize,
 }
 
+impl TransactionReadSize {
+    fn checked_sub(&self, baseline: &Self) -> Self {
+        Self {
+            total_document_size: self
+                .total_document_size
+                .checked_sub(baseline.total_document_size)
+                .expect("handler read accounting must include its baseline"),
+            total_document_count: self
+                .total_document_count
+                .checked_sub(baseline.total_document_count)
+                .expect("handler read accounting must include its baseline"),
+        }
+    }
+}
+
 impl TransactionReadSet {
     /// Create a read-set at the given timestamp.
     pub fn new() -> Self {
         Self {
             read_set: ReadSet::empty(),
+            limit_read_set: None,
             num_intervals: 0,
             user_tx_size: TransactionReadSize::default(),
             system_tx_size: TransactionReadSize::default(),
         }
+    }
+
+    pub(crate) fn empty_with_accounting(&self) -> Self {
+        Self {
+            read_set: ReadSet::empty(),
+            limit_read_set: Some(Box::new(self.read_set.clone())),
+            num_intervals: self.num_intervals,
+            user_tx_size: self.user_tx_size.clone(),
+            system_tx_size: self.system_tx_size.clone(),
+        }
+    }
+
+    pub(crate) fn split_handler_capture(self, baseline: &Self) -> (Self, Self) {
+        let Self {
+            read_set,
+            limit_read_set,
+            num_intervals,
+            user_tx_size,
+            system_tx_size,
+        } = self;
+        let handler_num_intervals = read_set.num_intervals();
+        let handler_reads = Self {
+            read_set,
+            limit_read_set: None,
+            num_intervals: handler_num_intervals,
+            user_tx_size: user_tx_size.checked_sub(&baseline.user_tx_size),
+            system_tx_size: system_tx_size.checked_sub(&baseline.system_tx_size),
+        };
+        let full_reads = Self {
+            read_set: *limit_read_set.expect("handler capture missing full read set"),
+            limit_read_set: None,
+            num_intervals,
+            user_tx_size,
+            system_tx_size,
+        };
+        (handler_reads, full_reads)
     }
 
     pub fn into_read_set(self) -> ReadSet {
@@ -281,9 +463,31 @@ impl TransactionReadSet {
         &mut self,
         index_name: TabletIndexName,
         fields: IndexedFields,
+        intervals: impl IntoIterator<Item = Interval> + 'static,
+    ) -> (usize, usize) {
+        if self.limit_read_set.is_none() {
+            return Self::_record_indexed_into(&mut self.read_set, index_name, fields, intervals);
+        }
+        let intervals: Vec<_> = intervals.into_iter().collect();
+        let result = Self::_record_indexed_into(
+            &mut self.read_set,
+            index_name.clone(),
+            fields.clone(),
+            intervals.clone(),
+        );
+        if let Some(limit_read_set) = self.limit_read_set.as_mut() {
+            return Self::_record_indexed_into(limit_read_set, index_name, fields, intervals);
+        }
+        result
+    }
+
+    fn _record_indexed_into(
+        read_set: &mut ReadSet,
+        index_name: TabletIndexName,
+        fields: IndexedFields,
         mut intervals: impl IntoIterator<Item = Interval> + 'static,
     ) -> (usize, usize) {
-        self.read_set.indexed.mutate_entry_or_insert_with(
+        read_set.indexed.mutate_entry_or_insert_with(
             index_name.clone(),
             || IndexReads {
                 fields: fields.clone(),
@@ -360,6 +564,19 @@ impl TransactionReadSet {
         self.num_intervals += num_intervals;
         self.user_tx_size += user_tx_size;
         self.system_tx_size += system_tx_size;
+    }
+
+    pub(crate) fn merge_handler_segment(&mut self, reads: TransactionReadSet) {
+        let num_intervals = reads.num_intervals();
+        let user_tx_size = reads.user_tx_size().clone();
+        let system_tx_size = reads.system_tx_size().clone();
+        self.merge(
+            reads.into_read_set(),
+            num_intervals,
+            user_tx_size,
+            system_tx_size,
+        );
+        self.num_intervals = self.read_set.num_intervals();
     }
 
     pub fn record_read_document(
@@ -477,8 +694,8 @@ impl TransactionReadSet {
     }
 
     pub fn top_three_intervals(&self) -> String {
-        let mut intervals: Vec<_> = self
-            .read_set
+        let read_set = self.limit_read_set.as_deref().unwrap_or(&self.read_set);
+        let mut intervals: Vec<_> = read_set
             .indexed
             .iter()
             .map(|(index, reads)| (reads.intervals.len(), index))
@@ -494,7 +711,20 @@ impl TransactionReadSet {
     }
 
     pub fn record_search(&mut self, index_name: TabletIndexName, search_reads: SearchQueryReads) {
-        self.read_set.search.mutate_entry_or_insert_with(
+        if let Some(limit_read_set) = self.limit_read_set.as_mut() {
+            Self::record_search_into(&mut self.read_set, index_name.clone(), search_reads.clone());
+            Self::record_search_into(limit_read_set, index_name, search_reads);
+        } else {
+            Self::record_search_into(&mut self.read_set, index_name, search_reads);
+        }
+    }
+
+    fn record_search_into(
+        read_set: &mut ReadSet,
+        index_name: TabletIndexName,
+        search_reads: SearchQueryReads,
+    ) {
+        read_set.search.mutate_entry_or_insert_with(
             index_name,
             SearchQueryReads::empty,
             |existing_reads| existing_reads.merge(search_reads),
@@ -511,5 +741,244 @@ impl TransactionReadSet {
 
     pub fn system_tx_size(&self) -> &TransactionReadSize {
         &self.system_tx_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "testing")]
+    use value::{
+        DeveloperDocumentId,
+        InternalId,
+        ResolvedDocumentId,
+        TableNumber,
+    };
+
+    use super::*;
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn lane_local_insert_id_normalization_removes_prefix_dependency_only() {
+        let primary_insert = ResolvedDocumentId::new(
+            TabletId::MIN,
+            DeveloperDocumentId::new(TableNumber::MIN, InternalId([1; 16])),
+        );
+        let shadow_insert = ResolvedDocumentId::new(
+            TabletId::MIN,
+            DeveloperDocumentId::new(TableNumber::MIN, InternalId([2; 16])),
+        );
+        let primary_existing = ResolvedDocumentId::new(
+            TabletId::MIN,
+            DeveloperDocumentId::new(TableNumber::MIN, InternalId([3; 16])),
+        );
+        let shadow_existing = ResolvedDocumentId::new(
+            TabletId::MIN,
+            DeveloperDocumentId::new(TableNumber::MIN, InternalId([4; 16])),
+        );
+        let read_set = |insert: ResolvedDocumentId, existing: Option<ResolvedDocumentId>| {
+            let mut intervals = IntervalSet::new();
+            // Keep this byte-for-byte aligned with Writes::register_new_id:
+            // generated-ID admission uses a prefix dependency, not a singleton.
+            intervals.add(Interval::prefix(
+                IndexKey::new(vec![], insert.into()).to_bytes().into(),
+            ));
+            if let Some(existing) = existing {
+                intervals.add(Interval::singleton(
+                    IndexKey::new(vec![], existing.into()).to_bytes().into(),
+                ));
+            }
+            ReadSet::new(
+                BTreeMap::from([(
+                    TabletIndexName::by_id(insert.tablet_id),
+                    IndexReads {
+                        fields: IndexedFields::by_id(),
+                        intervals,
+                        stack_traces: None,
+                    },
+                )]),
+                BTreeMap::new(),
+            )
+        };
+        let insert_mapping = BTreeMap::from([(primary_insert, shadow_insert)]);
+
+        assert!(read_set(primary_insert, None)
+            .has_same_read_dependencies_with_lane_local_insert_ids(
+                &read_set(shadow_insert, None),
+                &insert_mapping,
+            ));
+        assert!(!read_set(primary_insert, Some(primary_existing))
+            .has_same_read_dependencies_with_lane_local_insert_ids(
+                &read_set(shadow_insert, Some(shadow_existing)),
+                &insert_mapping,
+            ));
+    }
+
+    #[test]
+    fn handler_capture_split_keeps_coalesced_full_accounting() -> anyhow::Result<()> {
+        let limits = TransactionLimits::default();
+        let index_name = TabletIndexName::by_id(TabletId::MIN);
+        let fields = IndexedFields::by_id();
+        let mut baseline = TransactionReadSet::new();
+        baseline.record_indexed_directly(
+            index_name.clone(),
+            fields.clone(),
+            Interval::prefix(vec![0].into()),
+            &limits,
+        )?;
+        baseline.record_indexed_directly(
+            index_name.clone(),
+            fields.clone(),
+            Interval::prefix(vec![1].into()),
+            &limits,
+        )?;
+        baseline.user_tx_size = TransactionReadSize {
+            total_document_size: 10,
+            total_document_count: 1,
+        };
+        baseline.system_tx_size = TransactionReadSize {
+            total_document_size: 20,
+            total_document_count: 2,
+        };
+
+        let mut capture = baseline.empty_with_accounting();
+        capture.record_indexed_directly(index_name.clone(), fields, Interval::all(), &limits)?;
+        capture.user_tx_size.total_document_size += 30;
+        capture.user_tx_size.total_document_count += 3;
+        capture.system_tx_size.total_document_size += 40;
+        capture.system_tx_size.total_document_count += 4;
+
+        let (handler_reads, full_reads) = capture.split_handler_capture(&baseline);
+
+        assert_eq!(handler_reads.num_intervals(), 1);
+        assert_eq!(full_reads.num_intervals(), 1);
+        assert_eq!(
+            handler_reads
+                .read_set
+                .indexed
+                .get(&index_name)
+                .expect("handler read set did not retain its range")
+                .intervals
+                .len(),
+            1
+        );
+        assert_eq!(
+            full_reads
+                .read_set
+                .indexed
+                .get(&index_name)
+                .expect("full read set did not retain its range")
+                .intervals
+                .len(),
+            1
+        );
+        assert_eq!(
+            handler_reads.user_tx_size,
+            TransactionReadSize {
+                total_document_size: 30,
+                total_document_count: 3,
+            }
+        );
+        assert_eq!(
+            handler_reads.system_tx_size,
+            TransactionReadSize {
+                total_document_size: 40,
+                total_document_count: 4,
+            }
+        );
+        assert_eq!(
+            full_reads.user_tx_size,
+            TransactionReadSize {
+                total_document_size: 40,
+                total_document_count: 4,
+            }
+        );
+        assert_eq!(
+            full_reads.system_tx_size,
+            TransactionReadSize {
+                total_document_size: 60,
+                total_document_count: 6,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_unions_derived_dependencies_and_adds_accounting() -> anyhow::Result<()> {
+        let limits = TransactionLimits::default();
+        let derived_index = TabletIndexName::by_id(TabletId::MIN);
+        let direct_index = TabletIndexName::by_creation_time(TabletId::MIN);
+        let mut previous = TransactionReadSet::new();
+        previous.record_indexed_derived(
+            derived_index.clone(),
+            IndexedFields::by_id(),
+            Interval::prefix(vec![0].into()),
+        );
+        previous.record_indexed_directly(
+            direct_index.clone(),
+            IndexedFields::creation_time(),
+            Interval::prefix(vec![0].into()),
+            &limits,
+        )?;
+        previous.user_tx_size = TransactionReadSize {
+            total_document_size: 10,
+            total_document_count: 1,
+        };
+        previous.system_tx_size = TransactionReadSize {
+            total_document_size: 20,
+            total_document_count: 2,
+        };
+
+        let mut additional = TransactionReadSet::new();
+        for key in [0, 2] {
+            additional.record_indexed_derived(
+                derived_index.clone(),
+                IndexedFields::by_id(),
+                Interval::prefix(vec![key].into()),
+            );
+        }
+        additional.record_indexed_directly(
+            direct_index,
+            IndexedFields::creation_time(),
+            Interval::prefix(vec![0].into()),
+            &limits,
+        )?;
+        additional.user_tx_size = TransactionReadSize {
+            total_document_size: 30,
+            total_document_count: 3,
+        };
+        additional.system_tx_size = TransactionReadSize {
+            total_document_size: 40,
+            total_document_count: 4,
+        };
+
+        let additional_num_intervals = additional.num_intervals();
+        let additional_user_tx_size = additional.user_tx_size().clone();
+        let additional_system_tx_size = additional.system_tx_size().clone();
+        previous.merge(
+            additional.into_read_set(),
+            additional_num_intervals,
+            additional_user_tx_size,
+            additional_system_tx_size,
+        );
+
+        // Derived ranges remain OCC dependencies without becoming query
+        // accounting, while the direct range is charged once per segment.
+        assert_eq!(previous.num_intervals(), 2);
+        assert_eq!(previous.read_set.num_intervals(), 3);
+        assert_eq!(
+            previous.user_tx_size,
+            TransactionReadSize {
+                total_document_size: 40,
+                total_document_count: 4,
+            }
+        );
+        assert_eq!(
+            previous.system_tx_size,
+            TransactionReadSize {
+                total_document_size: 60,
+                total_document_count: 6,
+            }
+        );
+        Ok(())
     }
 }

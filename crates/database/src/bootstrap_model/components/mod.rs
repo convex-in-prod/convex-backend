@@ -141,9 +141,8 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
     ) -> anyhow::Result<ResolvedDocumentId> {
         let component_table = self
             .tx
-            .table_mapping()
-            .namespace(TableNamespace::Global)
-            .id(&COMPONENTS_TABLE)?;
+            .resolve_table_name(TableNamespace::Global, &COMPONENTS_TABLE)?
+            .context("component table missing")?;
         Ok(ResolvedDocumentId::new(
             component_table.tablet_id,
             component_id,

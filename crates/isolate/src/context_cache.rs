@@ -576,6 +576,7 @@ pub(crate) enum ContextCacheClearReason {
     CacheDrop,
 }
 
+#[derive(Clone)]
 pub struct ContextReadSet {
     pub read_set: TransactionReadSet,
     pub range_hashes: Vec<(
@@ -1179,11 +1180,9 @@ impl ContextCache {
         });
         for (namespace, tablet_index_name, table_name, intervals, hash) in &read_set.range_hashes {
             let tablet = *tablet_index_name.table();
-            if !tx.table_mapping().tablet_id_exists(tablet) {
+            let Ok((new_namespace, _, new_table_name)) = tx.table_metadata(tablet) else {
                 return Ok(false);
-            }
-            let (new_namespace, _, new_table_name) =
-                tx.table_mapping().get_table_metadata(tablet)?;
+            };
             anyhow::ensure!(namespace == new_namespace, "{tablet} changed namespace?");
             anyhow::ensure!(table_name == new_table_name, "{tablet} changed name?");
             let Some(new_hash) = tx
@@ -1216,9 +1215,8 @@ impl ContextCache {
         );
         let mut range_hashes = vec![];
         for (tablet_index_name, reads) in read_set.read_set().iter_indexed() {
-            let &(namespace, _table_number, ref table_name) = tx
-                .table_mapping()
-                .get_table_metadata(*tablet_index_name.table())?;
+            let &(namespace, _table_number, ref table_name) =
+                tx.table_metadata(*tablet_index_name.table())?;
             anyhow::ensure!(
                 table_name.is_system(),
                 "context init read non-system table {table_name}?"

@@ -79,6 +79,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
         context_cache: &mut ContextCache,
         Request {
             deployment_job: _deployment_job,
+            v8_capacity_reservation: _v8_capacity_reservation,
             client_id,
             inner,
             parent_trace: _,
