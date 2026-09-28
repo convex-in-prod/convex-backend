@@ -39,7 +39,10 @@ use crate::{
         log_virtual_table_get,
         log_virtual_table_query,
     },
-    query::IndexRangeResponse,
+    query::{
+        IndexRangeResponse,
+        QueryDocument,
+    },
     transaction::{
         IndexRangeRequest,
         MAX_PAGE_SIZE,
@@ -80,6 +83,17 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
         id: DeveloperDocumentId,
         version: Option<Version>,
     ) -> anyhow::Result<Option<(DeveloperDocument, WriteTimestamp)>> {
+        Ok(self
+            .get_with_ts_document(id, version)
+            .await?
+            .map(|(document, timestamp)| (document.into_developer(), timestamp)))
+    }
+
+    pub async fn get_with_ts_document(
+        &mut self,
+        id: DeveloperDocumentId,
+        version: Option<Version>,
+    ) -> anyhow::Result<Option<(QueryDocument, WriteTimestamp)>> {
         if !self
             .tx
             .table_mapping()
@@ -101,13 +115,14 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
             .is_some()
         {
             log_virtual_table_get();
-            VirtualTable::new(self.tx)
+            Ok(VirtualTable::new(self.tx)
                 .get(self.namespace, id, version)
-                .await
+                .await?
+                .map(|(document, timestamp)| (QueryDocument::Materialized(document), timestamp)))
         } else {
             let table_name = self.tx.table_mapping().tablet_name(id_.tablet_id)?;
-            let result = self.tx.get_inner(id_, table_name).await?;
-            Ok(result.map(|(doc, ts)| (doc.to_developer(), ts)))
+            let result = self.tx.get_inner_packed(id_, table_name).await?;
+            Ok(result.map(|(document, timestamp)| (QueryDocument::Packed(document), timestamp)))
         }
     }
 

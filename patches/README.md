@@ -77,6 +77,18 @@ adoption contract documented in the backend essay.
 
 ## Deployment and code generation
 
+Named local Node executor pools accept `maxGenerationAgeSeconds` and
+`backgroundDrainTimeoutSeconds` in `LOCAL_NODE_EXECUTOR_POOL_POLICIES`.
+Omitting the age setting inherits the positive global generation-age limit;
+explicit `null` disables age-only retirement for that pool while RSS,
+package, pressure, watchdog, and deployment retirement remain active. The
+background drain timeout defaults to 30 seconds and applies only when a
+process generation registers a resident retirement callback, so pools without
+resident work retain their existing retirement behavior. The timeout is one
+fixed monotonic deadline; callback errors and expiry are recorded before the
+generation is reaped. Forced replacement and emergency pressure or watchdog
+paths retain immediate termination authority.
+
 ### [Non-committing codegen analysis](non_committing_codegen_analysis/README.md)
 
 - Purpose: let standalone codegen obtain authoritative evaluated component analysis without
@@ -96,8 +108,10 @@ adoption contract documented in the backend essay.
 - Activation: root pacing is automatic when `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS`
   is configured. Whole-job admission and enabled deployment-lane allowances have their own
   activation contracts and remain effective when that root gate is unset.
-- Rollback: restore the previous backend image. Unsetting the cap also disables pacing, but it
-  simultaneously disables degradable-query backpressure.
+  With the Wasm integration, `ISOLATE_DEGRADABLE_QUERY_ANALYSIS_CAPACITY` separately protects V8
+  dispatch; it inherits the application cap unless explicitly configured.
+- Rollback: restore the previous backend image. Unsetting both caps disables root pacing;
+  unsetting the application cap also disables degradable-query backpressure.
 
 The maintained [deployment admission and operation extension](non_committing_codegen_analysis/deployment_operations.md)
 composes whole-job ownership with shared HTTP admission, dependency capacity,
@@ -171,6 +185,34 @@ requires explicit client negotiation, and its preparation is process-local.
   requires build args or Cargo profile settings.
 - Rollback: return to the normal release profile and default strip behavior, or restore the previous
   dependency-fetch and JavaScript-install layers. Runtime behavior and data are unchanged.
+
+### [Static Hermes Wasm UDF execution](static_hermes_wasm_udfs/README.md)
+
+- Purpose: route digest-bound deployment-selected root queries and mutations through generated
+  Static Hermes Wasm on a bounded cache of two Wasmtime engines while preserving explicit V8 routing
+  and bounded module, native-code, Store, and runtime ownership.
+- Prerequisites: a feature-enabled backend image; the separate cancellation-safe MySQL patch so an
+  interrupted connection cannot return to reuse; and an external compiler, precompiler, source-
+  authority, package, and deployment pipeline that produces the exact digest-bound schemas and
+  engine identity. Numeric MySQL cancellation remains disabled unless the operator separately
+  proves the trusted-single-namespace topology contract.
+- Activation: experimental and disabled by default. Read the linked compiler/artifact and
+  operations documents. A downstream integration must bind the active V8 source, publish and mount
+  a complete immutable shadow-only registry, select V8 primary with zero shadow sampling for both
+  UDF types, and verify unchanged V8 behavior. Read the live policy status: stored policy overrides
+  environment defaults after restart. Query shadows sample admitted cache-miss leaders and
+  direct no-cache admin/system queries; mutation shadow sampling is independent. V8 remains the
+  only response and commit authority. Wasm-primary
+  routing requires a primary-admitted generation and explicit policy selection, with initialized
+  capacity prepared and reserved before source or policy publication.
+  Route-aware reuse avoids destroy-and-recreate churn when matching runtimes return at the instance
+  ceiling, but does not establish performance or memory parity between the generated path and a
+  manually authored Wasm baseline.
+- Rollback: select V8 primary and zero shadow sampling for both UDF types through the live policy
+  API or matching `convex runtime-mode` command, and confirm the stored policy before restoring
+  the previous image. Newly dispatched executions use that selection without restart. See the
+  owning operations document for older backends that use environment defaults only. No data or
+  schema migration rollback is required.
 
 ### [Atomic Node executor source packages](atomic_node_executor_source_packages/README.md)
 
@@ -388,7 +430,10 @@ operator adoption units:
 8. Deliver matching backend and client protocol before enabling degradable frontend behavior.
 9. Add deployment-analysis pacing after degradable admission; validate capacity transfer with a
    controlled multi-module push before changing analysis concurrency or queue deadlines.
-10. Change one independent capacity or semantic opt-in at a time unless the documented policy
+10. Apply and verify cancellation-safe MySQL connections before experimenting with Static Hermes
+   Wasm UDF execution. Treat its feature image, active source, immutable registry, memory policy,
+   and metrics as one reviewed compatibility set, with the routing gate disabled first.
+11. Change one independent capacity or semantic opt-in at a time unless the documented policy
    explicitly requires a coupled rollout and rollback order.
 
 Keep deployment-specific names out of generic backend logic and infrastructure metric labels.

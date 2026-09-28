@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use common::{
-    document::DeveloperDocument,
     index::IndexKeyBytes,
     knobs::TRANSACTION_MAX_READ_SIZE_BYTES,
     query::{
@@ -39,6 +38,7 @@ use super::{
         CursorInterval,
     },
     IndexRangeResponse,
+    QueryDocument,
     QueryStream,
     QueryStreamNext,
 };
@@ -123,7 +123,7 @@ impl SearchQuery {
     async fn _next<RT: Runtime>(
         &mut self,
         tx: &mut Transaction<RT>,
-    ) -> anyhow::Result<Option<(DeveloperDocument, WriteTimestamp)>> {
+    ) -> anyhow::Result<Option<(QueryDocument, WriteTimestamp)>> {
         let iterator = match &mut self.results {
             Some(results) => results,
             None => self.results.get_or_insert(self.search(tx).await?),
@@ -226,7 +226,7 @@ impl SearchResultIterator {
     async fn next<RT: Runtime>(
         &mut self,
         tx: &mut Transaction<RT>,
-    ) -> anyhow::Result<Option<(DeveloperDocument, IndexKeyBytes, WriteTimestamp)>> {
+    ) -> anyhow::Result<Option<(QueryDocument, IndexKeyBytes, WriteTimestamp)>> {
         let timer = metrics::search::iterator_next_timer();
         task::consume_budget().await;
 
@@ -250,7 +250,7 @@ impl SearchResultIterator {
 
         let id = DeveloperDocumentId::new(self.table_number, candidate.id);
         let (document, existing_doc_ts) = UserFacingModel::new(tx, self.namespace)
-            .get_with_ts(id, self.version.clone())
+            .get_with_ts_document(id, self.version.clone())
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!("Unable to load search result {id}@{:?}", candidate.ts)

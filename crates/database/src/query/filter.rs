@@ -13,6 +13,7 @@ use common::{
 
 use super::{
     IndexRangeResponse,
+    QueryDocument,
     QueryNode,
     QueryStream,
     QueryStreamNext,
@@ -64,8 +65,15 @@ impl QueryStream for Filter {
                         return Ok(QueryStreamNext::WaitingOn(request))
                     },
                 };
-            let value = document.value().0.clone();
-            if self.expr.eval(&value)?.into_boolean()? {
+            let matches = match &document {
+                QueryDocument::Packed(document) => self
+                    .expr
+                    .eval_with_field(&|field| document.value().get_path(field))?,
+                QueryDocument::Materialized(document) => self
+                    .expr
+                    .eval_with_field(&|field| document.value().0.get_path(field).cloned())?,
+            };
+            if matches.into_boolean()? {
                 return Ok(QueryStreamNext::Ready(Some((document, write_timestamp))));
             }
         }

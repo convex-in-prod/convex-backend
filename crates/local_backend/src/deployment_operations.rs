@@ -113,7 +113,7 @@ pub fn http_admission(st: LocalAppState) -> common::http::DeploymentHttpAdmissio
 pub(crate) struct DeploymentOperations {
     operations: Arc<Mutex<BTreeMap<String, Operation>>>,
     clock: Arc<Mutex<SystemTime>>,
-    session_id: String,
+    pub(crate) session_id: String,
 }
 
 impl Default for DeploymentOperations {
@@ -136,6 +136,22 @@ struct Operation {
     cancellation: Option<watch::Sender<bool>>,
     prepared: Option<PreparedOperation>,
     finish: FinishState,
+}
+
+impl Operation {
+    fn revoke(&mut self, id: &str) {
+        if let Some(cancel) = &self.cancellation {
+            cancel.send_replace(true);
+        } else if self.prepared.take().is_some() {
+            self.response = encode_result(
+                &json!({"operationId":id,"state":"failed","code":"DeploymentOperationCancelled"}),
+            )
+            .expect("fixed cancellation exceeds result limit");
+            if self.finish == FinishState::Idle {
+                self.reserved_bytes = self.response.len();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,12 +227,37 @@ fn encode_result(value: &Value) -> Option<Bytes> {
     Some(Bytes::from(writer.bytes))
 }
 
+struct OperationJsonFormatter;
+
+impl serde_json::ser::Formatter for OperationJsonFormatter {
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        // A bare negative zero cannot survive JavaScript JSON.stringify. Keep
+        // it distinct so losing its sign cannot acquire preparation authority;
+        // server-owned Convex values and schema literals use {$float: ...}.
+        if value::numeric::is_negative_zero(value) {
+            return writer.write_all(b"-0");
+        }
+        // Values contain only finite floats. Match JavaScript number spelling,
+        // including integral floats, without rounding exact integer tokens.
+        writer.write_all(ryu_js::Buffer::new().format_finite(value).as_bytes())
+    }
+}
+
 pub(crate) fn normalized_digest(value: &mut Value) -> anyhow::Result<Sha256Digest> {
     value.sort_all_objects();
+    // Leave integer serialization exact: converting every number to f64 would
+    // let distinct integers above 2^53 acquire the same preparation or receipt.
     // Hash directly: an oversized analysis response must not allocate an
     // unbounded encoded copy before the bounded response writer sees it.
     let mut hash = Sha256::new();
-    serde_json::to_writer(&mut hash, value)?;
+    value.serialize(&mut serde_json::Serializer::with_formatter(
+        &mut hash,
+        OperationJsonFormatter,
+    ))?;
     Ok(hash.finalize())
 }
 
@@ -242,6 +283,9 @@ pub struct SubmitOperation {
 pub struct OperationControl {
     admin_key: String,
     operation_id: String,
+    // Legacy controls report analysis. A session-bound control also owns
+    // revocation and observation of publication authority after a lost reply.
+    session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -257,6 +301,7 @@ pub async fn capabilities(
     authorize(&st, req.admin_key).await?;
     Ok(axum::Json(json!({
         "protocolVersion": 1,
+        "publicationStatusProtocol": 1,
         "mutationPriorityProtocol": if *common::knobs::ISOLATE_QUEUE_DELAY_CONTROL_ENABLED { 1 } else { 0 },
         "nativeResidentProtocol": 1,
         "nativeResidentWarmHandoverProtocol": 1,
@@ -272,6 +317,19 @@ pub async fn capabilities(
 // The creation time is part of identity. Removing an expired entry cannot let
 // a late retry silently create new work with the same operation ID.
 pub(crate) fn operation_expiry(id: &str, now: SystemTime) -> anyhow::Result<SystemTime> {
+    let expires = operation_expiration(id, now)?;
+    anyhow::ensure!(
+        now < expires,
+        ErrorMetadata::bad_request(
+            "DeploymentOperationExpired",
+            "This operation ID has expired. Inspect deployment state before starting a new \
+             operation."
+        )
+    );
+    Ok(expires)
+}
+
+fn operation_expiration(id: &str, now: SystemTime) -> anyhow::Result<SystemTime> {
     anyhow::ensure!(
         id.len() <= 64,
         ErrorMetadata::bad_request("InvalidDeploymentOperation", "Operation ID is too long")
@@ -307,14 +365,6 @@ pub(crate) fn operation_expiry(id: &str, now: SystemTime) -> anyhow::Result<Syst
         )
     );
     let expires = created + LIFETIME;
-    anyhow::ensure!(
-        now < expires,
-        ErrorMetadata::bad_request(
-            "DeploymentOperationExpired",
-            "This operation ID has expired. Inspect deployment state before starting a new \
-             operation."
-        )
-    );
     Ok(expires)
 }
 
@@ -349,8 +399,14 @@ impl DeploymentOperations {
     pub(crate) fn prepared(
         &self,
         id: &str,
+        session_id: Option<&str>,
         mut response: Value,
     ) -> anyhow::Result<Option<PreparedPushLease>> {
+        // A previous session may read its durable receipt, but cannot borrow
+        // preparation admitted in this process, even if its ID was resubmitted.
+        if session_id.is_some_and(|session_id| session_id != self.session_id) {
+            return Ok(None);
+        }
         let digest = normalized_digest(&mut response)?;
         let mut operations = self.operations.lock();
         self.prune(&mut operations, self.now());
@@ -428,18 +484,54 @@ impl DeploymentOperations {
             "DeploymentOperationUnknown",
             "No retained operation exists in this process",
         ))?;
-        if let Some(cancel) = &operation.cancellation {
-            cancel.send_replace(true);
-        } else if operation.prepared.take().is_some() {
-            operation.response = encode_result(
-                &json!({"operationId":id,"state":"failed","code":"DeploymentOperationCancelled"}),
-            )
-            .expect("fixed cancellation exceeds result limit");
-            if operation.finish == FinishState::Idle {
-                operation.reserved_bytes = operation.response.len();
-            }
-        }
+        operation.revoke(id);
         Ok(operation.response.clone())
+    }
+
+    fn publication_control(
+        &self,
+        id: &str,
+        session_id: &str,
+        revoke: bool,
+    ) -> anyhow::Result<Value> {
+        let now = self.now();
+        let expires = operation_expiration(id, now)?;
+        let mut operations = self.operations.lock();
+        self.prune(&mut operations, now);
+        let now = self.now();
+        let publication_state = if session_id != self.session_id {
+            // Old submissions and finishes carry the old session and cannot
+            // acquire preparation in this process after a restart.
+            "revoked"
+        } else if let Some(operation) = operations.get_mut(id) {
+            if revoke {
+                operation.revoke(id);
+            }
+            if operation.finish == FinishState::Active {
+                "active"
+            } else if operation.prepared.is_some()
+                || operation
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|cancel| !*cancel.borrow())
+            {
+                "available"
+            } else {
+                "revoked"
+            }
+        } else if now >= expires {
+            // Pruning retains every active finish lease even after expiry.
+            // Absence now also prevents a delayed submission from starting.
+            "revoked"
+        } else {
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "DeploymentOperationUnknown",
+                "No retained publication operation exists in this process"
+            ));
+        };
+        Ok(
+            json!({"operationId":id,"sessionId":self.session_id,"publicationState":publication_state}),
+        )
     }
 }
 
@@ -476,10 +568,9 @@ pub async fn submit(
         ))
         .into());
     }
-    // Normalize object order and whitespace before binding identity.
-    req.config.sort_all_objects();
+    // Use the same JSON identity for submission, preparation and finish replay.
+    let digest = normalized_digest(&mut req.config)?;
     let encoded = serde_json::to_vec(&req.config).context("serializing deployment input")?;
-    let digest = Sha256::hash(&encoded);
     let reconstructed_bytes = if req
         .config
         .get("appDefinition")
@@ -691,6 +782,14 @@ pub async fn status(
     Json(req): Json<OperationControl>,
 ) -> Result<Response, HttpResponseError> {
     authorize(&st, req.admin_key).await?;
+    if let Some(session_id) = req.session_id {
+        return Ok(axum::Json(st.deployment_operations.publication_control(
+            &req.operation_id,
+            &session_id,
+            false,
+        )?)
+        .into_response());
+    }
     let mut operations = st.deployment_operations.operations.lock();
     let now = st.deployment_operations.now();
     st.deployment_operations.prune(&mut operations, now);
@@ -709,6 +808,14 @@ pub async fn cancel(
     Json(req): Json<OperationControl>,
 ) -> Result<Response, HttpResponseError> {
     authorize(&st, req.admin_key).await?;
+    if let Some(session_id) = req.session_id {
+        return Ok(axum::Json(st.deployment_operations.publication_control(
+            &req.operation_id,
+            &session_id,
+            true,
+        )?)
+        .into_response());
+    }
     Ok(response(
         st.deployment_operations.cancel(&req.operation_id)?,
     ))
@@ -717,6 +824,59 @@ pub async fn cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_json_identity_preserves_values_across_javascript_number_spelling() {
+        for (original, echo) in [
+            (
+                r#"{"z":[{"b":1.0,"a":0.0}],"a":null}"#,
+                r#"{"a":null,"z":[{"a":0,"b":1}]}"#,
+            ),
+            ("-0.0", "-0"),
+            ("12.5", "1.25e1"),
+            ("1e-6", "0.000001"),
+            ("1e-7", "0.0000001"),
+            ("9007199254740992.0", "9007199254740992"),
+            // JavaScript uses the shortest round-tripping decimal, which need
+            // not be the exact integer represented by the binary float.
+            ("1.0000000000000001e18", "1000000000000000100"),
+            ("-1.0000000000000001e18", "-1000000000000000100"),
+            ("1e20", "100000000000000000000"),
+        ] {
+            let mut original: Value = serde_json::from_str(original).unwrap();
+            let mut echo: Value = serde_json::from_str(echo).unwrap();
+            assert_eq!(
+                normalized_digest(&mut original).unwrap(),
+                normalized_digest(&mut echo).unwrap()
+            );
+        }
+        for (original, changed) in [
+            ("-0.0", "0"),
+            ("9007199254740992", "9007199254740993"),
+            ("-9007199254740992", "-9007199254740993"),
+            ("18446744073709551615", "18446744073709551614"),
+            ("-9223372036854775808", "-9223372036854775807"),
+            ("1000000000000000100", "1000000000000000128"),
+            ("1.25", "1.2500000000000002"),
+            (r#"{"nested":[{"value":1}]}"#, r#"{"nested":[{"value":2}]}"#),
+            (r#"{"nested":[{}]}"#, r#"{"nested":[{"added":null}]}"#),
+            ("[1,2]", "[2,1]"),
+        ] {
+            let mut original: Value = serde_json::from_str(original).unwrap();
+            let mut changed: Value = serde_json::from_str(changed).unwrap();
+            assert_ne!(
+                normalized_digest(&mut original).unwrap(),
+                normalized_digest(&mut changed).unwrap()
+            );
+        }
+        let mut signed_zero = Value::from(value::ConvexValue::from(-0.0));
+        assert!(signed_zero.get("$float").is_some());
+        assert_ne!(
+            normalized_digest(&mut signed_zero).unwrap(),
+            normalized_digest(&mut json!(0)).unwrap()
+        );
+        assert!(serde_json::from_str::<Value>("1e400").is_err());
+    }
 
     #[test]
     fn expiry_stays_final_after_clock_corrections() {
@@ -794,7 +954,7 @@ mod tests {
                 "{}:0123456789abcdef0123456789abcdef",
                 now.duration_since(UNIX_EPOCH).unwrap().as_secs()
             );
-            let mut response = json!({"prepared":true});
+            let mut response = json!({"prepared":1.0});
             let sources = Arc::new(PreparedPush::default());
             let weak_sources = Arc::downgrade(&sources);
             owner.operations.lock().insert(
@@ -814,10 +974,33 @@ mod tests {
                     finish: FinishState::Idle,
                 },
             );
-            let first = owner.prepared(&id, response.clone()).unwrap().unwrap();
+            // The ordinary JavaScript echo must acquire the same source lease.
+            let response = json!({"prepared":1});
             assert_eq!(
                 owner
-                    .prepared(&id, response.clone())
+                    .publication_control(&id, &owner.session_id, false)
+                    .unwrap()["publicationState"],
+                "available"
+            );
+            assert!(owner
+                .prepared(&id, Some("previous-session"), response.clone())
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                owner
+                    .prepared(&id, Some(&owner.session_id), json!({"prepared":false}))
+                    .err()
+                    .unwrap()
+                    .short_msg(),
+                "DeploymentOperationInputMismatch"
+            );
+            let first = owner
+                .prepared(&id, Some(&owner.session_id), response.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                owner
+                    .prepared(&id, Some(&owner.session_id), response.clone())
                     .err()
                     .unwrap()
                     .short_msg(),
@@ -826,7 +1009,12 @@ mod tests {
             match revoke {
                 Revocation::None => {},
                 Revocation::Cancel => {
-                    owner.cancel(&id).unwrap();
+                    assert_eq!(
+                        owner
+                            .publication_control(&id, &owner.session_id, true)
+                            .unwrap()["publicationState"],
+                        "active"
+                    );
                 },
                 Revocation::Expire => {
                     owner.operations.lock().get_mut(&id).unwrap().deadline =
@@ -834,10 +1022,16 @@ mod tests {
                 },
             }
             owner.prune(&mut owner.operations.lock(), owner.now());
+            assert_eq!(
+                owner
+                    .publication_control(&id, &owner.session_id, false)
+                    .unwrap()["publicationState"],
+                "active"
+            );
             assert_eq!(owner.operations.lock()[&id].reserved_bytes, 1234);
             assert_eq!(
                 owner
-                    .prepared(&id, response.clone())
+                    .prepared(&id, Some(&owner.session_id), response.clone())
                     .err()
                     .unwrap()
                     .short_msg(),
@@ -845,8 +1039,14 @@ mod tests {
             );
             assert!(weak_sources.upgrade().is_some());
             drop(first);
-            let next = owner.prepared(&id, response).unwrap();
+            let next = owner.prepared(&id, None, response).unwrap();
             if revoke != Revocation::None {
+                assert_eq!(
+                    owner
+                        .publication_control(&id, &owner.session_id, false)
+                        .unwrap()["publicationState"],
+                    "revoked"
+                );
                 assert!(next.is_none());
                 assert!(weak_sources.upgrade().is_none());
                 let operations = owner.operations.lock();
@@ -862,8 +1062,47 @@ mod tests {
                 assert!(next.is_some());
                 drop(next);
                 assert_eq!(owner.operations.lock()[&id].finish, FinishState::Idle);
+                assert_eq!(
+                    owner
+                        .publication_control(&id, &owner.session_id, true)
+                        .unwrap()["publicationState"],
+                    "revoked"
+                );
+                assert!(owner
+                    .prepared(&id, None, json!({"prepared":true}))
+                    .unwrap()
+                    .is_none());
             }
         }
+    }
+
+    #[test]
+    fn publication_absence_requires_expiry_or_a_different_session() {
+        let owner = DeploymentOperations::default();
+        let now = owner.now();
+        let created = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let id = format!("{created}:0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            owner
+                .publication_control(&id, &owner.session_id, true)
+                .unwrap_err()
+                .short_msg(),
+            "DeploymentOperationUnknown"
+        );
+        assert_eq!(
+            owner
+                .publication_control(&id, "previous-session", true)
+                .unwrap()["publicationState"],
+            "revoked"
+        );
+        *owner.clock.lock() = now + LIFETIME;
+        assert_eq!(
+            owner
+                .publication_control(&id, &owner.session_id, true)
+                .unwrap()["publicationState"],
+            "revoked"
+        );
+        assert!(operation_expiry(&id, owner.now()).is_err());
     }
 
     #[test]

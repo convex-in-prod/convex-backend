@@ -1063,7 +1063,7 @@ impl KeyBroker {
                     .decode_proto(ADMIN_KEY_VERSION, encrypted_part)
                     .inspect(|_| log_legacy_admin_key())
             })
-            .with_context(|| format!("Couldn't decode the AdminKeyProto {key}"))?;
+            .context("Couldn't decode the AdminKeyProto")?;
         let instance_name = instance_name
             .or(instance_name_from_encrypted_part.as_deref())
             .context("Invalid admin key format")?;

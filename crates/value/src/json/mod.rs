@@ -94,6 +94,12 @@ pub mod value {
         }
     }
 
+    pub fn to_raw_value<V: ConvexValueWalker>(
+        value: V,
+    ) -> serde_json::Result<Box<serde_json::value::RawValue>> {
+        serde_json::value::to_raw_value(&SerializeValue::new(value))
+    }
+
     pub fn serialize<V: ConvexValueWalker, S: Serializer>(
         value: V,
         serializer: S,

@@ -22,14 +22,21 @@ use parking_lot::Mutex;
 use slab::Slab;
 use tokio::sync::oneshot;
 
-use crate::metrics::{
-    concurrency_permit_acquire_timer,
-    decrement_active_javascript_occupancy,
-    decrement_active_javascript_waiters,
-    increment_active_javascript_occupancy,
-    increment_active_javascript_waiters,
-    initialize_active_javascript_metrics,
-    log_concurrency_permit_used,
+use crate::{
+    metrics::{
+        concurrency_permit_acquire_timer,
+        decrement_active_javascript_occupancy,
+        decrement_active_javascript_waiters,
+        increment_active_javascript_occupancy,
+        increment_active_javascript_waiters,
+        initialize_active_javascript_metrics,
+        log_concurrency_permit_used,
+    },
+    service_class_policy::{
+        class_index,
+        ServiceClassPolicy,
+        SERVICE_CLASSES,
+    },
 };
 
 /// Whether active JavaScript is starting or resuming after an asynchronous
@@ -192,9 +199,7 @@ struct ActivePermitsTracker {
     granted_by_class: [usize; 5],
     waiters: Slab<Waiter>,
     queues: [VecDeque<usize>; WaiterQueue::COUNT],
-    next_tied_class: ActiveJavascriptClass,
-    next_protected_control_plane: bool,
-    high_priority_streak: u8,
+    policy: ServiceClassPolicy,
 }
 
 impl ConcurrencyLimiter {
@@ -217,6 +222,21 @@ impl ConcurrencyLimiter {
         )
     }
 
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub(crate) fn new_for_wasm(
+        max_concurrency: usize,
+        protected_minimum: usize,
+        degradable_minimum: usize,
+    ) -> Self {
+        // Reuse the service policy without charging Wasm occupancy to V8 metrics.
+        Self::new_inner(
+            max_concurrency,
+            protected_minimum,
+            degradable_minimum,
+            false,
+            false,
+        )
+    }
 
     fn new_inner(
         max_concurrency: usize,
@@ -252,9 +272,7 @@ impl ConcurrencyLimiter {
                     granted_by_class: [0; 5],
                     waiters: Slab::new(),
                     queues: array::from_fn(|_| VecDeque::new()),
-                    next_tied_class: ActiveJavascriptClass::Degradable,
-                    next_protected_control_plane: true,
-                    high_priority_streak: 0,
+                    policy: ServiceClassPolicy::new(protected_minimum, degradable_minimum),
                 }),
                 max_permits: max_concurrency,
                 protected_minimum,
@@ -564,16 +582,6 @@ impl Drop for WaiterGuard {
 #[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
 struct PermitId(usize);
 
-fn class_index(class: ActiveJavascriptClass) -> usize {
-    match class {
-        ActiveJavascriptClass::Dependency => 0,
-        ActiveJavascriptClass::Protected => 1,
-        ActiveJavascriptClass::Degradable => 2,
-        ActiveJavascriptClass::ControlPlane => 3,
-        ActiveJavascriptClass::HighPriorityMutation => 4,
-    }
-}
-
 impl ActivePermitsTracker {
     fn register(&mut self, client_id: Arc<String>, class: ActiveJavascriptClass) -> PermitId {
         self.active_by_class[class_index(class)] += 1;
@@ -627,119 +635,10 @@ impl ActivePermitsTracker {
         }
     }
 
-    fn select_class(&mut self, inner: &ConcurrencyLimiterInner) -> Option<ActiveJavascriptClass> {
-        let group = self.select_group(inner)?;
-        if group != ActiveJavascriptClass::Protected {
-            return Some(group);
-        }
-        let ordinary = self.class_has_waiter(ActiveJavascriptClass::Protected);
-        let high = self.class_has_waiter(ActiveJavascriptClass::HighPriorityMutation);
-        let application = ordinary || high;
-        let control = self.class_has_waiter(ActiveJavascriptClass::ControlPlane);
-        let selected = match (application, control) {
-            (true, true) if self.next_protected_control_plane => {
-                ActiveJavascriptClass::ControlPlane
-            },
-            (true, _) => ActiveJavascriptClass::Protected,
-            (false, true) => ActiveJavascriptClass::ControlPlane,
-            (false, false) => unreachable!("selected protected group has no waiter"),
-        };
-        // Alternate grants whenever both queues are ready. Ordinary resumptions
-        // cannot hide deployment demand, and repeated deployments cannot starve
-        // live protected work. Both retain the existing combined service floor.
-        self.next_protected_control_plane = selected == ActiveJavascriptClass::Protected;
-        if selected == ActiveJavascriptClass::ControlPlane {
-            return Some(selected);
-        }
-        // Client hints divide existing protected service; sustained high demand
-        // never removes the ordinary service turn, including resumptions.
-        if high && (!ordinary || self.high_priority_streak < 2) {
-            self.high_priority_streak = self.high_priority_streak.saturating_add(1).min(2);
-            Some(ActiveJavascriptClass::HighPriorityMutation)
-        } else {
-            self.high_priority_streak = 0;
-            Some(ActiveJavascriptClass::Protected)
-        }
-    }
-
-    fn select_group(&mut self, inner: &ConcurrencyLimiterInner) -> Option<ActiveJavascriptClass> {
-        if self.class_has_waiter(ActiveJavascriptClass::Dependency) {
-            return Some(ActiveJavascriptClass::Dependency);
-        }
-        let protected_waiting = self.class_has_waiter(ActiveJavascriptClass::Protected)
-            || self.class_has_waiter(ActiveJavascriptClass::HighPriorityMutation)
-            || self.class_has_waiter(ActiveJavascriptClass::ControlPlane);
-        if inner.protected_minimum == 0 {
-            assert!(
-                !self.class_has_waiter(ActiveJavascriptClass::Degradable),
-                "degradable waiter escaped compatibility collapse"
-            );
-            return protected_waiting.then_some(ActiveJavascriptClass::Protected);
-        }
-
-        let degradable_waiting = self.class_has_waiter(ActiveJavascriptClass::Degradable);
-        match (protected_waiting, degradable_waiting) {
-            (false, false) => return None,
-            (true, false) => return Some(ActiveJavascriptClass::Protected),
-            (false, true) => return Some(ActiveJavascriptClass::Degradable),
-            (true, true) => {},
-        }
-
-        let protected_occupancy = self.class_occupancy(ActiveJavascriptClass::Protected)
-            + self.class_occupancy(ActiveJavascriptClass::HighPriorityMutation)
-            + self.class_occupancy(ActiveJavascriptClass::ControlPlane);
-        let degradable_occupancy = self.class_occupancy(ActiveJavascriptClass::Degradable);
-        let protected_below = protected_occupancy < inner.protected_minimum;
-        let degradable_below = degradable_occupancy < inner.degradable_minimum;
-        match (protected_below, degradable_below) {
-            (true, false) => Some(ActiveJavascriptClass::Protected),
-            (false, true) => Some(ActiveJavascriptClass::Degradable),
-            (true, true) => {
-                // Compare satisfaction ratios without floating point. Filling
-                // floors proportionally prevents the larger floor from delaying
-                // all progress in the smaller class during a cold burst.
-                let protected_scaled =
-                    protected_occupancy as u128 * inner.degradable_minimum as u128;
-                let degradable_scaled =
-                    degradable_occupancy as u128 * inner.protected_minimum as u128;
-                if protected_scaled < degradable_scaled {
-                    Some(ActiveJavascriptClass::Protected)
-                } else if degradable_scaled < protected_scaled {
-                    Some(ActiveJavascriptClass::Degradable)
-                } else {
-                    Some(self.take_next_tied_class())
-                }
-            },
-            (false, false) => {
-                let protected_elastic = protected_occupancy - inner.protected_minimum;
-                let degradable_elastic = degradable_occupancy - inner.degradable_minimum;
-                // Balance elastic occupancy, not only the handoff sequence.
-                // Otherwise a class that initially borrowed the whole gate can
-                // lose every elastic slot as its incumbents finish, even while
-                // both classes remain continuously runnable.
-                if protected_elastic < degradable_elastic {
-                    Some(ActiveJavascriptClass::Protected)
-                } else if degradable_elastic < protected_elastic {
-                    Some(ActiveJavascriptClass::Degradable)
-                } else {
-                    Some(self.take_next_tied_class())
-                }
-            },
-        }
-    }
-
-    fn take_next_tied_class(&mut self) -> ActiveJavascriptClass {
-        let selected = self.next_tied_class;
-        self.next_tied_class = match selected {
-            ActiveJavascriptClass::Protected => ActiveJavascriptClass::Degradable,
-            ActiveJavascriptClass::Degradable => ActiveJavascriptClass::Protected,
-            ActiveJavascriptClass::Dependency
-            | ActiveJavascriptClass::ControlPlane
-            | ActiveJavascriptClass::HighPriorityMutation => {
-                panic!("only protected and degradable groups can break an admission tie")
-            },
-        };
-        selected
+    fn select_class(&mut self) -> Option<ActiveJavascriptClass> {
+        let waiting = SERVICE_CLASSES.map(|class| self.class_has_waiter(class));
+        let occupancy = SERVICE_CLASSES.map(|class| self.class_occupancy(class));
+        self.policy.select_class(waiting, occupancy)
     }
 
     fn pop_waiter(&mut self, class: ActiveJavascriptClass) -> Option<usize> {
@@ -774,7 +673,7 @@ impl ActivePermitsTracker {
 
     fn dispatch(&mut self, inner: &ConcurrencyLimiterInner) {
         while self.total_occupancy() < inner.max_permits {
-            let Some(class) = self.select_class(inner) else {
+            let Some(class) = self.select_class() else {
                 return;
             };
             let waiter_id = self
@@ -1076,7 +975,7 @@ mod tests {
         };
         let before = snapshot();
         assert!(!before.is_empty());
-        let wasm = ConcurrencyLimiter::new_for_wasm(1);
+        let wasm = ConcurrencyLimiter::new_for_wasm(1, 0, 0);
         assert_eq!(wasm.max_permits(), Some(1));
         assert_eq!(javascript.max_permits(), Some(28));
         assert_eq!(snapshot(), before);

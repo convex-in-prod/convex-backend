@@ -8,6 +8,7 @@ use crate::convert_v8::TypeError;
 pub fn op_crypto_random_uuid<P: OpProvider>(provider: &mut P) -> anyhow::Result<String> {
     let rng = provider.rng()?;
     let uuid = uuid::Builder::from_random_bytes(rng.random()).into_uuid();
+    provider.record_generated_uuid(*uuid.as_bytes())?;
     Ok(uuid.to_string())
 }
 

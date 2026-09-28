@@ -28,7 +28,9 @@ The narrow objective is therefore:
 - queue before scarce global and resident-generation ownership is consumed;
 - retain the application-wide hard cap;
 - keep scheduled work `Pending` until admission is real;
-- let an operator choose a per-pool event-loop unresponsiveness budget; and
+- let an operator choose a per-pool event-loop unresponsiveness budget;
+- let an operator inherit or disable healthy generation-age retirement per pool;
+- give registered resident work one bounded cleanup callback before healthy reap; and
 - expose enough queue evidence to tune the static values.
 
 The objective is not to introduce a general Node scheduling framework, make
@@ -42,8 +44,15 @@ code may have started.
 An operator supplies a strict map from the existing pool name to optional
 admission, memory, and watchdog values: independent concurrency,
 queue-warning duration, V8 old-space allowance, RSS retirement threshold,
-cgroup-pressure RSS threshold, and maximum event-loop unresponsiveness. The
-map is bounded to the routing protocol's maximum of the default pool plus eight
+cgroup-pressure RSS threshold, maximum event-loop unresponsiveness, healthy
+generation age, and resident cleanup timeout. An omitted age inherits
+`LOCAL_NODE_EXECUTOR_MAX_GENERATION_AGE_SECS`; explicit `null` disables only
+age retirement for that pool. A registered resident callback receives one
+monotonic bounded deadline before healthy age, RSS, package, deployment, or
+topology reap. Callback errors and expiry remain observable and permit bounded
+reap. Watchdog, process-failure, cgroup-pressure, and forced replacement paths
+retain immediate termination authority. The map is bounded to the routing
+protocol's maximum of the default pool plus eight
 named pools, while still permitting configuration before a declared name is
 deployed. The application continues to own module-to-pool routing. Operator
 configuration cannot create a pool, reroute a module, or alter durable

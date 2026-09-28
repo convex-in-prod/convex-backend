@@ -168,6 +168,8 @@ use model::{
 use parking_lot::Mutex;
 use prometheus::VMHistogram;
 use sync_types::CanonicalizedModulePath;
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{
     mpsc,
     oneshot,
@@ -189,6 +191,13 @@ use udf::{
 };
 use value::identifier::Identifier;
 
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+use crate::environment::udf::static_hermes_wasmtime_gate::{
+    observe_v8_primary_demand,
+    PreparedStaticHermesWasmtimeInvocation,
+    PrimaryDemandObservation,
+    StaticHermesWasmtimeRouteHandle,
+};
 use crate::{
     concurrency_limiter::{
         ConcurrencyLimiter,
@@ -351,7 +360,7 @@ impl Drop for CancellationRegistration {
 }
 
 impl CancellationSignal {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(CancellationState {
                 cancelled: AtomicBool::new(false),
@@ -863,6 +872,11 @@ struct ActiveRequestGuard {
     active_workers: Arc<AtomicUsize>,
     pool_name: &'static str,
     scheduling_properties: RequestSchedulingProperties,
+    // A response can precede context preparation or dirty-isolate destruction.
+    // Keep V8 query/analysis capacity until this worker becomes reusable.
+    _v8_capacity_reservation: Option<QueryAnalysisPermit>,
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    _primary_demand: Option<[PrimaryDemandObservation; 2]>,
 }
 
 fn per_client_worker_capacity(max_workers: usize, max_percent_per_client: usize) -> usize {
@@ -907,6 +921,7 @@ impl ActiveRequestGuard {
         active_workers: Arc<AtomicUsize>,
         pool_name: &'static str,
         scheduling_properties: RequestSchedulingProperties,
+        v8_capacity_reservation: Option<QueryAnalysisPermit>,
     ) -> Self {
         active_workers.fetch_add(1, Ordering::Relaxed);
         metrics::log_scheduler_active_request_started(
@@ -918,6 +933,9 @@ impl ActiveRequestGuard {
             active_workers,
             pool_name,
             scheduling_properties,
+            _v8_capacity_reservation: v8_capacity_reservation,
+            #[cfg(feature = "static-hermes-wasmtime-gate")]
+            _primary_demand: None,
         }
     }
 }
@@ -1074,6 +1092,15 @@ pub struct UdfRequest<RT: Runtime> {
     pub context: ExecutionContext,
     pub environment_data: EnvironmentData<RT>,
     pub file_downloads: FileDownloads,
+    /// Query-shadow collection is opt-in because normal UDF execution has no
+    /// consumer for this process-local evidence.
+    pub trace_host_operations: bool,
+    /// Capture only reads made while the user handler is executing.
+    pub capture_handler_reads: bool,
+    /// Keep shadow admission held while separately scheduled nested V8 work
+    /// drains after the parent Wasm request is cancelled.
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub shadow_work_guard: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 pub struct HttpActionRequest<RT: Runtime> {
@@ -1107,6 +1134,23 @@ pub struct EnvironmentData<RT: Runtime> {
     pub file_storage: TransactionalFileStorage<RT>,
     pub module_loader: Arc<dyn ModuleCache<RT>>,
     pub deployment: DeploymentMetadata,
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub host_secret_values: Option<BTreeMap<String, HostSecretValue>>,
+}
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+#[derive(Clone, Eq, PartialEq)]
+pub struct HostSecretValue(Arc<Vec<u8>>);
+
+#[cfg(feature = "static-hermes-wasmtime-gate")]
+impl HostSecretValue {
+    pub fn new(value: impl Into<Vec<u8>>) -> Self {
+        Self(Arc::new(value.into()))
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
 }
 
 pub struct Request<RT: Runtime> {
@@ -1115,6 +1159,9 @@ pub struct Request<RT: Runtime> {
     pub parent_trace: EncodedSpan,
     pub scheduler_dependency: SchedulerDependencyClass,
     pub active_javascript_class: ActiveJavascriptClass,
+    // The worker owns this through cancellation cleanup, even after the caller
+    // releases its application-level cache-leader permit.
+    pub(crate) v8_capacity_reservation: Option<QueryAnalysisPermit>,
     // Dispatched work retains whole-job admission after subscriber cancellation.
     pub(crate) deployment_job: Option<common::query_analysis_admission::DeploymentAnalysisPermit>,
 }
@@ -1162,6 +1209,7 @@ impl<RT: Runtime> Request<RT> {
             active_javascript_class.for_scheduler_dependency(scheduler_dependency)
         };
         let request = Self {
+            v8_capacity_reservation: None,
             deployment_job: common::query_analysis_admission::DEPLOYMENT_ANALYSIS_JOB
                 .try_with(Clone::clone)
                 .ok(),
@@ -1573,6 +1621,7 @@ impl<RT: Runtime> Clone for IsolateClient<RT> {
             active_workers: self.active_workers.clone(),
             max_workers: self.max_workers,
             control_plane_lane_enabled: self.control_plane_lane_enabled,
+            v8_query_analysis_admission: self.v8_query_analysis_admission.clone(),
         }
     }
 }
@@ -1664,6 +1713,7 @@ pub struct IsolateClient<RT: Runtime> {
     active_workers: Arc<AtomicUsize>,
     max_workers: usize,
     control_plane_lane_enabled: bool,
+    v8_query_analysis_admission: Option<QueryAnalysisAdmission>,
 }
 
 impl<RT: Runtime> IsolateClient<RT> {
@@ -1688,6 +1738,10 @@ impl<RT: Runtime> IsolateClient<RT> {
         max_isolate_workers: usize,
         isolate_worker: W,
     ) -> anyhow::Result<Self> {
+        #[cfg(feature = "static-hermes-wasmtime-gate")]
+        {
+            crate::environment::udf::static_hermes_wasmtime_gate::initialize_route_configuration()?;
+        }
         let configured_context_cache_capacity =
             Self::preflight_context_cache_capacity(max_isolate_workers)?;
         anyhow::ensure!(
@@ -1806,6 +1860,19 @@ impl<RT: Runtime> IsolateClient<RT> {
         let active_workers = Arc::new(AtomicUsize::new(0));
         let _active_workers = active_workers.clone();
         let rt_clone = rt.clone();
+        #[cfg(feature = "static-hermes-wasmtime-gate")]
+        crate::environment::udf::static_hermes_wasmtime_gate::initialize_memory_pressure_sampler(
+            rt.clone(),
+        )?;
+        let v8_query_analysis_admission = common::knobs::ISOLATE_DEGRADABLE_QUERY_ANALYSIS_CAPACITY
+            .map(QueryAnalysisAdmission::new);
+        if let Some(admission) = &v8_query_analysis_admission {
+            metrics::log_scheduler_capacity(
+                pool_name,
+                "degradable_query_analysis",
+                admission.capacity(),
+            );
+        }
         let scheduler = rt.spawn("shared_isolate_scheduler", async move {
             // The scheduler thread selects a queued request and an available
             // worker, then sends the request to that worker.
@@ -1834,6 +1901,7 @@ impl<RT: Runtime> IsolateClient<RT> {
             active_workers,
             max_workers: max_isolate_workers,
             control_plane_lane_enabled,
+            v8_query_analysis_admission,
         })
     }
 
@@ -1858,6 +1926,170 @@ impl<RT: Runtime> IsolateClient<RT> {
     }
 
     #[fastrace::trace]
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub fn resolve_static_hermes_wasmtime_route(
+        udf_type: UdfType,
+        path_and_args: &ValidatedPathAndArgs,
+    ) -> anyhow::Result<Option<StaticHermesWasmtimeRouteHandle>> {
+        crate::environment::udf::static_hermes_wasmtime_gate::resolve_route(udf_type, path_and_args)
+    }
+
+    #[fastrace::trace]
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub async fn select_static_hermes_wasmtime_route_for_invocation(
+        route: StaticHermesWasmtimeRouteHandle,
+        udf_type: UdfType,
+        path_and_args: &ValidatedPathAndArgs,
+        transaction: &mut Transaction<RT>,
+    ) -> anyhow::Result<Option<StaticHermesWasmtimeRouteHandle>> {
+        crate::environment::udf::static_hermes_wasmtime_gate::select_route_for_invocation(
+            route,
+            udf_type,
+            path_and_args,
+            transaction,
+        )
+        .await
+    }
+
+    #[fastrace::trace]
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub fn resolve_static_hermes_wasmtime_shadow_route(
+        udf_type: UdfType,
+        path_and_args: &ValidatedPathAndArgs,
+    ) -> anyhow::Result<Option<StaticHermesWasmtimeRouteHandle>> {
+        crate::environment::udf::static_hermes_wasmtime_gate::resolve_shadow_route(
+            udf_type,
+            path_and_args,
+        )
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub fn active_static_hermes_query_shadow_registry(
+    ) -> anyhow::Result<Option<crate::StaticHermesQueryShadowRegistry>> {
+        crate::environment::udf::static_hermes_wasmtime_gate::active_query_shadow_registry()
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub fn static_hermes_generated_memory_statistics(
+        udf_type: UdfType,
+    ) -> anyhow::Result<Option<crate::StaticHermesGeneratedMemoryStatistics>> {
+        crate::environment::udf::static_hermes_wasmtime_gate::generated_memory_statistics(udf_type)
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub fn static_hermes_memory_inspection(
+        udf_type: UdfType,
+        after_route: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<crate::StaticHermesMemoryInspection> {
+        crate::environment::udf::static_hermes_wasmtime_gate::generated_memory_inspection(
+            udf_type,
+            after_route,
+            limit,
+        )
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub async fn prepare_static_hermes_wasmtime_invocation(
+        route: StaticHermesWasmtimeRouteHandle,
+        udf_type: UdfType,
+        path_and_args: ValidatedPathAndArgs,
+        transaction: Transaction<RT>,
+        mode: crate::StaticHermesWasmtimePreparationMode,
+    ) -> anyhow::Result<PreparedStaticHermesWasmtimeInvocation<RT>> {
+        use crate::environment::udf::static_hermes_wasmtime_gate::{
+            allow_disposed_wasm_primary_fallback,
+        };
+
+        crate::environment::udf::static_hermes_wasmtime_gate::prepare_routed_invocation(
+            route,
+            udf_type,
+            path_and_args,
+            transaction,
+            mode,
+        )
+        .await
+        // No handler owns this transaction yet. A failed preparation drops it;
+        // only classified engine failures may authorize ordinary V8 recovery.
+        .map_err(allow_disposed_wasm_primary_fallback)
+    }
+
+    #[fastrace::trace]
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub async fn execute_static_hermes_wasmtime_gate(
+        &self,
+        prepared: PreparedStaticHermesWasmtimeInvocation<RT>,
+        client_id: String,
+        udf_type: UdfType,
+        journal: QueryJournal,
+        context: ExecutionContext,
+        environment_data: EnvironmentData<RT>,
+        rng_seed: [u8; 32],
+        unix_timestamp: UnixTimestamp,
+        function_started_sender: Option<oneshot::Sender<()>>,
+        capture_handler_reads: bool,
+        shadow_work_guard: Option<Arc<OwnedSemaphorePermit>>,
+        trace_host_operations: bool,
+        scheduler_dependency: SchedulerDependencyClass,
+        active_javascript_class: ActiveJavascriptClass,
+    ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
+        assert_ne!(active_javascript_class, ActiveJavascriptClass::ControlPlane);
+        // A detached verifier has no ancestor to unblock. Primary requests must
+        // preserve the cache's query class and runtime-derived dependency ownership.
+        let active_javascript_class = if shadow_work_guard.is_some() {
+            ActiveJavascriptClass::Protected
+        } else {
+            active_javascript_class.for_scheduler_dependency(scheduler_dependency)
+        };
+        assert!(
+            active_javascript_class != ActiveJavascriptClass::Degradable
+                || udf_type == UdfType::Query,
+            "only an admitted root query can use degradable Wasm admission"
+        );
+        let (tx, rx) = oneshot::channel();
+        let cancellation = CancellationSignal::new();
+        let caller_cancellation = cancellation.clone();
+        let rt = self.rt.clone();
+        let nested_udf_callback = self.clone();
+        let execution_observation = crate::execution_observation::current()
+            .map(|observer| observer.task(crate::execution_observation::TaskKind::Runtime));
+        self.rt
+            .spawn_background("static_hermes_wasmtime_gate", async move {
+                let result = crate::execution_observation::observe(
+                    crate::environment::udf::static_hermes_wasmtime_gate::run_prepared_routed(
+                        rt,
+                        prepared,
+                        nested_udf_callback,
+                        client_id,
+                        0,
+                        udf_type,
+                        journal,
+                        context,
+                        environment_data,
+                        rng_seed,
+                        unix_timestamp,
+                        cancellation,
+                        function_started_sender,
+                        capture_handler_reads,
+                        shadow_work_guard,
+                        trace_host_operations,
+                        active_javascript_class,
+                    ),
+                    execution_observation,
+                )
+                .await;
+                let _ = tx.send(result);
+            });
+
+        let response = pin!(Self::receive_response(rx));
+        // Match execute_udf's publication-before-receiver-drop ordering.
+        let cancel_on_drop = CancelExecutionOnDrop(Some(caller_cancellation));
+        let response = response.await;
+        cancel_on_drop.disarm();
+        response?
+    }
+
+    #[fastrace::trace]
     pub async fn execute_udf(
         &self,
         udf_type: UdfType,
@@ -1872,6 +2104,10 @@ impl<RT: Runtime> IsolateClient<RT> {
         instance_name: String,
         function_started_sender: Option<oneshot::Sender<()>>,
         subfunctions_in_same_isolate: bool,
+        trace_host_operations: bool,
+        #[cfg(feature = "static-hermes-wasmtime-gate")] shadow_work_guard: Option<
+            Arc<OwnedSemaphorePermit>,
+        >,
         scheduler_dependency: SchedulerDependencyClass,
         active_javascript_class: ActiveJavascriptClass,
     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
@@ -1890,6 +2126,10 @@ impl<RT: Runtime> IsolateClient<RT> {
                 context,
                 environment_data,
                 file_downloads: FileDownloads::default(),
+                trace_host_operations,
+                capture_handler_reads: trace_host_operations,
+                #[cfg(feature = "static-hermes-wasmtime-gate")]
+                shadow_work_guard,
             },
             cancellation,
             response: tx,
@@ -2083,6 +2323,16 @@ impl<RT: Runtime> IsolateClient<RT> {
                             } else {
                                 None
                             };
+                        let v8_capacity_reservation = match &self.v8_query_analysis_admission {
+                            Some(admission) => {
+                                let timer =
+                                    Timer::new(&metrics::ISOLATE_ANALYSIS_V8_CAPACITY_WAIT_SECONDS);
+                                let permit = admission.acquire_analysis().await;
+                                drop(timer);
+                                Some(permit)
+                            },
+                            None => None,
+                        };
                         let (tx, rx) = oneshot::channel();
                         let cancellation = CancellationSignal::new();
                         let caller_cancellation = cancellation.clone();
@@ -2099,11 +2349,13 @@ impl<RT: Runtime> IsolateClient<RT> {
                             environment_variables: environment_variables.clone(),
                             cancellation,
                         };
-                        self.send_request(Request::new(
+                        let mut request = Request::new(
                             instance_name.clone(),
                             request,
                             EncodedSpan::from_parent(),
-                        ))?;
+                        );
+                        request.v8_capacity_reservation = v8_capacity_reservation;
+                        self.send_request(request)?;
                         let response = pin!(Self::receive_response(rx));
                         // Publish cancellation before receiver closure can wake
                         // the scheduler or race with worker response delivery.
@@ -2406,8 +2658,22 @@ impl<RT: Runtime> IsolateClient<RT> {
         Ok(())
     }
 
-    fn send_request(&self, request: Request<RT>) -> anyhow::Result<()> {
+    fn send_request(&self, mut request: Request<RT>) -> anyhow::Result<()> {
         let scheduling_properties = request.scheduling_properties(self.control_plane_lane_enabled);
+        if request.active_javascript_class == ActiveJavascriptClass::Degradable {
+            assert!(request.v8_capacity_reservation.is_none());
+            if let Some(admission) = &self.v8_query_analysis_admission {
+                request.v8_capacity_reservation =
+                    Some(admission.try_acquire_degradable().ok_or_else(|| {
+                        metrics::log_scheduler_request_rejected(
+                            self.pool_name,
+                            scheduling_properties.as_label(),
+                            "degradable_query_analysis_capacity",
+                        );
+                        ErrorMetadata::degradable_query_capacity()
+                    })?);
+            }
+        }
         let send_result = self
             .sender
             .try_send(request, scheduling_properties.queue_lane());
@@ -2468,8 +2734,8 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
             client_id,
             request,
             EncodedSpan::from_parent(),
-            // This queue exists only for a separately scheduled nested UDF
-            // whose caller retains an isolate worker.
+            // A separately scheduled nested UDF unblocks a caller retaining
+            // either a V8 worker or Wasm instance and memory ownership.
             SchedulerDependencyClass::UnblocksAncestor,
         );
         let scheduling_properties = request.scheduling_properties(self.control_plane_lane_enabled);
@@ -2505,6 +2771,8 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
                         })?),
                         Err(e) => Err(e),
                     },
+                    host_operation_error: outcome.host_operation_error,
+                    host_operation_trace: outcome.host_operation_trace,
                     syscall_trace: outcome.syscall_trace,
                 }
             },
@@ -3123,7 +3391,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
 
     fn dispatch_request(
         &mut self,
-        request: Request<RT>,
+        mut request: Request<RT>,
         permit: ConcurrencyPermit,
         dispatch_sojourn: Option<(IsolateQueueLane, Duration)>,
     ) -> SchedulerDispatchOutcome {
@@ -3165,7 +3433,26 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
             self.active_workers.clone(),
             self.worker.config().name,
             scheduling_properties,
+            request.v8_capacity_reservation.take(),
         );
+        #[cfg(feature = "static-hermes-wasmtime-gate")]
+        let active_request_guard = {
+            let mut guard = active_request_guard;
+            if let RequestType::Udf {
+                request,
+                reactor_depth: 0,
+                ..
+            } = &request.inner
+                && request.shadow_work_guard.is_none()
+            {
+                // A worker and CPU permit are assigned now. Keep observation
+                // through awaits, dirty-isolate destruction and preparation of
+                // the next context, until `ready` releases the worker.
+                guard._primary_demand =
+                    observe_v8_primary_demand(request.udf_type, &request.path_and_args);
+            }
+            guard
+        };
         let active_module = context_affinity.and_then(|(kind, _)| {
             request
                 .module()
@@ -3432,7 +3719,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
         WorkerSelection {
             worker_id: worker.worker_id,
             context_affinity,
-            // A reassigned isolate discards the prior client contexts.
+            // A reassigned isolate discards the prior client's contexts.
             cached_contexts: None,
             miss_placement: None,
             non_reusing_action_placement: None,
@@ -4533,12 +4820,14 @@ mod tests {
         rt.block_on("analysis_reservation_caller_drop_test", async move {
             let (path, module) = analysis_module("cancel.js");
             let (completion, completion_receiver) = oneshot::channel();
-            let (client, mut started) = analysis_test_client(
+            let (mut client, mut started) = analysis_test_client(
                 scheduler_rt,
                 4,
                 BTreeMap::from([(path.clone(), completion_receiver)]),
             );
             let admission = QueryAnalysisAdmission::new(1);
+            let v8_admission = QueryAnalysisAdmission::new(1);
+            client.v8_query_analysis_admission = Some(v8_admission.clone());
             let analyze_client = client.clone();
             let analyze_admission = admission.clone();
             let analyze_task = tokio::spawn(async move {
@@ -4566,6 +4855,10 @@ mod tests {
                 admission.try_acquire_degradable().is_none(),
                 "caller cancellation released capacity while analysis was still running"
             );
+            assert!(
+                v8_admission.try_acquire_degradable().is_none(),
+                "caller cancellation released V8 capacity while analysis was still running"
+            );
 
             completion
                 .send(Ok(Ok(AnalyzedModule::default())))
@@ -4581,10 +4874,68 @@ mod tests {
             .await
             .expect("analysis completion did not restore shared capacity");
             drop(restored);
+            drop(
+                tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, v8_admission.acquire_analysis())
+                    .await
+                    .expect("analysis completion did not restore V8 capacity"),
+            );
             client
                 .shutdown()
                 .await
                 .expect("analysis client shutdown failed");
+        });
+    }
+
+    #[test]
+    fn v8_degradable_dispatch_retains_capacity_after_caller_drop_and_exempts_dependencies() {
+        let tokio = ProdRuntime::init_tokio().unwrap();
+        let rt = ProdRuntime::new(&tokio);
+        let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+        rt.block_on("v8_dispatch_capacity_test", async move {
+            let (mut client, _) = analysis_test_client(scheduler_rt, 4, BTreeMap::new());
+            let v8_admission = QueryAnalysisAdmission::new(1);
+            client.v8_query_analysis_admission = Some(v8_admission.clone());
+            let (started, mut starts) = mpsc::unbounded_channel();
+            let PendingTestRequest {
+                request,
+                completion,
+                response,
+            } = test_request(1, TestRequestKind::Degradable, started.clone());
+            client.send_request(request).unwrap();
+            assert_eq!(
+                tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, starts.recv())
+                    .await
+                    .unwrap(),
+                Some(1)
+            );
+            drop(response);
+
+            let rejected = test_request(2, TestRequestKind::Degradable, started.clone());
+            let error = client.send_request(rejected.request).unwrap_err();
+            assert!(error.is_degradable_query_capacity());
+            assert!(v8_admission.try_acquire_degradable().is_none());
+
+            let dependency = test_request(3, TestRequestKind::Dependency, started);
+            client.send_request(dependency.request).unwrap();
+            assert_eq!(
+                tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, starts.recv())
+                    .await
+                    .unwrap(),
+                Some(3)
+            );
+            dependency.completion.send(()).unwrap();
+            dependency.response.await.unwrap().unwrap();
+
+            let mut analysis = Box::pin(v8_admission.acquire_analysis());
+            assert!(futures::poll!(&mut analysis).is_pending());
+            completion.send(()).unwrap();
+            let analysis = tokio::time::timeout(SCHEDULER_TEST_TIMEOUT, analysis)
+                .await
+                .unwrap();
+            assert!(v8_admission.try_acquire_degradable().is_none());
+            drop(analysis);
+            assert!(v8_admission.try_acquire_degradable().is_some());
+            client.shutdown().await.unwrap();
         });
     }
 

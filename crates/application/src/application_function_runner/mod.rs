@@ -116,6 +116,8 @@ use function_runner::{
         FunctionMetadata,
         HttpActionMetadata,
     },
+    FunctionExecutionMode,
+    FunctionExecutionResult,
     FunctionReads,
     FunctionRunner,
     FunctionWrites,
@@ -302,6 +304,8 @@ const NODE_ANALYZE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 mod http_routing;
 mod metrics;
+pub(crate) mod query_shadow;
+use query_shadow::QueryShadowCoordinator;
 
 /// Wrapper for [IsolateClient]s and [FunctionRunner]s that determines where to
 /// route requests.
@@ -400,7 +404,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
     }
 
     #[fastrace::trace]
-    pub(crate) async fn execute_query_or_mutation(
+    pub(crate) async fn execute_query_or_mutation_with_mode(
         &self,
         tx: Transaction<RT>,
         permit: RequestGuard<'_, RT>,
@@ -409,6 +413,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         journal: QueryJournal,
         context: ExecutionContext,
         scheduler_dependency: SchedulerDependencyClass,
+        execution_mode: FunctionExecutionMode,
     ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
         let (udf_type, function_metadata) = match function_kind {
             DatabaseFunctionKind::Query(active_javascript_class) => (
@@ -445,6 +450,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 None,
                 None,
                 scheduler_dependency,
+                execution_mode,
             )
             .await?;
         let tx = tx.with_context(|| format!("Missing transaction in response for {udf_type}"))?;
@@ -482,6 +488,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 None,
                 function_execution_start,
                 scheduler_dependency,
+                FunctionExecutionMode::Configured,
             )
             .await?;
 
@@ -515,6 +522,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                 Some(http_action_metadata),
                 None,
                 SchedulerDependencyClass::Independent,
+                FunctionExecutionMode::Configured,
             )
             .await?;
 
@@ -525,8 +533,6 @@ impl<RT: Runtime> FunctionRouter<RT> {
         Ok(outcome)
     }
 
-    // Drain the concurrency permits for `udf_type` to deterministically
-    // exercise the concurrency limit in tests.
     #[fastrace::trace]
     async fn function_runner_execute(
         &self,
@@ -539,6 +545,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         http_action_metadata: Option<HttpActionMetadata>,
         function_execution_start: Option<FunctionExecutionStartGate>,
         scheduler_dependency: SchedulerDependencyClass,
+        execution_mode: FunctionExecutionMode,
     ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
         // Read in this transaction so preference changes invalidate cached queries.
         let udf_runtime = BackendInfoModel::new(&mut tx)
@@ -566,6 +573,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
         let timer = function_run_timer(udf_type);
         let execution = isolate::execution_observation::observe(
             self.function_runner.run_function(
+                execution_mode,
                 udf_type,
                 udf_runtime,
                 tx.identity().clone(),
@@ -601,7 +609,15 @@ impl<RT: Runtime> FunctionRouter<RT> {
             // have both been checked.
             diagnostic.outcome = AttemptOutcome::SystemError;
         }
-        let (function_tx, outcome, usage_stats) = execution?;
+        let execution = execution?;
+        let FunctionExecutionResult::Completed {
+            transaction: function_tx,
+            outcome,
+            usage_stats,
+        } = execution
+        else {
+            anyhow::bail!("Static Hermes Wasm route was unavailable")
+        };
         timer.finish();
         drop(permit);
 
@@ -818,6 +834,11 @@ pub struct RequestGuard<'a, RT: Runtime> {
     permit: Option<DependencyOverflowPermit>,
 }
 
+pub struct MutationPermit<'a, RT: Runtime> {
+    request: RequestGuard<'a, RT>,
+    execution_mode: FunctionExecutionMode,
+}
+
 impl<RT: Runtime> RequestGuard<'_, RT> {
     async fn acquire_permit(&mut self, is_dependency: bool) -> anyhow::Result<()> {
         let timer = function_waiter_timer(self.limiter.udf_type);
@@ -1004,6 +1025,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
     key_broker: KeyBroker,
 
     isolate_functions: FunctionRouter<RT>,
+    mutation_shadow: QueryShadowCoordinator,
     // Used for analyze, schema, etc.
     node_actions: NodeActions<RT>,
 
@@ -1047,6 +1069,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             default_system_env_vars.clone(),
             function_log.clone(),
         );
+        let mutation_shadow = QueryShadowCoordinator::new(Arc::new(function_log.clone()));
         // Construct this gate once per application runner. The cache manager
         // and isolate analysis must receive clones of the same semaphore or
         // their loads become additive again.
@@ -1098,6 +1121,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             database,
             key_broker,
             isolate_functions,
+            mutation_shadow,
             node_actions,
             source_map_cache,
             modules_storage,
@@ -1112,6 +1136,56 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             ai_gateway_jwt_minter,
             deployment,
         }
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub async fn source_keyed_runtime_readiness(
+        &self,
+        runtime_content_sha256: &str,
+        generation: &isolate::SourceKeyedRuntimeGenerationIdentity,
+    ) -> anyhow::Result<isolate::SourceKeyedRuntimeReadiness> {
+        isolate::source_keyed_runtime_readiness(
+            self.runtime.clone(),
+            self.database.clone(),
+            self.default_system_env_vars.clone(),
+            runtime_content_sha256,
+            generation,
+        )
+        .await
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub async fn prepare_source_keyed_runtime(
+        &self,
+        runtime_content_sha256: &str,
+        generation: &isolate::SourceKeyedRuntimeGenerationIdentity,
+    ) -> anyhow::Result<isolate::SourceKeyedRuntimePreparation> {
+        isolate::prepare_source_keyed_runtime(
+            self.runtime.clone(),
+            self.database.clone(),
+            self.default_system_env_vars.clone(),
+            runtime_content_sha256,
+            generation,
+        )
+        .await
+    }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    pub async fn prepare_source_keyed_runtime_for_policy(
+        &self,
+        runtime_content_sha256: &str,
+        generation: &isolate::SourceKeyedRuntimeGenerationIdentity,
+        policy: common::wasm_runtime_policy::RuntimePolicySnapshot,
+    ) -> anyhow::Result<Option<isolate::SourceKeyedRuntimePreparation>> {
+        isolate::prepare_source_keyed_runtime_for_policy(
+            self.runtime.clone(),
+            self.database.clone(),
+            self.default_system_env_vars.clone(),
+            runtime_content_sha256,
+            generation,
+            policy,
+        )
+        .await
     }
 
     fn node_pool_action_limiter(
@@ -1201,12 +1275,15 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         let (mut tx, outcome) = match validate_result {
             Ok(path_and_args) => {
                 // Preserve the caller's uncommitted module writes in this transaction.
+                let execution_mode = self
+                    .mutation_shadow
+                    .execution_mode(&self.runtime, UdfType::Query);
                 let permit = self
                     .isolate_functions
                     .acquire_permit(UdfType::Query, SchedulerDependencyClass::Independent)
                     .await?;
                 self.isolate_functions
-                    .execute_query_or_mutation(
+                    .execute_query_or_mutation_with_mode(
                         tx,
                         permit,
                         path_and_args,
@@ -1214,6 +1291,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         QueryJournal::new(),
                         context.clone(),
                         SchedulerDependencyClass::Independent,
+                        execution_mode,
                     )
                     .await?
             },
@@ -1515,6 +1593,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     return Ok(Err(MutationError {
                         error: error.to_owned(),
                         log_lines,
+                        host_operation_error: outcome.host_operation_error,
                     }));
                 },
             };
@@ -1558,6 +1637,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         Err(MutationError {
                             error: js_error,
                             log_lines,
+                            host_operation_error: outcome.host_operation_error,
                         })
                     } else {
                         if let Some(occ_info) = e.occ_info()
@@ -1668,11 +1748,22 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
     pub async fn acquire_mutation_permit(
         &self,
         scheduler_dependency: SchedulerDependencyClass,
-    ) -> anyhow::Result<RequestGuard<'_, RT>> {
+    ) -> anyhow::Result<MutationPermit<'_, RT>> {
         self.database.check_write_throughput_limit()?;
-        self.isolate_functions
+        // Admission now precedes transaction creation and validation. Keep the
+        // attempt's policy with its permit so a live update cannot redirect it
+        // while it waits, including scheduled and cron mutation attempts.
+        let execution_mode = self
+            .mutation_shadow
+            .execution_mode(&self.runtime, UdfType::Mutation);
+        let request = self
+            .isolate_functions
             .acquire_permit(UdfType::Mutation, scheduler_dependency)
-            .await
+            .await?;
+        Ok(MutationPermit {
+            request,
+            execution_mode,
+        })
     }
 
     /// Attempts to run a mutation once using the given transaction.
@@ -1683,7 +1774,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
     pub async fn run_mutation_no_udf_log(
         &self,
         tx: Transaction<RT>,
-        permit: anyhow::Result<RequestGuard<'_, RT>>,
+        permit: anyhow::Result<MutationPermit<'_, RT>>,
         path: PublicFunctionPath,
         arguments: SerializedArgs,
         allowed_visibility: AllowedVisibility,
@@ -1727,7 +1818,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
     async fn run_mutation_inner(
         &self,
         mut tx: Transaction<RT>,
-        permit: anyhow::Result<RequestGuard<'_, RT>>,
+        permit: anyhow::Result<MutationPermit<'_, RT>>,
         path: PublicFunctionPath,
         arguments: SerializedArgs,
         allowed_visibility: AllowedVisibility,
@@ -1735,7 +1826,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         mutation_queue_length: Option<usize>,
         scheduler_dependency: SchedulerDependencyClass,
     ) -> anyhow::Result<(Transaction<RT>, ValidatedUdfOutcome)> {
-        let permit = permit?;
+        let MutationPermit {
+            request: permit,
+            execution_mode,
+        } = permit?;
         self.database.check_write_throughput_limit()?;
         if path.is_system() && !(tx.identity().is_admin() || tx.identity().is_system()) {
             anyhow::bail!(unauthorized_error("mutation"));
@@ -1769,7 +1863,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         let path = path_and_args.path().clone();
         let (mut tx, outcome) = self
             .isolate_functions
-            .execute_query_or_mutation(
+            .execute_query_or_mutation_with_mode(
                 tx,
                 permit,
                 path_and_args,
@@ -1777,6 +1871,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 QueryJournal::new(),
                 context.clone(),
                 scheduler_dependency,
+                execution_mode,
             )
             .await?;
         let mutation_outcome = match outcome {
@@ -2475,8 +2570,6 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         }
     }
 
-    // Drain the isolate concurrency permits for `udf_type` so tests can
-    // deterministically force `TooManyConcurrentRequests` and then recover.
     #[fastrace::trace]
     pub async fn build_deps(
         &self,
@@ -3603,4 +3696,7 @@ mod tests {
             Ok(())
         })
     }
+
+    #[cfg(feature = "static-hermes-wasmtime-gate")]
+    mod static_hermes_wasmtime_gate;
 }

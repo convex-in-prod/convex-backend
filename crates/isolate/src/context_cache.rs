@@ -576,6 +576,7 @@ pub(crate) enum ContextCacheClearReason {
     CacheDrop,
 }
 
+#[derive(Clone)]
 pub struct ContextReadSet {
     pub read_set: TransactionReadSet,
     pub range_hashes: Vec<(
