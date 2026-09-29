@@ -1,0 +1,4094 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 30 Sep 2026 00:54:09 +0800
+Subject: [PATCH 26/28] node-executor: supervise deployment-selected native
+ residents
+
+Bind immutable executable and configuration digests to the committed root source package, compare expected prior selection, and expose transactional deployment metadata for application ownership checks. Retain the newest empty package as deployment authority.
+
+Supervise inert preparation, activation, progress and bounded retirement with one native steady slot and the existing shared Node replacement surge owner. Keep process, verified artifact and capacity ownership through cancellation, force, memory pressure and shutdown until direct-child reaping is confirmed.
+
+Add administrative preparation and inspection, publication compatibility guards, durable reconciliation, actual executable lifecycle tests and generic operator adoption documentation.
+---
+ Cargo.lock                                    |    1 +
+ crates/application/src/deploy_config.rs       |  162 ++
+ crates/application/src/lib.rs                 |    2 +
+ .../src/system_table_cleanup/mod.rs           |  178 +-
+ crates/common/src/knobs.rs                    |    6 +-
+ .../src/environment/udf/async_syscall.rs      |   35 +-
+ crates/local_backend/src/deploy_config.rs     |    4 +-
+ crates/local_backend/src/deploy_config2.rs    |   23 +
+ .../src/deployment_operations.rs              |    1 +
+ crates/local_backend/src/lib.rs               |   36 +-
+ crates/local_backend/src/native_resident.rs   |  125 ++
+ crates/local_backend/src/router.rs            |    4 +
+ crates/model/src/source_packages/mod.rs       |    5 +
+ crates/model/src/source_packages/native.rs    |  151 ++
+ crates/model/src/source_packages/types.rs     |   17 +
+ crates/node_executor/Cargo.toml               |    8 +
+ crates/node_executor/NATIVE_RESIDENTS.md      |  139 ++
+ crates/node_executor/src/lib.rs               |    2 +
+ crates/node_executor/src/local.rs             |   73 +-
+ crates/node_executor/src/native.rs            | 1520 +++++++++++++++++
+ crates/node_executor/src/process.rs           |   15 +
+ crates/node_executor/src/routed.rs            |   58 +-
+ .../node_executor/testdata/native_resident.rs |  104 ++
+ crates/node_executor/tests/native_resident.rs |  641 +++++++
+ patches/README.md                             |   23 +-
+ patches/backend_memory_resilience/README.md   |   13 +-
+ .../README.md                                 |    5 +-
+ patches/native_residents/README.md            |   29 +
+ .../README.md                                 |   11 +-
+ 29 files changed, 3298 insertions(+), 93 deletions(-)
+ create mode 100644 crates/local_backend/src/native_resident.rs
+ create mode 100644 crates/model/src/source_packages/native.rs
+ create mode 100644 crates/node_executor/NATIVE_RESIDENTS.md
+ create mode 100644 crates/node_executor/src/native.rs
+ create mode 100644 crates/node_executor/src/process.rs
+ create mode 100644 crates/node_executor/testdata/native_resident.rs
+ create mode 100644 crates/node_executor/tests/native_resident.rs
+ create mode 100644 patches/native_residents/README.md
+
+diff --git a/Cargo.lock b/Cargo.lock
+index ba4a89c132a744aa7e4a9529c1d34c84822c3d28..4877e79bc586738ca7db8387fb36d7e9916308c0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -6762,6 +6762,7 @@ dependencies = [
+  "storage",
+  "tempfile",
+  "tokio",
++ "tokio-util",
+  "tracing",
+  "udf",
+  "value",
+diff --git a/crates/application/src/deploy_config.rs b/crates/application/src/deploy_config.rs
+index 0636197de917a69ba6e02c76a42b819208ae7ebc..c6093e81fe054c96c687a14609673820fa0a575b 100644
+--- a/crates/application/src/deploy_config.rs
++++ b/crates/application/src/deploy_config.rs
+@@ -198,6 +198,31 @@ pub struct PushMetrics {
+     pub occ_stats: OccRetryStats,
+ }
+ 
++pub(crate) async fn validate_native_resident_activation_in_tx<RT: Runtime>(
++    tx: &mut database::Transaction<RT>,
++    activation: Option<&model::source_packages::native::NativeResidentActivation>,
++) -> anyhow::Result<()> {
++    let latest = SourcePackageModel::new(tx, TableNamespace::Global)
++        .get_latest_record()
++        .await?;
++    let prior = latest
++        .as_ref()
++        .and_then(|package| package.native_resident.as_ref());
++    match activation {
++        Some(activation) => activation.validate_prior(prior),
++        None => {
++            anyhow::ensure!(
++                prior.is_none(),
++                ErrorMetadata::bad_request(
++                    "NativeResidentActivationRequired",
++                    "This deployment must explicitly retain or retire its selected native resident",
++                )
++            );
++            Ok(())
++        },
++    }
++}
++
+ fn project_source_bytes(config: &ProjectConfig) -> anyhow::Result<usize> {
+     let mut source_bytes = 0usize;
+     for module in config
+@@ -1124,6 +1149,10 @@ impl<RT: Runtime> Application<RT> {
+         request_metadata: RequestMetadata,
+         mut start_push: StartPushResponse,
+         message: Option<PushMessage>,
++        native_resident_activation: Option<
++            model::source_packages::native::NativeResidentActivation,
++        >,
++        native_resident: &node_executor::native::NativeResidentSupervisor,
+         force_node_cutover: bool,
+         operation: Option<FinishPushOperation>,
+     ) -> anyhow::Result<(SerializedFinishPushDiff, Timestamp)> {
+@@ -1139,10 +1168,25 @@ impl<RT: Runtime> Application<RT> {
+         let prepared = operation
+             .as_ref()
+             .and_then(|operation| operation.prepared.as_ref());
++        // Selection is installed on the root definition below. The client
++        // round trip cannot redirect that package into a different component.
++        anyhow::ensure!(
++            start_push.app.definition_path.is_root()
++                && start_push
++                    .analysis
++                    .iter()
++                    .all(|(path, definition)| { path == &definition.definition.path }),
++            ErrorMetadata::bad_request(
++                "InvalidDeploymentComponentDefinition",
++                "Deployment component definitions do not match their source packages",
++            )
++        );
+         // Resolve source bytes from this server's retained preparation or the
+         // uploaded archive. Both paths still validate activation inputs below.
+         let mut downloaded_source_packages = BTreeMap::new();
+         for (definition_path, source_package) in &mut start_push.component_definition_packages {
++            // The client round trip cannot supply durable native selection.
++            source_package.native_resident = None;
+             let package = if let Some(prepared) = prepared {
+                 prepared
+                     .packages
+@@ -1195,6 +1239,17 @@ impl<RT: Runtime> Application<RT> {
+         // configured process budget.
+         self.runner()
+             .validate_node_executor_pool_topology(&committed_pool_topology)?;
++
++        let root_definition_path = ComponentDefinitionPath::root();
++        if let Some(activation) = &native_resident_activation {
++            activation.validate()?;
++            start_push
++                .component_definition_packages
++                .get_mut(&root_definition_path)
++                .context("Missing root source package")?
++                .native_resident = activation.target.clone();
++        }
++
+         let cutover_reservation = self
+             .runner()
+             .reserve_node_executor_pool_cutover(&committed_pool_topology, force_node_cutover)
+@@ -1208,6 +1263,16 @@ impl<RT: Runtime> Application<RT> {
+         }
+ 
+         let finish_push_write_source = "finish_push";
++        // Capacity waits and post-commit Node drain must not hold this lock:
++        // another operator may need forced cutover to reclaim their surge owner.
++        let native_publication = self
++            .lock_native_resident_publication(
++                native_resident,
++                native_resident_activation
++                    .as_ref()
++                    .and_then(|activation| activation.application_contract.as_deref()),
++            )
++            .await?;
+ 
+         let (diff, ts) = self
+             .execute_with_audit_log_events_and_occ_retries_with_timestamp(
+@@ -1219,6 +1284,7 @@ impl<RT: Runtime> Application<RT> {
+                     let operation = &operation;
+                     let start_push = &start_push;
+                     let message = &message;
++                    let native_resident_activation = &native_resident_activation;
+                     async move {
+                         // Reading the bounded receipt table participates in OCC.
+                         // Concurrent retries cannot both activate this operation.
+@@ -1227,6 +1293,11 @@ impl<RT: Runtime> Application<RT> {
+                                 return Ok((FinishPushCommit::Replayed(diff, ts), vec![]));
+                             }
+                         }
++                        validate_native_resident_activation_in_tx(
++                            tx,
++                            native_resident_activation.as_ref(),
++                        )
++                        .await?;
+                         // Validate that environment variables haven't changed since `start_push`.
+                         let environment_variables =
+                             EnvironmentVariablesModel::new(tx).get_all().await?;
+@@ -1375,6 +1446,7 @@ impl<RT: Runtime> Application<RT> {
+             },
+         };
+ 
++        drop(native_publication);
+         self.complete_node_executor_pool_cutover_after_commit(
+             &committed_pool_topology,
+             ts,
+@@ -1396,6 +1468,7 @@ impl<RT: Runtime> Application<RT> {
+         schema_id: Option<String>,
+         node_dependencies: Option<Vec<NodeDependencyJson>>,
+         node_version: Option<NodeVersion>,
++        native_resident: &node_executor::native::NativeResidentSupervisor,
+         force_node_cutover: bool,
+     ) -> anyhow::Result<(PushAnalytics, PushMetrics)> {
+         use common::query_analysis_admission::{
+@@ -1457,6 +1530,7 @@ impl<RT: Runtime> Application<RT> {
+                 // Note: This is not transactional with the rest of the deploy to avoid keeping
+                 // a transaction open for a long time.
+                 let mut tx = self.begin(Identity::system()).await?;
++                validate_native_resident_activation_in_tx(&mut tx, None).await?;
+                 let user_environment_variables =
+                     EnvironmentVariablesModel::new(&mut tx).get_all().await?;
+                 let system_env_var_overrides = system_env_var_overrides(&mut tx).await?;
+@@ -1479,6 +1553,9 @@ impl<RT: Runtime> Application<RT> {
+                         force_node_cutover,
+                     )
+                     .await?;
++                let native_publication = self
++                    .lock_native_resident_publication(native_resident, None)
++                    .await?;
+                 let (
+                     ConfigMetadataAndSchema {
+                         config_metadata,
+@@ -1502,6 +1579,7 @@ impl<RT: Runtime> Application<RT> {
+                     )
+                     .await?;
+ 
++                drop(native_publication);
+                 self.complete_node_executor_pool_cutover_after_commit(
+                     &committed_pool_topology,
+                     commit_ts,
+@@ -1529,6 +1607,24 @@ impl<RT: Runtime> Application<RT> {
+             })
+             .await
+     }
++
++    async fn lock_native_resident_publication<'a>(
++        &self,
++        supervisor: &'a node_executor::native::NativeResidentSupervisor,
++        contract: Option<&str>,
++    ) -> anyhow::Result<tokio::sync::MutexGuard<'a, ()>> {
++        let guard = supervisor.publication_guard().await;
++        // A canceled HTTP caller can commit before notifying supervision. Read
++        // the durable head under the guard before trusting live compatibility.
++        let mut tx = self.begin(Identity::system()).await?;
++        let selected = SourcePackageModel::new(&mut tx, TableNamespace::Global)
++            .get_latest_record()
++            .await?
++            .and_then(|package| package.native_resident.clone());
++        supervisor.reconcile(selected, tx.into_token()?.ts())?;
++        supervisor.validate_publication_contract(contract)?;
++        Ok(guard)
++    }
+ }
+ 
+ struct ApplicationInitializerEvaluator<'a, RT: Runtime> {
+@@ -2495,6 +2591,7 @@ mod deployment_receipt_tests {
+         SourcePackage {
+             storage_key: "deployment-receipt-test".try_into().unwrap(),
+             sha256: Sha256Digest::from([1; 32]),
++            native_resident: None,
+             external_deps_package_id: None,
+             package_size: Default::default(),
+             node_version: None,
+@@ -2502,6 +2599,71 @@ mod deployment_receipt_tests {
+         }
+     }
+ 
++    #[test]
++    fn native_selection_participates_in_publication_occ_and_rejects_omission() -> anyhow::Result<()>
++    {
++        use model::source_packages::native::{
++            NativeResidentActivation,
++            NativeResidentDescriptor,
++        };
++        let tokio = ProdRuntime::init_tokio()?;
++        let rt = ProdRuntime::new(&tokio);
++        tokio.block_on(async {
++            let db =
++                deployment_test_database(rt, Arc::new(sqlite::SqlitePersistence::new(":memory:")?))
++                    .await?;
++            model::initialize_application_system_tables(&db).await?;
++            let descriptor = NativeResidentDescriptor {
++                artifact_sha256: "a".repeat(64),
++                configuration_sha256: "b".repeat(64),
++                lifecycle_protocol: 1,
++                application_contract: "example-v1".into(),
++            };
++            let activation = NativeResidentActivation {
++                expected_prior: None,
++                target: Some(descriptor.clone()),
++                application_contract: Some("example-v1".into()),
++            };
++            let mut stale = db.begin_system().await?;
++            validate_native_resident_activation_in_tx(&mut stale, None).await?;
++            let mut native = db.begin_system().await?;
++            validate_native_resident_activation_in_tx(&mut native, Some(&activation)).await?;
++            let mut package = source();
++            package.native_resident = Some(descriptor.clone());
++            SourcePackageModel::new(&mut native, TableNamespace::Global)
++                .put(package)
++                .await?;
++            db.commit_with_write_source(native, "native_selection_test")
++                .await?;
++            SourcePackageModel::new(&mut stale, TableNamespace::Global)
++                .put(source())
++                .await?;
++            assert!(db
++                .commit_with_write_source(stale, "stale_native_selection_test")
++                .await
++                .unwrap_err()
++                .is_occ());
++            let mut tx = db.begin_system().await?;
++            assert!(validate_native_resident_activation_in_tx(&mut tx, None)
++                .await
++                .is_err());
++            assert!(
++                validate_native_resident_activation_in_tx(&mut tx, Some(&activation))
++                    .await
++                    .is_err()
++            );
++            let retain = NativeResidentActivation {
++                expected_prior: Some(descriptor.clone()),
++                target: Some(descriptor),
++                application_contract: Some("example-v1".into()),
++            };
++            validate_native_resident_activation_in_tx(&mut tx, Some(&retain)).await?;
++            drop(tx);
++            db.shutdown().await?;
++            anyhow::Ok(())
++        })
++    }
++
+     #[test]
+     fn empty_source_activations_serialize_and_advance_the_generation() -> anyhow::Result<()> {
+         let tokio = ProdRuntime::init_tokio()?;
+diff --git a/crates/application/src/lib.rs b/crates/application/src/lib.rs
+index 6f40f29e3a2b663e415294cc7de05af007382825..d2e842acc7895f07284b6e83bf6e11b39de7181f 100644
+--- a/crates/application/src/lib.rs
++++ b/crates/application/src/lib.rs
+@@ -2431,6 +2431,7 @@ impl<RT: Runtime> Application<RT> {
+             analyze_results,
+         }: ApplyConfigArgs,
+     ) -> anyhow::Result<(ConfigMetadataAndSchema, Vec<DeploymentAuditLogEvent>)> {
++        deploy_config::validate_native_resident_activation_in_tx(tx, None).await?;
+         let schema_id = schema_id
+             .map(|schema_id| {
+                 parse_schema_id(
+@@ -2955,6 +2956,7 @@ impl<RT: Runtime> Application<RT> {
+         Ok(SourcePackage {
+             storage_key,
+             sha256,
++            native_resident: None,
+             external_deps_package_id,
+             package_size,
+             node_version,
+diff --git a/crates/application/src/system_table_cleanup/mod.rs b/crates/application/src/system_table_cleanup/mod.rs
+index 754d0f612c225ddd6be1414768c526d64716474f..dfa435314d9360eb303c0a2e13a56b3e0aa7d345 100644
+--- a/crates/application/src/system_table_cleanup/mod.rs
++++ b/crates/application/src/system_table_cleanup/mod.rs
+@@ -69,6 +69,7 @@ use model::{
+     session_requests::SESSION_REQUESTS_TABLE,
+     source_packages::{
+         types::SourcePackageId,
++        SourcePackageModel,
+         SourcePackagesTable,
+     },
+     SystemIndex,
+@@ -515,6 +516,13 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
+             .table_mapping()
+             .namespaces_for_name(&SourcePackagesTable::TABLE_NAME)
+         {
++            // A deployment with no modules has no module metadata pointing at
++            // its source package. Keep its newest record so the active runtime
++            // content is not discarded by cleanup.
++            let latest_source_package_id = SourcePackageModel::new(&mut tx, namespace)
++                .get_latest_record()
++                .await?
++                .map(|source_package| SourcePackageId::from(source_package.id().developer_id));
+             let mut source_package_ids: BTreeSet<SourcePackageId> = BTreeSet::new();
+             for module in ModuleModel::new(&mut tx)
+                 .get_all_metadata(namespace.into())
+@@ -528,7 +536,7 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
+                 .await?
+             {
+                 let id = SourcePackageId::from(source_package.id().developer_id);
+-                if !source_package_ids.contains(&id) {
++                if Some(id) != latest_source_package_id && !source_package_ids.contains(&id) {
+                     SystemMetadataModel::new(&mut tx, namespace)
+                         .delete(source_package.id())
+                         .await?;
+@@ -556,3 +564,171 @@ enum CreationTimeInterval {
+     None,
+     Before(CreationTime),
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::sync::Arc;
++
++    use common::{
++        persistence::Persistence,
++        runtime::new_unlimited_rate_limiter,
++        shutdown::ShutdownSignal,
++        types::ObjectKey,
++    };
++    use database::Database;
++    use indexing::index_cache::IndexCache;
++    use model::{
++        initialize_application_system_tables,
++        source_packages::{
++            types::{
++                PackageSize,
++                SourcePackage,
++                SourcePackageId,
++            },
++            SourcePackageModel,
++        },
++        virtual_system_mapping,
++    };
++    use runtime::prod::ProdRuntime;
++    use search::searcher::SearcherStub;
++    use sqlite::SqlitePersistence;
++    use storage::{
++        LocalDirStorage,
++        Storage,
++    };
++    use value::{
++        sha256::Sha256Digest,
++        TableNamespace,
++    };
++
++    use super::SystemTableCleanupWorker;
++
++    async fn new_test_database(runtime: ProdRuntime) -> anyhow::Result<Database<ProdRuntime>> {
++        let persistence: Arc<dyn Persistence> = Arc::new(SqlitePersistence::new(":memory:")?);
++        let (deleted_tablet_sender, _deleted_tablet_receiver) = tokio::sync::mpsc::channel(16);
++        Database::load(
++            persistence,
++            runtime.clone(),
++            Arc::new(SearcherStub),
++            ShutdownSignal::panic(),
++            virtual_system_mapping().clone(),
++            IndexCache::new(1 << 20).new_handle(),
++            Arc::new(new_unlimited_rate_limiter(runtime)),
++            deleted_tablet_sender,
++            "system_table_cleanup_tests".to_owned(),
++        )
++        .await
++    }
++
++    async fn insert_source_package(
++        database: &Database<ProdRuntime>,
++        storage_key: &str,
++        sha256_byte: u8,
++        native_resident: Option<model::source_packages::native::NativeResidentDescriptor>,
++    ) -> anyhow::Result<SourcePackageId> {
++        let mut tx = database.begin_system().await?;
++        let source_package_id = SourcePackageModel::new(&mut tx, TableNamespace::root_component())
++            .put(SourcePackage {
++                storage_key: ObjectKey::try_from(storage_key)?,
++                sha256: Sha256Digest::from([sha256_byte; 32]),
++                native_resident,
++                external_deps_package_id: None,
++                package_size: PackageSize::default(),
++                node_version: None,
++                node_executor_pool_topology: Default::default(),
++            })
++            .await?;
++        database
++            .commit_with_write_source(tx, "source_package_cleanup_test_setup")
++            .await?;
++        Ok(source_package_id)
++    }
++
++    #[test]
++    fn cleanup_keeps_the_newest_empty_source_package_runtime_identity() -> anyhow::Result<()> {
++        let tokio = ProdRuntime::init_tokio()?;
++        let runtime = ProdRuntime::new(&tokio);
++        let block_runtime = runtime.clone();
++        block_runtime.block_on("source_package_cleanup_empty_deployment", async move {
++            let database = new_test_database(runtime.clone()).await?;
++            initialize_application_system_tables(&database).await?;
++
++            let old_source_package_id = insert_source_package(
++                &database,
++                "source-package-cleanup-old",
++                1,
++                None,
++            )
++            .await?;
++            let native_resident = model::source_packages::native::NativeResidentDescriptor {
++                artifact_sha256: "a".repeat(64),
++                configuration_sha256: "b".repeat(64),
++                lifecycle_protocol: 1,
++                application_contract: "example-v1".into(),
++            };
++            let empty_source_package_id = insert_source_package(
++                &database,
++                "source-package-cleanup-empty",
++                2,
++                Some(native_resident.clone()),
++            )
++            .await?;
++
++            let mut before_cleanup = database.begin_system().await?;
++            assert!(
++                SourcePackageModel::new(&mut before_cleanup, TableNamespace::root_component())
++                    .get_latest()
++                    .await?
++                    .is_none()
++            );
++            let latest_before_cleanup =
++                SourcePackageModel::new(&mut before_cleanup, TableNamespace::root_component())
++                    .get_latest_record()
++                    .await?
++                    .expect("empty deployment source package was not recorded");
++            assert_eq!(
++                SourcePackageId::from(latest_before_cleanup.id().developer_id),
++                empty_source_package_id
++            );
++            drop(before_cleanup);
++
++            let exports_storage: Arc<dyn Storage> =
++                Arc::new(LocalDirStorage::new(runtime.clone())?);
++            let worker = SystemTableCleanupWorker {
++                database: database.clone(),
++                runtime: runtime.clone(),
++                exports_storage,
++            };
++            worker.cleanup_unused_source_packages().await?;
++
++            let mut after_cleanup = database.begin_system().await?;
++            assert!(
++                SourcePackageModel::new(&mut after_cleanup, TableNamespace::root_component())
++                    .get(old_source_package_id)
++                    .await
++                    .is_err()
++            );
++            let retained_source_package =
++                SourcePackageModel::new(&mut after_cleanup, TableNamespace::root_component())
++                    .get(empty_source_package_id)
++                    .await?;
++            assert_eq!(
++                retained_source_package.native_resident.as_ref(),
++                Some(&native_resident)
++            );
++            let latest_after_cleanup =
++                SourcePackageModel::new(&mut after_cleanup, TableNamespace::root_component())
++                    .get_latest_record()
++                    .await?
++                    .expect("cleanup removed the empty deployment source package");
++            assert_eq!(
++                SourcePackageId::from(latest_after_cleanup.id().developer_id),
++                empty_source_package_id
++            );
++            drop(after_cleanup);
++
++            database.shutdown().await?;
++            Ok(())
++        })
++    }
++}
+diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
+index 0c910803ea69695b8010bffca8401356e5d2986b..6d81e85c68dc5b5da61d5bce307eda4015a9a33d 100644
+--- a/crates/common/src/knobs.rs
++++ b/crates/common/src/knobs.rs
+@@ -611,8 +611,10 @@ pub static LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES: LazyLock<usize> = LazyLock::new(||
+ /// The default covers the effective default slot, the global system slot, and
+ /// one surge slot sized for the effective default allowance. Deployment
+ /// topology validation adds each named pool and sizes surge for the largest
+-/// application allowance. The value must cover all required slots even when
+-/// they are still lazy.
++/// application allowance. Enabling the native resident adapter also adds its
++/// steady limit and includes it when sizing that same surge slot; it does not
++/// increase this default total. The value must cover all required slots even
++/// when they are still lazy.
+ pub static LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES: LazyLock<usize> = LazyLock::new(|| {
+     let default_rss_bytes = local_node_executor_pool_rss_bytes("default");
+     let value = env_config_usize_strict(
+diff --git a/crates/isolate/src/environment/udf/async_syscall.rs b/crates/isolate/src/environment/udf/async_syscall.rs
+index 11258c8a438b7da4a9f0e6a10ca7d0283f6ca03f..2a73a8781b12b2f61d296db0aeed7004073d6e75 100644
+--- a/crates/isolate/src/environment/udf/async_syscall.rs
++++ b/crates/isolate/src/environment/udf/async_syscall.rs
+@@ -36,8 +36,6 @@ use common::{
+     try_anyhow,
+     types::{
+         AllowedVisibility,
+-        DeploymentClass,
+-        RegionName,
+         UdfType,
+         WriteTimestamp,
+     },
+@@ -93,6 +91,7 @@ use serde::{
+     Serialize,
+ };
+ use serde_json::{
++    json,
+     value::RawValue,
+     Value as JsonValue,
+ };
+@@ -686,7 +685,7 @@ pub(super) async fn run_async_syscall_batch<RT: Runtime>(
+                 "1.0/queryPage" => Box::pin(query_page(provider, args)).await,
+                 "1.0/getTransactionMetrics" => tx_metrics(provider),
+                 "1.0/getFunctionMetadata" => function_metadata(provider),
+-                "1.0/getDeploymentMetadata" => deployment_metadata(provider),
++                "1.0/getDeploymentMetadata" => Box::pin(deployment_metadata(provider)).await,
+                 "1.0/getRequestMetadata" => request_metadata(provider),
+                 // Auth
+                 "1.0/getUserIdentity" => Box::pin(get_user_identity(provider, args)).await,
+@@ -804,22 +803,24 @@ fn function_metadata<RT: Runtime>(
+ }
+ 
+ /// Returns metadata about the deployment this function is running on.
+-fn deployment_metadata<RT: Runtime>(
++async fn deployment_metadata<RT: Runtime>(
+     provider: &mut DatabaseUdfSyscallProvider<RT>,
+ ) -> anyhow::Result<Box<RawValue>> {
+-    let deployment = &provider.deployment;
+-    #[allow(non_snake_case)]
+-    #[derive(Serialize)]
+-    struct DeploymentMetadataJson<'a> {
+-        name: &'a String,
+-        region: &'a Option<RegionName>,
+-        class: &'a DeploymentClass,
+-    }
+-    Ok(serde_json::value::to_raw_value(&DeploymentMetadataJson {
+-        name: &deployment.name,
+-        region: &deployment.region,
+-        class: &deployment.class,
+-    })?)
++    // This read participates in the caller's snapshot and OCC read set. Native
++    // selection cannot race a lease acquisition that checks deployment metadata.
++    let native_resident = model::source_packages::SourcePackageModel::new(
++        provider.phase.tx()?,
++        TableNamespace::Global,
++    )
++    .get_latest_record()
++    .await?
++    .and_then(|package| package.native_resident.clone());
++    Ok(serde_json::value::to_raw_value(&json!({
++        "name": provider.deployment.name,
++        "region": provider.deployment.region,
++        "class": provider.deployment.class,
++        "nativeResident": native_resident,
++    }))?)
+ }
+ 
+ /// Returns metadata about the originating HTTP request.
+diff --git a/crates/local_backend/src/deploy_config.rs b/crates/local_backend/src/deploy_config.rs
+index 6c84828f78bd77e5d5a983849511192d9bb9b3e0..29622afe54b560ba00bf6a5f8b0b09b2f4351764 100644
+--- a/crates/local_backend/src/deploy_config.rs
++++ b/crates/local_backend/src/deploy_config.rs
+@@ -275,7 +275,7 @@ pub async fn push_config(
+     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
+     Json(req): Json<ConfigJson>,
+ ) -> Result<impl IntoResponse, HttpResponseError> {
+-    push_config_handler(&st.application, request_metadata, req)
++    push_config_handler(&st.application, &st.native_resident, request_metadata, req)
+         .await
+         .map_err(|e| {
+             if e.short_msg() == "NodeExecutorCutoverFailedAfterCommit" {
+@@ -291,6 +291,7 @@ pub async fn push_config(
+ #[fastrace::trace]
+ pub async fn push_config_handler(
+     application: &Application<ProdRuntime>,
++    native_resident: &node_executor::native::NativeResidentSupervisor,
+     request_metadata: RequestMetadata,
+     config: ConfigJson,
+ ) -> anyhow::Result<(Identity, PushAnalytics, PushMetrics)> {
+@@ -334,6 +335,7 @@ pub async fn push_config_handler(
+             config.schema_id,
+             config.node_dependencies,
+             node_version,
++            native_resident,
+             config.force_node_cutover,
+         )
+         .await?;
+diff --git a/crates/local_backend/src/deploy_config2.rs b/crates/local_backend/src/deploy_config2.rs
+index 435727e5ce18479f12511cd22c17fc3bac1adb4f..1f83c2caf5a2db6233bc8712201f35e733e2cef3 100644
+--- a/crates/local_backend/src/deploy_config2.rs
++++ b/crates/local_backend/src/deploy_config2.rs
+@@ -430,6 +430,8 @@ pub struct FinishPushRequest {
+     pub dry_run: bool,
+     pub message: Option<String>,
+     #[serde(default)]
++    pub native_resident: Option<model::source_packages::native::NativeResidentActivation>,
++    #[serde(default)]
+     pub force_node_cutover: bool,
+ }
+ 
+@@ -499,6 +501,22 @@ pub async fn finish_push_internal(
+         return Ok((SerializedFinishPushDiff::try_from(empty_diff)?, None));
+     }
+ 
++    if let Some(operation) = &operation {
++        let mut tx = st.application.begin(identity.clone()).await?;
++        if let Some((diff, ts)) = operation.validate(&mut tx).await? {
++            return Ok((diff, Some(ts)));
++        }
++    }
++
++    if let Some(activation) = &req.native_resident {
++        activation.validate()?;
++        if let Some(target) = &activation.target {
++            st.native_resident
++                .prepare(target, req.force_node_cutover)
++                .await?;
++        }
++    }
++
+     let (resp, ts) = st
+         .application
+         .finish_push(
+@@ -506,6 +524,8 @@ pub async fn finish_push_internal(
+             request_metadata,
+             start_push,
+             message,
++            req.native_resident,
++            &st.native_resident,
+             req.force_node_cutover,
+             operation,
+         )
+@@ -517,6 +537,9 @@ pub async fn finish_push_internal(
+                 e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}"))
+             }
+         })?;
++    // Read the durable head, including receipt replay and concurrent deployments.
++    // The background reconciler repeats this if the HTTP caller disappears.
++    crate::native_resident::reconcile(&st.application, &st.native_resident).await?;
+     Ok((resp, Some(ts)))
+ }
+ 
+diff --git a/crates/local_backend/src/deployment_operations.rs b/crates/local_backend/src/deployment_operations.rs
+index 57cd74ea4d54da7a289f1ca90672416b16b1c263..96f90b459f93df709d20cb41dd4c0c1fa9dbaacb 100644
+--- a/crates/local_backend/src/deployment_operations.rs
++++ b/crates/local_backend/src/deployment_operations.rs
+@@ -258,6 +258,7 @@ pub async fn capabilities(
+     Ok(axum::Json(json!({
+         "protocolVersion": 1,
+         "mutationPriorityProtocol": if *common::knobs::ISOLATE_QUEUE_DELAY_CONTROL_ENABLED { 1 } else { 0 },
++        "nativeResidentProtocol": 1,
+         "sessionId": st.deployment_operations.session_id,
+         "lifetimeSeconds": LIFETIME.as_secs(),
+         "maxOperations": MAX_OPERATIONS,
+diff --git a/crates/local_backend/src/lib.rs b/crates/local_backend/src/lib.rs
+index 510f89179a1f690c5d4743809b16e778976a53a9..37570e7e06a5f0fce58100b4b5d8dee167394c81 100644
+--- a/crates/local_backend/src/lib.rs
++++ b/crates/local_backend/src/lib.rs
+@@ -62,6 +62,13 @@ use function_runner::{
+     server::DeploymentStorage,
+     FunctionRunner,
+ };
++use futures::{
++    future::{
++        BoxFuture,
++        Shared,
++    },
++    FutureExt,
++};
+ use governor::Quota;
+ use http_client::CachedHttpClient;
+ use indexing::index_cache::IndexCache;
+@@ -221,6 +228,7 @@ pub mod log_sinks;
+ pub mod logs;
+ #[cfg(target_os = "linux")]
+ pub mod memory_metrics;
++mod native_resident;
+ pub mod node_action_callbacks;
+ pub mod parse;
+ pub mod proxy;
+@@ -238,6 +246,8 @@ pub mod usage_limits;
+ 
+ #[derive(Clone)]
+ pub struct LocalAppState {
++    pub(crate) native_resident: Arc<node_executor::native::NativeResidentSupervisor>,
++    native_resident_reconciler: Shared<BoxFuture<'static, Result<(), Arc<anyhow::Error>>>>,
+     pub(crate) deployment_operations: deployment_operations::DeploymentOperations,
+     // Origin for the server (e.g. http://127.0.0.1:3210, https://demo.convex.cloud)
+     pub origin: ConvexOrigin,
+@@ -251,9 +261,15 @@ pub struct LocalAppState {
+ 
+ impl LocalAppState {
+     pub async fn shutdown(self) -> anyhow::Result<()> {
+-        self.application.shutdown().await?;
+-
+-        Ok(())
++        let resident_result = self.native_resident.shutdown().await;
++        // A canceled shutdown waiter leaves the shared join and its result
++        // available to the next caller instead of detaching reconciliation.
++        let reconciliation_result = self.native_resident_reconciler.clone().await;
++        // A failed native cleanup cannot skip the application's own shutdown.
++        let application_result = self.application.shutdown().await;
++        resident_result?;
++        reconciliation_result.map_err(|error| anyhow::anyhow!("{error:#}"))?;
++        application_result
+     }
+ }
+ 
+@@ -339,6 +355,7 @@ pub async fn make_app(
+         Arc::new(RoutedLocalNodeExecutor::new_with_configuration(node_executor_config).await?);
+     node_executor
+         .reconcile_pool_topology(&committed_pool_topology, committed_pool_topology_version)?;
++    let native_resident = node_executor.native_resident_supervisor()?;
+     let node_actions = NodeActions::new(
+         node_executor,
+         config.convex_origin_url()?,
+@@ -433,7 +450,20 @@ pub async fn make_app(
+         runtime.spawn_background("beacon_worker", beacon_future);
+     }
+ 
++    native_resident::reconcile(&application, &native_resident).await?;
++    let native_resident_reconciler =
++        native_resident::start(application.clone(), native_resident.clone());
+     let app_state = LocalAppState {
++        native_resident,
++        native_resident_reconciler: async move {
++            native_resident_reconciler
++                .await
++                .map_err(anyhow::Error::from)
++                .and_then(|result| result)
++                .map_err(Arc::new)
++        }
++        .boxed()
++        .shared(),
+         deployment_operations: deployment_operations::DeploymentOperations::default(),
+         origin,
+         site_origin: config.convex_site_url()?,
+diff --git a/crates/local_backend/src/native_resident.rs b/crates/local_backend/src/native_resident.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..732abd0607e50b8797bd0739df140df4b8ff2dbc
+--- /dev/null
++++ b/crates/local_backend/src/native_resident.rs
+@@ -0,0 +1,125 @@
++//! Recover native execution from the same durable source-package authority used
++//! by function deployment. HTTP response delivery never owns reconciliation.
++use std::{
++    sync::Arc,
++    time::Duration,
++};
++
++use application::Application;
++use model::source_packages::{
++    native::NativeResidentDescriptor,
++    SourcePackageModel,
++};
++use node_executor::native::NativeResidentSupervisor;
++use roles::RequireDeploymentOp;
++use runtime::prod::ProdRuntime;
++use sync_types::Timestamp;
++use value::TableNamespace;
++
++struct CommittedSelection {
++    descriptor: Option<NativeResidentDescriptor>,
++    version: Timestamp,
++}
++
++async fn committed_selection(
++    application: &Application<ProdRuntime>,
++) -> anyhow::Result<CommittedSelection> {
++    let mut tx = application.begin(keybroker::Identity::system()).await?;
++    let descriptor = SourcePackageModel::new(&mut tx, TableNamespace::Global)
++        .get_latest_record()
++        .await?
++        .and_then(|package| package.native_resident.clone());
++    let version = tx.into_token()?.ts();
++    Ok(CommittedSelection {
++        descriptor,
++        version,
++    })
++}
++
++pub async fn reconcile(
++    application: &Application<ProdRuntime>,
++    supervisor: &NativeResidentSupervisor,
++) -> anyhow::Result<()> {
++    let committed = committed_selection(application).await?;
++    supervisor.reconcile(committed.descriptor, committed.version)
++}
++
++pub fn start(
++    application: Application<ProdRuntime>,
++    supervisor: Arc<NativeResidentSupervisor>,
++) -> tokio::task::JoinHandle<anyhow::Result<()>> {
++    tokio::spawn(async move {
++        let mut interval = tokio::time::interval(Duration::from_secs(1));
++        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++        loop {
++            interval.tick().await;
++            if supervisor.is_shutting_down() || supervisor.status().phase == "stopped" {
++                return Ok(());
++            }
++            if let Err(error) = reconcile(&application, &supervisor).await {
++                if supervisor.is_shutting_down() {
++                    return Ok(());
++                }
++                tracing::error!("Native resident durable-selection reconciliation failed");
++                supervisor.request_shutdown();
++                return Err(error);
++            }
++        }
++    })
++}
++
++#[derive(serde::Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct ControlRequest {
++    admin_key: String,
++    command: ControlCommand,
++}
++
++#[derive(serde::Deserialize)]
++#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
++enum ControlCommand {
++    Inspect,
++    Prepare {
++        descriptor: model::source_packages::native::NativeResidentDescriptor,
++    },
++    ForceRetire {
++        generation: String,
++    },
++}
++
++/// Administrative staging and inspection do not change committed selection.
++pub async fn control(
++    common::http::extract::MtState(st): common::http::extract::MtState<crate::LocalAppState>,
++    axum::Json(request): axum::Json<ControlRequest>,
++) -> Result<axum::Json<serde_json::Value>, common::http::HttpResponseError> {
++    async {
++        let identity = crate::admin::must_be_admin_from_key(
++            st.application.app_auth(),
++            st.instance_name.clone(),
++            request.admin_key,
++        )
++        .await?;
++        identity.require_operation(keybroker::DeploymentOp::Deploy)?;
++        match request.command {
++            ControlCommand::Inspect => (),
++            ControlCommand::Prepare { descriptor } => {
++                st.native_resident.prepare(&descriptor, false).await?
++            },
++            ControlCommand::ForceRetire { generation } => {
++                st.native_resident.force_retire(&generation)?
++            },
++        }
++        // Process convergence can lag publication. Staging CAS and uncertain
++        // publication resolution use this transaction's durable selection.
++        let committed = committed_selection(&st.application).await?;
++        anyhow::Ok(axum::Json(serde_json::json!({
++            "lifecycleProtocol": 1,
++            "enabled": st.native_resident.enabled(),
++            "committedSelection": committed.descriptor,
++            "committedSelectionTs": committed.version.to_string(),
++            "status": st.native_resident.status(),
++        })))
++    }
++    .await
++    .map_err(Into::into)
++}
+diff --git a/crates/local_backend/src/router.rs b/crates/local_backend/src/router.rs
+index f42359b61f6fb6c23e16d97f0cd28b8a203fb42e..cba97bd48411b7278c4f27af815c9a8601c3e04a 100644
+--- a/crates/local_backend/src/router.rs
++++ b/crates/local_backend/src/router.rs
+@@ -353,6 +353,10 @@ pub fn router(st: LocalAppState) -> Router {
+             post(deploy_config2::wait_for_schema),
+         )
+         .route("/deploy2/finish_push", post(deploy_config2::finish_push))
++        .route(
++            "/deploy2/native_resident",
++            post(crate::native_resident::control),
++        )
+         .route(
+             "/deploy2/report_push_completed",
+             post(deploy_config2::report_push_completed_handler),
+diff --git a/crates/model/src/source_packages/mod.rs b/crates/model/src/source_packages/mod.rs
+index 33b690151a50e7dba2dc9028c67b1a5bbe2526fe..0db1c451b53b918016f2e0e754cbbe48e88d302d 100644
+--- a/crates/model/src/source_packages/mod.rs
++++ b/crates/model/src/source_packages/mod.rs
+@@ -30,6 +30,7 @@ use crate::{
+     SystemTable,
+ };
+ 
++pub mod native;
+ pub mod types;
+ pub mod upload_download;
+ 
+@@ -58,6 +59,10 @@ impl<'a, RT: Runtime> SourcePackageModel<'a, RT> {
+ 
+     #[fastrace::trace]
+     pub async fn put(&mut self, source_package: SourcePackage) -> anyhow::Result<SourcePackageId> {
++        anyhow::ensure!(
++            self.namespace == TableNamespace::Global || source_package.native_resident.is_none(),
++            "Native resident selection belongs to the root source package"
++        );
+         // Latest-record reads are activation authority, including for empty
+         // packages. Serialize inserts and advance past the previous record:
+         // transaction start times can tie or differ from commit order.
+diff --git a/crates/model/src/source_packages/native.rs b/crates/model/src/source_packages/native.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..7bf801adeafbe55767ccc26e50d25fab278e81e0
+--- /dev/null
++++ b/crates/model/src/source_packages/native.rs
+@@ -0,0 +1,151 @@
++//! Immutable native-resident deployment authority shared by deployment and
++//! supervision.
++use anyhow::Context;
++use errors::ErrorMetadata;
++use serde::{
++    Deserialize,
++    Serialize,
++};
++
++#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct NativeResidentDescriptor {
++    pub artifact_sha256: String,
++    pub configuration_sha256: String,
++    pub lifecycle_protocol: u32,
++    pub application_contract: String,
++}
++
++impl NativeResidentDescriptor {
++    pub fn validate(&self) -> anyhow::Result<()> {
++        for digest in [&self.artifact_sha256, &self.configuration_sha256] {
++            anyhow::ensure!(
++                digest.len() == 64
++                    && digest
++                        .bytes()
++                        .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f')),
++                "Native resident digest must be lowercase SHA-256"
++            );
++        }
++        anyhow::ensure!(
++            self.lifecycle_protocol == 1,
++            "Unsupported native resident lifecycle protocol"
++        );
++        anyhow::ensure!(
++            !self.application_contract.is_empty()
++                && self.application_contract.len() <= 128
++                && self
++                    .application_contract
++                    .bytes()
++                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
++            "Invalid native resident application contract"
++        );
++        Ok(())
++    }
++}
++
++#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct NativeResidentActivation {
++    #[serde(deserialize_with = "Option::deserialize")]
++    pub expected_prior: Option<NativeResidentDescriptor>,
++    #[serde(deserialize_with = "Option::deserialize")]
++    pub target: Option<NativeResidentDescriptor>,
++    #[serde(deserialize_with = "Option::deserialize")]
++    pub application_contract: Option<String>,
++}
++
++impl NativeResidentActivation {
++    pub fn validate(&self) -> anyhow::Result<()> {
++        for descriptor in [&self.expected_prior, &self.target].into_iter().flatten() {
++            descriptor.validate()?;
++        }
++        if let Some(target) = &self.target {
++            anyhow::ensure!(
++                self.application_contract
++                    .as_ref()
++                    .context("Native resident deployment contract is required")?
++                    == &target.application_contract,
++                "Native resident deployment contract mismatch"
++            );
++        }
++        // An incompatible publication cannot expose new APIs to an old draining
++        // process.
++        if let Some(prior) = &self.expected_prior {
++            anyhow::ensure!(
++                self.application_contract.as_ref() == Some(&prior.application_contract),
++                "Retire the native resident before changing its application contract"
++            );
++        }
++        Ok(())
++    }
++
++    pub fn validate_prior(&self, prior: Option<&NativeResidentDescriptor>) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            prior == self.expected_prior.as_ref(),
++            ErrorMetadata::bad_request(
++                "NativeResidentExpectedPriorMismatch",
++                "Committed native resident changed before activation",
++            )
++        );
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn descriptor() -> NativeResidentDescriptor {
++        NativeResidentDescriptor {
++            artifact_sha256: "a".repeat(64),
++            configuration_sha256: "b".repeat(64),
++            lifecycle_protocol: 1,
++            application_contract: "example-v1".into(),
++        }
++    }
++    #[test]
++    fn activation_checks_compatibility_and_prior() {
++        let old = descriptor();
++        let mut activation = NativeResidentActivation {
++            expected_prior: Some(old.clone()),
++            target: Some(old.clone()),
++            application_contract: Some("example-v1".into()),
++        };
++        activation.validate().unwrap();
++        activation.validate_prior(Some(&old)).unwrap();
++        assert!(activation.validate_prior(None).is_err());
++        activation.application_contract = Some("example-v2".into());
++        assert!(activation.validate().is_err());
++    }
++    #[test]
++    fn ordinary_selection_does_not_require_native_contract() {
++        NativeResidentActivation {
++            expected_prior: None,
++            target: None,
++            application_contract: None,
++        }
++        .validate()
++        .unwrap();
++        let mut value = descriptor();
++        value.artifact_sha256 = "../resident".into();
++        assert!(value.validate().is_err());
++    }
++
++    #[test]
++    fn activation_requires_explicit_nullable_fields() {
++        let complete = serde_json::json!({
++            "expectedPrior": null,
++            "target": null,
++            "applicationContract": null,
++        });
++        serde_json::from_value::<NativeResidentActivation>(complete.clone())
++            .unwrap()
++            .validate()
++            .unwrap();
++        for field in ["expectedPrior", "target", "applicationContract"] {
++            let mut incomplete = complete.clone();
++            incomplete.as_object_mut().unwrap().remove(field);
++            assert!(serde_json::from_value::<NativeResidentActivation>(incomplete).is_err());
++        }
++    }
++}
+diff --git a/crates/model/src/source_packages/types.rs b/crates/model/src/source_packages/types.rs
+index 0daed7d2815011ecdb4f261138b8495f030220f3..e4d7add67aeb4ffb8a58cf374b4c4b5bdf87a8d2 100644
+--- a/crates/model/src/source_packages/types.rs
++++ b/crates/model/src/source_packages/types.rs
+@@ -173,6 +173,7 @@ impl TryFrom<SerializedNodeVersionDiff> for NodeVersionDiff {
+ pub struct SourcePackage {
+     pub storage_key: ObjectKey,
+     pub sha256: Sha256Digest,
++    pub native_resident: Option<super::native::NativeResidentDescriptor>,
+     pub external_deps_package_id: Option<ExternalDepsPackageId>,
+     pub package_size: PackageSize,
+     pub node_version: Option<NodeVersion>,
+@@ -187,6 +188,7 @@ impl SourcePackage {
+         self.node_version == other.node_version
+             && self.external_deps_package_id == other.external_deps_package_id
+             && self.node_executor_pool_topology == other.node_executor_pool_topology
++            && self.native_resident == other.native_resident
+     }
+ }
+ 
+@@ -326,6 +328,7 @@ impl From<SourcePackageId> for DeveloperDocumentId {
+ pub struct SerializedSourcePackage {
+     storage_key: String,
+     sha256: ByteBuf,
++    native_resident: Option<super::native::NativeResidentDescriptor>,
+     external_package_id: Option<String>,
+     package_size: Option<SerializedPackageSize>,
+     node_version: Option<String>,
+@@ -357,6 +360,7 @@ impl TryFrom<SourcePackage> for SerializedSourcePackage {
+         Ok(SerializedSourcePackage {
+             storage_key: value.storage_key.into(),
+             sha256: ByteBuf::from(value.sha256.to_vec()),
++            native_resident: value.native_resident,
+             external_package_id: value
+                 .external_deps_package_id
+                 .map(|id| DeveloperDocumentId::from(id).encode()),
+@@ -375,6 +379,9 @@ impl TryFrom<SerializedSourcePackage> for SourcePackage {
+     fn try_from(value: SerializedSourcePackage) -> Result<Self, Self::Error> {
+         let storage_key = value.storage_key.try_into()?;
+         let sha256 = value.sha256.into_vec().try_into()?;
++        if let Some(native_resident) = &value.native_resident {
++            native_resident.validate()?;
++        }
+         let external_package_id = match value.external_package_id {
+             None => None,
+             Some(s) => Some(DeveloperDocumentId::decode(&s)?.into()),
+@@ -445,6 +452,7 @@ impl TryFrom<SerializedSourcePackage> for SourcePackage {
+         Ok(Self {
+             storage_key,
+             sha256,
++            native_resident: value.native_resident,
+             external_deps_package_id: external_package_id,
+             package_size,
+             node_version,
+@@ -463,6 +471,7 @@ mod tests {
+         SerializedSourcePackage {
+             storage_key: "package.zip".to_owned(),
+             sha256: ByteBuf::from(vec![0; 32]),
++            native_resident: None,
+             external_package_id: None,
+             package_size: None,
+             node_version: None,
+@@ -502,14 +511,22 @@ mod tests {
+         let package = SourcePackage {
+             storage_key: "package.zip".try_into().unwrap(),
+             sha256: Sha256Digest::from([0; 32]),
++            native_resident: Some(super::super::native::NativeResidentDescriptor {
++                artifact_sha256: "a".repeat(64),
++                configuration_sha256: "b".repeat(64),
++                lifecycle_protocol: 1,
++                application_contract: "example-v1".into(),
++            }),
+             external_deps_package_id: None,
+             package_size: PackageSize::default(),
+             node_version: None,
+             node_executor_pool_topology: topology.clone(),
+         };
++        let native_resident = package.native_resident.clone();
+         let serialized = SerializedSourcePackage::try_from(package).unwrap();
+         let round_tripped = SourcePackage::try_from(serialized).unwrap();
+         assert_eq!(round_tripped.node_executor_pool_topology, topology);
++        assert_eq!(round_tripped.native_resident, native_resident);
+ 
+         let mut invalid = serialized_source_package();
+         invalid.node_pool_module_paths = Some(vec![]);
+diff --git a/crates/node_executor/Cargo.toml b/crates/node_executor/Cargo.toml
+index ec00d83f718d3dbed076129ea90450c31d65d5e2..598e13269ae0797760d578facc8da829ef86cfbd 100644
+--- a/crates/node_executor/Cargo.toml
++++ b/crates/node_executor/Cargo.toml
+@@ -7,6 +7,13 @@ license = "LicenseRef-FSL-1.1-Apache-2.0"
+ [lib]
+ doctest = false
+ 
++[[bin]]
++name = "native_resident_fixture"
++path = "testdata/native_resident.rs"
++required-features = ["testing"]
++test = false
++bench = false
++
+ [features]
+ testing = [
+     "common/testing",
+@@ -46,6 +53,7 @@ storage = { workspace = true }
+ sync_types = { workspace = true }
+ tempfile = { workspace = true }
+ tokio = { workspace = true }
++tokio-util = { workspace = true }
+ tracing = { workspace = true }
+ udf = { workspace = true }
+ value = { workspace = true }
+diff --git a/crates/node_executor/NATIVE_RESIDENTS.md b/crates/node_executor/NATIVE_RESIDENTS.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..79e8f22e02236be3328401d232a2a4e9d7e4d494
+--- /dev/null
++++ b/crates/node_executor/NATIVE_RESIDENTS.md
+@@ -0,0 +1,139 @@
++# Local native residents
++
++A native resident is a directly supervised executable, independent of Node source
++packages. It implements lifecycle protocol 1 and uses application APIs as an ordinary
++client. It does not implement a query, mutation, or action runtime.
++
++## Configuration and publication
++
++Set all three backend variables to enable the adapter:
++
++- `LOCAL_NATIVE_RESIDENT_ARTIFACTS_DIR`
++- `LOCAL_NATIVE_RESIDENT_CONFIGURATIONS_DIR`
++- `LOCAL_NATIVE_RESIDENT_MAX_RSS_BYTES` (at least 16 MiB)
++
++Set `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` to cover the Node steady slots, one
++native steady slot, and one surge slot sized for the largest Node or native replacement.
++The default total covers only the default and system Node slots and a Node replacement;
++it does not grow automatically when the native adapter is enabled. Startup and deployment
++validation reject an insufficient total. Node and native candidates and draining
++generations use the same surge owner.
++
++Publish the complete executable to `<artifacts>/<sha256>/resident` and its runtime JSON
++configuration to `<configurations>/<sha256>.json`. Install files atomically, keep them
++immutable, and retain active, staged, draining, and rollback versions. Configuration is
++limited to 32 KiB and executable size to 512 MiB. The backend checks both hashes before
++spawn. On Linux it executes the verified file descriptor through `/proc/self/fd`, sets
++parent-death termination, and passes configuration through owned pipes with an empty
++environment. Credentials belong in configuration, not executable arguments or artifacts.
++
++The finish-push body accepts `nativeResident`:
++
++```json
++{
++  "expectedPrior": null,
++  "target": {
++    "artifactSha256": "<64 lowercase hex characters>",
++    "configurationSha256": "<64 lowercase hex characters>",
++    "lifecycleProtocol": 1,
++    "applicationContract": "example-v1"
++  },
++  "applicationContract": "example-v1"
++}
++```
++
++All three envelope fields are required; a null value is explicit. The source-package
++transaction compares `expectedPrior` and records `target` with the
++function deployment. An omitted envelope is accepted only when no native resident is
++selected. A null target selects ordinary execution. Both V8-only and paired deployment
++use this boundary. Queries and mutations read `nativeResident` through
++`getDeploymentMetadata` in their own transaction, so application ownership checks
++participate in OCC with publication.
++
++A retained process and a target process must support the declared application contract.
++The backend serializes the live-process compatibility check with function publication
++and refreshes committed selection under that guard. A canceled publication caller cannot
++leave a stale compatibility decision authorizing an incompatible publication.
++The guard covers publication after capacity admission and is released before Node drain.
++Native staging uses the same bounded deployment surge admission and force policy as Node;
++`forceNodeCutover` can reclaim a draining surge owner before native staging begins.
++To change it incompatibly, first publish compatible functions with a null native target,
++wait for drain or confirmed termination, and then publish the incompatible deployment.
++Unchanged executable/configuration descriptors preserve the running process across
++function-only publications. Backend restart and lost HTTP replies recover from the
++latest committed source package, including an empty package.
++
++## Control and lifecycle
++
++`POST /api/deploy2/native_resident` accepts an administrative key and a typed command:
++
++```json
++{"adminKey":"...","command":{"type":"inspect"}}
++```
++
++The other commands are `{"type":"prepare","descriptor":{...}}` and
++`{"type":"forceRetire","generation":"..."}`. Prepare verifies inert readiness and
++reaps the trial before returning. Force retirement must match the exact current process
++generation and does not alter durable selection. Inspection returns lifecycle protocol,
++whether the adapter is enabled, `committedSelection` (descriptor or null),
++`committedSelectionTs` (transaction timestamp as a decimal string), and selected/active
++process status. The committed selection comes from the latest root source package in a
++fresh read transaction. `status.selected` reports the supervisor's last reconciled selection
++and can lag that transaction. Publication CAS and uncertain-reply resolution use the
++committed selection; process status reports convergence. Deployment capabilities expose
++`nativeResidentProtocol: 1`; enabling the adapter is a separate configuration requirement.
++
++Control uses newline-delimited JSON over child stdin/stdout. Each message is at most
++64 KiB. `generation` is an opaque string; protocol and nonce are unsigned integers.
++The child reserves stdout for the protocol.
++
++| Direction | Message |
++| --- | --- |
++| Backend → child | `{type:"initialize",generation,descriptor,configuration}` |
++| Child → backend | `{type:"ready",generation,artifactSha256,configurationSha256,lifecycleProtocol,applicationContract}` |
++| Backend → child | `{type:"activate",generation}` |
++| Backend → child | `{type:"probe",generation,nonce}` |
++| Child → backend | `{type:"progress",generation,nonce}` |
++| Backend → child | `{type:"retire",generation,deadlineMs:180000}` |
++| Child → backend | `{type:"drained",generation}` |
++| Child → backend | `{type:"failed",generation,code}` |
++
++Readiness is inert: no application ownership or external work starts before activate.
++Progress acknowledges the exact probe on the thread that owns application decisions;
++a responsive I/O thread does not establish coordinator progress. Healthy idle residents
++still service probes. Readiness has a ten-second deadline and probes a five-second
++response budget. Retirement permits the application's episode-aware drain for at most
++180 seconds. Failed drain, forced retirement, process failure, and memory pressure all
++retain termination authority. A successful drain reply does not prove process exit.
++The backend confirms direct-child reaping before returning capacity.
++RSS sampling continues while readiness and progress replies are pending. Memory pressure
++and shutdown interrupt stalled replies and retirement, including both the predecessor
++and an inert replacement. An inert replacement continues to answer coordinator probes
++while its predecessor drains. Promotion resumes any outstanding probe with its original
++nonce and deadline before activation.
++The incumbent remains supervised during replacement verification and readiness. Protocol
++writes retain their offsets and deadlines across cancellation and receive RSS checks;
++retirement interrupts cover blocked writes too. A failed inert candidate is terminated
++even if it subsequently sends a valid reply.
++
++Generation identities remain distinct across backend restarts and PID reuse. Stale replies
++cannot name a successor. Canceled startup and cleanup retain the child and
++shared capacity until reaping. Shutdown tracks canceled preparation cleanup and blocking
++artifact verification. Canceling a shutdown caller does not detach the supervisor or
++report cleanup complete. A backend shutdown terminates owned children; Linux
++parent-death signaling prevents an active resident outliving its supervisor.
++Repeated shutdown callers observe the same supervisor and reconciliation completion,
++including any terminal failure.
++
++## Verification
++
++The native integration fixture is an ordinary ELF executable. With the testing feature,
++`cargo test -p node_executor --features testing --test native_resident` exercises the
++actual verified-descriptor spawn, inert readiness, activation, function-only reuse,
++candidate replacement, forced retirement fencing, graceful drain, canceled preparation
++and shutdown, RSS enforcement before readiness and after activation, memory pressure
++during stalled progress and replacement drain, watchdog replacement, parent-death
++termination, and reaping. Native unit tests additionally cover progress mismatch,
++disconnect, stalled progress, canceled probe resumption, canceled startup, and incomplete
++artifact inputs. Follow the checkout's resource-guard instructions when running these
++commands.
+diff --git a/crates/node_executor/src/lib.rs b/crates/node_executor/src/lib.rs
+index 713ada525d66077f42c61cfdb5cbdd28be98b0e7..d278d51886ec616b83b20acd5b6c6100a8e6c4da 100644
+--- a/crates/node_executor/src/lib.rs
++++ b/crates/node_executor/src/lib.rs
+@@ -9,7 +9,9 @@
+ mod executor;
+ pub mod local;
+ mod metrics;
++pub mod native;
+ pub mod noop;
++mod process;
+ pub mod routed;
+ pub mod source_package;
+ 
+diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
+index 1303aa0496988a1f52e2fa6a68d3386a3f1d4cdf..1c67f43a99a37d313cec2f32205682d143814087 100644
+--- a/crates/node_executor/src/local.rs
++++ b/crates/node_executor/src/local.rs
+@@ -291,6 +291,8 @@ struct SurgeWaitRegistration {
+ }
+ 
+ impl SurgeCoordinator {
++    pub(crate) const DEPLOYMENT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(120);
++
+     pub(crate) fn new() -> Arc<Self> {
+         crate::metrics::set_local_node_surge_phase("unused");
+         crate::metrics::set_local_node_surge_queue("routine", 0);
+@@ -405,6 +407,41 @@ impl SurgeCoordinator {
+         crate::metrics::set_local_node_surge_queue("deployment", state.deployment.len());
+     }
+ 
++    pub(crate) async fn acquire_deployment(self: &Arc<Self>, force: bool) -> SurgePermit {
++        let acquire = self.acquire(SurgePriority::Deployment, Arc::from("deployment"));
++        tokio::pin!(acquire);
++        if force {
++            let mut interval = tokio::time::interval(Duration::from_millis(100));
++            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++            let mut preemption_requested = false;
++            loop {
++                // Register the waiter first. A protected deployment candidate
++                // can later transfer the same permit to a reclaimable drain.
++                tokio::select! {
++                    biased;
++                    permit = &mut acquire => return permit,
++                    _ = interval.tick(), if !preemption_requested => {
++                        if let Some(phase) = self.force_preempt_reclaimable() {
++                            preemption_requested = true;
++                            let event = if phase == "draining" {
++                                "forced_drain_termination"
++                            } else {
++                                "forced_candidate_cancel"
++                            };
++                            crate::metrics::log_local_node_deployment_cutover_event(event);
++                            tracing::warn!(
++                                lifecycle_context = "deployment_cutover",
++                                outcome = event,
++                                "Forced local executor surge reclamation"
++                            );
++                        }
++                    },
++                }
++            }
++        }
++        acquire.await
++    }
++
+     pub(crate) fn force_preempt_reclaimable(&self) -> Option<&'static str> {
+         let state = self
+             .state
+@@ -433,7 +470,7 @@ impl SurgeCoordinator {
+ }
+ 
+ impl SurgePermit {
+-    fn require_confirmed_cleanup(&self) {
++    pub(crate) fn require_confirmed_cleanup(&self) {
+         self.inner.cleanup_required.store(true, Ordering::Release);
+     }
+ 
+@@ -460,6 +497,12 @@ impl SurgePermit {
+         self.inner.cleanup_required.store(false, Ordering::Release);
+     }
+ 
++    pub(crate) fn release_for_steady_promotion(self) {
++        // The caller has transferred the child into its empty, separately
++        // reserved steady slot. It no longer consumes additional surge memory.
++        self.inner.cleanup_required.store(false, Ordering::Release);
++    }
++
+     pub(crate) fn direct_child_cleanup_confirmed(&self) -> bool {
+         !self.inner.cleanup_required.load(Ordering::Acquire)
+     }
+@@ -4396,27 +4439,15 @@ impl InnerLocalNodeExecutor {
+                 "probe_failed"
+             },
+         };
+-        let supervisor_kill_requested = match child.start_kill() {
+-            Ok(()) => true,
+-            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+-                // The operator or the process itself may have won the exit
+-                // race. Waiting below still reaps the child and records its
+-                // exit class.
+-                false
+-            },
+-            Err(error) => {
+-                anyhow::bail!(
+-                    "Failed to terminate local Node executor generation {generation}: {:?}",
++        let (supervisor_kill_requested, status) = crate::process::kill_and_reap(child)
++            .await
++            .map_err(|error| {
++                anyhow::anyhow!(
++                    "Failed to terminate and reap local Node executor generation {generation}: \
++                     {:?}",
+                     error.kind()
+-                );
+-            },
+-        };
+-        let status = child.wait().await.map_err(|error| {
+-            anyhow::anyhow!(
+-                "Failed to reap local Node executor generation {generation}: {:?}",
+-                error.kind()
+-            )
+-        })?;
++                )
++            })?;
+         let exit_class = Self::record_child_exit(pool_name, status);
+         Ok(ChildTerminationObservation {
+             state_before,
+diff --git a/crates/node_executor/src/native.rs b/crates/node_executor/src/native.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba7580200883ae3
+--- /dev/null
++++ b/crates/node_executor/src/native.rs
+@@ -0,0 +1,1520 @@
++//! Backend-owned native residents. The executable implements lifecycle protocol
++//! v1; it is not an action runtime and receives no request or module-loading
++//! API.
++#[cfg(target_os = "linux")]
++use std::os::fd::AsRawFd;
++use std::{
++    fs::File,
++    io::{
++        Read,
++        Seek,
++    },
++    path::{
++        Path,
++        PathBuf,
++    },
++    process::Stdio,
++    sync::Arc,
++    time::Duration,
++};
++
++use anyhow::Context;
++use common::{
++    memory_pressure::MemoryPressureSignal,
++    types::Timestamp,
++};
++use futures::{
++    future::{
++        BoxFuture,
++        Shared,
++    },
++    FutureExt,
++};
++use model::source_packages::native::NativeResidentDescriptor;
++use serde::{
++    Deserialize,
++    Serialize,
++};
++use serde_json::{
++    json,
++    Value,
++};
++use tokio::{
++    io::{
++        AsyncBufReadExt,
++        AsyncWriteExt,
++        BufReader,
++    },
++    process::{
++        Child,
++        ChildStdin,
++        ChildStdout,
++        Command,
++    },
++    sync::{
++        watch,
++        Mutex,
++    },
++    time::{
++        Instant,
++        MissedTickBehavior,
++    },
++};
++use tokio_util::task::TaskTracker;
++use value::sha256::Sha256;
++
++use crate::{
++    local::{
++        SurgeCoordinator,
++        SurgePermit,
++        SurgePriority,
++    },
++    process::kill_and_reap,
++};
++
++const MAX_CONTROL_BYTES: usize = 64 * 1024;
++const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
++const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
++const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
++const RETIRE_TIMEOUT: Duration = Duration::from_secs(180);
++const REAP_TIMEOUT: Duration = Duration::from_secs(5);
++
++#[derive(Clone)]
++struct Configuration {
++    artifacts: PathBuf,
++    configurations: PathBuf,
++    max_rss_bytes: usize,
++}
++
++/// Native RSS contributes to the same steady-state and replacement budget as
++/// Node. An unset limit disables native residents; enabling them requires
++/// explicit capacity.
++pub(crate) fn configured_rss_bytes() -> anyhow::Result<usize> {
++    match std::env::var("LOCAL_NATIVE_RESIDENT_MAX_RSS_BYTES") {
++        Ok(value) => {
++            let bytes: usize = value.parse().context("Invalid native resident RSS limit")?;
++            anyhow::ensure!(
++                bytes >= 16 * 1024 * 1024,
++                "Native resident RSS limit must be at least 16 MiB"
++            );
++            Ok(bytes)
++        },
++        Err(std::env::VarError::NotPresent) => Ok(0),
++        Err(error) => Err(error.into()),
++    }
++}
++
++impl Configuration {
++    fn from_env() -> anyhow::Result<Option<Self>> {
++        let max_rss_bytes = configured_rss_bytes()?;
++        if max_rss_bytes == 0 {
++            anyhow::ensure!(
++                std::env::var_os("LOCAL_NATIVE_RESIDENT_ARTIFACTS_DIR").is_none()
++                    && std::env::var_os("LOCAL_NATIVE_RESIDENT_CONFIGURATIONS_DIR").is_none(),
++                "Native resident directories require an explicit RSS limit"
++            );
++            return Ok(None);
++        }
++        anyhow::ensure!(
++            cfg!(target_os = "linux"),
++            "Native residents require Linux parent-death supervision"
++        );
++        Ok(Some(Self {
++            artifacts: std::env::var_os("LOCAL_NATIVE_RESIDENT_ARTIFACTS_DIR")
++                .context("Native resident artifact directory is required")?
++                .into(),
++            configurations: std::env::var_os("LOCAL_NATIVE_RESIDENT_CONFIGURATIONS_DIR")
++                .context("Native resident configuration directory is required")?
++                .into(),
++            max_rss_bytes,
++        }))
++    }
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++struct Selection {
++    version: Timestamp,
++    descriptor: Option<NativeResidentDescriptor>,
++}
++
++#[derive(Clone, Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct NativeResidentStatus {
++    pub selected: Option<NativeResidentDescriptor>,
++    pub active_generation: Option<String>,
++    pub active_descriptor: Option<NativeResidentDescriptor>,
++    pub phase: &'static str,
++}
++
++/// A single task owns transitions, children, and cleanup. Publishing a newer
++/// selection never detaches an earlier candidate or releases its surge permit.
++pub struct NativeResidentSupervisor {
++    config: Option<Configuration>,
++    surge: Arc<SurgeCoordinator>,
++    pressure: MemoryPressureSignal,
++    selection: watch::Sender<Selection>,
++    shutdown: watch::Sender<bool>,
++    force: watch::Sender<Option<String>>,
++    status: watch::Receiver<NativeResidentStatus>,
++    task: Shared<BoxFuture<'static, Result<(), Arc<anyhow::Error>>>>,
++    staging: Mutex<()>,
++    publication: Mutex<()>,
++    cleanup: TaskTracker,
++}
++
++impl NativeResidentSupervisor {
++    pub(crate) fn new(
++        surge: Arc<SurgeCoordinator>,
++        pressure: MemoryPressureSignal,
++    ) -> anyhow::Result<Arc<Self>> {
++        Self::with_configuration(Configuration::from_env()?, surge, pressure)
++    }
++
++    fn with_configuration(
++        config: Option<Configuration>,
++        surge: Arc<SurgeCoordinator>,
++        pressure: MemoryPressureSignal,
++    ) -> anyhow::Result<Arc<Self>> {
++        let (selection, selection_rx) = watch::channel(Selection {
++            version: Timestamp::MIN,
++            descriptor: None,
++        });
++        let (shutdown, shutdown_rx) = watch::channel(false);
++        let (force, force_rx) = watch::channel(None);
++        let (status_tx, status) = watch::channel(NativeResidentStatus {
++            selected: None,
++            active_generation: None,
++            active_descriptor: None,
++            phase: "inactive",
++        });
++        let cleanup = TaskTracker::new();
++        let task = tokio::spawn(run_supervisor(
++            config.clone(),
++            surge.clone(),
++            pressure.clone(),
++            selection_rx,
++            shutdown_rx,
++            force_rx,
++            status_tx,
++            cleanup.clone(),
++        ));
++        Ok(Arc::new(Self {
++            config,
++            surge,
++            pressure,
++            selection,
++            shutdown,
++            force,
++            status,
++            task: async move {
++                task.await
++                    .context("Native resident supervisor task failed")
++                    .and_then(|result| result)
++                    .map_err(Arc::new)
++            }
++            .boxed()
++            .shared(),
++            staging: Mutex::new(()),
++            publication: Mutex::new(()),
++            cleanup,
++        }))
++    }
++
++    pub fn status(&self) -> NativeResidentStatus {
++        self.status.borrow().clone()
++    }
++
++    /// Serialize the live-process compatibility check with publication. The
++    /// caller refreshes committed selection under this guard before checking.
++    pub async fn publication_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
++        self.publication.lock().await
++    }
++
++    pub fn validate_publication_contract(&self, contract: Option<&str>) -> anyhow::Result<()> {
++        let status = self.status.borrow();
++        let selection = self.selection.borrow();
++        // A cold candidate can still become active before reconciliation observes
++        // an intervening retirement commit. Its contract remains live until the
++        // supervisor has applied that selection and reaped the candidate.
++        for resident in [
++            status.active_descriptor.as_ref(),
++            status.selected.as_ref(),
++            selection.descriptor.as_ref(),
++        ]
++        .into_iter()
++        .flatten()
++        {
++            anyhow::ensure!(
++                contract == Some(resident.application_contract.as_str()),
++                "Wait for native resident retirement before publishing an incompatible \
++                 application contract"
++            );
++        }
++        Ok(())
++    }
++
++    pub fn reconcile(
++        &self,
++        descriptor: Option<NativeResidentDescriptor>,
++        version: Timestamp,
++    ) -> anyhow::Result<()> {
++        if let Some(descriptor) = &descriptor {
++            descriptor.validate()?;
++            anyhow::ensure!(
++                self.config.is_some(),
++                "Native residents are not configured on this backend"
++            );
++        }
++        anyhow::ensure!(
++            !*self.shutdown.borrow(),
++            "Native resident supervisor is shutting down"
++        );
++        let mut failure = false;
++        self.selection.send_if_modified(|current| {
++            if version < current.version {
++                return false;
++            }
++            if version == current.version {
++                failure = current.descriptor != descriptor;
++                return false;
++            }
++            let changed = current.descriptor != descriptor;
++            *current = Selection {
++                version,
++                descriptor,
++            };
++            changed
++        });
++        anyhow::ensure!(
++            !failure,
++            "Native resident selection differs at the same commit version"
++        );
++        anyhow::ensure!(
++            !self.selection.is_closed(),
++            "Native resident supervision stopped"
++        );
++        Ok(())
++    }
++
++    /// Readiness is inert and bounded. Reap the trial before Node cutover
++    /// reserves surge capacity; holding both reservations would deadlock a
++    /// mixed deployment.
++    pub async fn prepare(
++        &self,
++        descriptor: &NativeResidentDescriptor,
++        force: bool,
++    ) -> anyhow::Result<()> {
++        let _operation = self.cleanup.token();
++        descriptor.validate()?;
++        let config = self
++            .config
++            .as_ref()
++            .context("Native residents are not configured on this backend")?;
++        let _stage = self.staging.lock().await;
++        // Subscribe before checking admission. A signal published between the
++        // check and the capacity wait must remain an unobserved interruption.
++        let mut shutdown = self.shutdown.subscribe();
++        let mut memory = self.pressure.subscribe();
++        anyhow::ensure!(
++            !*self.shutdown.borrow() && !self.pressure.is_active(),
++            "Native resident staging is unavailable"
++        );
++        if self.status.borrow().selected.as_ref() == Some(descriptor)
++            && self.status.borrow().active_generation.is_some()
++            && self.status.borrow().phase == "active"
++        {
++            return Ok(());
++        }
++        let permit = tokio::select! {
++            permit = tokio::time::timeout(
++                SurgeCoordinator::DEPLOYMENT_ADMISSION_TIMEOUT,
++                self.surge.acquire_deployment(force),
++            ) => permit.context("Native resident staging capacity is unavailable")?,
++            _ = shutdown.changed() => anyhow::bail!("Native resident staging interrupted by shutdown"),
++            _ = memory.changed() => anyhow::bail!("Native resident staging interrupted by memory pressure"),
++        };
++        anyhow::ensure!(
++            !*self.shutdown.borrow() && !self.pressure.is_active(),
++            "Native resident staging is unavailable"
++        );
++        let generation = new_generation();
++        tokio::select! {
++            result = async {
++                let mut child = start(
++                    config, descriptor, generation, Some(permit), self.cleanup.clone(),
++                ).await?;
++                child.terminate().await
++            } => result,
++            _ = shutdown.changed() => anyhow::bail!("Native resident staging interrupted by shutdown"),
++            _ = memory.changed() => anyhow::bail!("Native resident staging interrupted by memory pressure"),
++        }
++    }
++
++    pub fn enabled(&self) -> bool {
++        self.config.is_some()
++    }
++
++    pub fn force_retire(&self, generation: &str) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            self.status.borrow().active_generation.as_deref() == Some(generation),
++            "Native resident force request does not match the active generation"
++        );
++        self.force.send_replace(Some(generation.to_owned()));
++        Ok(())
++    }
++
++    pub fn is_shutting_down(&self) -> bool {
++        *self.shutdown.borrow()
++    }
++
++    pub fn request_shutdown(&self) {
++        self.shutdown.send_replace(true);
++    }
++
++    pub async fn shutdown(&self) -> anyhow::Result<()> {
++        self.request_shutdown();
++        // Administrative readiness trials own real children too. Join their
++        // bounded cleanup before the backend releases its application runtime.
++        // Admission is closed. Let queued preparations acquire the staging
++        // lock and observe shutdown so their tracked operation tokens can drain.
++        drop(self.staging.lock().await);
++        // Every caller observes the same join and terminal result, including
++        // cancellation after the join but before cleanup finishes.
++        let supervision = self.task.clone().await;
++        // No child producer remains after staging and supervisor completion.
++        // Canceled futures register their cleanup synchronously from Drop.
++        self.cleanup.close();
++        tokio::time::timeout(REAP_TIMEOUT, self.cleanup.wait())
++            .await
++            .context("Native resident cleanup is still awaiting confirmed reaping")?;
++        supervision.map_err(|error| anyhow::anyhow!("{error:#}"))
++    }
++}
++
++#[cfg(feature = "testing")]
++pub fn test_supervisor(
++    artifacts: PathBuf,
++    configurations: PathBuf,
++) -> anyhow::Result<Arc<NativeResidentSupervisor>> {
++    test_supervisor_with_limits(
++        artifacts,
++        configurations,
++        64 * 1024 * 1024,
++        MemoryPressureSignal::default(),
++    )
++}
++
++#[cfg(feature = "testing")]
++pub fn test_supervisor_with_limits(
++    artifacts: PathBuf,
++    configurations: PathBuf,
++    max_rss_bytes: usize,
++    pressure: MemoryPressureSignal,
++) -> anyhow::Result<Arc<NativeResidentSupervisor>> {
++    NativeResidentSupervisor::with_configuration(
++        Some(Configuration {
++            artifacts,
++            configurations,
++            max_rss_bytes,
++        }),
++        SurgeCoordinator::new(),
++        pressure,
++    )
++}
++
++fn new_generation() -> String {
++    // Administrative requests can survive a backend restart and PID reuse.
++    // A process-local sequence would let such a request name a new child.
++    format!("{:032x}", rand::random::<u128>())
++}
++
++#[derive(Deserialize)]
++#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
++enum Reply {
++    #[serde(rename_all = "camelCase")]
++    Ready {
++        generation: String,
++        artifact_sha256: String,
++        configuration_sha256: String,
++        lifecycle_protocol: u32,
++        application_contract: String,
++    },
++    Progress {
++        generation: String,
++        nonce: u64,
++    },
++    Drained {
++        generation: String,
++    },
++    Failed {
++        generation: String,
++        code: String,
++    },
++}
++
++struct ResidentChild {
++    child: Option<Child>,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++    generation: String,
++    descriptor: NativeResidentDescriptor,
++    permit: Option<SurgePermit>,
++    probe: u64,
++    pending_probe: Option<Instant>,
++    pending_write: Option<ControlWrite>,
++    pending: Vec<u8>,
++    cleanup: TaskTracker,
++}
++
++struct ControlWrite {
++    bytes: Vec<u8>,
++    written: usize,
++    deadline: Instant,
++}
++
++impl ResidentChild {
++    async fn send(&mut self, message: Value, max_rss_bytes: usize) -> anyhow::Result<()> {
++        let mut bytes = serde_json::to_vec(&message)?;
++        anyhow::ensure!(
++            bytes.len() < MAX_CONTROL_BYTES,
++            "Native control request exceeds its bound"
++        );
++        bytes.push(b'\n');
++        let pending = self.pending_write.get_or_insert_with(|| ControlWrite {
++            bytes: bytes.clone(),
++            written: 0,
++            deadline: Instant::now() + PROBE_TIMEOUT,
++        });
++        anyhow::ensure!(
++            pending.bytes == bytes,
++            "Native control write changed during cancellation"
++        );
++        let deadline = pending.deadline;
++        let mut interval = tokio::time::interval(Duration::from_millis(100));
++        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
++        loop {
++            let pending = self
++                .pending_write
++                .as_mut()
++                .expect("Native control write missing");
++            tokio::select! {
++                biased;
++                _ = tokio::time::sleep_until(deadline) => anyhow::bail!("Native control write timed out"),
++                _ = interval.tick() => self.check_rss(max_rss_bytes).await?,
++                count = self.stdin.write(&pending.bytes[pending.written..]) => {
++                    let count = count?;
++                    anyhow::ensure!(count > 0, "Native control write closed");
++                    pending.written += count;
++                    if pending.written == pending.bytes.len() {
++                        self.pending_write = None;
++                        return Ok(());
++                    }
++                },
++            }
++        }
++    }
++
++    async fn read(&mut self) -> anyhow::Result<Reply> {
++        // read_line may allocate until EOF. Read bounded chunks before parsing.
++        loop {
++            let available = self.stdout.fill_buf().await?;
++            anyhow::ensure!(!available.is_empty(), "Native control channel closed");
++            let length = available
++                .iter()
++                .position(|b| *b == b'\n')
++                .map_or(available.len(), |end| end + 1);
++            anyhow::ensure!(
++                self.pending.len() + length <= MAX_CONTROL_BYTES,
++                "Native control reply exceeds its bound"
++            );
++            let complete = available[length - 1] == b'\n';
++            self.pending.extend_from_slice(&available[..length]);
++            self.stdout.consume(length);
++            if complete {
++                break;
++            }
++        }
++        let reply: Reply = serde_json::from_slice(&self.pending)
++            .map_err(|_| anyhow::anyhow!("Invalid native control reply"))?;
++        self.pending.clear();
++        let generation = match &reply {
++            Reply::Ready { generation, .. }
++            | Reply::Progress { generation, .. }
++            | Reply::Drained { generation }
++            | Reply::Failed { generation, .. } => generation,
++        };
++        anyhow::ensure!(
++            generation == &self.generation,
++            "Native control reply generation mismatch"
++        );
++        if let Reply::Failed { code, .. } = &reply {
++            // Child-controlled details do not become backend log fields.
++            anyhow::ensure!(code.len() <= 128, "Invalid native failure code");
++            anyhow::bail!("Native resident reported failure");
++        }
++        Ok(reply)
++    }
++
++    async fn read_healthy_until(
++        &mut self,
++        deadline: Instant,
++        max_rss_bytes: usize,
++    ) -> anyhow::Result<Reply> {
++        let mut interval = tokio::time::interval(Duration::from_millis(100));
++        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
++        loop {
++            tokio::select! {
++                biased;
++                _ = tokio::time::sleep_until(deadline) => anyhow::bail!("Native resident control reply timed out"),
++                _ = interval.tick() => self.check_rss(max_rss_bytes).await?,
++                reply = self.read() => return reply,
++            }
++        }
++    }
++
++    async fn ready(
++        &mut self,
++        expected: &NativeResidentDescriptor,
++        max_rss_bytes: usize,
++        deadline: Instant,
++    ) -> anyhow::Result<()> {
++        let reply = self.read_healthy_until(deadline, max_rss_bytes).await?;
++        match reply {
++            Reply::Ready {
++                artifact_sha256,
++                configuration_sha256,
++                lifecycle_protocol,
++                application_contract,
++                ..
++            } => {
++                anyhow::ensure!(
++                    NativeResidentDescriptor {
++                        artifact_sha256,
++                        configuration_sha256,
++                        lifecycle_protocol,
++                        application_contract
++                    } == *expected,
++                    "Native resident readiness identity mismatch"
++                );
++                Ok(())
++            },
++            Reply::Progress { .. } | Reply::Drained { .. } | Reply::Failed { .. } => {
++                anyhow::bail!("Unexpected native readiness reply")
++            },
++        }
++    }
++
++    async fn activate(&mut self, max_rss_bytes: usize) -> anyhow::Result<()> {
++        self.send(
++            json!({"type": "activate", "generation": self.generation}),
++            max_rss_bytes,
++        )
++        .await
++    }
++
++    async fn probe(&mut self, max_rss_bytes: usize) -> anyhow::Result<()> {
++        // Predecessor drain can finish while the inert candidate awaits progress.
++        // Promotion resumes that exact probe instead of consuming its reply as
++        // stale evidence for a newer nonce, or extending the health deadline.
++        let must_send = self.pending_probe.is_none() || self.pending_write.is_some();
++        let deadline = if let Some(deadline) = self.pending_probe {
++            deadline
++        } else {
++            self.probe = self
++                .probe
++                .checked_add(1)
++                .context("Native probe sequence overflow")?;
++            let deadline = Instant::now() + PROBE_TIMEOUT;
++            self.pending_probe = Some(deadline);
++            deadline
++        };
++        if must_send {
++            // Record the nonce and deadline before writing: a canceled partial
++            // write resumes its bytes and cannot renew the progress budget.
++            self.send(
++                json!({"type": "probe", "generation": self.generation, "nonce": self.probe}),
++                max_rss_bytes,
++            )
++            .await?;
++        }
++        match self.read_healthy_until(deadline, max_rss_bytes).await? {
++            Reply::Progress { nonce, .. } => {
++                anyhow::ensure!(nonce == self.probe, "Native progress nonce mismatch")
++            },
++            Reply::Ready { .. } | Reply::Drained { .. } | Reply::Failed { .. } => {
++                anyhow::bail!("Unexpected native progress reply")
++            },
++        }
++        self.pending_probe = None;
++        self.check_rss(max_rss_bytes).await
++    }
++
++    #[cfg(target_os = "linux")]
++    async fn check_rss(&mut self, max_rss_bytes: usize) -> anyhow::Result<()> {
++        let child = self.child.as_mut().context("Native child already reaped")?;
++        anyhow::ensure!(child.try_wait()?.is_none(), "Native child exited");
++        let pid = child.id().context("Native child PID is unavailable")?;
++        let statm = tokio::fs::read_to_string(format!("/proc/{pid}/statm")).await?;
++        let pages: usize = statm
++            .split_whitespace()
++            .nth(1)
++            .context("Invalid native process RSS")?
++            .parse()?;
++        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
++        anyhow::ensure!(page_size > 0, "Invalid host page size");
++        let rss = pages
++            .checked_mul(usize::try_from(page_size)?)
++            .context("Native RSS overflow")?;
++        anyhow::ensure!(
++            rss <= max_rss_bytes,
++            "Native resident exceeded its RSS limit"
++        );
++        Ok(())
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    async fn check_rss(&mut self, _max_rss_bytes: usize) -> anyhow::Result<()> {
++        anyhow::bail!("Native resident process sampling requires Linux")
++    }
++
++    async fn retire(
++        &mut self,
++        max_rss_bytes: usize,
++        pressure: &MemoryPressureSignal,
++        shutdown: &mut watch::Receiver<bool>,
++        force: &mut watch::Receiver<Option<String>>,
++    ) -> anyhow::Result<()> {
++        let deadline = Instant::now() + RETIRE_TIMEOUT;
++        let generation = self.generation.clone();
++        let permit = self.permit.clone();
++        let mut memory = pressure.subscribe();
++        // These interrupts cover writes as well as reads. A resident that stops
++        // consuming stdin must not postpone shutdown or pressure termination.
++        tokio::select! {
++            biased;
++            _ = tokio::time::sleep_until(deadline) => anyhow::bail!("Native resident retirement timed out"),
++            _ = shutdown.wait_for(|shutdown| *shutdown) => anyhow::bail!("Native resident shutdown"),
++            _ = memory.wait_for(|pressure| *pressure) => anyhow::bail!("Native resident memory pressure"),
++            _ = force.wait_for(|forced| forced.as_deref() == Some(generation.as_str())) => anyhow::bail!("Native drain was explicitly forced"),
++            _ = async {
++                match permit {
++                    Some(permit) => permit.wait_until_preempted().await,
++                    None => std::future::pending().await,
++                }
++            } => anyhow::bail!("Native drain was forcibly preempted"),
++            result = self.drain(max_rss_bytes) => result,
++        }
++    }
++
++    async fn drain(&mut self, max_rss_bytes: usize) -> anyhow::Result<()> {
++        // Candidate readiness may cancel the incumbent's monitor while a probe
++        // is pending. Finish that exact exchange before starting retirement.
++        if self.pending_probe.is_some() {
++            self.probe(max_rss_bytes).await?;
++        }
++        self.send(json!({"type": "retire", "generation": self.generation, "deadlineMs": RETIRE_TIMEOUT.as_millis() as u64}), max_rss_bytes).await?;
++        let mut interval = tokio::time::interval(Duration::from_millis(100));
++        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
++        let mut next_probe = Instant::now();
++        loop {
++            tokio::select! {
++                _ = interval.tick() => {
++                    self.check_rss(max_rss_bytes).await?;
++                    if let Some(deadline) = self.pending_probe {
++                        anyhow::ensure!(Instant::now() < deadline, "Native retiring coordinator stopped progressing");
++                    } else if Instant::now() >= next_probe {
++                        self.probe = self.probe.checked_add(1).context("Native probe sequence overflow")?;
++                        self.pending_probe = Some(Instant::now() + PROBE_TIMEOUT);
++                        self.send(json!({"type": "probe", "generation": self.generation, "nonce": self.probe}), max_rss_bytes).await?;
++                        next_probe = Instant::now() + Duration::from_secs(1);
++                    }
++                },
++                reply = self.read() => match reply? {
++                    Reply::Drained { .. } => return Ok(()),
++                    Reply::Progress { nonce, .. } => {
++                        anyhow::ensure!(self.pending_probe.is_some() && self.probe == nonce, "Native retirement progress nonce mismatch");
++                        self.pending_probe = None;
++                    },
++                    Reply::Ready { .. } | Reply::Failed { .. } => anyhow::bail!("Unexpected native retirement reply"),
++                },
++            }
++        }
++    }
++
++    async fn terminate(&mut self) -> anyhow::Result<()> {
++        if let Some(child) = &mut self.child {
++            tokio::time::timeout(REAP_TIMEOUT, kill_and_reap(child))
++                .await
++                .context("Native child reaping timed out")??;
++            self.child.take();
++            if let Some(permit) = self.permit.take() {
++                permit.confirm_direct_child_reaped();
++            }
++        }
++        Ok(())
++    }
++}
++
++impl Drop for ResidentChild {
++    fn drop(&mut self) {
++        let Some(mut child) = self.child.take() else {
++            return;
++        };
++        let permit = self.permit.take();
++        // Caller cancellation never reports cleanup or returns shared surge before
++        // confirmed reap. kill_on_drop remains a last resort during runtime teardown.
++        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
++            self.cleanup.spawn_on(
++                async move {
++                    match kill_and_reap(&mut child).await {
++                        Ok(_) => {
++                            if let Some(permit) = permit {
++                                permit.confirm_direct_child_reaped();
++                            }
++                        },
++                        Err(_) => {
++                            tracing::error!("Failed to reap a native resident during cleanup");
++                            // Keep the child and its accounting in the tracked
++                            // owner. Shutdown reports this unfinished cleanup.
++                            std::future::pending::<()>().await;
++                            drop((child, permit));
++                        },
++                    }
++                },
++                &runtime,
++            );
++        }
++    }
++}
++
++fn verified_file(path: &Path, expected: &str, limit: u64) -> anyhow::Result<File> {
++    let mut file = File::open(path).context("Native resident input is unavailable")?;
++    let metadata = file.metadata()?;
++    anyhow::ensure!(
++        metadata.is_file() && metadata.len() <= limit,
++        "Invalid native resident input size"
++    );
++    let mut hash = Sha256::new();
++    std::io::copy(&mut (&mut file).take(limit + 1), &mut hash)?;
++    anyhow::ensure!(
++        hash.finalize().as_hex() == expected,
++        "Native resident input checksum mismatch"
++    );
++    file.rewind()?;
++    Ok(file)
++}
++
++#[cfg(target_os = "linux")]
++async fn start(
++    config: &Configuration,
++    descriptor: &NativeResidentDescriptor,
++    generation: String,
++    permit: Option<SurgePermit>,
++    cleanup: TaskTracker,
++) -> anyhow::Result<ResidentChild> {
++    let artifact_path = config
++        .artifacts
++        .join(&descriptor.artifact_sha256)
++        .join("resident");
++    let configuration_path = config
++        .configurations
++        .join(format!("{}.json", descriptor.configuration_sha256));
++    let identity = descriptor.clone();
++    // Blocking file verification cannot be canceled once running. Shutdown
++    // still owns that work even when its awaiting preparation was canceled.
++    let verification = cleanup.token();
++    let (artifact, configuration) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
++        let _verification = verification;
++        let artifact = verified_file(
++            &artifact_path,
++            &identity.artifact_sha256,
++            MAX_ARTIFACT_BYTES,
++        )?;
++        let mut configuration = verified_file(
++            &configuration_path,
++            &identity.configuration_sha256,
++            (MAX_CONTROL_BYTES / 2) as u64,
++        )?;
++        let mut bytes = Vec::new();
++        configuration.read_to_end(&mut bytes)?;
++        let configuration: Value =
++            serde_json::from_slice(&bytes).context("Invalid native resident configuration")?;
++        anyhow::ensure!(
++            configuration.is_object(),
++            "Native resident configuration must be an object"
++        );
++        Ok((artifact, configuration))
++    })
++    .await??;
++    // Execute the verified inode, avoiding a path replacement between hashing and
++    // exec.
++    let mut command = Command::new(format!("/proc/self/fd/{}", artifact.as_raw_fd()));
++    command
++        .env_clear()
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .kill_on_drop(true);
++    #[cfg(target_os = "linux")]
++    unsafe {
++        let parent = libc::getpid();
++        command.pre_exec(move || {
++            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
++                return Err(std::io::Error::last_os_error());
++            }
++            if libc::getppid() != parent {
++                return Err(std::io::Error::other(
++                    "Native resident parent exited during spawn",
++                ));
++            }
++            Ok(())
++        });
++    }
++    let readiness_deadline = Instant::now() + STARTUP_TIMEOUT;
++    let mut child = command.spawn().context("Failed to spawn native resident")?;
++    if let Some(permit) = &permit {
++        permit.require_confirmed_cleanup();
++    }
++    let stdin = child
++        .stdin
++        .take()
++        .context("Native resident stdin missing")?;
++    let stdout = BufReader::new(
++        child
++            .stdout
++            .take()
++            .context("Native resident stdout missing")?,
++    );
++    let mut result = ResidentChild {
++        child: Some(child),
++        stdin,
++        stdout,
++        generation,
++        descriptor: descriptor.clone(),
++        permit,
++        probe: 0,
++        pending_probe: None,
++        pending_write: None,
++        pending: Vec::new(),
++        cleanup,
++    };
++    let readiness = async {
++        result.send(json!({"type": "initialize", "generation": result.generation, "descriptor": descriptor, "configuration": configuration}), config.max_rss_bytes).await?;
++        result.ready(descriptor, config.max_rss_bytes, readiness_deadline).await
++    }.await;
++    if let Err(error) = readiness {
++        result.terminate().await?;
++        return Err(error);
++    }
++    Ok(result)
++}
++
++#[cfg(not(target_os = "linux"))]
++async fn start(
++    _config: &Configuration,
++    _descriptor: &NativeResidentDescriptor,
++    _generation: String,
++    _permit: Option<SurgePermit>,
++    _cleanup: TaskTracker,
++) -> anyhow::Result<ResidentChild> {
++    anyhow::bail!("Native resident execution requires Linux")
++}
++
++async fn monitor_child(candidate: &mut ResidentChild, max_rss_bytes: usize) -> anyhow::Result<()> {
++    let mut interval = tokio::time::interval(Duration::from_secs(1));
++    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
++    loop {
++        interval.tick().await;
++        candidate.probe(max_rss_bytes).await?;
++    }
++}
++
++async fn run_supervisor(
++    config: Option<Configuration>,
++    surge: Arc<SurgeCoordinator>,
++    pressure: MemoryPressureSignal,
++    mut selection: watch::Receiver<Selection>,
++    mut shutdown: watch::Receiver<bool>,
++    mut force: watch::Receiver<Option<String>>,
++    status: watch::Sender<NativeResidentStatus>,
++    cleanup: TaskTracker,
++) -> anyhow::Result<()> {
++    let mut active: Option<ResidentChild> = None;
++    let mut interval = tokio::time::interval(Duration::from_secs(1));
++    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
++    let mut memory = pressure.subscribe();
++    'supervisor: loop {
++        tokio::select! {
++            _ = memory.changed() => (),
++            _ = shutdown.changed() => break,
++            result = selection.changed() => if result.is_err() { break; },
++            _ = force.changed() => (),
++            _ = interval.tick() => (),
++        }
++        if *shutdown.borrow() {
++            break;
++        }
++        let desired = selection.borrow().clone();
++        let Some(config) = &config else {
++            anyhow::ensure!(
++                desired.descriptor.is_none(),
++                "Native resident selected without configuration"
++            );
++            continue;
++        };
++        if pressure.is_active() {
++            if let Some(mut old) = active.take() {
++                old.terminate().await?;
++            }
++            status.send_replace(NativeResidentStatus {
++                selected: desired.descriptor,
++                active_generation: None,
++                active_descriptor: None,
++                phase: "pressure",
++            });
++            continue;
++        }
++        if let Some(child) = &mut active {
++            let generation = child.generation.clone();
++            let healthy = tokio::select! {
++                result = child.probe(config.max_rss_bytes) => result.is_ok(),
++                _ = shutdown.changed() => break,
++                _ = memory.changed() => continue,
++                _ = force.wait_for(|forced| {
++                    forced.as_deref() == Some(generation.as_str())
++                }) => false,
++            };
++            if force.borrow().as_deref() == Some(child.generation.as_str()) || !healthy {
++                tracing::warn!("Native resident failed its coordinator progress or RSS check");
++                child.terminate().await?;
++                active = None;
++            }
++        }
++        if active.as_ref().map(|child| &child.descriptor) == desired.descriptor.as_ref() {
++            status.send_replace(NativeResidentStatus {
++                selected: desired.descriptor,
++                active_generation: active.as_ref().map(|child| child.generation.clone()),
++                active_descriptor: active.as_ref().map(|child| child.descriptor.clone()),
++                phase: if active.is_some() {
++                    "active"
++                } else {
++                    "inactive"
++                },
++            });
++            continue;
++        }
++        status.send_replace(NativeResidentStatus {
++            selected: desired.descriptor.clone(),
++            active_generation: active.as_ref().map(|child| child.generation.clone()),
++            active_descriptor: active.as_ref().map(|child| child.descriptor.clone()),
++            phase: "candidate",
++        });
++        let mut candidate = if let Some(descriptor) = &desired.descriptor {
++            let acquisition = surge.acquire(SurgePriority::Deployment, Arc::from("native"));
++            tokio::pin!(acquisition);
++            // Retain the receiver checked above: resubscribing here would mark
++            // pressure that arrived during the incumbent probe as already seen.
++            let permit = loop {
++                // Waiting behind another adapter's drain must not suspend
++                // supervision of the incumbent native steady slot.
++                tokio::select! {
++                    permit = &mut acquisition => break permit,
++                    _ = shutdown.changed() => break 'supervisor,
++                    result = selection.changed() => {
++                        if result.is_err() {
++                            break 'supervisor;
++                        }
++                        if selection.borrow().descriptor != desired.descriptor {
++                            continue 'supervisor;
++                        }
++                    },
++                    _ = memory.changed() => continue 'supervisor,
++                    _ = force.changed() => {
++                        if let Some(child) = &mut active
++                            && force.borrow().as_deref() == Some(child.generation.as_str())
++                        {
++                            child.terminate().await?;
++                            active = None;
++                        }
++                    },
++                    _ = interval.tick() => {
++                        if let Some(child) = &mut active {
++                            let generation = child.generation.clone();
++                            let healthy = tokio::select! {
++                                result = child.probe(config.max_rss_bytes) => result.is_ok(),
++                                _ = shutdown.changed() => break 'supervisor,
++                                _ = memory.changed() => continue 'supervisor,
++                                _ = force.wait_for(|forced| {
++                                    forced.as_deref() == Some(generation.as_str())
++                                }) => false,
++                            };
++                            if !healthy {
++                                tracing::warn!("Native resident failed while waiting for replacement capacity");
++                                child.terminate().await?;
++                                active = None;
++                            }
++                        }
++                    },
++                }
++            };
++            // Both first startup and replacement serialize with other adapters.
++            // Release the permit after promotion when there is no old native child.
++            let incumbent_generation = active.as_ref().map(|child| child.generation.clone());
++            let candidate = tokio::select! {
++                candidate = start(
++                    config, descriptor, new_generation(), Some(permit), cleanup.clone(),
++                ) => candidate,
++                _ = shutdown.changed() => break 'supervisor,
++                _ = memory.changed() => continue 'supervisor,
++                // Drop watch read guards inside these futures before any
++                // selected branch awaits child cleanup.
++                _ = async {
++                    selection.wait_for(|selection| selection.descriptor != desired.descriptor)
++                        .await.map(|_| ())
++                } => {
++                    continue 'supervisor;
++                },
++                // Verification and readiness can stall too. Keep the steady
++                // child supervised for the entire lifetime of its replacement.
++                _ = async {
++                    match &mut active {
++                        Some(child) => monitor_child(child, config.max_rss_bytes).await,
++                        None => std::future::pending().await,
++                    }
++                } => {
++                    if let Some(mut child) = active.take() {
++                        child.terminate().await?;
++                    }
++                    continue 'supervisor;
++                },
++                _ = async {
++                    force.wait_for(|forced| {
++                        incumbent_generation.is_some() && *forced == incumbent_generation
++                    }).await.map(|_| ())
++                } => {
++                    if let Some(mut child) = active.take() {
++                        child.terminate().await?;
++                    }
++                    continue 'supervisor;
++                },
++            };
++            match candidate {
++                Ok(candidate) => Some(candidate),
++                Err(_) => {
++                    tracing::warn!("Native resident candidate startup failed");
++                    continue;
++                },
++            }
++        } else {
++            None
++        };
++        // A candidate never obtains activation for a replaced committed selection.
++        if selection.borrow().descriptor != desired.descriptor
++            || *shutdown.borrow()
++            || pressure.is_active()
++        {
++            if let Some(candidate) = &mut candidate {
++                candidate.terminate().await?;
++            }
++            continue;
++        }
++        if let Some(mut old) = active.take() {
++            if let Some(candidate) = &mut candidate {
++                old.permit = candidate.permit.take();
++                if let Some(permit) = &old.permit {
++                    permit.set_phase("draining");
++                }
++            }
++            status.send_replace(NativeResidentStatus {
++                selected: desired.descriptor.clone(),
++                active_generation: Some(old.generation.clone()),
++                active_descriptor: Some(old.descriptor.clone()),
++                phase: "draining",
++            });
++            let mut candidate_failed = false;
++            let retirement = match candidate.as_mut() {
++                Some(candidate) => tokio::select! {
++                    result = old.retire(
++                        config.max_rss_bytes, &pressure, &mut shutdown, &mut force,
++                    ) => result,
++                    result = monitor_child(candidate, config.max_rss_bytes) => {
++                        candidate_failed = true;
++                        result
++                    },
++                },
++                None => {
++                    old.retire(config.max_rss_bytes, &pressure, &mut shutdown, &mut force)
++                        .await
++                },
++            };
++            if retirement.is_err() {
++                tracing::warn!("Native resident replacement interrupted application drain");
++            }
++            old.terminate().await?;
++            if candidate_failed {
++                // A later valid reply cannot restore a candidate that already
++                // failed protocol, progress, or RSS supervision during drain.
++                candidate
++                    .as_mut()
++                    .expect("Failed native candidate missing")
++                    .terminate()
++                    .await?;
++                continue;
++            }
++        }
++        if selection.borrow().descriptor != desired.descriptor
++            || *shutdown.borrow()
++            || pressure.is_active()
++        {
++            if let Some(candidate) = &mut candidate {
++                candidate.terminate().await?;
++            }
++            continue;
++        }
++        if let Some(candidate) = &mut candidate {
++            // A candidate can wait through the predecessor's whole drain. Recheck
++            // its coordinator progress before granting activation authority.
++            let promotion = tokio::select! {
++                result = async {
++                    candidate.probe(config.max_rss_bytes).await?;
++                    // A publication may replace selection while the readiness
++                    // probe yields. Check at the final activation boundary.
++                    anyhow::ensure!(selection.borrow().descriptor == desired.descriptor, "Native candidate selection changed");
++                    candidate.activate(config.max_rss_bytes).await
++                } => result,
++                _ = shutdown.changed() => Err(anyhow::anyhow!("Native candidate shutdown")),
++                _ = memory.changed() => Err(anyhow::anyhow!("Native candidate memory pressure")),
++            };
++            if promotion.is_err() {
++                candidate.terminate().await?;
++                continue;
++            }
++            if let Some(permit) = candidate.permit.take() {
++                permit.release_for_steady_promotion();
++            }
++        }
++        active = candidate;
++        status.send_replace(NativeResidentStatus {
++            selected: desired.descriptor,
++            active_generation: active.as_ref().map(|child| child.generation.clone()),
++            active_descriptor: active.as_ref().map(|child| child.descriptor.clone()),
++            phase: if active.is_some() {
++                "active"
++            } else {
++                "inactive"
++            },
++        });
++    }
++    if let Some(mut child) = active {
++        child.terminate().await?;
++    }
++    cleanup.close();
++    tokio::time::timeout(REAP_TIMEOUT, cleanup.wait())
++        .await
++        .context("Native resident shutdown cleanup is not yet confirmed")?;
++    status.send_replace(NativeResidentStatus {
++        selected: None,
++        active_generation: None,
++        active_descriptor: None,
++        phase: "stopped",
++    });
++    Ok(())
++}
++
++#[cfg(all(test, target_os = "linux"))]
++mod tests {
++    use super::*;
++
++    fn descriptor() -> NativeResidentDescriptor {
++        NativeResidentDescriptor {
++            artifact_sha256: "a".repeat(64),
++            configuration_sha256: "b".repeat(64),
++            lifecycle_protocol: 1,
++            application_contract: "example-v1".to_owned(),
++        }
++    }
++
++    async fn fixture(mode: &str, permit: Option<SurgePermit>) -> ResidentChild {
++        // A real OS child exercises pipe readiness, progress, disconnect, and
++        // reaping without coupling lifecycle tests to a particular application.
++        let mut child = Command::new("python3")
++            .args(["-u", "-c", r#"
++import json, sys, time
++mode = sys.argv[1]
++for line in sys.stdin:
++    msg = json.loads(line)
++    kind = msg['type']
++    generation = msg['generation']
++    if kind == 'initialize':
++        print(json.dumps(dict(type='ready', generation=generation, **msg['descriptor'])), flush=True)
++        if mode == 'blocked_input':
++            time.sleep(30)
++    elif kind == 'probe':
++        if mode == 'stalled':
++            time.sleep(30)
++        elif mode == 'disconnect':
++            break
++        else:
++            if mode == 'delayed':
++                time.sleep(0.1)
++            print(json.dumps(dict(type='progress', generation=generation, nonce=msg['nonce'] + (1 if mode == 'wrong_nonce' else 0))), flush=True)
++    elif kind == 'retire':
++        print(json.dumps(dict(type='drained', generation=generation)), flush=True)
++"#, mode])
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
++            .kill_on_drop(true).spawn().unwrap();
++        if let Some(permit) = &permit {
++            permit.require_confirmed_cleanup();
++        }
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        let mut child = ResidentChild {
++            child: Some(child),
++            stdin,
++            stdout,
++            generation: "test-1".into(),
++            descriptor: descriptor(),
++            permit,
++            probe: 0,
++            pending_probe: None,
++            pending_write: None,
++            pending: Vec::new(),
++            cleanup: TaskTracker::new(),
++        };
++        child.send(json!({"type":"initialize", "generation":child.generation, "descriptor":descriptor(), "configuration":{}}), usize::MAX).await.unwrap();
++        child
++            .ready(&descriptor(), usize::MAX, Instant::now() + STARTUP_TIMEOUT)
++            .await
++            .unwrap();
++        child
++    }
++
++    #[tokio::test]
++    async fn resident_progress_and_explicit_drain_precede_confirmed_reap() {
++        let surge = SurgeCoordinator::new();
++        let permit = surge
++            .acquire(SurgePriority::Deployment, Arc::from("native"))
++            .await;
++        let mut child = fixture("healthy", Some(permit)).await;
++        child.activate(usize::MAX).await.unwrap();
++        child.probe(usize::MAX).await.unwrap();
++        let (_shutdown, mut shutdown) = watch::channel(false);
++        let (_force, mut force) = watch::channel(None);
++        child
++            .retire(
++                usize::MAX,
++                &MemoryPressureSignal::default(),
++                &mut shutdown,
++                &mut force,
++            )
++            .await
++            .unwrap();
++        // Drained is an application outcome, not proof that the process exited.
++        assert!(child.child.as_mut().unwrap().try_wait().unwrap().is_none());
++        assert!(tokio::time::timeout(
++            Duration::from_millis(20),
++            surge.acquire(SurgePriority::Deployment, Arc::from("node"))
++        )
++        .await
++        .is_err());
++        child.terminate().await.unwrap();
++        tokio::time::timeout(
++            Duration::from_secs(1),
++            surge.acquire(SurgePriority::Deployment, Arc::from("node")),
++        )
++        .await
++        .unwrap();
++    }
++
++    #[tokio::test]
++    async fn stale_progress_and_disconnect_fail_health() {
++        for mode in ["wrong_nonce", "disconnect"] {
++            let mut child = fixture(mode, None).await;
++            assert!(child.probe(usize::MAX).await.is_err());
++            child.terminate().await.unwrap();
++        }
++    }
++
++    #[tokio::test]
++    async fn cancelled_candidate_probe_resumes_exact_nonce_and_deadline() {
++        let mut child = fixture("delayed", None).await;
++        assert!(
++            tokio::time::timeout(Duration::from_millis(20), child.probe(usize::MAX))
++                .await
++                .is_err()
++        );
++        let deadline = child.pending_probe.unwrap();
++        assert!(
++            tokio::time::timeout(Duration::from_millis(20), child.probe(usize::MAX))
++                .await
++                .is_err()
++        );
++        assert_eq!(child.pending_probe, Some(deadline));
++        child.probe(usize::MAX).await.unwrap();
++        assert_eq!(child.probe, 1);
++        assert!(child.pending_probe.is_none());
++        assert!(Instant::now() < deadline);
++        child.terminate().await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn blocked_probe_write_preserves_budget_and_pressure_interrupts_retirement() {
++        let mut child = fixture("blocked_input", None).await;
++        let pid = child.child.as_ref().unwrap().id().unwrap();
++        let capacity = unsafe { libc::fcntl(child.stdin.as_raw_fd(), libc::F_GETPIPE_SZ) };
++        assert!(capacity > 0);
++        child
++            .stdin
++            .write_all(&vec![b' '; capacity as usize])
++            .await
++            .unwrap();
++        assert!(
++            tokio::time::timeout(Duration::from_millis(20), child.probe(usize::MAX))
++                .await
++                .is_err()
++        );
++        let deadline = child.pending_probe.unwrap();
++        assert!(child.pending_write.is_some());
++        assert!(
++            tokio::time::timeout(Duration::from_millis(20), child.probe(usize::MAX))
++                .await
++                .is_err()
++        );
++        assert_eq!(child.pending_probe, Some(deadline));
++        assert_eq!(child.probe, 1);
++        let pressure = MemoryPressureSignal::default();
++        let trigger = pressure.clone();
++        let publish_pressure = async move {
++            tokio::time::sleep(Duration::from_millis(20)).await;
++            trigger.set_active(true);
++        };
++        let (_shutdown, mut shutdown) = watch::channel(false);
++        let (_force, mut force) = watch::channel(None);
++        let (_, retired) = tokio::join!(
++            publish_pressure,
++            tokio::time::timeout(
++                Duration::from_secs(1),
++                child.retire(usize::MAX, &pressure, &mut shutdown, &mut force),
++            )
++        );
++        assert!(retired
++            .expect("Pressure waited for the blocked write timeout")
++            .is_err());
++        child.terminate().await.unwrap();
++        assert!(!Path::new(&format!("/proc/{pid}")).exists());
++    }
++
++    #[tokio::test]
++    async fn cancelled_shutdown_preserves_supervisor_failure_for_later_callers() {
++        let supervisor = NativeResidentSupervisor::with_configuration(
++            None,
++            SurgeCoordinator::new(),
++            MemoryPressureSignal::default(),
++        )
++        .unwrap();
++        // Inject an invariant failure in the real supervisor task before join.
++        supervisor.selection.send_replace(Selection {
++            version: Timestamp::try_from(1u64).unwrap(),
++            descriptor: Some(descriptor()),
++        });
++        assert!(supervisor.task.clone().await.is_err());
++        let cleanup = supervisor.cleanup.token();
++        assert!(
++            tokio::time::timeout(Duration::from_millis(20), supervisor.shutdown())
++                .await
++                .is_err()
++        );
++        drop(cleanup);
++        for _ in 0..2 {
++            assert!(supervisor
++                .shutdown()
++                .await
++                .unwrap_err()
++                .to_string()
++                .contains("without configuration"));
++        }
++    }
++
++    #[tokio::test]
++    async fn candidate_cancellation_keeps_surge_until_reaped() {
++        let surge = SurgeCoordinator::new();
++        let permit = surge
++            .acquire(SurgePriority::Deployment, Arc::from("native"))
++            .await;
++        let child = fixture("healthy", Some(permit)).await;
++        let pid = child.child.as_ref().unwrap().id().unwrap();
++        drop(child);
++        let _permit = tokio::time::timeout(
++            Duration::from_secs(2),
++            surge.acquire(SurgePriority::Deployment, Arc::from("node")),
++        )
++        .await
++        .unwrap();
++        assert!(!Path::new(&format!("/proc/{pid}")).exists());
++    }
++
++    #[tokio::test]
++    async fn forced_preparation_reclaims_shared_drain_only_after_reaping() {
++        let surge = SurgeCoordinator::new();
++        let permit = surge
++            .acquire(SurgePriority::Deployment, Arc::from("node"))
++            .await;
++        let mut old = fixture("healthy", Some(permit.clone())).await;
++        let pid = old.child.as_ref().unwrap().id().unwrap();
++        permit.set_phase("draining");
++        let root = tempfile::tempdir().unwrap();
++        let supervisor = NativeResidentSupervisor::with_configuration(
++            Some(Configuration {
++                artifacts: root.path().join("unpublished"),
++                configurations: root.path().join("configurations"),
++                max_rss_bytes: usize::MAX,
++            }),
++            surge.clone(),
++            MemoryPressureSignal::default(),
++        )
++        .unwrap();
++        let preparation = {
++            let supervisor = supervisor.clone();
++            tokio::spawn(async move { supervisor.prepare(&descriptor(), true).await })
++        };
++        tokio::time::timeout(Duration::from_secs(1), permit.wait_until_preempted())
++            .await
++            .unwrap();
++        assert!(!preparation.is_finished());
++        old.terminate().await.unwrap();
++        assert!(!Path::new(&format!("/proc/{pid}")).exists());
++        drop(permit);
++        // Verification can only begin after that shared surge owner was reaped.
++        let error = tokio::time::timeout(Duration::from_secs(1), preparation)
++            .await
++            .unwrap()
++            .unwrap()
++            .unwrap_err();
++        assert!(error.to_string().contains("input is unavailable"));
++        supervisor.shutdown().await.unwrap();
++        tokio::time::timeout(Duration::from_secs(1), surge.acquire_deployment(false))
++            .await
++            .unwrap();
++    }
++
++    #[tokio::test]
++    async fn worker_responsiveness_cannot_replace_coordinator_progress() {
++        let mut child = fixture("stalled", None).await;
++        let started = Instant::now();
++        assert!(child.probe(usize::MAX).await.is_err());
++        assert!(started.elapsed() < Duration::from_secs(10));
++        child.terminate().await.unwrap();
++    }
++
++    #[test]
++    fn artifact_verification_rejects_partial_and_changed_inputs() {
++        use std::io::Write;
++        let mut file = tempfile::NamedTempFile::new().unwrap();
++        file.write_all(b"complete executable").unwrap();
++        let digest = Sha256::hash(b"complete executable").as_hex();
++        assert!(verified_file(file.path(), &digest, 1024).is_ok());
++        assert!(verified_file(file.path(), &digest, 2).is_err());
++        file.as_file_mut().set_len(8).unwrap();
++        assert!(verified_file(file.path(), &digest, 1024).is_err());
++    }
++}
+diff --git a/crates/node_executor/src/process.rs b/crates/node_executor/src/process.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d6e3b7cc0e0377a668a1fa94674c32e0cc94bbe
+--- /dev/null
++++ b/crates/node_executor/src/process.rs
+@@ -0,0 +1,15 @@
++//! Direct-child termination shared by local executor adapters.
++use std::process::ExitStatus;
++
++use tokio::process::Child;
++
++pub(crate) async fn kill_and_reap(child: &mut Child) -> std::io::Result<(bool, ExitStatus)> {
++    let requested = match child.start_kill() {
++        Ok(()) => true,
++        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => false,
++        Err(error) => return Err(error),
++    };
++    // A successful kill request is not evidence of reaping. Capacity stays owned
++    // until wait succeeds, including when another supervisor already killed it.
++    Ok((requested, child.wait().await?))
++}
+diff --git a/crates/node_executor/src/routed.rs b/crates/node_executor/src/routed.rs
+index 46ab34d8ca767eeb1e29fa2d393d7eb355b08b16..e56a7761d705b479ee3305f6b86a911daae52835 100644
+--- a/crates/node_executor/src/routed.rs
++++ b/crates/node_executor/src/routed.rs
+@@ -20,6 +20,7 @@ use std::{
+     },
+ };
+ 
++use anyhow::Context;
+ use async_trait::async_trait;
+ use common::{
+     execution_start::FunctionExecutionStartGate,
+@@ -74,8 +75,6 @@ use crate::{
+ const MAX_NAMED_POOLS: usize = 8;
+ const MAX_SYSTEM_OPERATION_WAITERS: usize = 8;
+ const SYSTEM_OPERATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+-const DEPLOYMENT_CUTOVER_ADMISSION_TIMEOUT: Duration = Duration::from_secs(120);
+-const FORCED_CUTOVER_PREEMPTION_INTERVAL: Duration = Duration::from_millis(100);
+ const ENVIRONMENT_FINGERPRINT_VERSION: &[u8] = b"local-node-environment-v1";
+ 
+ struct SystemOperationWaiter {
+@@ -1477,6 +1476,15 @@ impl RoutedLocalNodeExecutorConfig {
+ }
+ 
+ impl RoutedLocalNodeExecutor {
++    pub fn native_resident_supervisor(
++        &self,
++    ) -> anyhow::Result<Arc<crate::native::NativeResidentSupervisor>> {
++        crate::native::NativeResidentSupervisor::new(
++            self.local_config.surge_coordinator(),
++            self.memory_pressure.clone(),
++        )
++    }
++
+     pub async fn new_with_configuration(
+         config: RoutedLocalNodeExecutorConfig,
+     ) -> anyhow::Result<Self> {
+@@ -2353,6 +2361,11 @@ fn calculate_local_node_rss_budget(
+             .ok_or_else(|| anyhow::anyhow!("Required Node executor steady RSS budget overflow"))?;
+         surge_bytes = surge_bytes.max(named_rss_bytes);
+     }
++    let native_rss_bytes = crate::native::configured_rss_bytes()?;
++    steady_bytes = steady_bytes
++        .checked_add(native_rss_bytes)
++        .context("Required native resident steady RSS budget overflow")?;
++    surge_bytes = surge_bytes.max(native_rss_bytes);
+     let required_bytes = steady_bytes
+         .checked_add(surge_bytes)
+         .ok_or_else(|| anyhow::anyhow!("Required Node executor RSS budget overflow"))?;
+@@ -2625,44 +2638,7 @@ async fn acquire_deployment_cutover_permit(
+     shutting_down: &AtomicBool,
+     shutdown_changed: &Notify,
+ ) -> anyhow::Result<crate::local::SurgePermit> {
+-    let acquire = async {
+-        let acquire = coordinator.acquire(
+-            crate::local::SurgePriority::Deployment,
+-            Arc::from("deployment"),
+-        );
+-        tokio::pin!(acquire);
+-        if force {
+-            let mut preemption_interval = tokio::time::interval(FORCED_CUTOVER_PREEMPTION_INTERVAL);
+-            preemption_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+-            let mut preemption_requested = false;
+-            loop {
+-                // Poll acquisition first so the deployment registers before it
+-                // signals the current owner. Recheck because an unstealable
+-                // deployment candidate can later become a reclaimable drain.
+-                tokio::select! {
+-                    biased;
+-                    permit = &mut acquire => return permit,
+-                    _ = preemption_interval.tick(), if !preemption_requested => {
+-                        if let Some(phase) = coordinator.force_preempt_reclaimable() {
+-                            preemption_requested = true;
+-                            let event = if phase == "draining" {
+-                                "forced_drain_termination"
+-                            } else {
+-                                "forced_candidate_cancel"
+-                            };
+-                            crate::metrics::log_local_node_deployment_cutover_event(event);
+-                            tracing::warn!(
+-                                lifecycle_context = "deployment_cutover",
+-                                outcome = event,
+-                                "Forced local Node executor surge reclamation"
+-                            );
+-                        }
+-                    },
+-                }
+-            }
+-        }
+-        acquire.await
+-    };
++    let acquire = coordinator.acquire_deployment(force);
+     tokio::select! {
+         result = tokio::time::timeout(timeout, acquire) => match result {
+             Ok(permit) => {
+@@ -2982,7 +2958,7 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
+         let coordinator = self.local_config.surge_coordinator();
+         let permit = acquire_deployment_cutover_permit(
+             &coordinator,
+-            DEPLOYMENT_CUTOVER_ADMISSION_TIMEOUT,
++            crate::local::SurgeCoordinator::DEPLOYMENT_ADMISSION_TIMEOUT,
+             force,
+             &self.shutting_down,
+             &self.shutdown_changed,
+diff --git a/crates/node_executor/testdata/native_resident.rs b/crates/node_executor/testdata/native_resident.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..87aab2924f49bc1f3325ddb4591b36e3b890c91b
+--- /dev/null
++++ b/crates/node_executor/testdata/native_resident.rs
+@@ -0,0 +1,104 @@
++//! Small native lifecycle peer used only by integration tests.
++use std::io::{
++    BufRead,
++    Write,
++};
++
++use anyhow::Context;
++use serde_json::{
++    json,
++    Value,
++};
++
++fn main() -> anyhow::Result<()> {
++    if std::env::args().nth(1).as_deref() == Some("parent") {
++        let arguments = std::env::args().collect::<Vec<_>>();
++        let descriptor = serde_json::from_slice(&std::fs::read(&arguments[4])?)?;
++        return tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()?
++            .block_on(async {
++                let supervisor = node_executor::native::test_supervisor(
++                    arguments[2].clone().into(),
++                    arguments[3].clone().into(),
++                )?;
++                supervisor
++                    .reconcile(Some(descriptor), common::types::Timestamp::try_from(1u64)?)?;
++                std::future::pending::<anyhow::Result<()>>().await
++            });
++    }
++    let mut events = None;
++    let mut mode = String::new();
++    let mut active = false;
++    let mut retained = Vec::new();
++    for line in std::io::stdin().lock().lines() {
++        let input: Value = serde_json::from_str(&line?)?;
++        let kind = input["type"].as_str().context("type missing")?;
++        if kind == "initialize" {
++            mode = input["configuration"]["mode"]
++                .as_str()
++                .unwrap_or("healthy")
++                .to_owned();
++            events = Some(
++                std::fs::OpenOptions::new().append(true).create(true).open(
++                    input["configuration"]["eventFile"]
++                        .as_str()
++                        .context("event file missing")?,
++                )?,
++            );
++        }
++        let events = events.as_mut().context("initialize missing")?;
++        // Candidate and predecessor append concurrently. Serialize first so a
++        // complete small record is emitted by one append write.
++        let mut event = serde_json::to_vec(
++            &json!({"type":kind, "generation":input["generation"], "pid":std::process::id()}),
++        )?;
++        event.push(b'\n');
++        events.write_all(&event)?;
++        events.flush()?;
++        if (kind == "initialize" && mode == "rss_before_ready")
++            || (kind == "activate" && mode == "rss_active")
++        {
++            retained.resize(96 * 1024 * 1024, 1u8);
++            std::hint::black_box(&retained);
++        }
++        let reply = match kind {
++            "initialize" if mode == "stall_ready" || mode == "rss_before_ready" => None,
++            "initialize" => {
++                let mut descriptor = input["descriptor"].clone();
++                descriptor["type"] = "ready".into();
++                descriptor["generation"] = input["generation"].clone();
++                Some(descriptor)
++            },
++            "activate" => {
++                active = true;
++                None
++            },
++            "probe" if active && mode == "stall_active" => None,
++            "probe" => Some(
++                json!({"type":"progress", "generation":input["generation"], "nonce":input["nonce"]}),
++            ),
++            "retire" if mode == "drain_hold" => None,
++            "retire" => Some(json!({"type":"drained", "generation":input["generation"]})),
++            _ => anyhow::bail!("unknown control request"),
++        };
++        if let Some(reply) = reply {
++            if kind == "probe" && !active && mode == "invalid_then_progress" {
++                // A malformed reply followed by a valid one must not revive
++                // this inert generation after its monitor fails.
++                println!(
++                    "{}",
++                    json!({"type":"progress", "generation":input["generation"], "nonce":input["nonce"].as_u64().unwrap() + 1})
++                );
++            }
++            println!("{reply}");
++            std::io::stdout().flush()?;
++        }
++    }
++    if mode == "ignore_eof" {
++        loop {
++            std::thread::sleep(std::time::Duration::from_secs(1));
++        }
++    }
++    Ok(())
++}
+diff --git a/crates/node_executor/tests/native_resident.rs b/crates/node_executor/tests/native_resident.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a545f12024d137280b397440bfce83b5f91a6bc
+--- /dev/null
++++ b/crates/node_executor/tests/native_resident.rs
+@@ -0,0 +1,641 @@
++#![cfg(all(feature = "testing", target_os = "linux"))]
++
++use std::{
++    path::Path,
++    time::Duration,
++};
++
++use common::{
++    memory_pressure::MemoryPressureSignal,
++    types::Timestamp,
++};
++use model::source_packages::native::NativeResidentDescriptor;
++use node_executor::native::{
++    test_supervisor,
++    test_supervisor_with_limits,
++    NativeResidentSupervisor,
++};
++use serde_json::{
++    json,
++    Value,
++};
++use value::sha256::Sha256;
++
++async fn wait_for_active(supervisor: &NativeResidentSupervisor) {
++    tokio::time::timeout(Duration::from_secs(10), async {
++        while supervisor.status().phase != "active" {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("native resident did not activate");
++}
++
++#[tokio::test]
++async fn verified_elf_descriptor_executes_and_selection_survives_function_only_changes() {
++    let root = tempfile::tempdir().unwrap();
++    let artifacts = root.path().join("artifacts");
++    let configurations = root.path().join("configurations");
++    std::fs::create_dir_all(&configurations).unwrap();
++    let bytes = std::fs::read(env!("CARGO_BIN_EXE_native_resident_fixture")).unwrap();
++    let artifact_sha256 = Sha256::hash(&bytes).as_hex();
++    let directory = artifacts.join(&artifact_sha256);
++    std::fs::create_dir_all(&directory).unwrap();
++    std::fs::copy(
++        env!("CARGO_BIN_EXE_native_resident_fixture"),
++        directory.join("resident"),
++    )
++    .unwrap();
++    let event_file = root.path().join("events.jsonl");
++    let configuration = serde_json::to_vec(&json!({"eventFile":event_file})).unwrap();
++    let configuration_sha256 = Sha256::hash(&configuration).as_hex();
++    std::fs::write(
++        configurations.join(format!("{configuration_sha256}.json")),
++        configuration,
++    )
++    .unwrap();
++    let descriptor = NativeResidentDescriptor {
++        artifact_sha256,
++        configuration_sha256,
++        lifecycle_protocol: 1,
++        application_contract: "example-v1".into(),
++    };
++    let supervisor = test_supervisor(artifacts, configurations.clone()).unwrap();
++    supervisor.prepare(&descriptor, false).await.unwrap();
++    let staged = std::fs::read_to_string(&event_file).unwrap();
++    assert!(!staged.contains("activate"));
++    supervisor
++        .reconcile(Some(descriptor.clone()), Timestamp::try_from(1u64).unwrap())
++        .unwrap();
++    assert!(supervisor
++        .validate_publication_contract(Some("example-v2"))
++        .is_err());
++    wait_for_active(&supervisor).await;
++    let generation = supervisor.status().active_generation.unwrap();
++    supervisor
++        .reconcile(Some(descriptor.clone()), Timestamp::try_from(2u64).unwrap())
++        .unwrap();
++    tokio::time::sleep(Duration::from_millis(1100)).await;
++    assert_eq!(
++        supervisor.status().active_generation.as_ref(),
++        Some(&generation)
++    );
++    let replacement_configuration =
++        serde_json::to_vec(&json!({"eventFile":event_file, "revision":2})).unwrap();
++    let replacement_configuration_sha256 = Sha256::hash(&replacement_configuration).as_hex();
++    std::fs::write(
++        configurations.join(format!("{replacement_configuration_sha256}.json")),
++        replacement_configuration,
++    )
++    .unwrap();
++    let replacement = NativeResidentDescriptor {
++        configuration_sha256: replacement_configuration_sha256,
++        ..descriptor
++    };
++    supervisor
++        .reconcile(
++            Some(replacement.clone()),
++            Timestamp::try_from(3u64).unwrap(),
++        )
++        .unwrap();
++    tokio::time::timeout(Duration::from_secs(10), async {
++        while supervisor.status().active_descriptor.as_ref() != Some(&replacement)
++            || supervisor.status().phase != "active"
++        {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .unwrap();
++    let predecessor = generation;
++    let generation = supervisor.status().active_generation.unwrap();
++    assert_ne!(generation, predecessor);
++    assert!(supervisor.force_retire(&predecessor).is_err());
++    assert!(supervisor.force_retire("stale-generation").is_err());
++    supervisor.force_retire(&generation).unwrap();
++    tokio::time::timeout(Duration::from_secs(10), async {
++        loop {
++            let status = supervisor.status();
++            if status.phase == "active" && status.active_generation.as_ref() != Some(&generation) {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .unwrap();
++    assert!(supervisor.force_retire(&generation).is_err());
++    supervisor
++        .reconcile(None, Timestamp::try_from(4u64).unwrap())
++        .unwrap();
++    assert!(supervisor.validate_publication_contract(None).is_err());
++    tokio::time::timeout(Duration::from_secs(10), async {
++        while supervisor.status().phase != "inactive" {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .unwrap();
++    supervisor.validate_publication_contract(None).unwrap();
++    supervisor.shutdown().await.unwrap();
++    let events = std::fs::read_to_string(event_file)
++        .unwrap()
++        .lines()
++        .map(|line| serde_json::from_str::<Value>(line).unwrap())
++        .collect::<Vec<_>>();
++    assert_eq!(
++        events
++            .iter()
++            .filter(|event| event["type"] == "activate")
++            .count(),
++        3
++    );
++    assert_eq!(
++        events
++            .iter()
++            .filter(|event| event["type"] == "retire")
++            .count(),
++        2
++    );
++    let retired = events
++        .iter()
++        .position(|event| event["type"] == "retire" && event["generation"] == predecessor)
++        .unwrap();
++    let promoted = events
++        .iter()
++        .position(|event| event["type"] == "activate" && event["generation"] == generation)
++        .unwrap();
++    assert!(retired < promoted);
++    for event in events {
++        let pid = event["pid"].as_u64().unwrap();
++        assert!(
++            !Path::new(&format!("/proc/{pid}")).exists(),
++            "native child was not reaped"
++        );
++    }
++}
++
++struct Fixture {
++    root: tempfile::TempDir,
++    artifacts: std::path::PathBuf,
++    configurations: std::path::PathBuf,
++    descriptor: NativeResidentDescriptor,
++}
++
++impl Fixture {
++    fn new(mode: &str) -> Self {
++        let root = tempfile::tempdir().unwrap();
++        let artifacts = root.path().join("artifacts");
++        let configurations = root.path().join("configurations");
++        std::fs::create_dir_all(&configurations).unwrap();
++        let bytes = std::fs::read(env!("CARGO_BIN_EXE_native_resident_fixture")).unwrap();
++        let artifact_sha256 = Sha256::hash(&bytes).as_hex();
++        let directory = artifacts.join(&artifact_sha256);
++        std::fs::create_dir_all(&directory).unwrap();
++        std::fs::copy(
++            env!("CARGO_BIN_EXE_native_resident_fixture"),
++            directory.join("resident"),
++        )
++        .unwrap();
++        let configuration =
++            serde_json::to_vec(&json!({"eventFile":root.path().join("events.jsonl"), "mode":mode}))
++                .unwrap();
++        let configuration_sha256 = Sha256::hash(&configuration).as_hex();
++        std::fs::write(
++            configurations.join(format!("{configuration_sha256}.json")),
++            configuration,
++        )
++        .unwrap();
++        Self {
++            root,
++            artifacts,
++            configurations,
++            descriptor: NativeResidentDescriptor {
++                artifact_sha256,
++                configuration_sha256,
++                lifecycle_protocol: 1,
++                application_contract: "example-v1".into(),
++            },
++        }
++    }
++
++    fn supervisor(
++        &self,
++        pressure: MemoryPressureSignal,
++    ) -> std::sync::Arc<NativeResidentSupervisor> {
++        test_supervisor_with_limits(
++            self.artifacts.clone(),
++            self.configurations.clone(),
++            64 * 1024 * 1024,
++            pressure,
++        )
++        .unwrap()
++    }
++
++    fn events(&self) -> Vec<Value> {
++        match std::fs::read_to_string(self.root.path().join("events.jsonl")) {
++            Ok(events) => events
++                .lines()
++                .map(|line| serde_json::from_str(line).unwrap())
++                .collect(),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
++            Err(error) => panic!("fixture events failed: {error}"),
++        }
++    }
++
++    fn publish_configuration(&self, mode: &str) -> NativeResidentDescriptor {
++        let configuration = serde_json::to_vec(&json!({
++            "eventFile": self.root.path().join("events.jsonl"), "mode": mode,
++        }))
++        .unwrap();
++        let configuration_sha256 = Sha256::hash(&configuration).as_hex();
++        std::fs::write(
++            self.configurations
++                .join(format!("{configuration_sha256}.json")),
++            configuration,
++        )
++        .unwrap();
++        NativeResidentDescriptor {
++            configuration_sha256,
++            ..self.descriptor.clone()
++        }
++    }
++
++    async fn event(&self, kind: &str, ordinal: usize) -> Value {
++        tokio::time::timeout(Duration::from_secs(10), async {
++            loop {
++                if let Some(event) = self
++                    .events()
++                    .into_iter()
++                    .filter(|event| event["type"] == kind)
++                    .nth(ordinal)
++                {
++                    return event;
++                }
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .expect("native fixture did not observe lifecycle event")
++    }
++
++    fn assert_reaped(&self) {
++        for event in self.events() {
++            assert!(
++                !Path::new(&format!("/proc/{}", event["pid"].as_u64().unwrap())).exists(),
++                "native child retained after confirmed shutdown"
++            );
++        }
++    }
++}
++
++#[tokio::test]
++async fn incumbent_remains_supervised_while_candidate_readiness_stalls() {
++    let fixture = Fixture::new("healthy");
++    let supervisor = fixture.supervisor(MemoryPressureSignal::default());
++    supervisor
++        .reconcile(
++            Some(fixture.descriptor.clone()),
++            Timestamp::try_from(1u64).unwrap(),
++        )
++        .unwrap();
++    let incumbent = fixture.event("activate", 0).await;
++    let replacement = fixture.publish_configuration("stall_ready");
++    supervisor
++        .reconcile(Some(replacement), Timestamp::try_from(2u64).unwrap())
++        .unwrap();
++    fixture.event("initialize", 1).await;
++    let earlier_probes = fixture
++        .events()
++        .iter()
++        .filter(|event| event["type"] == "probe" && event["pid"] == incumbent["pid"])
++        .count();
++    tokio::time::timeout(Duration::from_secs(2), async {
++        loop {
++            if fixture
++                .events()
++                .iter()
++                .filter(|event| event["type"] == "probe" && event["pid"] == incumbent["pid"])
++                .count()
++                > earlier_probes
++            {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("Incumbent supervision stopped during readiness");
++    supervisor
++        .force_retire(incumbent["generation"].as_str().unwrap())
++        .unwrap();
++    tokio::time::timeout(Duration::from_secs(2), async {
++        while Path::new(&format!("/proc/{}", incumbent["pid"].as_u64().unwrap())).exists() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("Force retirement waited for candidate readiness");
++    supervisor
++        .reconcile(
++            Some(fixture.descriptor.clone()),
++            Timestamp::try_from(3u64).unwrap(),
++        )
++        .unwrap();
++    let successor = fixture.event("activate", 1).await;
++    assert_ne!(successor["generation"], incumbent["generation"]);
++    supervisor.shutdown().await.unwrap();
++    fixture.assert_reaped();
++}
++
++#[tokio::test]
++async fn failed_inert_candidate_is_reaped_even_if_a_valid_reply_follows() {
++    let fixture = Fixture::new("drain_hold");
++    let supervisor = fixture.supervisor(MemoryPressureSignal::default());
++    supervisor
++        .reconcile(
++            Some(fixture.descriptor.clone()),
++            Timestamp::try_from(1u64).unwrap(),
++        )
++        .unwrap();
++    fixture.event("activate", 0).await;
++    let replacement = fixture.publish_configuration("invalid_then_progress");
++    supervisor
++        .reconcile(Some(replacement), Timestamp::try_from(2u64).unwrap())
++        .unwrap();
++    let candidate = fixture.event("initialize", 1).await;
++    tokio::time::timeout(Duration::from_secs(3), async {
++        while Path::new(&format!("/proc/{}", candidate["pid"].as_u64().unwrap())).exists() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("A failed candidate survived its monitor failure");
++    assert!(
++        !fixture
++            .events()
++            .iter()
++            .any(|event| event["type"] == "activate"
++                && event["generation"] == candidate["generation"])
++    );
++    let healthy = fixture.publish_configuration("healthy");
++    supervisor
++        .reconcile(Some(healthy), Timestamp::try_from(3u64).unwrap())
++        .unwrap();
++    fixture.event("activate", 1).await;
++    supervisor.shutdown().await.unwrap();
++    fixture.assert_reaped();
++}
++
++#[tokio::test]
++async fn memory_pressure_interrupts_stalled_progress_and_allows_recovery() {
++    let fixture = Fixture::new("stall_active");
++    let pressure = MemoryPressureSignal::new(true);
++    let supervisor = fixture.supervisor(pressure.clone());
++    assert!(supervisor
++        .prepare(&fixture.descriptor, false)
++        .await
++        .is_err());
++    assert!(fixture.events().is_empty());
++    supervisor
++        .reconcile(
++            Some(fixture.descriptor.clone()),
++            Timestamp::try_from(1u64).unwrap(),
++        )
++        .unwrap();
++    pressure.set_active(false);
++    let active = fixture.event("activate", 0).await;
++    fixture.event("probe", 1).await;
++    pressure.set_active(true);
++    tokio::time::timeout(Duration::from_secs(2), async {
++        while supervisor.status().phase != "pressure" {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("pressure waited for stalled progress timeout");
++    assert!(!Path::new(&format!("/proc/{}", active["pid"].as_u64().unwrap())).exists());
++    pressure.set_active(false);
++    let successor = fixture.event("activate", 1).await;
++    assert_ne!(active["generation"], successor["generation"]);
++    supervisor.shutdown().await.unwrap();
++    fixture.assert_reaped();
++}
++
++#[tokio::test]
++async fn pressure_and_shutdown_reap_both_children_during_retirement() {
++    for interrupt_with_pressure in [true, false] {
++        let fixture = Fixture::new("drain_hold");
++        let pressure = MemoryPressureSignal::default();
++        let supervisor = fixture.supervisor(pressure.clone());
++        supervisor
++            .reconcile(
++                Some(fixture.descriptor.clone()),
++                Timestamp::try_from(1u64).unwrap(),
++            )
++            .unwrap();
++        fixture.event("activate", 0).await;
++        let configuration = serde_json::to_vec(&json!({
++            "eventFile": fixture.root.path().join("events.jsonl"),
++            "mode": "healthy",
++        }))
++        .unwrap();
++        let configuration_sha256 = Sha256::hash(&configuration).as_hex();
++        std::fs::write(
++            fixture
++                .configurations
++                .join(format!("{configuration_sha256}.json")),
++            configuration,
++        )
++        .unwrap();
++        supervisor
++            .reconcile(
++                Some(NativeResidentDescriptor {
++                    configuration_sha256,
++                    ..fixture.descriptor.clone()
++                }),
++                Timestamp::try_from(2u64).unwrap(),
++            )
++            .unwrap();
++        fixture.event("retire", 0).await;
++        assert_eq!(supervisor.status().phase, "draining");
++        assert_eq!(
++            fixture
++                .events()
++                .iter()
++                .filter(|event| event["type"] == "initialize")
++                .count(),
++            2,
++        );
++        if interrupt_with_pressure {
++            pressure.set_active(true);
++            tokio::time::timeout(Duration::from_secs(2), async {
++                while supervisor.status().phase != "pressure" {
++                    tokio::time::sleep(Duration::from_millis(10)).await;
++                }
++            })
++            .await
++            .expect("pressure did not interrupt retirement");
++            fixture.assert_reaped();
++        }
++        tokio::time::timeout(Duration::from_secs(2), supervisor.shutdown())
++            .await
++            .expect("shutdown did not interrupt retirement")
++            .unwrap();
++        fixture.assert_reaped();
++        assert_eq!(
++            fixture
++                .events()
++                .iter()
++                .filter(|event| event["type"] == "activate")
++                .count(),
++            1,
++            "inert successor activated during interruption",
++        );
++    }
++}
++
++#[tokio::test]
++async fn rss_is_enforced_before_readiness_and_after_activation() {
++    let fixture = Fixture::new("rss_before_ready");
++    let supervisor = fixture.supervisor(MemoryPressureSignal::default());
++    let started = tokio::time::Instant::now();
++    assert!(supervisor
++        .prepare(&fixture.descriptor, false)
++        .await
++        .is_err());
++    assert!(
++        started.elapsed() < Duration::from_secs(3),
++        "RSS enforcement waited for readiness timeout"
++    );
++    supervisor.shutdown().await.unwrap();
++    fixture.assert_reaped();
++    assert!(fixture
++        .events()
++        .iter()
++        .all(|event| event["type"] != "activate"));
++
++    let fixture = Fixture::new("rss_active");
++    let supervisor = fixture.supervisor(MemoryPressureSignal::default());
++    supervisor
++        .reconcile(
++            Some(fixture.descriptor.clone()),
++            Timestamp::try_from(1u64).unwrap(),
++        )
++        .unwrap();
++    let active = fixture.event("activate", 0).await;
++    tokio::time::timeout(Duration::from_secs(3), async {
++        while Path::new(&format!("/proc/{}", active["pid"].as_u64().unwrap())).exists() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("active RSS breach did not terminate child");
++    supervisor.shutdown().await.unwrap();
++    fixture.assert_reaped();
++}
++
++#[tokio::test]
++async fn cancelled_preparation_and_shutdown_keep_cleanup_owned() {
++    use futures::{
++        poll,
++        FutureExt,
++    };
++    let fixture = Fixture::new("stall_ready");
++    let supervisor = fixture.supervisor(MemoryPressureSignal::default());
++    let prepare_supervisor = supervisor.clone();
++    let descriptor = fixture.descriptor.clone();
++    let preparation =
++        tokio::spawn(async move { prepare_supervisor.prepare(&descriptor, false).await });
++    fixture.event("initialize", 0).await;
++    preparation.abort();
++    assert!(preparation.await.unwrap_err().is_cancelled());
++    let mut cancelled_shutdown = Box::pin(supervisor.shutdown());
++    let result = poll!(cancelled_shutdown.as_mut());
++    if let std::task::Poll::Ready(result) = result {
++        result.unwrap();
++    }
++    drop(cancelled_shutdown);
++    supervisor.shutdown().await.unwrap();
++    assert_eq!(supervisor.status().phase, "stopped");
++    fixture.assert_reaped();
++    assert!(supervisor
++        .prepare(&fixture.descriptor, false)
++        .now_or_never()
++        .unwrap()
++        .is_err());
++}
++
++#[tokio::test]
++async fn real_coordinator_stall_reaps_before_replacement() {
++    let fixture = Fixture::new("stall_active");
++    let supervisor = fixture.supervisor(MemoryPressureSignal::default());
++    supervisor
++        .reconcile(
++            Some(fixture.descriptor.clone()),
++            Timestamp::try_from(1u64).unwrap(),
++        )
++        .unwrap();
++    let first = fixture.event("activate", 0).await;
++    let second = fixture.event("activate", 1).await;
++    assert_ne!(first["generation"], second["generation"]);
++    assert!(!Path::new(&format!("/proc/{}", first["pid"].as_u64().unwrap())).exists());
++    supervisor.shutdown().await.unwrap();
++    fixture.assert_reaped();
++}
++
++#[tokio::test]
++async fn parent_death_kills_a_resident_that_ignores_pipe_closure() {
++    struct Subreaper(libc::c_int);
++    impl Drop for Subreaper {
++        fn drop(&mut self) {
++            unsafe {
++                libc::prctl(libc::PR_SET_CHILD_SUBREAPER, self.0);
++            }
++        }
++    }
++    let mut prior = 0;
++    assert_eq!(
++        unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut prior) },
++        0
++    );
++    assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
++    let _subreaper = Subreaper(prior);
++    let fixture = Fixture::new("ignore_eof");
++    let descriptor_path = fixture.root.path().join("descriptor.json");
++    std::fs::write(
++        &descriptor_path,
++        serde_json::to_vec(&fixture.descriptor).unwrap(),
++    )
++    .unwrap();
++    let mut parent = tokio::process::Command::new(env!("CARGO_BIN_EXE_native_resident_fixture"))
++        .arg("parent")
++        .arg(&fixture.artifacts)
++        .arg(&fixture.configurations)
++        .arg(descriptor_path)
++        .stdin(std::process::Stdio::null())
++        .stdout(std::process::Stdio::null())
++        .stderr(std::process::Stdio::null())
++        .kill_on_drop(true)
++        .spawn()
++        .unwrap();
++    let active = fixture.event("activate", 0).await;
++    parent.kill().await.unwrap();
++    let pid = libc::pid_t::try_from(active["pid"].as_u64().unwrap()).unwrap();
++    let status = tokio::time::timeout(Duration::from_secs(3), async {
++        loop {
++            let mut status = 0;
++            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
++            if waited == pid {
++                break status;
++            }
++            assert_eq!(waited, 0, "orphaned resident was not adopted for reaping");
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("parent loss left an active resident");
++    assert!(libc::WIFSIGNALED(status));
++    assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
++    fixture.assert_reaped();
++}
+diff --git a/patches/README.md b/patches/README.md
+index 8142c60a707dd64ea5f00bf93ceb1cb9b2e165ea..76a1d1af16eec2f38491c91d1f7fa88d4d90be04 100644
+--- a/patches/README.md
++++ b/patches/README.md
+@@ -84,6 +84,25 @@ codegen protocol above remains a smaller adoption unit. Whole-job and HTTP
+ admission apply to legacy callers too. Retained operation identity/status/cancel
+ requires explicit client negotiation, and its preparation is process-local.
+ 
++### [Supervised native residents](native_residents/README.md)
++
++- Purpose: supervise a digest-bound native executable selected by the committed root source
++  package, with transactional application ownership metadata and bounded process cleanup.
++- Prerequisites: coordinated local executor pools, deployment operations, and the matching CLI
++  native-resident publication envelope. Static Hermes Wasm execution is independent.
++- Activation: configure immutable artifact and configuration directories and an explicit shared
++  Node/native RSS budget, prepare the executable, then publish its descriptor with functions.
++- Rollback: publish an explicit null target or a retained compatible descriptor, preserving the
++  expected-prior check and confirming process drain or termination before incompatible changes.
++
++### [Search archive cleanup after runtime shutdown](search_archive_cleanup/README.md)
++
++- Purpose: let the dedicated archive cleanup thread delete retired directories after the async
++  runtime's blocking pool has stopped.
++- Prerequisites: the upstream archive cache and its dedicated cleanup thread.
++- Activation: automatic; no configuration, schema or storage-format change.
++- Rollback: restore the previous backend binary.
++
+ ## Log privacy
+ 
+ ### [Redact validator values from external log sinks](validation_error_log_redaction/README.md)
+@@ -192,7 +211,9 @@ requires explicit client negotiation, and its preparation is process-local.
+   reserve the configured total Node RSS budget when that patch is present.
+ - Activation: first set `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` to cover the default
+   application slot, internal system slot, every named application slot, and one full application
+-  surge allowance, and verify that the complete configured memory
++  surge allowance. When the [native resident adapter](../crates/node_executor/NATIVE_RESIDENTS.md)
++  is enabled, include its steady limit and size that same surge allowance for the largest Node
++  or native replacement. Verify that the complete configured memory
+   budget fits the finite cgroup. Replace the backend with one advertising cutover capability
+   version 1 before using `--force-node-cutover` from the matching CLI; ordinary requests that omit
+   the option remain compatible with older CLIs. Then add `"use node"` and
+diff --git a/patches/backend_memory_resilience/README.md b/patches/backend_memory_resilience/README.md
+index cc0371bc6d9cb7d604c61525bd20089f795cc107..68213618b3da7d289f914ddc3c1e1f1efdf8d407 100644
+--- a/patches/backend_memory_resilience/README.md
++++ b/patches/backend_memory_resilience/README.md
+@@ -36,14 +36,21 @@ When application-declared local Node executor pools are available, startup
+ memory feasibility reserves `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`.
+ Deploy and startup validation separately require the default application
+ steady slot, the internal system steady slot, every named application steady
+-slot, and one global application surge slot to fit within that total:
++slot, the configured native resident steady slot, and one shared replacement
++surge slot to fit within that total:
+ 
+ ```text
+ effective_default_rss + LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES +
+-  sum(effective_named_pool_rss) +
+-  max(effective_default_rss, every effective_named_pool_rss)
++  sum(effective_named_pool_rss) + native_resident_rss +
++  max(effective_default_rss, every effective_named_pool_rss, native_resident_rss)
+ ```
+ 
++`native_resident_rss` is `LOCAL_NATIVE_RESIDENT_MAX_RSS_BYTES` when configured,
++and zero otherwise. Enabling the [native resident adapter](../../crates/node_executor/NATIVE_RESIDENTS.md)
++requires an explicit total covering that additional capacity; the default
++total remains sized for the default and system Node slots and a Node replacement.
++Native and Node replacements use the same surge coordinator.
++
+ The allowance includes the lazy system and application steady slots and the
+ lazy surge slot when they have not started a child. It reserves the complete
+ allowance for the largest possible application generation, not the normally
+diff --git a/patches/local_node_executor_pool_admission/README.md b/patches/local_node_executor_pool_admission/README.md
+index 0f0aa3e2cad89c8454c6f6e85e9bd1bef2d8241b..6a7269dcf70097d719e8b5df25a7b0aaafc9fc8b 100644
+--- a/patches/local_node_executor_pool_admission/README.md
++++ b/patches/local_node_executor_pool_admission/README.md
+@@ -164,7 +164,10 @@ Apply the routing and scheduled-admission prerequisites first. Configure only
+ the pools that need an override. Verify each `maxConcurrency` against the
+ application-wide Node limit and each pool's effective memory settings against
+ its `maxRssBytes`. Set the total Node RSS budget to cover the effective pools
+-in the committed topology and one largest application surge allowance.
++in the committed topology and one largest application surge allowance. When the
++[native resident adapter](../../crates/node_executor/NATIVE_RESIDENTS.md) is enabled,
++include its steady RSS limit and size that same surge allowance for the largest
++Node or native replacement.
+ Restart the backend, then verify the configuration, per-pool
+ memory-threshold, startup-budget, and queue metrics before increasing traffic.
+ Invalid threshold ordering or a total below the default/system/surge minimum
+diff --git a/patches/native_residents/README.md b/patches/native_residents/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..41be045e8e541d83799825fec63f67c3d3436956
+--- /dev/null
++++ b/patches/native_residents/README.md
+@@ -0,0 +1,29 @@
++# Supervised native residents
++
++This patch extends the coordinated local executor owner with one optional native
++resident steady slot. Native and Node replacements share the existing surge
++capacity. The process implements a bounded lifecycle protocol and calls application
++APIs as an ordinary client; it is independent of the function execution runtime.
++
++The [native resident contract](../../crates/node_executor/NATIVE_RESIDENTS.md)
++defines artifact publication, configuration, deployment envelopes, protocol messages,
++capacity, shutdown and verification. Apply the coordinated local executor pools and
++deployment operations patches first. The matching CLI must advertise and validate
++native-resident protocol 1 before sending a publication envelope.
++
++Function publication compares the expected prior descriptor and records the selected
++descriptor in the root source package. Deployment metadata reads use the function's
++transaction, so ownership checks conflict with concurrent selection changes. Live
++process status is convergence evidence and cannot replace that durable authority.
++
++Enable the adapter only after installing immutable executable/configuration files and
++reserving the native steady allowance plus the largest shared replacement allowance.
++Keep active, staged, draining and rollback inputs. An omitted envelope is allowed only
++when no native resident is selected; an explicit null target retires that selection.
++An incompatible application contract requires an intervening compatible publication
++with null selection and confirmed process cleanup.
++
++The patch retains direct-child and capacity ownership through canceled preparation,
++retirement, forced replacement, memory pressure and shutdown. The process fixture
++checks these boundaries using an actual local executable. It does not exercise a
++particular application's external side effects or establish production throughput.
+diff --git a/patches/pinned_local_node_executor_pools/README.md b/patches/pinned_local_node_executor_pools/README.md
+index 49ac276dc50ca8f13a01e6b700f406e8eecc569d..fcbbaa7849b17afcbfd047e7a57df2d2ae1fda14 100644
+--- a/patches/pinned_local_node_executor_pools/README.md
++++ b/patches/pinned_local_node_executor_pools/README.md
+@@ -442,12 +442,19 @@ allowance. A deployment therefore requires:
+ (N + 3) * LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES
+ ```
+ 
+-The required product must not exceed `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`.
++With the [native resident adapter](../../crates/node_executor/NATIVE_RESIDENTS.md)
++enabled, also reserve its steady RSS limit and size the existing surge slot for
++the larger of the Node and native limits. The formula above describes Node-only
++capacity. The complete formula, including per-pool overrides, is maintained in
++[Backend Memory Resilience](../backend_memory_resilience/README.md). The native
++resident uses the same surge coordinator and does not add a second surge slot.
++
++The complete requirement must not exceed `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`.
+ The backend checks the proposed deployment before commit and the committed
+ topology during startup. The Linux startup memory-feasibility calculation
+ reserves the configured total Node RSS budget directly, including capacity for
+ lazy steady slots and the lazy surge slot that have no child yet. The surge
+-reserve is one complete allowance for the largest effective application pool,
++reserve is one complete allowance for the largest effective Node or native resident,
+ not the expected smaller RSS of a fresh process. The system slot is a full
+ steady allowance even though its child starts lazily.
+ This is a planning allowance, not a hard aggregate limit; sampled child RSS

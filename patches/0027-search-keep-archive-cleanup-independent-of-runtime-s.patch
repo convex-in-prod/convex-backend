@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 30 Sep 2026 00:54:09 +0800
+Subject: [PATCH 27/28] search: keep archive cleanup independent of runtime
+ shutdown
+
+Use synchronous filesystem operations on the existing dedicated archive cleanup thread. Tokio blocking-pool shutdown must not prevent late cache handles from deleting retired directories. Preserve symlink exclusion, missing-path tolerance and failure behavior, and cover nested read-only cleanup.
+---
+ crates/search/src/archive/cache.rs       | 60 +++++++++++++++++-------
+ patches/search_archive_cleanup/README.md | 14 ++++++
+ 2 files changed, 58 insertions(+), 16 deletions(-)
+ create mode 100644 patches/search_archive_cleanup/README.md
+
+diff --git a/crates/search/src/archive/cache.rs b/crates/search/src/archive/cache.rs
+index 89042eb7a6a29bb2c4c80c4e064a8ac0a71f076f..7379b5944ee4284953bbb49bfb365a16b5a2c162 100644
+--- a/crates/search/src/archive/cache.rs
++++ b/crates/search/src/archive/cache.rs
+@@ -1,5 +1,6 @@
+ use std::{
+     fmt,
++    fs as sync_fs,
+     io,
+     mem,
+     ops::Deref,
+@@ -155,10 +156,9 @@ impl fmt::Debug for CachedArchive {
+ /// retains; directories pinned by outstanding handles (in practice, the entries
+ /// of the in-memory segment caches) can add to that.
+ ///
+-/// In the interest of hot-path performance, any deletion or pruning operations
+-/// are best-effort and are spawned to the thread pool rather than occurring in
+-/// the calling task. For now, errors in these spawned tasks will panic the
+-/// entire process.
++/// Deletion requests are queued to a dedicated thread so recursive filesystem
++/// operations do not block the calling task. Unexpected filesystem errors
++/// panic the cleanup thread.
+ pub struct ArchiveCacheManager<RT: Runtime> {
+     path: PathBuf,
+     max_size: u64,
+@@ -501,23 +501,28 @@ async fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
+ /// entry needs the bit cleared throughout the tree. Symlinks are skipped so the
+ /// walk never leaves the cache directory; paths that disappear mid-walk are
+ /// tolerated.
+-async fn clear_readonly_recursive(path: &Path) -> io::Result<()> {
++fn clear_readonly_recursive(path: &Path) -> io::Result<()> {
+     let mut stack = vec![path.to_owned()];
+     while let Some(current) = stack.pop() {
+-        let Some(metadata) = ignore_not_found(fs::symlink_metadata(&current).await)? else {
++        let Some(metadata) = ignore_not_found(sync_fs::symlink_metadata(&current))? else {
+             continue;
+         };
+         if metadata.is_symlink() {
+             continue;
+         }
+         if metadata.permissions().readonly() {
+-            ignore_not_found(set_readonly(&current, false).await)?;
++            let mut permissions = metadata.permissions();
++            permissions.set_readonly(false);
++            ignore_not_found(sync_fs::set_permissions(&current, permissions))?;
+         }
+         if metadata.is_dir() {
+-            let Some(mut entries) = ignore_not_found(fs::read_dir(&current).await)? else {
++            let Some(entries) = ignore_not_found(sync_fs::read_dir(&current))? else {
+                 continue;
+             };
+-            while let Some(entry) = ignore_not_found(entries.next_entry().await)?.flatten() {
++            for entry in entries {
++                let Some(entry) = ignore_not_found(entry)? else {
++                    continue;
++                };
+                 stack.push(entry.path());
+             }
+         }
+@@ -565,18 +570,18 @@ impl CacheCleaner {
+ /// Runs on a separate thread to delete archives that have been removed from the
+ /// in-memory cache.
+ /// Using a separate thread for this is just an optimization, recognizing that a
+-/// recursive deletion doesn't need to be in the critical path and may block the
+-/// for a meaningful amount of time as opposed to our other filesystem ops which
++/// recursive deletion doesn't need to be in the critical path and may block for
++/// a meaningful amount of time as opposed to our other filesystem ops which
+ /// should be quite fast.
+ async fn cleanup_thread(mut rx: mpsc::UnboundedReceiver<(PathBuf, SearchFileType, u64)>) {
+     while let Some((path, search_file_type, size)) = rx.recv().await {
+-        // Yes, we'll panic and restart here. If we actually see panics in
+-        // production here, we should investigate further but for now, it's simpler
+-        // to disallow inconsistent filesystem state.
++        // Cleanup already has a dedicated thread. Synchronous file operations avoid
++        // Tokio's blocking pool, which may have shut down before the cache is
++        // dropped.
+         tracing::debug!("Removing path {} from disk", path.display());
+         let result: io::Result<()> = try {
+-            clear_readonly_recursive(&path).await?;
+-            fs::remove_dir_all(&path).await?;
++            clear_readonly_recursive(&path)?;
++            sync_fs::remove_dir_all(&path)?;
+         };
+         match result {
+             Ok(()) => {
+@@ -588,3 +593,26 @@ async fn cleanup_thread(mut rx: mpsc::UnboundedReceiver<(PathBuf, SearchFileType
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn clears_readonly_nested_archive_before_removal() -> anyhow::Result<()> {
++        let parent = tempfile::tempdir()?;
++        let archive = parent.path().join("archive");
++        let nested = archive.join("segment");
++        sync_fs::create_dir_all(&nested)?;
++        sync_fs::write(nested.join("data"), b"index")?;
++        let mut permissions = sync_fs::metadata(&nested)?.permissions();
++        permissions.set_readonly(true);
++        sync_fs::set_permissions(&nested, permissions)?;
++
++        clear_readonly_recursive(&archive)?;
++        assert!(!sync_fs::metadata(&nested)?.permissions().readonly());
++        sync_fs::remove_dir_all(&archive)?;
++        assert!(!archive.exists());
++        Ok(())
++    }
++}
+diff --git a/patches/search_archive_cleanup/README.md b/patches/search_archive_cleanup/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..b58ea5e2fda23cef0968ef9e90c5abfcfd898875
+--- /dev/null
++++ b/patches/search_archive_cleanup/README.md
+@@ -0,0 +1,14 @@
++# Search archive cleanup after runtime shutdown
++
++The archive cache already delegates recursive deletion to a dedicated thread.
++Using asynchronous filesystem calls there still depends on Tokio's blocking pool,
++which can have stopped before the cache's final handles are dropped. Use synchronous
++filesystem calls on that existing cleanup thread so retirement remains available
++through runtime shutdown.
++
++The recursive walk clears read-only permissions, skips symlinks, and tolerates paths
++that disappear during cleanup. Unexpected filesystem errors still fail the cleanup
++thread. No new worker, retry policy, storage format or configuration is introduced.
++
++The focused test `clears_readonly_nested_archive_before_removal` checks nested
++read-only cleanup. It does not simulate every runtime shutdown interleaving.

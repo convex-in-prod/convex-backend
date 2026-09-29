@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Tue, 25 Aug 2026 16:02:20 +0800
-Subject: [PATCH 24/26] isolate: balance class-aware active-JavaScript
+Subject: [PATCH 24/28] isolate: balance class-aware active-JavaScript
  admission
 
 Propagate the backend-owned service class from an admitted degradable query leader into its isolate request and suspended permit. Keep dependency work first, preserve resumptions ahead of new starts within each class, and make protected and degradable floors non-preemptive while allowing unused capacity to be borrowed.
@@ -9,29 +9,41 @@ Propagate the backend-owned service class from an admitted degradable query lead
 Keep the phase-only behavior when class-aware floors are disabled, reject invalid unlimited-capacity floor configurations, and publish the capacity, occupancy, waiter, and acquisition evidence needed to operate the policy. Update the patch-train documentation so the existing degradable, dependency, queue, deployment-analysis, and scheduled-action descriptions agree on the combined admission contract.
 
 Give typed configuration work a fair queue within the protected JavaScript group. Reserve queue and worker eligibility inside existing shared-base limits, retain dependency precedence and overflow, and keep protected/degradable service floors non-preemptive. Account pending initial waits in the same worker limits and expose the combined protected occupancy directly.
+
+Accept a closed per-call HTTP mutation priority hint, propagate it through request execution metadata, and give high mutations at most two turns before eligible ordinary application demand. Preserve dependency and configuration barriers, existing capacity bounds, cancellation ownership and closed metric labels. Publish the protocol capability and checked OpenAPI contract.
 ---
  .../src/application_function_runner/mod.rs    |  45 +-
  crates/application/src/cache/mod.rs           |   8 +-
- crates/common/src/knobs.rs                    |  35 +-
- crates/common/src/types/functions.rs          |  32 +-
+ crates/common/src/execution_context.rs        |  43 +-
+ crates/common/src/knobs.rs                    |  46 +-
+ crates/common/src/types/functions.rs          |  54 +-
+ crates/common/src/types/mod.rs                |   1 +
  .../src/in_process_function_runner.rs         |   1 +
- crates/function_runner/src/server.rs          |  57 +-
- crates/isolate/src/client.rs                  | 642 +++++++++++----
- crates/isolate/src/concurrency_limiter.rs     | 729 +++++++++++++++---
- crates/isolate/src/isolate_queue.rs           |  87 ++-
- crates/isolate/src/metrics.rs                 |  39 +-
+ crates/function_runner/src/server.rs          |  61 +-
+ crates/isolate/README.md                      |  41 +
+ crates/isolate/src/client.rs                  | 645 ++++++++++---
+ crates/isolate/src/concurrency_limiter.rs     | 899 +++++++++++++++---
+ crates/isolate/src/isolate_queue.rs           | 285 +++++-
+ crates/isolate/src/metrics.rs                 |  62 +-
+ crates/local_backend/AGENTS.md                |  16 +-
+ .../src/deployment_operations.rs              |   1 +
+ crates/local_backend/src/public_api.rs        |  99 +-
+ crates/local_backend/src/router.rs            |  25 +
+ crates/pb/protos/common.proto                 |   1 +
+ .../platform/public-deployment-openapi.json   |  45 +-
  patches/README.md                             |  14 +-
- patches/degradable_reactive_queries/README.md |  52 +-
- .../active_javascript_admission.md            |  48 +-
- patches/dependency_capacity/README.md         |  56 +-
- .../dependency_capacity/design_reference.md   |  96 ++-
+ patches/degradable_reactive_queries/README.md |  56 +-
+ .../active_javascript_admission.md            |  65 +-
+ patches/dependency_capacity/README.md         |  60 +-
+ .../dependency_capacity/design_reference.md   | 100 +-
  patches/deployment_analysis_pacing/README.md  |   4 +-
- patches/isolate_queue_control/README.md       | 119 +--
- .../deployment_lane_design_reference.md       |  45 +-
- .../isolate_delay_queue_design_reference.md   | 486 ++++++++++++
+ patches/isolate_queue_control/README.md       | 163 ++--
+ .../deployment_lane_design_reference.md       |  49 +-
+ .../isolate_delay_queue_design_reference.md   | 498 ++++++++++
+ .../deployment_operations.md                  |  15 +-
  patches/scheduled_action_admission/README.md  |   2 +-
  self-hosted/advanced/knobs.md                 |  76 +-
- 21 files changed, 2170 insertions(+), 503 deletions(-)
+ 31 files changed, 2910 insertions(+), 570 deletions(-)
  create mode 100644 patches/isolate_queue_control/isolate_delay_queue_design_reference.md
 
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
@@ -163,11 +175,150 @@ index b18d95ab6536e7092cd0ba51a7946388d68cc2bb..3e7e4556b6d92e8d7b03c93670aecdbb
                              )
                              .await?;
                          let FunctionOutcome::Query(mut query_outcome) = outcome else {
+diff --git a/crates/common/src/execution_context.rs b/crates/common/src/execution_context.rs
+index 6b5fe119ff393ef897047d39c0c21ec3182962bd..fe8cf9e29f8d4daf279d9f1f059f903c2bc3fc3e 100644
+--- a/crates/common/src/execution_context.rs
++++ b/crates/common/src/execution_context.rs
+@@ -21,7 +21,10 @@ use value::{
+ 
+ use crate::{
+     components::ComponentId,
+-    types::FunctionCaller,
++    types::{
++        FunctionCaller,
++        MutationPriority,
++    },
+ };
+ 
+ /// A client IP address extracted from HTTP headers, with max length
+@@ -108,6 +111,7 @@ impl HeapSize for RequestMetadata {
+ pub struct RequestContext {
+     pub request_id: RequestId,
+     pub request_metadata: RequestMetadata,
++    pub mutation_priority: MutationPriority,
+ }
+ 
+ impl RequestContext {
+@@ -115,6 +119,7 @@ impl RequestContext {
+         Self {
+             request_id,
+             request_metadata,
++            mutation_priority: MutationPriority::Normal,
+         }
+     }
+ 
+@@ -124,6 +129,7 @@ impl RequestContext {
+         Self {
+             request_id,
+             request_metadata: RequestMetadata::system(),
++            mutation_priority: MutationPriority::Normal,
+         }
+     }
+ 
+@@ -145,6 +151,7 @@ pub struct ExecutionContext {
+     is_root: bool,
+     /// Metadata about the originating HTTP request (IP, user agent).
+     pub request_metadata: RequestMetadata,
++    pub mutation_priority: MutationPriority,
+ }
+ 
+ impl ExecutionContext {
+@@ -155,6 +162,7 @@ impl ExecutionContext {
+             parent_scheduled_job: caller.parent_scheduled_job(),
+             is_root: caller.is_root(),
+             request_metadata: request_context.request_metadata,
++            mutation_priority: request_context.mutation_priority,
+         }
+     }
+ 
+@@ -171,6 +179,7 @@ impl ExecutionContext {
+             parent_scheduled_job,
+             is_root,
+             request_metadata,
++            mutation_priority: MutationPriority::Normal,
+         }
+     }
+ 
+@@ -301,6 +310,7 @@ impl From<ExecutionContext> for pb::common::ExecutionContext {
+             is_root: Some(value.is_root),
+             client_ip: value.request_metadata.ip.map(|ip| ip.into_string()),
+             client_user_agent: value.request_metadata.user_agent.map(|ua| ua.into_string()),
++            mutation_high_priority: Some(value.mutation_priority == MutationPriority::High),
+         }
+     }
+ }
+@@ -321,6 +331,11 @@ impl TryFrom<pb::common::ExecutionContext> for ExecutionContext {
+             },
+             parent_scheduled_job: parent_document_id.map(|id| (parent_component_id, id)),
+             is_root: value.is_root.unwrap_or_default(),
++            mutation_priority: if value.mutation_high_priority.unwrap_or(false) {
++                MutationPriority::High
++            } else {
++                MutationPriority::Normal
++            },
+             request_metadata: RequestMetadata {
+                 ip: value.client_ip.map(ClientIp::from),
+                 user_agent: value.client_user_agent.map(ClientUserAgent::from),
+@@ -343,3 +358,29 @@ impl From<ExecutionContext> for JsonValue {
+         })
+     }
+ }
++
++#[cfg(test)]
++mod mutation_priority_tests {
++    use super::*;
++
++    #[test]
++    fn mutation_priority_survives_execution_context_protobuf() {
++        let mut request = RequestContext::new_for_system_request(RequestId::new());
++        assert_eq!(request.mutation_priority, MutationPriority::Normal);
++        request.mutation_priority = MutationPriority::High;
++        let context = ExecutionContext::new(request, &FunctionCaller::Cron);
++        assert_eq!(context.mutation_priority, MutationPriority::High);
++        let proto: pb::common::ExecutionContext = context.clone().into();
++        assert_eq!(ExecutionContext::try_from(proto.clone()).unwrap(), context);
++        let old_proto = pb::common::ExecutionContext {
++            mutation_high_priority: None,
++            ..proto
++        };
++        assert_eq!(
++            ExecutionContext::try_from(old_proto)
++                .unwrap()
++                .mutation_priority,
++            MutationPriority::Normal
++        );
++    }
++}
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index ac052c25e12fc778e8fe0a015eb1ee3a5d57db06..d5f7d256e082a66fd6203e5e85464baec796ca6e 100644
+index ac052c25e12fc778e8fe0a015eb1ee3a5d57db06..0c910803ea69695b8010bffca8401356e5d2986b 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -1636,8 +1636,8 @@ pub static ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS: LazyLock<Duration> =
+@@ -1565,8 +1565,9 @@ pub static ISOLATE_ANALYZE_USER_TIMEOUT: LazyLock<Duration> =
+     LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_ANALYZE_USER_TIMEOUT_SECONDS", 4)));
+ 
+ /// Shared isolate queue capacity. The default policy uses generic CoDel. The
+-/// strict opt-in lane-aware policy keeps FIFO ordering and applies its own
+-/// delay controller. Both policies add dependency-only capacity configured by
++/// strict opt-in lane-aware policy gives high mutations bounded preference
++/// among eligible requests and applies its own delay controller. Both policies
++/// add dependency-only capacity configured by
+ /// `ISOLATE_DEPENDENCY_WORKER_RESERVE`. Larger values retain more UDF arguments
+ /// and can increase overload latency.
+ pub static ISOLATE_QUEUE_SIZE: LazyLock<usize> =
+@@ -1607,9 +1608,9 @@ pub static ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS: LazyLock<Duration> = LazyLock::n
+     env_config_duration_millis_strict("ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS", 1000)
+ });
+ 
+-/// Queue age above which an overloaded lane adaptively sheds ordinary and
+-/// independent-action work. This must be greater than the queueing-delay
+-/// target. When unset, this is twice the configured target.
++/// Queue age above which an overloaded lane adaptively sheds ordinary,
++/// high-mutation, and independent-action work. This must exceed the
++/// queueing-delay target. When unset, this is twice the configured target.
+ pub static ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS: LazyLock<Duration> = LazyLock::new(|| {
+     let name = "ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS";
+     let Some(millis) = env_config_optional_usize_strict(name) else {
+@@ -1636,8 +1637,8 @@ pub static ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS: LazyLock<Duration> =
  pub static ISOLATE_CONTROL_PLANE_LANE_ENABLED: LazyLock<bool> =
      LazyLock::new(|| env_config_bool_strict("ISOLATE_CONTROL_PLANE_LANE_ENABLED", false));
  
@@ -178,7 +329,7 @@ index ac052c25e12fc778e8fe0a015eb1ee3a5d57db06..d5f7d256e082a66fd6203e5e85464bae
  pub static ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY: LazyLock<usize> =
      LazyLock::new(|| env_config_usize_strict("ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY", 16));
  
-@@ -1857,7 +1857,7 @@ pub fn validate_active_javascript_class_minimums(
+@@ -1857,7 +1858,7 @@ pub fn validate_active_javascript_class_minimums(
      );
      if protected_active_minimum > 0 {
          anyhow::ensure!(
@@ -187,7 +338,7 @@ index ac052c25e12fc778e8fe0a015eb1ee3a5d57db06..d5f7d256e082a66fd6203e5e85464bae
              "active-JavaScript class minimums require finite FUNRUN_ISOLATE_ACTIVE_THREADS"
          );
          let combined_minimum = protected_active_minimum
-@@ -2232,20 +2232,21 @@ pub static TICKETMASTER_CLUSTER_NAME: LazyLock<String> =
+@@ -2232,20 +2233,21 @@ pub static TICKETMASTER_CLUSTER_NAME: LazyLock<String> =
  pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("PROBER_PROBE_TIMEOUT", 5)));
  
@@ -217,7 +368,7 @@ index ac052c25e12fc778e8fe0a015eb1ee3a5d57db06..d5f7d256e082a66fd6203e5e85464bae
  pub static FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN: LazyLock<usize> =
      LazyLock::new(|| env_config_usize_strict("FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN", 0));
  
-@@ -2967,11 +2968,23 @@ mod strict_capacity_tests {
+@@ -2967,11 +2969,23 @@ mod strict_capacity_tests {
          assert!(validate_active_javascript_class_minimums(28, 0, 0, None).is_ok());
          assert!(validate_active_javascript_class_minimums(28, 0, 14, Some(32)).is_err());
          assert!(validate_active_javascript_class_minimums(0, 4, 14, Some(32)).is_err());
@@ -242,10 +393,10 @@ index ac052c25e12fc778e8fe0a015eb1ee3a5d57db06..d5f7d256e082a66fd6203e5e85464bae
      fn local_node_pool_policies_are_strict_and_bounded() {
          let policies = parse_local_node_executor_pool_policies(
 diff --git a/crates/common/src/types/functions.rs b/crates/common/src/types/functions.rs
-index 9564002503cdaabe31e7044e4b0654311d966c3d..50a1ad0d8b6f4f4a4b6543239cbfb88ed757afe6 100644
+index 9564002503cdaabe31e7044e4b0654311d966c3d..3c17bc30ddc0fc78865bedc2707df91aa161d422 100644
 --- a/crates/common/src/types/functions.rs
 +++ b/crates/common/src/types/functions.rs
-@@ -139,32 +139,40 @@ pub enum SchedulerDependencyClass {
+@@ -139,32 +139,62 @@ pub enum SchedulerDependencyClass {
  
  impl SchedulerDependencyClass {
      pub fn unblocks_ancestor(&self) -> bool {
@@ -254,6 +405,24 @@ index 9564002503cdaabe31e7044e4b0654311d966c3d..50a1ad0d8b6f4f4a4b6543239cbfb88e
 +            Self::Independent => false,
 +            Self::UnblocksAncestor => true,
 +        }
++    }
++}
++
++/// Per-call scheduling preference; it grants no additional execution authority.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
++#[serde(rename_all = "camelCase")]
++pub enum MutationPriority {
++    #[default]
++    Normal,
++    High,
++}
++
++impl MutationPriority {
++    pub fn active_javascript_class(self) -> ActiveJavascriptClass {
++        match self {
++            Self::Normal => ActiveJavascriptClass::Protected,
++            Self::High => ActiveJavascriptClass::HighPriorityMutation,
++        }
      }
  }
  
@@ -261,13 +430,17 @@ index 9564002503cdaabe31e7044e4b0654311d966c3d..50a1ad0d8b6f4f4a4b6543239cbfb88e
  ///
 -/// The class is backend-owned. A client can opt an independent root query down
 -/// to `Degradable`, but only the runtime can create `Dependency` work.
-+/// The class is backend-owned. The query cache assigns `Degradable` only after
++/// The backend derives classes from execution ancestry and admission. The
++/// bounded mutation preference additionally accepts a client hint. The query
++/// cache assigns `Degradable` only after
 +/// admitting an independent root query cache miss; a client declaration alone
 +/// does not assign it. Only runtime-derived ancestry creates `Dependency` work.
  #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
  pub enum ActiveJavascriptClass {
      Dependency,
      Protected,
++    /// Client-requested preference within ordinary protected capacity.
++    HighPriorityMutation,
      Degradable,
 +    /// Backend configuration evaluation, sharing the protected service floor
 +    /// with ordinary protected work through a separate fair queue.
@@ -298,6 +471,18 @@ index 9564002503cdaabe31e7044e4b0654311d966c3d..50a1ad0d8b6f4f4a4b6543239cbfb88e
          }
      }
  }
+diff --git a/crates/common/src/types/mod.rs b/crates/common/src/types/mod.rs
+index eb6469b2c438c4930eab3a8cf417db14b8d3074d..b2452d4b88a7302ce3d654ebcfdc1238f65e94a6 100644
+--- a/crates/common/src/types/mod.rs
++++ b/crates/common/src/types/mod.rs
+@@ -87,6 +87,7 @@ pub use functions::{
+     AllowedVisibility,
+     FunctionCaller,
+     ModuleEnvironment,
++    MutationPriority,
+     QueryInvocation,
+     SchedulerDependencyClass,
+     UdfIdentifier,
 diff --git a/crates/function_runner/src/in_process_function_runner.rs b/crates/function_runner/src/in_process_function_runner.rs
 index ada5400ddf3e1f5f83fd5bf5e05808264abdd6c1..25aca440edb9417426804e06f27c4f211b87675f 100644
 --- a/crates/function_runner/src/in_process_function_runner.rs
@@ -311,7 +496,7 @@ index ada5400ddf3e1f5f83fd5bf5e05808264abdd6c1..25aca440edb9417426804e06f27c4f21
          } else {
              ConcurrencyLimiter::unlimited()
 diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
-index 0f8de57a03eec3c98b3ec7f8885997d3fedf525e..904128ffbfa7f73b5a311b6323137af46fd9193f 100644
+index 0f8de57a03eec3c98b3ec7f8885997d3fedf525e..fc4f7efc704ceea8dc00cbcecfcf4d580b8d203b 100644
 --- a/crates/function_runner/src/server.rs
 +++ b/crates/function_runner/src/server.rs
 @@ -148,10 +148,19 @@ pub struct RunRequestArgs {
@@ -338,7 +523,7 @@ index 0f8de57a03eec3c98b3ec7f8885997d3fedf525e..904128ffbfa7f73b5a311b6323137af4
  }
  
  pub struct HttpActionMetadata {
-@@ -377,11 +386,32 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -377,11 +386,36 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                      function_execution_start.is_none(),
                      "Database functions cannot have an action execution start barrier"
                  );
@@ -364,7 +549,11 @@ index 0f8de57a03eec3c98b3ec7f8885997d3fedf525e..904128ffbfa7f73b5a311b6323137af4
 +                        FunctionMetadata::Mutation {
 +                            path_and_args,
 +                            journal,
-+                        } => (path_and_args, journal, ActiveJavascriptClass::Protected),
++                        } => (
++                            path_and_args,
++                            journal,
++                            context.mutation_priority.active_javascript_class(),
++                        ),
 +                        FunctionMetadata::Query { .. } | FunctionMetadata::Action { .. } => {
 +                            anyhow::bail!("Function metadata does not match {udf_type}")
 +                        },
@@ -376,7 +565,7 @@ index 0f8de57a03eec3c98b3ec7f8885997d3fedf525e..904128ffbfa7f73b5a311b6323137af4
                  // Initialize the UDF's RNG from some high-quality entropy. As with
                  // `unix_timestamp` below, the UDF is only deterministic modulo this
                  // system-generated input.
-@@ -413,8 +443,13 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -413,8 +447,13 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                  ))
              },
              UdfType::Action => {
@@ -392,8 +581,57 @@ index 0f8de57a03eec3c98b3ec7f8885997d3fedf525e..904128ffbfa7f73b5a311b6323137af4
                  let log_line_sender =
                      log_line_sender.context("Missing log line sender for action")?;
                  let function_execution_start =
+diff --git a/crates/isolate/README.md b/crates/isolate/README.md
+index 4caf76f4d985ceaf9f1d64b782157f3800b4bcc1..16ae4516b084c91ace838eda14e2ef2803428d9b 100644
+--- a/crates/isolate/README.md
++++ b/crates/isolate/README.md
+@@ -73,3 +73,44 @@ There are a few ways user code can interact with our system.
+                                       │                     │
+                                       └─────────────────────┘
+ ```
++
++
++# HTTP mutation priority
++
++`POST /api/mutation` accepts `priority: "normal" | "high"`; omission means normal.
++The hint applies to that call and its OCC retries. It grants no authorization and does
++not change HTTP admission, transaction concurrency, total workers, or CPU capacity.
++All callers use the same endpoint authentication and function authorization.
++
++High priority requires `ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=true`. Deployment operation
++capabilities expose `mutationPriorityProtocol: 1` when available, or `0` with the legacy
++CoDel queue. A high request on the legacy configuration fails with
++`MutationPriorityUnavailable`; normal requests retain the existing behavior. The
++WebSocket protocol and its connection mutation serialization are unchanged.
++
++Physical isolate selection gives high mutations at most two turns before an eligible
++ordinary request. A high request cannot cross an older eligible dependency or deployment
++control request. Ineligible high requests do not block other work. High requests use
++ordinary queue and worker capacity, with the same expiration and overload rules; they
++cannot consume dependency or control-plane reserves.
++
++Initial and resumed JavaScript admission use the same bounded preference within the
++protected service group. Deployment control-plane alternation and protected/degradable
++service floors are preserved. Class-aware dependency admission still precedes both
++application queues. Compatibility admission without service floors or control-plane
++support retains its existing collapse of dependency callbacks into ordinary resumptions;
++those callbacks receive the bounded ordinary service turn. Resumptions precede initial
++starts within each selected class. Cancellation returns queued or granted capacity.
++
++Primary Wasm invocations use this policy in their separate active-CPU limiter. The
++execution retains its class across asynchronous suspension and resumption. Opportunistic
++shadow admission remains immediate and never queues behind the priority hint.
++Detached V8 verification uses ordinary service without inheriting the primary
++mutation's hint.
++
++Priority changes admission order. It does not bound network, database, or transaction
++commit latency, and it never preempts a running function.
++
++Active-JavaScript class and queue metrics distinguish `high_priority_mutation`.
++Protected-group occupancy includes ordinary protected, high mutation, and control-plane
++permits, including unclaimed grants. Wasm admission uses its own CPU metrics.
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792ccc97a6f94 100644
+index 2242c0b4f77cf367a2027ebf18945d907452b12b..8172750986c84d8378732e37060b40be81f10ea5 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -317,7 +317,6 @@ impl AnalyzeResponseSender {
@@ -404,7 +642,16 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
  
  /// Caller-drop signal for one isolate execution tree.
  ///
-@@ -749,8 +748,8 @@ fn validate_control_plane_lane_config(
+@@ -458,6 +457,8 @@ impl RequestSchedulingProperties {
+             IsolateQueueLane::ControlPlane
+         } else if self.unblocks_ancestor {
+             IsolateQueueLane::Dependency
++        } else if self.active_javascript_class == ActiveJavascriptClass::HighPriorityMutation {
++            IsolateQueueLane::HighPriorityMutation
+         } else if self.is_isolate_action {
+             IsolateQueueLane::IndependentAction
+         } else {
+@@ -749,8 +750,8 @@ fn validate_control_plane_lane_config(
          "ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY must be at least ANALYZE_CONCURRENCY"
      );
      anyhow::ensure!(
@@ -415,7 +662,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
      );
      anyhow::ensure!(
          control_plane_hard_max_age > ordinary_hard_max_age,
-@@ -764,6 +763,7 @@ fn validate_control_plane_lane_config(
+@@ -764,6 +765,7 @@ fn validate_control_plane_lane_config(
  struct ActiveRequestCounts {
      total: usize,
      independent_actions: usize,
@@ -423,7 +670,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
  }
  
  impl ActiveRequestCounts {
-@@ -773,6 +773,7 @@ impl ActiveRequestCounts {
+@@ -773,6 +775,7 @@ impl ActiveRequestCounts {
  
      fn increment(&mut self, properties: RequestSchedulingProperties) {
          self.total += 1;
@@ -431,7 +678,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          if properties.is_isolate_action && !properties.unblocks_ancestor {
              self.independent_actions += 1;
          }
-@@ -783,6 +784,10 @@ impl ActiveRequestCounts {
+@@ -783,6 +786,10 @@ impl ActiveRequestCounts {
              .total
              .checked_sub(1)
              .expect("active request class count underflow");
@@ -442,7 +689,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          if properties.is_isolate_action && !properties.unblocks_ancestor {
              self.independent_actions = self
                  .independent_actions
-@@ -794,6 +799,7 @@ impl ActiveRequestCounts {
+@@ -794,6 +801,7 @@ impl ActiveRequestCounts {
      fn add_assign(&mut self, other: Self) {
          self.total += other.total;
          self.independent_actions += other.independent_actions;
@@ -450,11 +697,12 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
      }
  }
  
-@@ -802,24 +808,10 @@ fn active_javascript_class_index(class: ActiveJavascriptClass) -> usize {
+@@ -802,24 +810,11 @@ fn active_javascript_class_index(class: ActiveJavascriptClass) -> usize {
          ActiveJavascriptClass::Dependency => 0,
          ActiveJavascriptClass::Protected => 1,
          ActiveJavascriptClass::Degradable => 2,
 +        ActiveJavascriptClass::ControlPlane => 3,
++        ActiveJavascriptClass::HighPriorityMutation => 4,
      }
  }
  
@@ -476,7 +724,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
  struct PendingExternalPermit<RT: Runtime> {
      request: Request<RT>,
      outcome: ExternalPermitWaitOutcome,
-@@ -939,6 +931,7 @@ struct SchedulerStateSnapshot {
+@@ -939,6 +934,7 @@ struct SchedulerStateSnapshot {
      active_counts: ActiveRequestCounts,
      max_workers: usize,
      base_worker_capacity: usize,
@@ -484,7 +732,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
      max_independent_actions: usize,
      max_workers_per_client: usize,
      base_workers_per_client: usize,
-@@ -963,10 +956,27 @@ impl SchedulerStateSnapshot {
+@@ -963,10 +959,27 @@ impl SchedulerStateSnapshot {
          IsolateQueueEligibility {
              physical_total: self.active_counts.total >= self.max_workers,
              shared_base: !properties.unblocks_ancestor
@@ -514,7 +762,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
              independent_action_cap: properties.is_isolate_action
                  && !properties.unblocks_ancestor
                  && self.active_counts.independent_actions >= self.max_independent_actions,
-@@ -979,20 +989,6 @@ impl SchedulerStateSnapshot {
+@@ -979,20 +992,6 @@ impl SchedulerStateSnapshot {
      }
  }
  
@@ -535,7 +783,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
  #[derive(Clone)]
  pub struct IsolateConfig {
      // Name of isolate pool, used in metrics.
-@@ -1116,8 +1112,16 @@ impl<RT: Runtime> Request<RT> {
+@@ -1116,8 +1115,16 @@ impl<RT: Runtime> Request<RT> {
          scheduler_dependency: SchedulerDependencyClass,
          active_javascript_class: ActiveJavascriptClass,
      ) -> Self {
@@ -554,7 +802,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          let request = Self {
              deployment_job: common::query_analysis_admission::DEPLOYMENT_ANALYSIS_JOB
                  .try_with(Clone::clone)
-@@ -1311,6 +1315,7 @@ pub enum RequestType<RT: Runtime> {
+@@ -1311,6 +1318,7 @@ pub enum RequestType<RT: Runtime> {
          is_control_plane: bool,
          reuses_database_context: bool,
          fail_worker: bool,
@@ -562,7 +810,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          started: mpsc::UnboundedSender<usize>,
          completion: oneshot::Receiver<()>,
          response: oneshot::Sender<anyhow::Result<()>>,
-@@ -1616,7 +1621,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1616,7 +1624,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              max_independent_actions <= base_worker_capacity,
              "MAX_ISOLATE_ACTION_WORKERS must not exceed shared base isolate worker capacity"
          );
@@ -571,7 +819,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
              *ISOLATE_QUEUE_DELAY_TARGET_MILLIS,
              *ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS,
              *ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS,
-@@ -1625,6 +1630,15 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1625,6 +1633,15 @@ impl<RT: Runtime> IsolateClient<RT> {
              *ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY,
          )?;
          let control_plane_lane_enabled = *ISOLATE_CONTROL_PLANE_LANE_ENABLED;
@@ -587,7 +835,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          validate_control_plane_lane_config(
              control_plane_lane_enabled,
              *ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY,
-@@ -1634,6 +1648,9 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1634,6 +1651,9 @@ impl<RT: Runtime> IsolateClient<RT> {
              *ISOLATE_QUEUE_DELAY_CONTROL_ENABLED,
              *ANALYZE_CONCURRENCY,
          )?;
@@ -597,7 +845,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          let delay_control_config = (*ISOLATE_QUEUE_DELAY_CONTROL_ENABLED).then_some(queue_config);
          let heap_per_worker = ISOLATE_MAX_USER_HEAP_SIZE
              .checked_add(*ISOLATE_MAX_HEAP_EXTRA_SIZE)
-@@ -1699,6 +1716,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1699,6 +1719,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                  max_percent_per_client,
                  _active_workers,
                  control_plane_lane_enabled,
@@ -605,7 +853,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
              );
              scheduler.run(receiver, internal_receiver).await
          });
-@@ -2420,8 +2438,10 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -2420,8 +2441,10 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      /// if at least one request is active for that client.
      in_progress_counts_by_client: HashMap<String, ActiveRequestCounts>,
      in_progress_counts: ActiveRequestCounts,
@@ -618,7 +866,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
      pending_permit_counts_by_client: HashMap<String, ActiveRequestCounts>,
      pending_permit_counts: ActiveRequestCounts,
      /// Externally visible active-worker accounting. The worker request owns the
-@@ -2431,6 +2451,7 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -2431,6 +2454,7 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      max_workers: usize,
      /// Shared capacity available to every request class.
      base_worker_capacity: usize,
@@ -626,7 +874,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
      /// Maximum independent V8 and HTTP actions retaining workers.
      max_independent_actions: usize,
      handles: Arc<Mutex<Vec<IsolateWorkerHandle>>>,
-@@ -2478,7 +2499,16 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2478,7 +2502,16 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          max_percent_per_client: usize,
          active_workers: Arc<AtomicUsize>,
          control_plane_lane_enabled: bool,
@@ -643,7 +891,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          let dependency_reserve = max_workers - base_worker_capacity;
          let max_workers_per_client =
              per_client_worker_capacity(max_workers, max_percent_per_client);
-@@ -2503,6 +2533,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2503,6 +2536,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              available_workers: HashMap::new(),
              max_workers,
              base_worker_capacity,
@@ -651,7 +899,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
              max_independent_actions,
              handles,
              max_workers_per_client,
-@@ -2569,6 +2600,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2569,6 +2603,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              active_counts,
              max_workers: self.max_workers,
              base_worker_capacity: self.base_worker_capacity,
@@ -659,7 +907,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
              max_independent_actions: self.max_independent_actions,
              max_workers_per_client: self.max_workers_per_client,
              base_workers_per_client: self.base_workers_per_client,
-@@ -2577,6 +2609,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2577,6 +2612,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
  
      fn reserve_pending_permit(&mut self, request: &Request<RT>) {
          let properties = request.scheduling_properties(self.control_plane_lane_enabled);
@@ -671,7 +919,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          self.pending_permit_counts.increment(properties);
          self.pending_permit_counts_by_client
              .entry(request.client_id.clone())
-@@ -2622,14 +2659,15 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2622,14 +2662,15 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          let mut external_expired_receiver = receiver.expired_receiver();
          let scheduler_state = Arc::new(Mutex::new(self.state_snapshot()));
          let control_plane_lane_enabled = self.control_plane_lane_enabled;
@@ -681,7 +929,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
 +        let selection_limiter = active_limiter.clone();
          let selection_state = scheduler_state.clone();
 -        let pending_external_classes = Arc::new(Mutex::new([false; 3]));
-+        let pending_external_classes = Arc::new(Mutex::new([false; 4]));
++        let pending_external_classes = Arc::new(Mutex::new([false; 5]));
          let selection_pending_classes = pending_external_classes.clone();
          let external_request_stream = stream::unfold(receiver, move |mut receiver| {
              let selection_state = selection_state.clone();
@@ -690,7 +938,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
              async move {
                  let output = receiver
                      .recv_next_selecting(|request| {
-@@ -2642,9 +2680,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2642,9 +2683,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          // wave from one class can be removed from the queue and
                          // hide demand from the other class behind permit waits.
                          eligibility.active_javascript_class_pending = pending_classes.lock()
@@ -702,7 +950,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
                              )];
                          eligibility
                      })
-@@ -2761,22 +2798,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2761,22 +2801,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          },
                      }
                  },
@@ -729,7 +977,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
                  pending = pending_external_permits.next(), if has_pending_external => {
                      let Some(PendingExternalPermit {
                          request,
-@@ -2788,9 +2813,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2788,9 +2816,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      self.release_pending_permit(&request);
                      let properties =
                          request.scheduling_properties(self.control_plane_lane_enabled);
@@ -741,7 +989,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
                      );
                      let was_pending = mem::replace(
                          &mut pending_external_classes.lock()[class_index],
-@@ -2821,6 +2845,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2821,6 +2848,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          },
                      }
                  },
@@ -764,7 +1012,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
                  output = external_request_stream.next(), if external_request_stream_open => {
                      let Some(IsolateQueueOutput {
                          item: request,
-@@ -2848,9 +2888,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2848,9 +2891,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      }
                      let permit_deadline = permit_deadline
                          .expect("non-rejected external request must retain its queue deadline");
@@ -776,7 +1024,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
                      );
                      let mut pending_classes = pending_external_classes.lock();
                      assert!(
-@@ -2882,11 +2921,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2882,11 +2924,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          properties,
                          &request.client_id,
                      );
@@ -793,7 +1041,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
                      eligibility
                  }), if external_expiration_receiver_open => {
                      match expired {
-@@ -3056,29 +3095,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3056,29 +3098,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      }
  
      /// Find a worker for the request's client.
@@ -829,7 +1077,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          let reusable_context_kind = request.reusable_context_kind();
          // Try to find an existing worker for this client.
          if let Some((client_id, mut workers)) = self.available_workers.remove_entry(client_id) {
-@@ -3127,11 +3154,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3127,11 +3157,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              if !workers.is_empty() {
                  self.available_workers.insert(client_id, workers);
              }
@@ -843,7 +1091,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          }
          // If we've recently started up and haven't yet created `max_workers` threads,
          // create a new worker instead of "stealing" some other client's worker.
-@@ -3152,12 +3179,12 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3152,12 +3182,12 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  self.worker.config().name,
                  self.worker_senders.len() - 1
              );
@@ -858,7 +1106,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          }
          // No existing worker for this client and we've already started the max number
          // of workers -- just grab the least recently used worker. This worker is least
-@@ -3172,10 +3199,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3172,10 +3202,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      .last_used_ts
              })
          else {
@@ -870,7 +1118,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          };
          let worker = workers
              .pop_back()
-@@ -3189,12 +3213,12 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3189,12 +3216,12 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              let key = key.clone();
              self.available_workers.remove(&key);
          }
@@ -885,7 +1133,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
      }
  
      fn aggregate_heap_stats(&self) -> IsolateHeapStats {
-@@ -3494,7 +3518,6 @@ mod tests {
+@@ -3494,7 +3521,6 @@ mod tests {
          per_client_worker_capacity,
          validate_control_plane_lane_config,
          wait_for_external_permit,
@@ -893,7 +1141,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          ActiveRequestCounts,
          AnalysisModuleSnapshot,
          AnalyzeResponseSender,
-@@ -3528,13 +3551,9 @@ mod tests {
+@@ -3528,13 +3554,9 @@ mod tests {
          isolate::Isolate,
          isolate_queue::{
              IsolateQueueConfig,
@@ -908,7 +1156,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          ConcurrencyLimiter,
          ConcurrencyPermit,
      };
-@@ -3641,6 +3660,7 @@ mod tests {
+@@ -3641,6 +3663,7 @@ mod tests {
                          is_control_plane: _,
                          reuses_database_context: _,
                          fail_worker,
@@ -916,7 +1164,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
                          started,
                          completion,
                          response,
-@@ -3775,6 +3795,19 @@ mod tests {
+@@ -3775,6 +3798,19 @@ mod tests {
          response: oneshot::Receiver<anyhow::Result<()>>,
      }
  
@@ -936,7 +1184,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
      struct InFlightTestRequest {
          completion: oneshot::Sender<()>,
          response: oneshot::Receiver<anyhow::Result<()>>,
-@@ -3826,6 +3859,7 @@ mod tests {
+@@ -3826,6 +3862,7 @@ mod tests {
              is_control_plane: matches!(kind, TestRequestKind::ControlPlane),
              reuses_database_context: false,
              fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
@@ -944,7 +1192,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
              started,
              completion: completion_receiver,
              response: response_sender,
-@@ -4041,6 +4075,7 @@ mod tests {
+@@ -4041,6 +4078,7 @@ mod tests {
                  max_percent_per_client,
                  active_workers.clone(),
                  control_plane_lane_enabled,
@@ -952,7 +1200,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
              );
              Self {
                  sender,
-@@ -4210,6 +4245,7 @@ mod tests {
+@@ -4210,6 +4248,7 @@ mod tests {
              active_counts: global_active,
              max_workers: 6,
              base_worker_capacity: 5,
@@ -960,7 +1208,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
              max_independent_actions: 3,
              max_workers_per_client: 6,
              base_workers_per_client: 5,
-@@ -4434,6 +4470,10 @@ mod tests {
+@@ -4434,6 +4473,10 @@ mod tests {
              let request = Request::new("deployment".to_string(), inner, EncodedSpan::empty());
              assert!(request.is_response_closed());
              let enabled = request.scheduling_properties(true);
@@ -971,7 +1219,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
              assert_eq!(enabled.queue_lane(), IsolateQueueLane::ControlPlane);
              assert_eq!(enabled.as_label(), "control_plane");
              assert!(!enabled.can_block_on_descendant);
-@@ -4473,6 +4513,16 @@ mod tests {
+@@ -4473,6 +4516,16 @@ mod tests {
              )
          };
          assert!(valid().is_ok());
@@ -988,7 +1236,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          assert!(validate_control_plane_lane_config(
              false,
              1,
-@@ -4578,6 +4628,7 @@ mod tests {
+@@ -4578,6 +4631,7 @@ mod tests {
          let active = ActiveRequestCounts {
              total: 5,
              independent_actions: 3,
@@ -996,7 +1244,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          };
          let state = snapshot(active, active);
          let control_plane = RequestSchedulingProperties {
-@@ -4603,6 +4654,7 @@ mod tests {
+@@ -4603,6 +4657,7 @@ mod tests {
          let active = ActiveRequestCounts {
              total: 5,
              independent_actions: 0,
@@ -1004,7 +1252,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          };
          let state = snapshot(active, active);
          assert!(!state.can_start_request(properties(false, false, false), "deployment"));
-@@ -4615,6 +4667,7 @@ mod tests {
+@@ -4615,6 +4670,7 @@ mod tests {
          let active = ActiveRequestCounts {
              total: 4,
              independent_actions: 0,
@@ -1012,7 +1260,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          };
          let state = snapshot(active, active);
          assert!(state.can_start_request(properties(false, false, false), "deployment"));
-@@ -4627,6 +4680,7 @@ mod tests {
+@@ -4627,6 +4683,7 @@ mod tests {
          let active = ActiveRequestCounts {
              total: 6,
              independent_actions: 0,
@@ -1020,7 +1268,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          };
          let state = snapshot(active, active);
          assert!(!state.can_start_request(properties(false, false, false), "deployment"));
-@@ -4634,22 +4688,32 @@ mod tests {
+@@ -4634,22 +4691,32 @@ mod tests {
      }
  
      #[test]
@@ -1069,7 +1317,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
      }
  
      #[test]
-@@ -4680,10 +4744,12 @@ mod tests {
+@@ -4680,10 +4747,12 @@ mod tests {
          let global = ActiveRequestCounts {
              total: 4,
              independent_actions: 0,
@@ -1082,7 +1330,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          };
          let mut state = snapshot(global, client);
          state.base_workers_per_client = 2;
-@@ -4695,6 +4761,7 @@ mod tests {
+@@ -4695,6 +4764,7 @@ mod tests {
          let client_at_total = ActiveRequestCounts {
              total: 3,
              independent_actions: 0,
@@ -1090,7 +1338,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          };
          let mut state = snapshot(global, client_at_total);
          state.base_workers_per_client = 2;
-@@ -4723,6 +4790,7 @@ mod tests {
+@@ -4723,6 +4793,7 @@ mod tests {
              100,
              Arc::new(AtomicUsize::new(0)),
              false,
@@ -1098,7 +1346,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          );
          let (worker_sender, _worker_receiver) = mpsc::channel(1);
          scheduler.worker_senders.push(worker_sender);
-@@ -4752,10 +4820,7 @@ mod tests {
+@@ -4752,10 +4823,7 @@ mod tests {
          };
          *reuses_database_context = true;
  
@@ -1110,7 +1358,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          assert_eq!(selection.worker_id, 0);
          assert_eq!(
              selection.context_affinity,
-@@ -4771,6 +4836,7 @@ mod tests {
+@@ -4771,6 +4839,7 @@ mod tests {
          let active = ActiveRequestCounts {
              total: 3,
              independent_actions: 3,
@@ -1118,7 +1366,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          };
          let state = snapshot(active, active);
          assert!(!state.can_start_request(properties(false, true, true), "deployment"));
-@@ -5089,13 +5155,106 @@ mod tests {
+@@ -5089,13 +5158,106 @@ mod tests {
          });
      }
  
@@ -1226,7 +1474,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
              let protected_held = limiter
                  .acquire_with_class(
                      Arc::new("protected-held".to_owned()),
-@@ -5147,13 +5306,177 @@ mod tests {
+@@ -5147,13 +5309,177 @@ mod tests {
          });
      }
  
@@ -1405,7 +1653,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          let PendingTestRequest {
              request: global_pending,
              ..
-@@ -5162,6 +5485,14 @@ mod tests {
+@@ -5162,6 +5488,14 @@ mod tests {
              TestRequestKind::Degradable,
              global_harness.started_sender.clone(),
          );
@@ -1420,7 +1668,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          let global_scheduler = &mut global_harness
              .pending_scheduler
              .as_mut()
-@@ -5170,22 +5501,56 @@ mod tests {
+@@ -5170,22 +5504,56 @@ mod tests {
          global_scheduler.reserve_pending_permit(&global_pending);
          let global_state = global_scheduler.state_snapshot();
          let candidate = properties(false, false, false);
@@ -1479,7 +1727,7 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
          let client_scheduler = &mut client_harness
              .pending_scheduler
              .as_mut()
-@@ -5196,8 +5561,25 @@ mod tests {
+@@ -5196,8 +5564,25 @@ mod tests {
          let client_eligibility =
              client_state.request_eligibility(candidate, &client_pending.client_id);
          assert!(!client_eligibility.physical_total);
@@ -1506,10 +1754,10 @@ index 2242c0b4f77cf367a2027ebf18945d907452b12b..ac61f47b78c7f10c22e38967a9c792cc
  
      #[test]
 diff --git a/crates/isolate/src/concurrency_limiter.rs b/crates/isolate/src/concurrency_limiter.rs
-index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ecc499fa8d 100644
+index 1743bd613dcf338859353c02f674017cad372252..f552d55f13d88edb639f992bb95b285da820f760 100644
 --- a/crates/isolate/src/concurrency_limiter.rs
 +++ b/crates/isolate/src/concurrency_limiter.rs
-@@ -43,12 +43,15 @@ pub(crate) enum ConcurrencyPermitPhase {
+@@ -43,12 +43,17 @@ pub(crate) enum ConcurrencyPermitPhase {
  /// Limits how many isolate threads can actively run JavaScript at the same
  /// time.
  ///
@@ -1523,14 +1771,16 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
 -/// between the two classes. Resumptions precede initial starts within the
 -/// selected class.
 +/// between the two classes, and resumptions precede initial starts within the
-+/// selected class. Without class minimums, the limiter retains its phase-only
-+/// compatibility policy unless control-plane admission is enabled. That option
-+/// alternates control-plane and ordinary grants inside the protected group;
-+/// it does not increase capacity or change the group's combined service floor.
++/// selected class. High mutation hints receive at most two protected
++/// application turns before an ordinary turn. Without class minimums, other
++/// classes retain their phase-only compatibility collapse unless control-plane
++/// admission is enabled. That option alternates control-plane and application
++/// grants inside the protected group; it does not increase capacity or change
++/// its service floor.
  #[derive(Clone, Debug)]
  pub struct ConcurrencyLimiter {
      inner: Arc<ConcurrencyLimiterInner>,
-@@ -60,11 +63,13 @@ struct ConcurrencyLimiterInner {
+@@ -60,11 +65,13 @@ struct ConcurrencyLimiterInner {
      max_permits: usize,
      protected_minimum: usize,
      degradable_minimum: usize,
@@ -1546,7 +1796,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
      Granted,
  }
  
-@@ -72,7 +77,6 @@ enum WaiterState {
+@@ -72,7 +79,6 @@ enum WaiterState {
  struct Waiter {
      queue: WaiterQueue,
      state: WaiterState,
@@ -1554,20 +1804,28 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
  }
  
  #[derive(Debug)]
-@@ -90,13 +94,21 @@ enum WaiterQueue {
+@@ -90,13 +96,29 @@ enum WaiterQueue {
      ProtectedInitial,
      DegradableResume,
      DegradableInitial,
 +    ControlPlaneResume,
 +    ControlPlaneInitial,
++    HighPriorityMutationResume,
++    HighPriorityMutationInitial,
  }
  
  impl WaiterQueue {
 -    const COUNT: usize = 6;
-+    const COUNT: usize = 8;
++    const COUNT: usize = 10;
  
      fn new(class: ActiveJavascriptClass, phase: ConcurrencyPermitPhase) -> Self {
          match (class, phase) {
++            (ActiveJavascriptClass::HighPriorityMutation, ConcurrencyPermitPhase::Resume) => {
++                Self::HighPriorityMutationResume
++            },
++            (ActiveJavascriptClass::HighPriorityMutation, ConcurrencyPermitPhase::Initial) => {
++                Self::HighPriorityMutationInitial
++            },
 +            (ActiveJavascriptClass::ControlPlane, ConcurrencyPermitPhase::Resume) => {
 +                Self::ControlPlaneResume
 +            },
@@ -1577,26 +1835,31 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
              (ActiveJavascriptClass::Dependency, ConcurrencyPermitPhase::Resume) => {
                  Self::DependencyResume
              },
-@@ -120,6 +132,8 @@ impl WaiterQueue {
+@@ -120,6 +142,10 @@ impl WaiterQueue {
  
      fn index(self) -> usize {
          match self {
++            Self::HighPriorityMutationResume => 8,
++            Self::HighPriorityMutationInitial => 9,
 +            Self::ControlPlaneResume => 6,
 +            Self::ControlPlaneInitial => 7,
              Self::DependencyResume => 0,
              Self::DependencyInitial => 1,
              Self::ProtectedResume => 2,
-@@ -131,6 +145,9 @@ impl WaiterQueue {
+@@ -131,6 +157,12 @@ impl WaiterQueue {
  
      fn class(self) -> ActiveJavascriptClass {
          match self {
++            Self::HighPriorityMutationResume | Self::HighPriorityMutationInitial => {
++                ActiveJavascriptClass::HighPriorityMutation
++            },
 +            Self::ControlPlaneResume | Self::ControlPlaneInitial => {
 +                ActiveJavascriptClass::ControlPlane
 +            },
              Self::DependencyResume | Self::DependencyInitial => ActiveJavascriptClass::Dependency,
              Self::ProtectedResume | Self::ProtectedInitial => ActiveJavascriptClass::Protected,
              Self::DegradableResume | Self::DegradableInitial => ActiveJavascriptClass::Degradable,
-@@ -139,8 +156,14 @@ impl WaiterQueue {
+@@ -139,8 +171,16 @@ impl WaiterQueue {
  
      fn phase(self) -> &'static str {
          match self {
@@ -1605,27 +1868,30 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
 +            Self::DependencyResume
 +            | Self::ProtectedResume
 +            | Self::DegradableResume
++            | Self::HighPriorityMutationResume
 +            | Self::ControlPlaneResume => "resume",
 +            Self::DependencyInitial
 +            | Self::ProtectedInitial
 +            | Self::DegradableInitial
++            | Self::HighPriorityMutationInitial
 +            | Self::ControlPlaneInitial => "initial",
          }
      }
  }
-@@ -148,22 +171,41 @@ impl WaiterQueue {
+@@ -148,22 +188,42 @@ impl WaiterQueue {
  #[derive(Debug)]
  struct ActivePermitsTracker {
      active_permits: Slab<ActivePermit>,
 -    active_by_class: [usize; 3],
 -    granted_by_class: [usize; 3],
-+    active_by_class: [usize; 4],
-+    granted_by_class: [usize; 4],
++    active_by_class: [usize; 5],
++    granted_by_class: [usize; 5],
      waiters: Slab<Waiter>,
      queues: [VecDeque<usize>; WaiterQueue::COUNT],
 -    next_elastic_class: ActiveJavascriptClass,
 +    next_tied_class: ActiveJavascriptClass,
 +    next_protected_control_plane: bool,
++    high_priority_streak: u8,
  }
  
  impl ConcurrencyLimiter {
@@ -1659,7 +1925,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
      ) -> Self {
          assert!(
              max_concurrency > 0,
-@@ -174,6 +216,10 @@ impl ConcurrencyLimiter {
+@@ -174,6 +234,10 @@ impl ConcurrencyLimiter {
              degradable_minimum == 0,
              "protected and degradable minimums must be enabled together"
          );
@@ -1670,19 +1936,20 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
          assert!(
              protected_minimum
                  .checked_add(degradable_minimum)
-@@ -184,26 +230,31 @@ impl ConcurrencyLimiter {
+@@ -184,26 +248,32 @@ impl ConcurrencyLimiter {
              inner: Arc::new(ConcurrencyLimiterInner {
                  tracker: Mutex::new(ActivePermitsTracker {
                      active_permits: Slab::new(),
 -                    active_by_class: [0; 3],
 -                    granted_by_class: [0; 3],
-+                    active_by_class: [0; 4],
-+                    granted_by_class: [0; 4],
++                    active_by_class: [0; 5],
++                    granted_by_class: [0; 5],
                      waiters: Slab::new(),
                      queues: array::from_fn(|_| VecDeque::new()),
 -                    next_elastic_class: ActiveJavascriptClass::Degradable,
 +                    next_tied_class: ActiveJavascriptClass::Degradable,
 +                    next_protected_control_plane: true,
++                    high_priority_streak: 0,
                  }),
                  max_permits: max_concurrency,
                  protected_minimum,
@@ -1714,7 +1981,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
          limiter
      }
  
-@@ -234,7 +285,60 @@ impl ConcurrencyLimiter {
+@@ -234,7 +304,61 @@ impl ConcurrencyLimiter {
      }
  
      pub(crate) fn class_aware_admission_enabled(&self) -> bool {
@@ -1724,6 +1991,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
 +
 +    pub(crate) fn effective_class(&self, class: ActiveJavascriptClass) -> ActiveJavascriptClass {
 +        match class {
++            ActiveJavascriptClass::HighPriorityMutation => class,
 +            ActiveJavascriptClass::ControlPlane => {
 +                if self.inner.control_plane_enabled {
 +                    class
@@ -1776,7 +2044,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
      }
  
      // If a client uses a thread for too long. We still want to log periodically.
-@@ -254,7 +358,9 @@ impl ConcurrencyLimiter {
+@@ -254,7 +378,9 @@ impl ConcurrencyLimiter {
                              "{client_id} held concurrency semaphore for more than {frequency:?}"
                          );
                      }
@@ -1787,7 +2055,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
                  }
              }
          }
-@@ -280,44 +386,80 @@ impl ConcurrencyLimiter {
+@@ -280,44 +406,80 @@ impl ConcurrencyLimiter {
          class: ActiveJavascriptClass,
          phase: ConcurrencyPermitPhase,
      ) -> ConcurrencyPermit {
@@ -1799,8 +2067,8 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
 -        } else {
 -            class
 -        };
-+        // Compatibility mode remains phase-only. The control-plane option
-+        // creates a fair subqueue inside protected capacity, not extra permits.
++        // Client priority and control-plane turns divide protected capacity.
++        // Other classes retain their compatibility collapse when floors are off.
 +        let class = self.effective_class(class);
          let queue = WaiterQueue::new(class, phase);
 -        let timer = concurrency_permit_acquire_timer(class, queue.phase());
@@ -1886,7 +2154,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
                  "active-JavaScript waiter awoke without a grant"
              );
              let class_index = class_index(class);
-@@ -326,8 +468,9 @@ impl ConcurrencyLimiter {
+@@ -326,8 +488,9 @@ impl ConcurrencyLimiter {
                  .expect("active-JavaScript granted count underflow");
              tracker.register(client_id.clone(), class)
          };
@@ -1898,7 +2166,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
          ConcurrencyPermit {
              permit_id,
              limiter: self.clone(),
-@@ -340,10 +483,10 @@ impl ConcurrencyLimiter {
+@@ -340,10 +503,10 @@ impl ConcurrencyLimiter {
          &self,
          client_id: Arc<String>,
      ) -> ConcurrencyPermit {
@@ -1913,7 +2181,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
          let phase = if !self.class_aware_admission_enabled() {
              ConcurrencyPermitPhase::Resume
          } else {
-@@ -355,25 +498,27 @@ impl ConcurrencyLimiter {
+@@ -355,25 +518,27 @@ impl ConcurrencyLimiter {
  
      fn cancel_waiter(&self, waiter_id: usize) {
          let mut tracker = self.inner.tracker.lock();
@@ -1947,7 +2215,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
              },
          }
          tracker.dispatch(&self.inner);
-@@ -383,6 +528,9 @@ impl ConcurrencyLimiter {
+@@ -383,6 +548,9 @@ impl ConcurrencyLimiter {
  struct WaiterGuard {
      limiter: ConcurrencyLimiter,
      waiter_id: Option<usize>,
@@ -1957,15 +2225,16 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
  }
  
  impl Drop for WaiterGuard {
-@@ -401,6 +549,7 @@ fn class_index(class: ActiveJavascriptClass) -> usize {
+@@ -401,6 +569,8 @@ fn class_index(class: ActiveJavascriptClass) -> usize {
          ActiveJavascriptClass::Dependency => 0,
          ActiveJavascriptClass::Protected => 1,
          ActiveJavascriptClass::Degradable => 2,
 +        ActiveJavascriptClass::ControlPlane => 3,
++        ActiveJavascriptClass::HighPriorityMutation => 4,
      }
  }
  
-@@ -420,7 +569,6 @@ impl ActivePermitsTracker {
+@@ -420,7 +590,6 @@ impl ActivePermitsTracker {
          self.active_by_class[class_index] = self.active_by_class[class_index]
              .checked_sub(1)
              .expect("active-JavaScript class count underflow");
@@ -1973,10 +2242,14 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
          (permit.started.elapsed(), permit.class)
      }
  
-@@ -435,6 +583,10 @@ impl ActivePermitsTracker {
+@@ -435,6 +604,14 @@ impl ActivePermitsTracker {
  
      fn class_has_waiter(&self, class: ActiveJavascriptClass) -> bool {
          match class {
++            ActiveJavascriptClass::HighPriorityMutation => {
++                !self.queues[WaiterQueue::HighPriorityMutationResume.index()].is_empty()
++                    || !self.queues[WaiterQueue::HighPriorityMutationInitial.index()].is_empty()
++            },
 +            ActiveJavascriptClass::ControlPlane => {
 +                !self.queues[WaiterQueue::ControlPlaneResume.index()].is_empty()
 +                    || !self.queues[WaiterQueue::ControlPlaneInitial.index()].is_empty()
@@ -1984,7 +2257,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
              ActiveJavascriptClass::Dependency => {
                  !self.queues[WaiterQueue::DependencyResume.index()].is_empty()
                      || !self.queues[WaiterQueue::DependencyInitial.index()].is_empty()
-@@ -451,11 +603,41 @@ impl ActivePermitsTracker {
+@@ -451,11 +628,55 @@ impl ActivePermitsTracker {
      }
  
      fn select_class(&mut self, inner: &ConcurrencyLimiterInner) -> Option<ActiveJavascriptClass> {
@@ -1993,8 +2266,10 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
 +            return Some(group);
 +        }
 +        let ordinary = self.class_has_waiter(ActiveJavascriptClass::Protected);
++        let high = self.class_has_waiter(ActiveJavascriptClass::HighPriorityMutation);
++        let application = ordinary || high;
 +        let control = self.class_has_waiter(ActiveJavascriptClass::ControlPlane);
-+        let selected = match (ordinary, control) {
++        let selected = match (application, control) {
 +            (true, true) if self.next_protected_control_plane => {
 +                ActiveJavascriptClass::ControlPlane
 +            },
@@ -2006,7 +2281,18 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
 +        // cannot hide deployment demand, and repeated deployments cannot starve
 +        // live protected work. Both retain the existing combined service floor.
 +        self.next_protected_control_plane = selected == ActiveJavascriptClass::Protected;
-+        Some(selected)
++        if selected == ActiveJavascriptClass::ControlPlane {
++            return Some(selected);
++        }
++        // Client hints divide existing protected service; sustained high demand
++        // never removes the ordinary service turn, including resumptions.
++        if high && (!ordinary || self.high_priority_streak < 2) {
++            self.high_priority_streak = self.high_priority_streak.saturating_add(1).min(2);
++            Some(ActiveJavascriptClass::HighPriorityMutation)
++        } else {
++            self.high_priority_streak = 0;
++            Some(ActiveJavascriptClass::Protected)
++        }
 +    }
 +
 +    fn select_group(&mut self, inner: &ConcurrencyLimiterInner) -> Option<ActiveJavascriptClass> {
@@ -2014,6 +2300,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
              return Some(ActiveJavascriptClass::Dependency);
          }
 +        let protected_waiting = self.class_has_waiter(ActiveJavascriptClass::Protected)
++            || self.class_has_waiter(ActiveJavascriptClass::HighPriorityMutation)
 +            || self.class_has_waiter(ActiveJavascriptClass::ControlPlane);
 +        if inner.protected_minimum == 0 {
 +            assert!(
@@ -2027,7 +2314,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
          let degradable_waiting = self.class_has_waiter(ActiveJavascriptClass::Degradable);
          match (protected_waiting, degradable_waiting) {
              (false, false) => return None,
-@@ -464,19 +646,8 @@ impl ActivePermitsTracker {
+@@ -464,19 +685,9 @@ impl ActivePermitsTracker {
              (true, true) => {},
          }
  
@@ -2045,11 +2332,12 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
 -
 -        let protected_occupancy = self.class_occupancy(ActiveJavascriptClass::Protected);
 +        let protected_occupancy = self.class_occupancy(ActiveJavascriptClass::Protected)
++            + self.class_occupancy(ActiveJavascriptClass::HighPriorityMutation)
 +            + self.class_occupancy(ActiveJavascriptClass::ControlPlane);
          let degradable_occupancy = self.class_occupancy(ActiveJavascriptClass::Degradable);
          let protected_below = protected_occupancy < inner.protected_minimum;
          let degradable_below = degradable_occupancy < inner.degradable_minimum;
-@@ -496,7 +667,7 @@ impl ActivePermitsTracker {
+@@ -496,7 +707,7 @@ impl ActivePermitsTracker {
                  } else if degradable_scaled < protected_scaled {
                      Some(ActiveJavascriptClass::Degradable)
                  } else {
@@ -2058,7 +2346,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
                  }
              },
              (false, false) => {
-@@ -511,19 +682,19 @@ impl ActivePermitsTracker {
+@@ -511,19 +722,21 @@ impl ActivePermitsTracker {
                  } else if degradable_elastic < protected_elastic {
                      Some(ActiveJavascriptClass::Degradable)
                  } else {
@@ -2079,15 +2367,21 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
              ActiveJavascriptClass::Degradable => ActiveJavascriptClass::Protected,
 -            ActiveJavascriptClass::Dependency => {
 -                panic!("dependency cannot be the next elastic active-JavaScript class")
-+            ActiveJavascriptClass::Dependency | ActiveJavascriptClass::ControlPlane => {
++            ActiveJavascriptClass::Dependency
++            | ActiveJavascriptClass::ControlPlane
++            | ActiveJavascriptClass::HighPriorityMutation => {
 +                panic!("only protected and degradable groups can break an admission tie")
              },
          };
          selected
-@@ -531,6 +702,10 @@ impl ActivePermitsTracker {
+@@ -531,6 +744,14 @@ impl ActivePermitsTracker {
  
      fn pop_waiter(&mut self, class: ActiveJavascriptClass) -> Option<usize> {
          let queues = match class {
++            ActiveJavascriptClass::HighPriorityMutation => [
++                WaiterQueue::HighPriorityMutationResume,
++                WaiterQueue::HighPriorityMutationInitial,
++            ],
 +            ActiveJavascriptClass::ControlPlane => [
 +                WaiterQueue::ControlPlaneResume,
 +                WaiterQueue::ControlPlaneInitial,
@@ -2095,7 +2389,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
              ActiveJavascriptClass::Dependency => [
                  WaiterQueue::DependencyResume,
                  WaiterQueue::DependencyInitial,
-@@ -563,20 +738,20 @@ impl ActivePermitsTracker {
+@@ -563,20 +784,20 @@ impl ActivePermitsTracker {
                  .waiters
                  .get_mut(waiter_id)
                  .expect("queued active-JavaScript waiter is missing");
@@ -2128,7 +2422,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
          }
      }
  
-@@ -637,9 +812,14 @@ impl Drop for ConcurrencyPermit {
+@@ -637,9 +858,14 @@ impl Drop for ConcurrencyPermit {
          let mut tracker = self.limiter.inner.tracker.lock();
          let (duration, class) = tracker.deregister(self.permit_id);
          assert_eq!(class, self.class, "active-JavaScript permit class drifted");
@@ -2144,10 +2438,134 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
      }
  }
  
-@@ -687,31 +867,177 @@ mod tests {
+@@ -687,31 +913,301 @@ mod tests {
          limiter.acquire_with_class(Arc::new(name), class, phase)
      }
  
++    #[tokio::test]
++    async fn mutation_priority_is_bounded_and_survives_suspension() {
++        use ActiveJavascriptClass::{
++            HighPriorityMutation as High,
++            Protected,
++        };
++        use ConcurrencyPermitPhase::{
++            Initial,
++            Resume,
++        };
++        let limiter = ConcurrencyLimiter::new(1);
++        let suspended = acquire(&limiter, "high-resume", High, Initial)
++            .await
++            .suspend();
++        let held = acquire(&limiter, "held", Protected, Initial).await;
++        let mut ordinary_resume = Box::pin(acquire(&limiter, "ordinary-resume", Protected, Resume));
++        let mut ordinary_initial =
++            Box::pin(acquire(&limiter, "ordinary-initial", Protected, Initial));
++        let mut high_resume = Box::pin(suspended.acquire());
++        let mut high_first = Box::pin(acquire(&limiter, "high-first", High, Initial));
++        let mut high_second = Box::pin(acquire(&limiter, "high-second", High, Initial));
++        assert!(poll!(ordinary_resume.as_mut()).is_pending());
++        assert!(poll!(ordinary_initial.as_mut()).is_pending());
++        assert!(poll!(high_resume.as_mut()).is_pending());
++        assert!(poll!(high_first.as_mut()).is_pending());
++        assert!(poll!(high_second.as_mut()).is_pending());
++        drop(held);
++        let resumed = high_resume
++            .now_or_never()
++            .expect("high resume must be first");
++        assert_eq!(resumed.class, High);
++        assert!(poll!(ordinary_resume.as_mut()).is_pending());
++        drop(resumed);
++        let first = high_first.now_or_never().expect("second high turn");
++        drop(first);
++        let ordinary = ordinary_resume
++            .now_or_never()
++            .expect("ordinary resume after two high turns");
++        assert!(poll!(high_second.as_mut()).is_pending());
++        drop(ordinary);
++        drop(high_second.now_or_never().expect("next high turn"));
++        drop(
++            ordinary_initial
++                .now_or_never()
++                .expect("ordinary initial progresses"),
++        );
++        assert_eq!(limiter.active_permits(), 0);
++    }
++
++    #[tokio::test]
++    async fn mutation_priority_preserves_floors_and_platform_admission() {
++        use ActiveJavascriptClass::{
++            ControlPlane,
++            Degradable,
++            Dependency,
++            HighPriorityMutation as High,
++            Protected,
++        };
++        use ConcurrencyPermitPhase::Initial;
++        let limiter = ConcurrencyLimiter::new_with_class_minimums(2, 1, 1, true);
++        let first = acquire(&limiter, "first", High, Initial).await;
++        let second = acquire(&limiter, "second", High, Initial).await;
++        let mut ordinary = Box::pin(acquire(&limiter, "ordinary", Protected, Initial));
++        let mut high = Box::pin(acquire(&limiter, "high", High, Initial));
++        let mut degradable = Box::pin(acquire(&limiter, "degradable", Degradable, Initial));
++        let mut control = Box::pin(acquire(&limiter, "control", ControlPlane, Initial));
++        let mut dependency = Box::pin(acquire(&limiter, "dependency", Dependency, Initial));
++        assert!(poll!(ordinary.as_mut()).is_pending());
++        assert!(poll!(high.as_mut()).is_pending());
++        assert!(poll!(degradable.as_mut()).is_pending());
++        assert!(poll!(control.as_mut()).is_pending());
++        assert!(poll!(dependency.as_mut()).is_pending());
++        drop(first);
++        let dependency = dependency
++            .now_or_never()
++            .expect("dependency precedes client hints");
++        assert_eq!(limiter.active_permits(), 2);
++        drop(dependency);
++        let degradable = degradable
++            .now_or_never()
++            .expect("degradable floor survives high demand");
++        drop(second);
++        let control = control
++            .now_or_never()
++            .expect("control plane retains its turn");
++        assert_eq!(limiter.active_permits(), 2);
++        drop(control);
++        drop(high.now_or_never().expect("high application turn"));
++        drop(ordinary.now_or_never().expect("ordinary application turn"));
++        drop(degradable);
++        assert_eq!(limiter.active_permits(), 0);
++    }
++
++    #[tokio::test]
++    async fn cancelled_high_mutations_release_queued_and_granted_capacity() {
++        use ActiveJavascriptClass::{
++            HighPriorityMutation as High,
++            Protected,
++        };
++        use ConcurrencyPermitPhase::Initial;
++        let limiter = ConcurrencyLimiter::new(1);
++        let held = acquire(&limiter, "held", Protected, Initial).await;
++        let mut queued = Box::pin(acquire(&limiter, "cancel-queued", High, Initial));
++        assert!(poll!(queued.as_mut()).is_pending());
++        drop(queued);
++        assert_eq!(limiter.waiting_permits(High, Initial), 0);
++        let mut granted = Box::pin(acquire(&limiter, "cancel-granted", High, Initial));
++        let mut ordinary = Box::pin(acquire(&limiter, "ordinary", Protected, Initial));
++        assert!(poll!(granted.as_mut()).is_pending());
++        assert!(poll!(ordinary.as_mut()).is_pending());
++        drop(held);
++        assert!(poll!(ordinary.as_mut()).is_pending());
++        drop(granted);
++        drop(
++            ordinary
++                .now_or_never()
++                .expect("cancelled grant transfers capacity"),
++        );
++        assert_eq!(limiter.active_permits(), 0);
++        assert!(limiter
++            .try_acquire(Arc::new("reusable".to_owned()))
++            .is_some());
++    }
++
 +    #[cfg(feature = "static-hermes-wasmtime-gate")]
 +    #[tokio::test]
 +    async fn wasm_limiter_does_not_publish_javascript_metrics() {
@@ -2296,7 +2714,8 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
 +        drop(held);
 +        let Poll::Ready(first_resume_permit) = poll!(first_resume.as_mut()) else {
 +            panic!("first resumption was not granted first");
-+        };
+         };
+-        drop(low_priority_permit);
 +        assert_eq!(first_resume_permit.class, ActiveJavascriptClass::Protected);
 +        assert!(matches!(poll!(second_resume.as_mut()), Poll::Pending));
 +        assert!(matches!(poll!(first_initial.as_mut()), Poll::Pending));
@@ -2311,8 +2730,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
 +
 +        let Poll::Ready(first_initial_permit) = poll!(first_initial.as_mut()) else {
 +            panic!("first initial start did not follow resumptions");
-         };
--        drop(low_priority_permit);
++        };
 +        assert_eq!(first_initial_permit.class, ActiveJavascriptClass::Protected);
 +        assert!(matches!(poll!(second_initial.as_mut()), Poll::Pending));
 +        drop(first_initial_permit);
@@ -2334,7 +2752,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
          let held = limiter.acquire(Arc::new("held".to_owned()), false).await;
          let second_held = limiter
              .acquire(Arc::new("second-held".to_owned()), false)
-@@ -746,6 +1072,24 @@ mod tests {
+@@ -746,6 +1242,24 @@ mod tests {
          drop(second_held);
      }
  
@@ -2359,7 +2777,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
      #[tokio::test]
      async fn degradable_uses_ordinary_admission_without_class_minimums() {
          let limiter = ConcurrencyLimiter::new(1);
-@@ -761,7 +1105,7 @@ mod tests {
+@@ -761,7 +1275,7 @@ mod tests {
  
      #[tokio::test]
      async fn resumption_precedes_initial_start_within_a_class() {
@@ -2368,7 +2786,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
          let first = limiter.acquire(Arc::new("first".to_owned()), false).await;
          let second = limiter.acquire(Arc::new("second".to_owned()), false).await;
          let mut initial = Box::pin(acquire(
-@@ -790,7 +1134,7 @@ mod tests {
+@@ -790,7 +1304,7 @@ mod tests {
  
      #[tokio::test]
      async fn class_minimums_are_work_conserving_and_balance_elastic_occupancy() {
@@ -2377,7 +2795,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
          let held: Vec<_> = futures::future::join_all(
              (0..6).map(|index| limiter.acquire(Arc::new(format!("held-{index}")), false)),
          )
-@@ -837,9 +1181,79 @@ mod tests {
+@@ -837,9 +1351,79 @@ mod tests {
          drop(degradable_permits);
      }
  
@@ -2458,7 +2876,7 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
          let first = limiter.acquire(Arc::new("first".to_owned()), false).await;
          let second = limiter.acquire(Arc::new("second".to_owned()), false).await;
          let mut cancelled = Box::pin(acquire(
-@@ -864,6 +1278,103 @@ mod tests {
+@@ -864,6 +1448,103 @@ mod tests {
          assert_eq!(limiter.active_permits(), 0);
      }
  
@@ -2563,10 +2981,44 @@ index 1743bd613dcf338859353c02f674017cad372252..88ab2a070c9988e603c9c007022709ec
      async fn cancelling_a_granted_request_transfers_capacity() {
          let limiter = ConcurrencyLimiter::new(1);
 diff --git a/crates/isolate/src/isolate_queue.rs b/crates/isolate/src/isolate_queue.rs
-index bbe65c8f03bc31ebb7819ddeb78a273a256a3c97..e606f2f74d64a668f00eeddac1ec1011fe27cc98 100644
+index bbe65c8f03bc31ebb7819ddeb78a273a256a3c97..552e608e6776dc2bc2e1acb7dc068e14245e0ffc 100644
 --- a/crates/isolate/src/isolate_queue.rs
 +++ b/crates/isolate/src/isolate_queue.rs
-@@ -140,6 +140,7 @@ pub(crate) struct IsolateQueueConfig {
+@@ -26,14 +26,16 @@ pub(crate) enum IsolateQueueLane {
+     ControlPlane,
+     IndependentAction,
+     Ordinary,
++    HighPriorityMutation,
+ }
+ 
+ impl IsolateQueueLane {
+-    const ALL: [Self; 4] = [
++    pub(crate) const ALL: [Self; 5] = [
+         Self::Dependency,
+         Self::ControlPlane,
+         Self::IndependentAction,
+         Self::Ordinary,
++        Self::HighPriorityMutation,
+     ];
+ 
+     fn index(self) -> usize {
+@@ -42,6 +44,7 @@ impl IsolateQueueLane {
+             Self::ControlPlane => 1,
+             Self::IndependentAction => 2,
+             Self::Ordinary => 3,
++            Self::HighPriorityMutation => 4,
+         }
+     }
+ 
+@@ -51,6 +54,7 @@ impl IsolateQueueLane {
+             Self::ControlPlane => "control_plane",
+             Self::IndependentAction => "independent_action",
+             Self::Ordinary => "ordinary",
++            Self::HighPriorityMutation => "high_priority_mutation",
+         }
+     }
+ }
+@@ -140,6 +144,7 @@ pub(crate) struct IsolateQueueConfig {
      hard_max_age: Duration,
      control_plane_hard_max_age: Duration,
      pub(crate) control_plane_capacity: usize,
@@ -2574,7 +3026,7 @@ index bbe65c8f03bc31ebb7819ddeb78a273a256a3c97..e606f2f74d64a668f00eeddac1ec1011
  }
  
  impl IsolateQueueConfig {
-@@ -201,6 +202,7 @@ impl IsolateQueueConfig {
+@@ -201,6 +206,7 @@ impl IsolateQueueConfig {
              hard_max_age,
              control_plane_hard_max_age,
              control_plane_capacity,
@@ -2582,7 +3034,31 @@ index bbe65c8f03bc31ebb7819ddeb78a273a256a3c97..e606f2f74d64a668f00eeddac1ec1011
          })
      }
  }
-@@ -377,6 +379,10 @@ impl<T> IsolateDelayQueue<T> {
+@@ -331,7 +337,7 @@ pub(crate) struct IsolateQueueOutput<T> {
+ }
+ 
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+-struct IneligibleCounts([[usize; 6]; 4]);
++struct IneligibleCounts([[usize; 6]; 5]);
+ 
+ impl IneligibleCounts {
+     fn increment(&mut self, lane: IsolateQueueLane, eligibility: IsolateQueueEligibility) {
+@@ -360,11 +366,12 @@ struct SelectionAttempt<T> {
+ 
+ struct IsolateDelayQueue<T> {
+     buffer: VecDeque<QueueEntry<T>>,
+-    lane_depths: [usize; 4],
++    lane_depths: [usize; 5],
+     capacity: usize,
+     capacity_with_reserve: usize,
+     config: IsolateQueueConfig,
+-    controllers: [LaneDelayController; 4],
++    controllers: [LaneDelayController; 5],
++    high_priority_streak: u8,
+ }
+ 
+ impl<T> IsolateDelayQueue<T> {
+@@ -377,13 +384,18 @@ impl<T> IsolateDelayQueue<T> {
          let capacity_with_reserve = capacity
              .checked_add(reserved_capacity)
              .expect("isolate queue capacity overflow");
@@ -2592,8 +3068,18 @@ index bbe65c8f03bc31ebb7819ddeb78a273a256a3c97..e606f2f74d64a668f00eeddac1ec1011
 +        );
          Self {
              buffer: VecDeque::new(),
-             lane_depths: [0; 4],
-@@ -396,10 +402,18 @@ impl<T> IsolateDelayQueue<T> {
+-            lane_depths: [0; 4],
++            lane_depths: [0; 5],
+             capacity,
+             capacity_with_reserve,
+             config,
+-            controllers: [LaneDelayController::new(now, config.interval); 4],
++            controllers: [LaneDelayController::new(now, config.interval); 5],
++            high_priority_streak: 0,
+         }
+     }
+ 
+@@ -396,10 +408,20 @@ impl<T> IsolateDelayQueue<T> {
          // The scheduler derives the lane once from request properties. Using
          // that same value as the reserve authority prevents admission and
          // delay-control classification from drifting apart.
@@ -2604,7 +3090,9 @@ index bbe65c8f03bc31ebb7819ddeb78a273a256a3c97..e606f2f74d64a668f00eeddac1ec1011
 +        let capacity = match lane {
 +            IsolateQueueLane::Dependency => self.capacity_with_reserve,
 +            IsolateQueueLane::ControlPlane => self.capacity,
-+            IsolateQueueLane::Ordinary | IsolateQueueLane::IndependentAction => {
++            IsolateQueueLane::Ordinary
++            | IsolateQueueLane::IndependentAction
++            | IsolateQueueLane::HighPriorityMutation => {
 +                // Count occupied control-plane slots only once. Dependencies
 +                // retain access to the complete queue so ancestors can finish.
 +                self.capacity
@@ -2616,7 +3104,222 @@ index bbe65c8f03bc31ebb7819ddeb78a273a256a3c97..e606f2f74d64a668f00eeddac1ec1011
          };
          if self.buffer.len() >= capacity {
              // Return ownership so the sender can drop arbitrary request
-@@ -1615,6 +1629,71 @@ mod tests {
+@@ -463,17 +485,47 @@ impl<T> IsolateDelayQueue<T> {
+         }
+ 
+         let mut ineligible = IneligibleCounts::default();
+-        let mut selected_index = None;
++        let mut first = None;
++        let mut ordinary = None;
++        let mut high = None;
++        let mut platform = None;
+         for (index, entry) in self.buffer.iter().enumerate() {
+             let eligibility = select(&entry.item);
+             if eligibility.is_eligible() {
+-                if selected_index.is_none() {
+-                    selected_index = Some(index);
++                first.get_or_insert(index);
++                match entry.lane {
++                    IsolateQueueLane::HighPriorityMutation => {
++                        high.get_or_insert(index);
++                    },
++                    IsolateQueueLane::Dependency | IsolateQueueLane::ControlPlane => {
++                        platform.get_or_insert(index);
++                    },
++                    IsolateQueueLane::Ordinary | IsolateQueueLane::IndependentAction => {
++                        ordinary.get_or_insert(index);
++                    },
+                 }
+             } else {
+                 ineligible.increment(entry.lane, eligibility);
+             }
+         }
++        // A client hint cannot cross an eligible platform request in the queue.
++        // Keep FIFO at that barrier rather than promoting later platform work
++        // indefinitely ahead of older ordinary work. Otherwise high gets at
++        // most two selections before the oldest eligible ordinary request.
++        let selected_index = match high {
++            None => first,
++            Some(_) if ordinary.is_some() && self.high_priority_streak >= 2 => {
++                // Paying the ordinary turn must not move it ahead of an older
++                // platform request either. That finite prefix drains first.
++                match (ordinary, platform) {
++                    (Some(ordinary), Some(platform)) => Some(ordinary.min(platform)),
++                    (ordinary, None) => ordinary,
++                    (None, Some(_)) => unreachable!("ordinary waiter was checked above"),
++                }
++            },
++            Some(high) if platform.is_some_and(|platform| platform < high) => first,
++            Some(high) => Some(high),
++        };
+         let Some(selected_index) = selected_index else {
+             return SelectionAttempt {
+                 selected: None,
+@@ -482,6 +534,15 @@ impl<T> IsolateDelayQueue<T> {
+         };
+ 
+         let entry = self.remove(selected_index);
++        match entry.lane {
++            IsolateQueueLane::HighPriorityMutation => {
++                self.high_priority_streak = self.high_priority_streak.saturating_add(1).min(2)
++            },
++            IsolateQueueLane::Ordinary | IsolateQueueLane::IndependentAction => {
++                self.high_priority_streak = 0
++            },
++            IsolateQueueLane::Dependency | IsolateQueueLane::ControlPlane => (),
++        }
+         let sojourn = now.saturating_duration_since(entry.enqueued_at);
+         let controller = &mut self.controllers[entry.lane.index()];
+         let mut transitions = controller.observe(now, sojourn, self.config);
+@@ -573,9 +634,10 @@ impl<T> IsolateDelayQueue<T> {
+     fn drain(
+         &mut self,
+         now: tokio::time::Instant,
+-    ) -> (VecDeque<QueueEntry<T>>, [ControllerTransitions; 4]) {
++    ) -> (VecDeque<QueueEntry<T>>, [ControllerTransitions; 5]) {
+         let queued = std::mem::take(&mut self.buffer);
+-        self.lane_depths = [0; 4];
++        self.lane_depths = [0; 5];
++        self.high_priority_streak = 0;
+         let transitions = IsolateQueueLane::ALL
+             .map(|lane| self.controllers[lane.index()].reset(now, self.config.interval));
+         (queued, transitions)
+@@ -1155,6 +1217,134 @@ mod tests {
+         IsolateQueueEligibility::eligible()
+     }
+ 
++    #[test]
++    fn mutation_priority_has_bounded_turns_and_respects_platform_fifo() {
++        use IsolateQueueLane::{
++            ControlPlane,
++            Dependency,
++            HighPriorityMutation as High,
++            Ordinary,
++        };
++        let now = tokio::time::Instant::now();
++        let mut queue = IsolateDelayQueue::new(now, 16, 2, config());
++        for (item, lane) in [
++            ("ordinary-first", Ordinary),
++            ("dependency", Dependency),
++            ("high-first", High),
++            ("ordinary-second", Ordinary),
++            ("high-second", High),
++            ("high-third", High),
++            ("control", ControlPlane),
++            ("high-fourth", High),
++        ] {
++            queue.push(item, lane, now).unwrap();
++        }
++        for expected in [
++            "ordinary-first",
++            "dependency",
++            "high-first",
++            "high-second",
++            "ordinary-second",
++            "high-third",
++            "control",
++            "high-fourth",
++        ] {
++            let selected = queue.pop_selecting(now, &mut eligible).selected.unwrap();
++            assert_eq!(selected.output.item, expected);
++            assert_eq!(selected.output.rejection, None);
++        }
++        // The ordinary turn cannot cross a platform request that arrived
++        // between it and the remaining high request.
++        queue.push("high-fifth", High, now).unwrap();
++        queue.push("control-second", ControlPlane, now).unwrap();
++        queue.push("ordinary-third", Ordinary, now).unwrap();
++        for expected in ["control-second", "ordinary-third", "high-fifth"] {
++            assert_eq!(
++                queue
++                    .pop_selecting(now, &mut eligible)
++                    .selected
++                    .unwrap()
++                    .output
++                    .item,
++                expected
++            );
++        }
++        assert!(queue.is_empty());
++        assert_eq!(queue.lane_depths, [0; 5]);
++    }
++
++    #[test]
++    fn mutation_priority_does_not_use_reserves_or_block_on_ineligible_work() {
++        use IsolateQueueLane::{
++            ControlPlane,
++            Dependency,
++            HighPriorityMutation as High,
++            Ordinary,
++        };
++        let now = tokio::time::Instant::now();
++        let mut config = config();
++        config.control_plane_reserved_capacity = 1;
++        let mut queue = IsolateDelayQueue::new(now, 3, 1, config);
++        queue.push("blocked-high", High, now).unwrap();
++        queue.push("ordinary", Ordinary, now).unwrap();
++        assert_eq!(
++            queue.push("high-rejected", High, now),
++            Err((IsolateQueueSendError::QueueFull, "high-rejected"))
++        );
++        queue.push("control", ControlPlane, now).unwrap();
++        assert_eq!(
++            queue.push("high-rejected", High, now),
++            Err((IsolateQueueSendError::QueueFull, "high-rejected"))
++        );
++        assert!(queue.push("dependency", Dependency, now).unwrap());
++        let mut eligibility = |item: &&str| IsolateQueueEligibility {
++            physical_total: *item == "blocked-high",
++            ..IsolateQueueEligibility::eligible()
++        };
++        assert_eq!(
++            queue
++                .pop_selecting(now, &mut eligibility)
++                .selected
++                .unwrap()
++                .output
++                .item,
++            "ordinary"
++        );
++        assert_eq!(
++            queue
++                .pop_selecting(now, &mut eligibility)
++                .selected
++                .unwrap()
++                .output
++                .item,
++            "control"
++        );
++        assert_eq!(
++            queue
++                .pop_selecting(now, &mut eligibility)
++                .selected
++                .unwrap()
++                .output
++                .item,
++            "dependency"
++        );
++        assert!(queue
++            .pop_selecting(now, &mut eligibility)
++            .selected
++            .is_none());
++        let expired = queue
++            .pop_selecting(now + config.hard_max_age, &mut eligibility)
++            .selected
++            .unwrap();
++        assert_eq!(expired.output.item, "blocked-high");
++        assert_eq!(
++            expired.output.rejection,
++            Some(IsolateQueueRejection::HardExpired)
++        );
++        assert_eq!(queue.lane_depths, [0; 5]);
++        assert!(queue.is_empty());
++    }
++
+     #[test]
+     fn controller_requires_two_slow_samples_from_a_complete_interval() {
+         let start = tokio::time::Instant::now();
+@@ -1615,6 +1805,71 @@ mod tests {
          );
      }
  
@@ -2689,10 +3392,10 @@ index bbe65c8f03bc31ebb7819ddeb78a273a256a3c97..e606f2f74d64a668f00eeddac1ec1011
      fn control_plane_preserves_fifo_with_ordinary_requests() {
          let start = tokio::time::Instant::now();
 diff --git a/crates/isolate/src/metrics.rs b/crates/isolate/src/metrics.rs
-index e679080a4d153b7d9036d1f8a075e59f21e07e0c..729bcf77dd6310dfedf136b231c4915484b7a3f4 100644
+index e679080a4d153b7d9036d1f8a075e59f21e07e0c..1c44bad28800a3c4322569dcf0a39a2ce40bb2f3 100644
 --- a/crates/isolate/src/metrics.rs
 +++ b/crates/isolate/src/metrics.rs
-@@ -44,7 +44,6 @@ use metrics::{
+@@ -44,11 +44,11 @@ use metrics::{
  use prometheus::VMHistogram;
  
  use crate::{
@@ -2700,7 +3403,12 @@ index e679080a4d153b7d9036d1f8a075e59f21e07e0c..729bcf77dd6310dfedf136b231c49154
      context_cache::{
          ContextCacheClearReason,
          ReusableContextKind,
-@@ -631,8 +630,6 @@ register_convex_counter!(
+     },
++    isolate_queue::IsolateQueueLane,
+     module_map::ModulesRegistered,
+     IsolateHeapStats,
+ };
+@@ -631,8 +631,6 @@ register_convex_counter!(
  #[strum(serialize_all = "snake_case")]
  pub(crate) enum RejectedBeforeExecutionReason {
      ExpiredInQueue,
@@ -2709,7 +3417,7 @@ index e679080a4d153b7d9036d1f8a075e59f21e07e0c..729bcf77dd6310dfedf136b231c49154
      IsolateNotClean,
      InitialPermitTimeout,
      ExecuteQueueFull,
-@@ -646,9 +643,6 @@ impl RejectedBeforeExecutionReason {
+@@ -646,9 +644,6 @@ impl RejectedBeforeExecutionReason {
                  "Too many concurrent requests in a short period of time. Spread out your requests \
                   out over time or throttle them to avoid errors.",
              ),
@@ -2719,7 +3427,7 @@ index e679080a4d153b7d9036d1f8a075e59f21e07e0c..729bcf77dd6310dfedf136b231c49154
              Self::IsolateNotClean => ErrorMetadata::rejected_before_execution(
                  "IsolateNotClean",
                  "Selected isolate was not clean",
-@@ -686,13 +680,12 @@ pub fn initialize_capacity_counters(name: &'static str) {
+@@ -686,19 +681,12 @@ pub fn initialize_capacity_counters(name: &'static str) {
          "dependency_descendant_holder",
          "control_plane",
      ];
@@ -2731,10 +3439,26 @@ index e679080a4d153b7d9036d1f8a075e59f21e07e0c..729bcf77dd6310dfedf136b231c49154
          "delay_control_shed",
          "caller_dropped",
 -        "no_worker",
+-    ];
+-    const QUEUE_LANES: [&str; 4] = [
+-        "dependency",
+-        "control_plane",
+-        "independent_action",
+-        "ordinary",
      ];
-     const QUEUE_LANES: [&str; 4] = [
-         "dependency",
-@@ -1341,8 +1334,7 @@ pub fn create_code_cache_timer() -> StatusTimer {
+     const QUEUE_REJECTION_REASONS: [&str; 6] = [
+         "queue_full",
+@@ -721,7 +709,8 @@ pub fn initialize_capacity_counters(name: &'static str) {
+             log_counter_with_labels(&ISOLATE_SCHEDULER_REQUESTS_REJECTED_TOTAL, 0, labels);
+         }
+     }
+-    for lane in QUEUE_LANES {
++    for lane in IsolateQueueLane::ALL {
++        let lane = lane.as_label();
+         for reason in QUEUE_REJECTION_REASONS {
+             log_counter_with_labels(
+                 &ISOLATE_QUEUE_REJECTIONS_TOTAL,
+@@ -1341,8 +1330,7 @@ pub fn create_code_cache_timer() -> StatusTimer {
  
  register_convex_histogram!(
      CONCURRENCY_PERMIT_ACQUIRE_SECONDS,
@@ -2744,15 +3468,16 @@ index e679080a4d153b7d9036d1f8a075e59f21e07e0c..729bcf77dd6310dfedf136b231c49154
      &[STATUS_LABEL[0], "active_javascript_class", "phase"]
  );
  
-@@ -1353,6 +1345,7 @@ fn active_javascript_class_label(class: ActiveJavascriptClass) -> StaticMetricLa
+@@ -1353,6 +1341,8 @@ fn active_javascript_class_label(class: ActiveJavascriptClass) -> StaticMetricLa
              ActiveJavascriptClass::Dependency => "dependency",
              ActiveJavascriptClass::Protected => "protected",
              ActiveJavascriptClass::Degradable => "degradable",
 +            ActiveJavascriptClass::ControlPlane => "control_plane",
++            ActiveJavascriptClass::HighPriorityMutation => "high_priority_mutation",
          },
      )
  }
-@@ -1373,17 +1366,21 @@ pub(crate) fn concurrency_permit_acquire_timer(
+@@ -1373,17 +1363,22 @@ pub(crate) fn concurrency_permit_acquire_timer(
  
  register_convex_gauge!(
      ACTIVE_JAVASCRIPT_CAPACITY_INFO,
@@ -2768,7 +3493,8 @@ index e679080a4d153b7d9036d1f8a075e59f21e07e0c..729bcf77dd6310dfedf136b231c49154
  );
 +register_convex_gauge!(
 +    ACTIVE_JAVASCRIPT_PROTECTED_GROUP_OCCUPANCY_INFO,
-+    "Combined protected and control-plane permits held or granted; shares one protected floor"
++    "Combined ordinary protected, high mutation, and control-plane permits held or granted; \
++     shares one protected floor"
 +);
  register_convex_gauge!(
      ACTIVE_JAVASCRIPT_WAITERS_INFO,
@@ -2777,23 +3503,26 @@ index e679080a4d153b7d9036d1f8a075e59f21e07e0c..729bcf77dd6310dfedf136b231c49154
      &["active_javascript_class", "phase"]
  );
  
-@@ -1405,7 +1402,9 @@ pub(crate) fn initialize_active_javascript_metrics(
+@@ -1405,7 +1400,10 @@ pub(crate) fn initialize_active_javascript_metrics(
      }
      static INITIALIZE_OCCUPANCY: Once = Once::new();
      INITIALIZE_OCCUPANCY.call_once(|| {
 +        log_gauge(&ACTIVE_JAVASCRIPT_PROTECTED_GROUP_OCCUPANCY_INFO, 0.0);
          for class in [
 +            ActiveJavascriptClass::ControlPlane,
++            ActiveJavascriptClass::HighPriorityMutation,
              ActiveJavascriptClass::Dependency,
              ActiveJavascriptClass::Protected,
              ActiveJavascriptClass::Degradable,
-@@ -1430,6 +1429,14 @@ pub(crate) fn initialize_active_javascript_metrics(
+@@ -1430,6 +1428,16 @@ pub(crate) fn initialize_active_javascript_metrics(
  }
  
  pub(crate) fn increment_active_javascript_occupancy(class: ActiveJavascriptClass) {
 +    if matches!(
 +        class,
-+        ActiveJavascriptClass::Protected | ActiveJavascriptClass::ControlPlane
++        ActiveJavascriptClass::Protected
++            | ActiveJavascriptClass::ControlPlane
++            | ActiveJavascriptClass::HighPriorityMutation
 +    ) {
 +        // Aggregate before scrape/alignment: adding separate class maxima
 +        // would invent simultaneous occupancy when their peaks differ.
@@ -2802,19 +3531,325 @@ index e679080a4d153b7d9036d1f8a075e59f21e07e0c..729bcf77dd6310dfedf136b231c49154
      add_to_gauge_with_labels(
          &ACTIVE_JAVASCRIPT_OCCUPANCY_INFO,
          1.0,
-@@ -1438,6 +1445,12 @@ pub(crate) fn increment_active_javascript_occupancy(class: ActiveJavascriptClass
+@@ -1438,6 +1446,14 @@ pub(crate) fn increment_active_javascript_occupancy(class: ActiveJavascriptClass
  }
  
  pub(crate) fn decrement_active_javascript_occupancy(class: ActiveJavascriptClass) {
 +    if matches!(
 +        class,
-+        ActiveJavascriptClass::Protected | ActiveJavascriptClass::ControlPlane
++        ActiveJavascriptClass::Protected
++            | ActiveJavascriptClass::ControlPlane
++            | ActiveJavascriptClass::HighPriorityMutation
 +    ) {
 +        ACTIVE_JAVASCRIPT_PROTECTED_GROUP_OCCUPANCY_INFO.dec();
 +    }
      subtract_from_gauge_with_labels(
          &ACTIVE_JAVASCRIPT_OCCUPANCY_INFO,
          1.0,
+@@ -1896,15 +1912,15 @@ mod tests {
+         );
+         assert_eq!(
+             zero_series_for_pool(&*ISOLATE_SCHEDULER_REQUESTS_REJECTED_TOTAL, POOL_NAME),
+-            30
++            25
+         );
+         assert_eq!(
+             zero_series_for_pool(&*ISOLATE_QUEUE_REJECTIONS_TOTAL, POOL_NAME),
+-            24
++            30
+         );
+         assert_eq!(
+             zero_series_for_pool(&*ISOLATE_QUEUE_OVERLOAD_TRANSITIONS_TOTAL, POOL_NAME),
+-            8
++            10
+         );
+     }
+ }
+diff --git a/crates/local_backend/AGENTS.md b/crates/local_backend/AGENTS.md
+index c0e1e26a9b3d30abc6bb970fdd7915356b601915..fd1f57861e31c32df0f45801ad7b5786e4bffbac 100644
+--- a/crates/local_backend/AGENTS.md
++++ b/crates/local_backend/AGENTS.md
+@@ -12,6 +12,16 @@ in `src/router.rs`, each with a checked-in spec:
+ | `DashboardApiDoc` | `/api/dashboard_openapi.json` | `npm-packages/dashboard/dashboard-deployment-openapi.json`         |
+ 
+ After changing anything that feeds the specs — a route, its
+-`#[utoipa::path(...)]` annotation, or a docstring baked into a description — run
+-`just generate-api-specs`, or `test_api_specs_match` will fail. Commit the
+-regenerated JSON specs and TypeScript clients alongside the Rust change.
++`#[utoipa::path(...)]` annotation, or a docstring baked into a description —
++regenerate the affected checked-in JSON specs and TypeScript clients alongside
++the Rust change.
++
++For the public API spec, run this command from the repository root:
++
++```sh
++UPDATE_API_SPECS=1 scripts/run_cargo.sh test -p local_backend --lib test_public_api_spec_matches
++```
++
++Without `UPDATE_API_SPECS`, the same test checks that the generated public spec
++matches the checked-in file. This checkout does not define the
++`just generate-api-specs` recipe referenced by some package scripts.
+diff --git a/crates/local_backend/src/deployment_operations.rs b/crates/local_backend/src/deployment_operations.rs
+index 74e6aba0b84c639a478634742e6a99e4ca18a3a1..57cd74ea4d54da7a289f1ca90672416b16b1c263 100644
+--- a/crates/local_backend/src/deployment_operations.rs
++++ b/crates/local_backend/src/deployment_operations.rs
+@@ -257,6 +257,7 @@ pub async fn capabilities(
+     authorize(&st, req.admin_key).await?;
+     Ok(axum::Json(json!({
+         "protocolVersion": 1,
++        "mutationPriorityProtocol": if *common::knobs::ISOLATE_QUEUE_DELAY_CONTROL_ENABLED { 1 } else { 0 },
+         "sessionId": st.deployment_operations.session_id,
+         "lifetimeSeconds": LIFETIME.as_secs(),
+         "maxOperations": MAX_OPERATIONS,
+diff --git a/crates/local_backend/src/public_api.rs b/crates/local_backend/src/public_api.rs
+index e936519b2046b4d5dd75217deba29fc8e8f0f123..9c3941b9aa5132f56667cb0b94fe10b7f3e2c0ff 100644
+--- a/crates/local_backend/src/public_api.rs
++++ b/crates/local_backend/src/public_api.rs
+@@ -31,7 +31,10 @@ use common::{
+         ExtractResolvedHostname,
+         HttpResponseError,
+     },
+-    knobs::MAX_BACKEND_PUBLIC_API_REQUEST_SIZE,
++    knobs::{
++        ISOLATE_QUEUE_DELAY_CONTROL_ENABLED,
++        MAX_BACKEND_PUBLIC_API_REQUEST_SIZE,
++    },
+     types::{
+         FunctionCaller,
+         QueryInvocation,
+@@ -652,13 +655,42 @@ pub async fn public_query_batch_post(
+     Ok(Json(QueryBatchResponse { results }))
+ }
+ 
++fn mutation_args_schema() -> utoipa::openapi::schema::Schema {
++    use utoipa::openapi::schema::{
++        ArrayBuilder,
++        ObjectBuilder,
++        OneOfBuilder,
++        SchemaType,
++    };
++
++    OneOfBuilder::new()
++        .item(ObjectBuilder::new())
++        .item(ArrayBuilder::new().items(ObjectBuilder::new().schema_type(SchemaType::AnyValue)))
++        .build()
++        .into()
++}
++
++#[derive(Deserialize, ToSchema)]
++pub struct MutationPostRequest {
++    // Keep raw arguments directly on the request: serde flatten buffers fields
++    // through Content and cannot preserve UdfArgsJson's RawValue.
++    path: String,
++    #[schema(schema_with = mutation_args_schema)]
++    args: UdfArgsJson,
++    format: Option<String>,
++    /// Bounded scheduling preference. Defaults to normal and does not change
++    /// authorization.
++    #[serde(default)]
++    priority: common::types::MutationPriority,
++}
++
+ /// Execute mutation
+ ///
+ /// Execute a mutation function.
+ #[utoipa::path(
+     post,
+     path = "/mutation",
+-    request_body = UdfPostRequest,
++    request_body = MutationPostRequest,
+     responses((status = 200, body = UdfResponse)),
+ )]
+ #[debug_handler]
+@@ -670,10 +702,20 @@ pub async fn public_mutation_post(
+     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
+     ExtractAuthenticationToken(auth_token): ExtractAuthenticationToken,
+     ExtractClientVersion(client_version): ExtractClientVersion,
+-    Json(req): Json<UdfPostRequest>,
++    Json(req): Json<MutationPostRequest>,
+ ) -> Result<impl IntoResponse, HttpResponseError> {
++    if req.priority == common::types::MutationPriority::High
++        && !*ISOLATE_QUEUE_DELAY_CONTROL_ENABLED
++    {
++        return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
++            "MutationPriorityUnavailable",
++            "High mutation priority requires the isolate lane scheduler",
++        ))
++        .into());
++    }
+     let export_path = parse_export_path(&req.path)?;
+-    let request_context = RequestContext::new(request_id, request_metadata);
++    let mut request_context = RequestContext::new(request_id, request_metadata);
++    request_context.mutation_priority = req.priority;
+     // NOTE: We could coalesce authenticating and executing the query into one
+     // rpc but we keep things simple by reusing the same method as the sync worker.
+     // Round trip latency between Usher and Backend is much smaller than between
+@@ -787,3 +829,52 @@ where
+         .routes(utoipa_axum::routes!(public_function_post_with_path))
+         .layer(DefaultBodyLimit::max(*MAX_BACKEND_PUBLIC_API_REQUEST_SIZE))
+ }
++
++#[cfg(test)]
++mod mutation_priority_tests {
++    use common::types::MutationPriority;
++    use serde_json::json;
++
++    use super::MutationPostRequest;
++
++    #[test]
++    fn mutation_priority_defaults_to_normal_and_rejects_unknown_hints() {
++        let normal: MutationPostRequest =
++            serde_json::from_str(&json!({"path": "example:write", "args": [{}]}).to_string())
++                .unwrap();
++        assert_eq!(normal.priority, MutationPriority::Normal);
++        for (hint, expected) in [
++            ("normal", MutationPriority::Normal),
++            ("high", MutationPriority::High),
++        ] {
++            let request: MutationPostRequest = serde_json::from_str(
++                &json!({"path": "example:write", "args": [{}], "priority": hint}).to_string(),
++            )
++            .unwrap();
++            assert_eq!(request.priority, expected);
++            assert_eq!(request.path, "example:write");
++        }
++        for hint in [json!("administrator"), json!(true), json!(null), json!(1)] {
++            assert!(serde_json::from_str::<MutationPostRequest>(
++                &json!({"path": "example:write", "args": [{}], "priority": hint}).to_string()
++            )
++            .is_err());
++        }
++    }
++
++    #[test]
++    fn mutation_priority_preserves_raw_named_and_positional_arguments() {
++        for priority in ["", ",\"priority\":\"normal\"", ",\"priority\":\"high\""] {
++            for args in [r#"{"number":1e+09}"#, r#"[{"number":1e+09}]"#] {
++                let request: MutationPostRequest = serde_json::from_str(&format!(
++                    r#"{{"path":"example:write","args":{args}{priority}}}"#,
++                ))
++                .unwrap();
++                assert_eq!(
++                    request.args.into_serialized_args().unwrap().get(),
++                    r#"[{"number":1e+09}]"#,
++                );
++            }
++        }
++    }
++}
+diff --git a/crates/local_backend/src/router.rs b/crates/local_backend/src/router.rs
+index c8938d4baf450a7100bf0bc704d57e5381a450ec..f42359b61f6fb6c23e16d97f0cd28b8a203fb42e 100644
+--- a/crates/local_backend/src/router.rs
++++ b/crates/local_backend/src/router.rs
+@@ -653,3 +653,28 @@ pub fn cors() -> CorsLayer {
+         .allow_origin(AllowOrigin::mirror_request())
+         .max_age(Duration::from_secs(86400))
+ }
++
++#[cfg(test)]
++mod public_api_spec_tests {
++    use super::*;
++
++    #[test]
++    fn test_public_api_spec_matches() -> anyhow::Result<()> {
++        let (_, actual) = OpenApiRouter::<RouterState>::with_openapi(PublicApiDoc::openapi())
++            .merge(public_api_router())
++            .split_for_parts();
++        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++            .join("../../npm-packages/@convex-dev/platform/public-deployment-openapi.json");
++        if std::env::var_os("UPDATE_API_SPECS").is_some() {
++            std::fs::write(&path, format!("{}\n", actual.to_pretty_json()?))?;
++        }
++        let expected: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
++        assert_eq!(
++            serde_json::to_value(actual)?,
++            expected,
++            "Regenerate with UPDATE_API_SPECS=1 cargo test -p local_backend --lib \
++             test_public_api_spec_matches"
++        );
++        Ok(())
++    }
++}
+diff --git a/crates/pb/protos/common.proto b/crates/pb/protos/common.proto
+index d1f8a19d590040f310d3780d63dd30e3116ee803..5723c33fd0eee1e294f2ef80f385bd69c9e632bc 100644
+--- a/crates/pb/protos/common.proto
++++ b/crates/pb/protos/common.proto
+@@ -123,6 +123,7 @@ message ExecutionContext {
+   optional bool is_root = 4;
+   optional string client_ip = 6;
+   optional string client_user_agent = 7;
++  optional bool mutation_high_priority = 8;
+ }
+ 
+ enum UdfType {
+diff --git a/npm-packages/@convex-dev/platform/public-deployment-openapi.json b/npm-packages/@convex-dev/platform/public-deployment-openapi.json
+index 4a7bd1f4fcaa31b34f552eee613f9b48724195e4..959b994e2e5a8c2f4038002e6891436eee8f0dc6 100644
+--- a/npm-packages/@convex-dev/platform/public-deployment-openapi.json
++++ b/npm-packages/@convex-dev/platform/public-deployment-openapi.json
+@@ -177,7 +177,7 @@
+           "content": {
+             "application/json": {
+               "schema": {
+-                "$ref": "#/components/schemas/UdfPostRequest"
++                "$ref": "#/components/schemas/MutationPostRequest"
+               }
+             }
+           },
+@@ -298,6 +298,47 @@
+   },
+   "components": {
+     "schemas": {
++      "MutationPostRequest": {
++        "type": "object",
++        "required": [
++          "path",
++          "args"
++        ],
++        "properties": {
++          "path": {
++            "type": "string"
++          },
++          "args": {
++            "oneOf": [
++              {
++                "type": "object"
++              },
++              {
++                "type": "array",
++                "items": {}
++              }
++            ]
++          },
++          "format": {
++            "type": [
++              "string",
++              "null"
++            ]
++          },
++          "priority": {
++            "$ref": "#/components/schemas/MutationPriority",
++            "description": "Bounded scheduling preference. Defaults to normal and does not change\nauthorization."
++          }
++        }
++      },
++      "MutationPriority": {
++        "type": "string",
++        "description": "Per-call scheduling preference; it grants no additional execution authority.",
++        "enum": [
++          "normal",
++          "high"
++        ]
++      },
+       "QueryBatchArgs": {
+         "type": "object",
+         "required": [
+@@ -496,4 +537,4 @@
+       "Value": {}
+     }
+   }
+-}
+\ No newline at end of file
++}
 diff --git a/patches/README.md b/patches/README.md
 index ebff31b47775905c6b6ff190a26b0352af9d0c28..8142c60a707dd64ea5f00bf93ceb1cb9b2e165ea 100644
 --- a/patches/README.md
@@ -2855,7 +3890,7 @@ index ebff31b47775905c6b6ff190a26b0352af9d0c28..8142c60a707dd64ea5f00bf93ceb1cb9
  - [Combined dependency and HTTP capacity design](dependency_capacity/design_reference.md)
    retains the benchmark tables, full stage model, metrics interpretation, and application coverage
 diff --git a/patches/degradable_reactive_queries/README.md b/patches/degradable_reactive_queries/README.md
-index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..e9fc63289bd6f6a6d59b6c7c792f7577d5ff0dc6 100644
+index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..37ebbc3b723f5ae52556e5fe62f56d69aaf8801d 100644
 --- a/patches/degradable_reactive_queries/README.md
 +++ b/patches/degradable_reactive_queries/README.md
 @@ -164,11 +164,12 @@ service protections are deliberately local:
@@ -2876,12 +3911,14 @@ index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..e9fc63289bd6f6a6d59b6c7c792f7577
  
  The client field only opts work down. A forged degradable value can reduce the sender's own
  service. Omitting the field remains possible, so the mechanism is not an overload defense against
-@@ -539,15 +540,19 @@ them into one Boolean would make precedence and metrics ambiguous.
+@@ -538,16 +539,22 @@ them into one Boolean would make precedence and metrics ambiguous.
+ 
  The degradable-query patch does not add an isolate queue lane. The leader cap
  remains strictly below application and isolate-worker shared-base capacity.
- The active-JavaScript gate separately applies backend-owned `Dependency`,
+-The active-JavaScript gate separately applies backend-owned `Dependency`,
 -`Protected`, and `Degradable` classes. Only an actual admitted cache-miss
-+`Protected`, `ControlPlane`, and `Degradable` classes. Only an actual admitted cache-miss
++The active-JavaScript gate separately applies `Dependency`, `Protected`,
++`HighPriorityMutation`, `ControlPlane`, and `Degradable` classes. Only an actual admitted cache-miss
  leader receives `Degradable`; separately scheduled descendants override it
  with the existing backend-derived dependency class.
  
@@ -2894,14 +3931,16 @@ index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..e9fc63289bd6f6a6d59b6c7c792f7577
 +class minimums or the control-plane lane enabled, dependencies receive the next
 +grant because they release isolate-holding ancestors. After both application
 +floors are met, elastic occupancy is balanced between the two classes, and
-+resumptions precede initial starts within a selected class. With zero minimums and the control-plane lane
-+disabled, the compatibility policy remains phase-only. The enabled control-plane
-+lane alternates configuration and ordinary protected grants within the existing
-+protected share; see [deployment operations](../non_committing_codegen_analysis/deployment_operations.md).
++resumptions precede initial starts within a selected class. With zero minimums and the control-plane
++lane disabled, non-high classes retain the phase-only compatibility policy. High mutations keep a
++separate class under the [HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority).
++The enabled control-plane lane alternates configuration grants with combined ordinary/high-mutation
++demand within the existing protected share; see
++[deployment operations](../non_committing_codegen_analysis/deployment_operations.md).
  
  The scheduler exposes at most one external initial waiter per active class so
  a wave from one class cannot hide the other class behind serial permit waits.
-@@ -557,8 +562,10 @@ and delay accounting. These mechanics are detailed in
+@@ -557,8 +564,10 @@ and delay accounting. These mechanics are detailed in
  [`active_javascript_admission.md`](active_javascript_admission.md).
  
  With deployment-analysis pacing applied, each active isolate module attempt
@@ -2914,7 +3953,7 @@ index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..e9fc63289bd6f6a6d59b6c7c792f7577
  
  This model is intentionally finite. One admitted query can perform expensive
  work or separately scheduled fan-out. The cap bounds admitted roots plus
-@@ -601,8 +608,9 @@ minimums require finite `FUNRUN_ISOLATE_ACTIVE_THREADS`, require the leader
+@@ -601,8 +610,9 @@ minimums require finite `FUNRUN_ISOLATE_ACTIVE_THREADS`, require the leader
  cap, cannot sum above active capacity, and cannot set the degradable minimum
  above the leader cap. With positive minimums the leader cap can exceed active
  capacity because the cap bounds admitted tree lifetime while active capacity
@@ -2926,7 +3965,7 @@ index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..e9fc63289bd6f6a6d59b6c7c792f7577
  
  If a custom runner does not expose equivalent capacity, it cannot claim the
  same normal-capacity reservation from this cap alone.
-@@ -775,9 +783,8 @@ the cap reserves capacity and the existing query policy remains unchanged. The o
+@@ -775,9 +785,8 @@ the cap reserves capacity and the existing query policy remains unchanged. The o
  admission models without changing Connect parsing, leader admission, cache bypass, client pressure
  semantics, or isolate queue selection.
  
@@ -2938,7 +3977,7 @@ index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..e9fc63289bd6f6a6d59b6c7c792f7577
  leader-cap value that is appropriate, but it does not change workload class or
  pressure semantics. Measure and roll back the features independently.
  
-@@ -798,11 +805,12 @@ must never claim that class. The degradable-client patch does not depend on such
+@@ -798,11 +807,12 @@ must never claim that class. The degradable-client patch does not depend on such
  a lane and should not encode deployment paths as application allowlists.
  
  The pacing integration makes analysis replace degradable demand at the
@@ -2948,7 +3987,7 @@ index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..e9fc63289bd6f6a6d59b6c7c792f7577
 -evidence, liveness argument, worked capacity example, and controlled
 -validation.
 +root-work gate. With the control-plane lane enabled, analysis alternates with
-+ordinary protected work within their combined service floor and elastic share.
++combined ordinary/high-mutation demand within the protected service floor and elastic share.
 +It uses the control-plane allowance within shared-base worker capacity. These policies
 +add no worker or active-JavaScript permits. See its owning essay for the
 +source-level CPU evidence, liveness argument, worked capacity example, and
@@ -2957,7 +3996,7 @@ index 0d5a291ccd16a8832ea5c3c933e22b837e76ddd1..e9fc63289bd6f6a6d59b6c7c792f7577
  Context reuse and bounded query-context prewarming are also complementary.
  They can lower module-evaluation CPU and improve warm service time. They do not
 diff --git a/patches/degradable_reactive_queries/active_javascript_admission.md b/patches/degradable_reactive_queries/active_javascript_admission.md
-index d3d5fe3f24d4a19852ac9eed0ee46ce5d1fbf6c8..aec0be5f67afec44dc7e6cd28b913fb676f618e0 100644
+index d3d5fe3f24d4a19852ac9eed0ee46ce5d1fbf6c8..7e311e63da12db26e43857d1d39bb33e5369d7c1 100644
 --- a/patches/degradable_reactive_queries/active_javascript_admission.md
 +++ b/patches/degradable_reactive_queries/active_javascript_admission.md
 @@ -3,8 +3,9 @@
@@ -2972,36 +4011,50 @@ index d3d5fe3f24d4a19852ac9eed0ee46ce5d1fbf6c8..aec0be5f67afec44dc7e6cd28b913fb6
  per-function policy, preemption, or another worker pool.
  
  ## Resource model
-@@ -24,11 +25,14 @@ that coupling while retaining a finite CPU gate.
+@@ -24,11 +25,16 @@ that coupling while retaining a finite CPU gate.
  
  ## Classification and propagation
  
 -The active gate has exactly three backend-owned classes:
-+The active gate has four backend-owned classes:
++The active gate has five classes:
  
  - `Dependency` is work whose completion releases an isolate-holding ancestor.
 -- `Protected` is ordinary root work, actions, analysis and evaluation, and
 -  every other request without a narrower classification.
 +- `Protected` is ordinary root work, actions, and every other request without a
 +  narrower classification.
++- `HighPriorityMutation` is a mutation carrying the per-call high hint. It shares
++  protected capacity with bounded preference over ordinary protected work.
 +- `ControlPlane` is typed backend configuration evaluation. With its lane enabled,
-+  it alternates grants with ordinary protected work inside their combined floor
++  it alternates grants with combined ordinary/high-mutation demand inside the protected floor
 +  and elastic share; otherwise it uses ordinary protected admission.
  - `Degradable` is an admitted degradable root query cache-miss leader.
  
  A client declaration alone never creates `Degradable` active work. The query
-@@ -54,6 +58,10 @@ Let:
+@@ -36,7 +42,7 @@ cache assigns `Degradable` only to a `CacheOp::Go` that still owns the acquired
+ degradable leader permit after the cache recheck. Cache hits, followers, normal
+ bypasses, and rejected admission do not carry the class into execution.
+ 
+-Backend-derived dependency ownership overrides either application class. This
++Backend-derived dependency ownership overrides every application class. This
+ keeps separately scheduled descendants on the ancestor-unblocking path even
+ when the root leader is degradable. The resulting class is stored in the
+ isolate request and in every suspended active permit. Reacquisition therefore
+@@ -54,6 +60,13 @@ Let:
  
  The limiter applies these rules whenever a permit becomes available:
  
-+For these comparisons, protected demand and occupancy include `ControlPlane`.
-+After choosing that group, the limiter alternates ordinary protected and
-+control-plane grants when both wait. Resume priority applies within each class.
++For these comparisons, protected demand and occupancy include `HighPriorityMutation`
++and `ControlPlane`. After choosing that group, the limiter alternates application
++and control-plane grants when both wait. Within application demand, high mutations
++receive at most two grants before a waiting ordinary protected request. Resume
++priority applies within each class. See the
++[HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority).
 +
  1. A dependency waiter receives the next grant.
  2. If only protected or only degradable work is waiting, that class receives
     the grant and can borrow the complete active capacity.
-@@ -95,9 +103,10 @@ class. Requests from that class remain in the queue until the exposed waiter
+@@ -95,9 +108,11 @@ class. Requests from that class remain in the queue until the exposed waiter
  acquires a permit, times out at the original queue deadline, or loses its
  caller. One direct internal dependency waiter is exposed separately and has no
  external queue deadline because that callback cannot be retried safely.
@@ -3010,22 +4063,27 @@ index d3d5fe3f24d4a19852ac9eed0ee46ce5d1fbf6c8..aec0be5f67afec44dc7e6cd28b913fb6
 -concurrency.
 +When both service floors are zero, degradable requests use the protected slot.
 +An enabled deployment lane retains separate control-plane and dependency slots.
-+With that lane disabled too, all external classes collapse to the single
-+existing phase-only initial wait. Unlimited active capacity has no permit wait.
++With that lane disabled too, non-high external classes collapse to the single
++existing phase-only initial wait. High mutations retain their separate slot.
++Unlimited active capacity has no permit wait.
  
  Every exposed waiter reserves its global and per-client worker eligibility
  while waiting for the active permit. The reservation prevents concurrent
-@@ -117,24 +126,31 @@ Positive values require all of the following:
+@@ -117,24 +132,34 @@ Positive values require all of the following:
  - `P + G <= A` without integer overflow;
  - `G` no larger than the degradable leader cap.
  
 -When both minimums are zero, class-aware admission is disabled completely. The
-+When both minimums are zero and the control-plane lane is disabled, class-aware admission is disabled. The
- active limiter retains the existing behavior in which all resumptions precede
- initial starts; dependencies and degradable execution both use ordinary active
- admission for their phase. In that mode the leader cap remains strictly below
+-active limiter retains the existing behavior in which all resumptions precede
+-initial starts; dependencies and degradable execution both use ordinary active
+-admission for their phase. In that mode the leader cap remains strictly below
 -finite active capacity. With positive minimums, the leader cap can exceed `A`
 -because `G` supplies admitted degradable execution progress.
++When both minimums are zero and the control-plane lane is disabled, service-floor
++and dependency-class admission are disabled. Dependencies and degradable execution
++use ordinary active admission for their phase. High mutations retain their separate
++class with bounded preference; resumptions precede initial starts within each
++effective class. In that mode the leader cap remains strictly below
 +any configured finite active capacity; `0` continues to mean unlimited. With
 +positive minimums, the leader cap can exceed `A` because `G` supplies admitted
 +degradable execution progress.
@@ -3036,10 +4094,11 @@ index d3d5fe3f24d4a19852ac9eed0ee46ce5d1fbf6c8..aec0be5f67afec44dc7e6cd28b913fb6
  dependencies.
  
 +The enabled control-plane lane retains separate fair admission even with zero
-+class minimums. Its grants alternate with ordinary work; dependencies retain
++class minimums. Its grants alternate with combined ordinary/high-mutation demand; dependencies retain
 +precedence. No extra CPU permits are created. See
 +[deployment operations](../non_committing_codegen_analysis/deployment_operations.md).
-+When comparing occupancy with the protected floor, sum `protected` and `control_plane`.
++When comparing occupancy with the protected floor, sum `protected`,
++`high_priority_mutation`, and `control_plane`.
 +
  ## Observability and tests
  
@@ -3047,24 +4106,25 @@ index d3d5fe3f24d4a19852ac9eed0ee46ce5d1fbf6c8..aec0be5f67afec44dc7e6cd28b913fb6
  
  - configured total, protected minimum, and degradable minimum;
 -- held or granted occupancy by `dependency`, `protected`, and `degradable`;
-+- held or granted occupancy by `dependency`, `protected`, `control_plane`, and `degradable`;
++- held or granted occupancy by `dependency`, `protected`, `high_priority_mutation`,
++  `control_plane`, and `degradable`;
  - waiters by class and `initial` or `resume` phase;
  - acquisition latency by the same class and phase labels.
  
-@@ -151,3 +167,11 @@ or a dedicated degradable worker pool. The two service classes correspond to
+@@ -151,3 +176,11 @@ or a dedicated degradable worker pool. The two service classes correspond to
  the existing trust and overload contract. Additional policy requires evidence
  that these classes and bounded metrics cannot express a measured scheduling
  problem.
 +
 +
 +For protected-floor comparisons, `active_javascript_protected_group_occupancy_info`
-+records protected plus control-plane occupancy before scraping. Do not add
++records protected plus high-mutation plus control-plane occupancy before scraping. Do not add
 +separate class maxima, including maxima within the same aligned bucket: their
 +peaks need not be simultaneous. Older images without this gauge have missing
 +combined-occupancy evidence. The sum does not change dependency precedence,
 +non-preemptive turnover, or the degradable floor.
 diff --git a/patches/dependency_capacity/README.md b/patches/dependency_capacity/README.md
-index 7a1702b2f1c882cf9f30f42146a25809e7da8c20..5f39aeaf171c89174ada6342df40aedc7181acf1 100644
+index 7a1702b2f1c882cf9f30f42146a25809e7da8c20..0d4311bcb395e8daae74c4b9cd8d091872874685 100644
 --- a/patches/dependency_capacity/README.md
 +++ b/patches/dependency_capacity/README.md
 @@ -14,7 +14,7 @@ degradable-query integration gives dependency work the next grant at the already
@@ -3120,7 +4180,8 @@ index 7a1702b2f1c882cf9f30f42146a25809e7da8c20..5f39aeaf171c89174ada6342df40aedc
 +class-sensitive admission check. Direct internal priority therefore cannot duplicate reserve
 +capacity. Worker completion updates global and
  per-client accounting before another dispatch decision. External dependencies do not jump older
- eligible external work below shared base capacity; they become the only externally eligible class
+-eligible external work below shared base capacity; they become the only externally eligible class
++eligible ordinary or independent-action work below shared base capacity; they become the only externally eligible class
  when the shared base is full.
  
  `FUNRUN_ISOLATE_ACTIVE_THREADS` remains a separate active-JavaScript permit gate with one fixed
@@ -3137,7 +4198,7 @@ index 7a1702b2f1c882cf9f30f42146a25809e7da8c20..5f39aeaf171c89174ada6342df40aedc
  
  Initial external permit waits remain bounded by the request's original queue deadline: the
  applicable CoDel expiration or lane hard deadline. Direct separately scheduled nested transactional
-@@ -140,13 +147,15 @@ permit. The scheduler exposes one external waiter per active class and one inter
+@@ -140,13 +147,17 @@ permit. The scheduler exposes one external waiter per active class and one inter
  waiter, reserving worker eligibility for each exposed request. A non-consuming queue expiry
  companion continues enforcing every retained entry's deadline.
  
@@ -3152,15 +4213,17 @@ index 7a1702b2f1c882cf9f30f42146a25809e7da8c20..5f39aeaf171c89174ada6342df40aedc
 +active-JavaScript service floors enabled, every ancestor-unblocking request, including an external
 +action callback, uses the `Dependency` class and receives the next available grant. An independent
 +root stays in its application class when it reacquires a suspended permit; resumption priority
-+applies within that class. With both floors and the control-plane lane disabled, every class collapses to the phase-only
-+compatibility policy: direct internal callbacks and reacquisitions use the resumption tier, while
-+external callbacks remain initial starts bounded by their original queue deadline. Neither mode
++applies within that class. With both floors and the control-plane lane disabled, non-high classes
++collapse to the phase-only compatibility policy: direct internal callbacks and reacquisitions use
++the resumption tier, while external callbacks remain initial starts bounded by their original queue
++deadline. High mutations retain their separate class with bounded preference under the
++[HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority). Neither mode
 +adds active-permit overflow because doing so could oversubscribe the host and move rather than
 +remove the bottleneck.
  
  ## Configuration
  
-@@ -294,3 +303,8 @@ deployment operations. A synthetic stress fixture is not required.
+@@ -294,3 +305,8 @@ deployment operations. A synthetic stress fixture is not required.
    Work-conserving service floors within the existing finite total avoid that failure mode.
  - Unlimited dependency admission cannot be made safe because recursive depth, fan-out, memory, and
    CPU remain finite.
@@ -3170,10 +4233,10 @@ index 7a1702b2f1c882cf9f30f42146a25809e7da8c20..5f39aeaf171c89174ada6342df40aedc
 +overflow and dependency precedence are preserved. See
 +[deployment operations](../non_committing_codegen_analysis/deployment_operations.md).
 diff --git a/patches/dependency_capacity/design_reference.md b/patches/dependency_capacity/design_reference.md
-index 04acc4ebb310db50826d1eae222e57a39de7fca0..fb0de5d6aabe4ac48f7a191b35b513e2a714f29d 100644
+index 04acc4ebb310db50826d1eae222e57a39de7fca0..5e4f0f537a1fcb43e25d70aed6eeb06ad66c1770 100644
 --- a/patches/dependency_capacity/design_reference.md
 +++ b/patches/dependency_capacity/design_reference.md
-@@ -6,6 +6,13 @@
+@@ -6,6 +6,17 @@
  > prerequisites, rollout, and rollback. This reference preserves the original combined rationale,
  > benchmark tables, stage interaction analysis, and coverage matrix.
  
@@ -3184,10 +4247,14 @@ index 04acc4ebb310db50826d1eae222e57a39de7fca0..fb0de5d6aabe4ac48f7a191b35b513e2
 +carves three deployment allowances from the main HTTP ordinary ceiling; the
 +`H - D` HTTP model below records the baseline before that extension.
 +
++The later [HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority)
++adds a separate high-mutation class with bounded preference, including when
++service floors and the control-plane lane are disabled.
++
  This document covers two patches that can be applied independently:
  
  - the runtime admission patch makes the self-hosted HTTP gates configurable,
-@@ -181,8 +188,11 @@ CPU oversubscription control for V8 work.
+@@ -181,8 +192,11 @@ CPU oversubscription control for V8 work.
  
  The stock self-hosted Compose file passes through `MAX_ISOLATE_WORKERS`,
  `ISOLATE_DEPENDENCY_WORKER_RESERVE`, `MAX_ISOLATE_ACTION_WORKERS`,
@@ -3201,7 +4268,7 @@ index 04acc4ebb310db50826d1eae222e57a39de7fca0..fb0de5d6aabe4ac48f7a191b35b513e2
  
  ## Scheduler Dependency-Reserve Patch
  
-@@ -211,8 +221,10 @@ action cap. There is no additional first-caller or role-combination policy.
+@@ -211,8 +225,10 @@ action cap. There is no additional first-caller or role-combination policy.
  
  Upstream splits scheduler ingress by ownership boundary. A direct nested UDF
  callback enters an internal unbounded channel, is polled before the external
@@ -3214,7 +4281,7 @@ index 04acc4ebb310db50826d1eae222e57a39de7fca0..fb0de5d6aabe4ac48f7a191b35b513e2
  discards closed callers, and selects the oldest callback eligible in one worker
  snapshot. It can therefore skip a per-client-ineligible callback without letting
  newer eligible callbacks from other clients lose otherwise usable physical
-@@ -234,11 +246,15 @@ The worker policy has three capacities:
+@@ -234,11 +250,15 @@ The worker policy has three capacities:
  - `B = T - R`, the shared base assigned-worker capacity;
  - `R = ISOLATE_DEPENDENCY_WORKER_RESERVE`, dependency-only overflow above `B`.
  
@@ -3235,7 +4302,7 @@ index 04acc4ebb310db50826d1eae222e57a39de7fca0..fb0de5d6aabe4ac48f7a191b35b513e2
  is no target number of active dependencies and no dependency-first priority
  below `B`. Completion accounting remains the first branch of the scheduler's
  biased selection loop, matching upstream ordering; the rejected dependency-
-@@ -352,8 +368,9 @@ policy, and overload response:
+@@ -352,8 +372,9 @@ policy, and overload response:
     `min(R, configured_limit - 1)` above shared base occupancy. Outstanding,
     wait-duration, and wait-timeout metrics identify this stage.
  4. Equal query cache misses can coalesce, making followers wait for one peer
@@ -3247,7 +4314,7 @@ index 04acc4ebb310db50826d1eae222e57a39de7fca0..fb0de5d6aabe4ac48f7a191b35b513e2
  5. Externally submitted isolate work shares one bounded queue. Its shared base
     capacity is `ISOLATE_QUEUE_SIZE`, with `R` extra external dependency-only
     slots. Queue-full sends fail immediately. The default policy assigns the `5`
-@@ -361,34 +378,33 @@ policy, and overload response:
+@@ -361,34 +382,33 @@ policy, and overload response:
     generic CoDel depth. The opt-in lane policy uses its configured hard age and
     lane-specific depth, delay, overload, and rejection metrics. Scheduler
     counters separate class-specific enqueue, dispatch, expiry, and rejection in
@@ -3305,7 +4372,7 @@ index 04acc4ebb310db50826d1eae222e57a39de7fca0..fb0de5d6aabe4ac48f7a191b35b513e2
  8. A Node action does not use an isolate worker, but it has its own application
     action permit and executor capacity. Every Node `ctx.run*` callback re-enters
     the main HTTP service and then the corresponding application and isolate
-@@ -568,18 +584,16 @@ Direct internal nested UDF callbacks have no external queue deadline.
+@@ -568,18 +588,16 @@ Direct internal nested UDF callbacks have no external queue deadline.
  Use
  `isolate_scheduler_requests_rejected_total{pool_name, scheduler_class, reason}`
  to distinguish queue-full or lane-full admission rejection, delay-control
@@ -3327,7 +4394,7 @@ index 04acc4ebb310db50826d1eae222e57a39de7fca0..fb0de5d6aabe4ac48f7a191b35b513e2
  five scheduler classes below are closed metric-label contracts.
  
  Use
-@@ -705,7 +719,7 @@ that code pattern.
+@@ -705,7 +723,7 @@ that code pattern.
  | A query calls `ctx.runQuery`, or a mutation calls `ctx.runQuery` or `ctx.runMutation`, with `SUBFUNCTIONS_IN_SAME_ISOLATE=false`                                    | Covered as a finite chain: every separately scheduled child is dependency-marked and may itself be a descendant-holder. Size `R` for expected nesting and fanout; a chain requiring more than `T` simultaneous workers can still fail. `useStaleSnapshot` and `transactionLimits` do not change isolate placement.                           |
  | The application runs many independent V8 or HTTP actions                                                                                                            | `MAX_ISOLATE_ACTION_WORKERS` limits assigned independent action shells without reducing query/mutation worker capacity. A lower value protects mixed traffic; a higher value can improve an action-only route. There is no universal ratio, so document whether the selected value is benchmarked or an informed starting point.             |
  | `HTTP_SERVER_MAX_CONCURRENT_REQUESTS <= HTTP_SERVER_DEPENDENCY_RESERVE`                                                                                             | The standard local backend does not start because the configured overflow would leave no shared base HTTP admission. Set the HTTP total above the HTTP reserve. This matters for `"use node"` chains; V8-only callbacks do not re-enter through HTTP.                                                                    |
@@ -3352,10 +4419,10 @@ index 14bce41fbc3f1895c5f845f3506672887bb762a3..13400eb30818675e7e2dbc628668e075
  Root pacing creates no additional worker or CPU capacity. The enabled
  deployment lane reserves queue and worker space within the existing base and
 diff --git a/patches/isolate_queue_control/README.md b/patches/isolate_queue_control/README.md
-index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f51b90d72 100644
+index de256682fa5a85b8911129aaaae3d0c82b3fcb69..1b14b3626104276f4bfe3b2338c46b63988a393e 100644
 --- a/patches/isolate_queue_control/README.md
 +++ b/patches/isolate_queue_control/README.md
-@@ -11,6 +11,15 @@ evaluation requests into a bounded `control_plane` lane with a longer hard deadl
+@@ -11,6 +11,18 @@ evaluation requests into a bounded `control_plane` lane with a longer hard deadl
  shedding. Neither feature creates execution capacity, replaces worker limits, or grants
  unconditional dispatch priority.
  
@@ -3368,10 +4435,46 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
 +[`deployment-lane design reference`](deployment_lane_design_reference.md)
 +preserves the control-plane-specific motivation and alternatives.
 +
++The [HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority)
++adds bounded high-mutation preference within ordinary capacity at queue and CPU admission.
++
  ## Relationship to generic CoDel
  
  The isolate scheduler constructs exactly one external queue implementation when
-@@ -79,7 +88,9 @@ only when that request is currently blocked by one or more of:
+@@ -41,8 +53,8 @@ the policy is disabled so malformed latent configuration fails at startup.
+ delay, but it neither wraps nor implements the generic CoDel algorithm. After
+ the generic queue remains continuously nonempty for its idle-expiration period,
+ it dispatches unexpired work in LIFO rather than FIFO order and returns expired
+-oldest entries separately. The isolate-specific policy instead preserves FIFO
+-among simultaneously eligible requests and adds scheduler-aware eligibility,
++oldest entries separately. The isolate-specific policy selects eligible requests
++with bounded high-mutation preference and adds scheduler-aware eligibility,
+ per-lane delay observations, adaptive shedding, and absolute hard deadlines.
+ 
+ ## Queue and lane model
+@@ -56,6 +68,7 @@ Each request is classified from the scheduler properties already propagated by
+ the dependency-reserve patch:
+ 
+ - `dependency` when `unblocks_ancestor` is true;
++- `high_priority_mutation` for a mutation carrying the per-call high hint;
+ - `independent_action` when it is an isolate action and does not unblock an
+   ancestor;
+ - `ordinary` otherwise.
+@@ -70,19 +83,22 @@ unblocks an isolate-holding ancestor is in the dependency lane, while active
+ request metrics retain `is_isolate_action` separately. This prevents action
+ identity and ancestry role from being collapsed into one classification.
+ 
+-The queue remains physically FIFO. On each dispatch attempt, the scheduler
+-evaluates entries against one immutable snapshot of worker state and selects
+-the oldest eligible request in the entire queue. It may skip an older request
+-only when that request is currently blocked by one or more of:
++The queue stores entries in arrival order. On each dispatch attempt, the scheduler
++evaluates entries against one immutable snapshot of worker state. High mutations
++receive at most two turns before eligible ordinary or independent-action work.
++They cannot cross an older eligible dependency or control-plane request. Otherwise
++selection uses the oldest eligible request. A request is ineligible when blocked by:
+ 
+ - the physical worker total;
  - shared-base worker capacity;
  - the per-client total;
  - the per-client shared base;
@@ -3380,9 +4483,32 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
 +- an already exposed initial active-JavaScript waiter for the same effective
 +  service class.
  
- This selection rule preserves FIFO among simultaneously eligible requests and
- allows work for one client or class to proceed around an ineligible head. It
-@@ -160,12 +171,13 @@ in the same snapshot; FIFO remains intact among simultaneously eligible
+-This selection rule preserves FIFO among simultaneously eligible requests and
+-allows work for one client or class to proceed around an ineligible head. It
++This selection rule allows work for one client or class to proceed around an
++ineligible head while preserving the platform barriers above. It
+ does not grant queue admission beyond the class's finite capacity.
+ 
+ ## Per-lane delay controller
+@@ -110,14 +126,14 @@ not synthesize a minimum and does not change overload state. Completely
+ draining a lane clears its controller immediately, including partial interval
+ state. A later enqueue starts that lane with a fresh interval.
+ 
+-The controller never changes request eligibility. Once an ordinary or
+-independent-action request has been selected by normal scheduler eligibility,
++The controller never changes request eligibility. Once an ordinary, high-mutation,
++or independent-action request has been selected by normal scheduler eligibility,
+ it is adaptively rejected only when its lane is overloaded and its own sojourn
+ is strictly greater than `ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS`. A newer
+ request is not rejected because another request was old. Dependencies are
+ observed and can report overload, but they are never adaptively shed.
+ 
+-Ordinary, independent-action, and dependency entries use the same finite hard age,
++Ordinary, high-mutation, independent-action, and dependency entries use the same finite hard age,
+ `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS`. An enabled control-plane entry uses
+ `ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS`. Each entry stores its absolute deadline, and the
+ consuming receiver and its non-consuming expiry companion arm the earliest deadline across the
+@@ -160,12 +176,14 @@ in the same snapshot; FIFO remains intact among simultaneously eligible
  internal callbacks.
  
  After an external entry becomes scheduler-eligible, its original hard deadline
@@ -3395,13 +4521,26 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
 -worker.
 +use the backend-owned dependency class without a CoDel deadline because those
 +nested requests cannot be retried safely. When class-aware admission is
-+disabled, these waits retain the phase-only compatibility policy. Both paths
++disabled, non-high work retains the phase-only compatibility policy; high mutations
++retain a separate class with bounded preference. Both paths
 +still consume the same physical worker total and dependency reserve when the
 +scheduler assigns a worker.
  
  The periodic lane metrics reporter shares only the locked queue state. It does
  not clone receiver wake state or keep the queue logically open. The expiry
-@@ -223,16 +235,19 @@ Construction additionally requires:
+@@ -213,26 +231,29 @@ Construction additionally requires:
+   intervals react faster but are more sensitive to sparse samples.
+ - `ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS` is derived as twice the configured
+   target when unset, which is `300` with the built-in target. An overloaded
+-  ordinary or independent-action lane sheds a selected request only when that
++  ordinary, high-mutation, or independent-action lane sheds a selected request only when that
+   request's own queue age exceeds this value. Set it above the target and below
+   the ordinary hard maximum age. It never adaptively sheds dependency or
+   control-plane work.
+ - `ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS` has built-in patch value `5000`. It is the
+-  absolute enqueue-to-initial-active-permit deadline for ordinary,
++  absolute enqueue-to-initial-active-permit deadline for ordinary, high-mutation,
+   independent-action, and dependency requests. Set it above the adaptive-shed
    threshold but below relevant outer request timeouts.
  - `ISOLATE_CONTROL_PLANE_LANE_ENABLED` has built-in patch value `false`. It
    classifies only the five typed analysis and configuration-evaluation request
@@ -3426,7 +4565,7 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
  - `CODEL_QUEUE_IDLE_EXPIRATION_MILLIS` has default `5000` in unmodified
    `get-convex/convex-backend`. It controls when the generic CoDel queue changes
    from its idle FIFO regime to congestion handling; it is not a hard maximum
-@@ -242,15 +257,15 @@ Construction additionally requires:
+@@ -242,15 +263,15 @@ Construction additionally requires:
    CoDel queue's congested regime. It does not configure lane-mode shedding or
    hard deadlines.
  
@@ -3445,7 +4584,7 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
  than `ISOLATE_QUEUE_SIZE`, and the control-plane hard deadline must exceed the
  ordinary hard deadline. These checks prevent one push from rejecting its
  configured fan-out and keep the longer contract explicit.
-@@ -296,7 +311,7 @@ control-plane classification is disabled. Enabling the deployment lane also adds
+@@ -296,7 +317,7 @@ control-plane classification is disabled. Enabling the deployment lane also adds
  `scheduler_class="control_plane"`; `isolate_control_plane_lane_enabled_info{pool_name}` proves
  whether that classification is effective.
  Rejection reasons distinguish `lane_full`, `queue_full`, `hard_expired`, `caller_dropped`,
@@ -3454,7 +4593,16 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
  `control_plane` are invariant violations and must remain zero.
  
  The patch extends the dependency-capacity scheduler counter initialization with the control-plane
-@@ -358,15 +373,17 @@ control_plane_depth < ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY
+@@ -345,7 +366,7 @@ the lane. Classification never matches application module, function, component,
+ client, or tenant names.
+ 
+ When disabled, these requests retain ordinary scheduler class, deadline, and shedding behavior.
+-When enabled, they remain in the same physical FIFO and use only shared-base queue and worker
++When enabled, they remain in the same physical queue and use only shared-base queue and worker
+ capacity. An older eligible ordinary request runs before a newer control-plane request, and an older
+ eligible control-plane request runs before newer ordinary work. Existing eligibility may skip an
+ older entry blocked by physical, shared-base, per-client, or action-cap constraints; the lane adds
+@@ -358,15 +379,17 @@ control_plane_depth < ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY
  total_shared_depth < ISOLATE_QUEUE_SIZE
  ```
  
@@ -3477,9 +4625,12 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
  and deployment-phase timeouts remain separate.
  
  Each post-admission analysis or evaluation retry is a new queue entry with a new deadline. The
-@@ -379,39 +396,35 @@ permit from the configured degradable-query capacity and releases it before retr
+@@ -377,41 +400,37 @@ The ordered [`deployment-analysis pacing`](../deployment_analysis_pacing/README.
+ adds a pre-queue gate only for isolate module analysis. Each module attempt fairly borrows one
+ permit from the configured degradable-query capacity and releases it before retry backoff. This
  reduces analysis arrivals under elastic query load but does not alter this lane's classification,
- capacity, deadline, FIFO selection, or evaluation-request behavior.
+-capacity, deadline, FIFO selection, or evaluation-request behavior.
++capacity, deadline, selection policy, or evaluation-request behavior.
  
 -Analysis and evaluation requests carry one-shot response senders but no UDF cancellation signal.
 +Analysis and all four configuration evaluation variants carry one-shot response
@@ -3526,7 +4677,7 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
 +`ISOLATE_CONTROL_PLANE_WORKER_RESERVE` defaults to one when the lane is enabled,
 +clipped to leave ordinary worker capacity. It reserves global and per-client
 +eligibility before active-permit acquisition. A separate control-plane JavaScript
-+queue alternates grants with ordinary protected work within their combined
++queue alternates grants with combined ordinary/high-mutation demand within the protected
 +service floor and elastic share. Dependency precedence and degradable floors
 +remain intact; totals are unchanged. See
 +[deployment operations](../non_committing_codegen_analysis/deployment_operations.md)
@@ -3534,7 +4685,12 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
  
  ### Deployment-lane rollout
  
-@@ -427,7 +440,7 @@ borrowing, preemption, or dynamic-priority protocol without separate evidence an
+@@ -423,14 +442,14 @@ borrowing, preemption, or dynamic-priority protocol without separate evidence an
+    backend population.
+ 4. Confirm enabled state, lane capacity, deadline, and zero initial depth locally and in remote
+    metrics.
+-5. Run an ordinary push under representative traffic. Verify FIFO dispatch, no adaptive shedding,
++5. Run an ordinary push under representative traffic. Verify eligible platform barriers, no adaptive shedding,
     no dependency-reserve use, finite expiry, and unchanged ordinary deadlines.
  6. When carrying deployment-analysis pacing, verify that analysis reservations displace
     degradable permits and pace queue arrivals.
@@ -3542,8 +4698,12 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
 +7. Observe repeated normal and busy pushes before changing the worker reservation or queue cap.
  
  Rollback sets `ISOLATE_CONTROL_PLANE_LANE_ENABLED=false` and restarts the backend. The lane-aware
- ordinary/dependency/action policy remains active, and no schema or data migration is required.
-@@ -441,10 +454,9 @@ strict configuration, and bounded metrics. Production verification uses an ordin
+-ordinary/dependency/action policy remains active, and no schema or data migration is required.
++ordinary/high-mutation/dependency/action policy remains active, and no schema or data migration is required.
+ 
+ ### Deployment-lane verification
+ 
+@@ -441,10 +460,9 @@ strict configuration, and bounded metrics. Production verification uses an ordin
  traffic; a dedicated deployment stress fixture is not required.
  
  Rejected designs include treating deployment as a dependency, unconditional priority, a second
@@ -3557,7 +4717,16 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
  the typed work the isolate scheduler actually executes. The separate
  [`scheduled-action admission patch`](../scheduled_action_admission/README.md) does not reserve idle
  capacity for a class: after a concrete scheduled action wins normal admission, it briefly holds
-@@ -496,10 +508,11 @@ has an unambiguous rollback. Context reuse can be disabled without changing
+@@ -453,7 +471,7 @@ that selected worker while committing the action's durable at-most-once claim.
+ ## Resource cost and current evidence
+ 
+ Lane mode stores an enqueue timestamp and lane with each bounded queue entry.
+-Expiry discovery, oldest-eligible selection, and earliest-deadline discovery
++Expiry discovery, eligible selection, and earliest-deadline discovery
+ scan at most `ISOLATE_QUEUE_SIZE + ISOLATE_DEPENDENCY_WORKER_RESERVE` entries;
+ removing an interior `VecDeque` entry can also move entries. The once-per-second
+ metrics refresh scans the queue for each lane. The expiry companion repeats a
+@@ -496,10 +514,11 @@ has an unambiguous rollback. Context reuse can be disabled without changing
  queue state; queue control can be disabled without changing context semantics.
  
  `FUNRUN_ISOLATE_ACTIVE_THREADS` remains a separate CPU-execution gate. An external request acquires
@@ -3572,7 +4741,15 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
  
  Query coalescing and application dependency gates run before the isolate queue.
  They must continue propagating dependency role so a child does not wait behind
-@@ -521,12 +534,14 @@ with actual dispatch sojourn rather than with end-to-end request latency.
+@@ -514,19 +533,21 @@ dependency requests dispatch through worker reserve under a bounded saturation
+ test and that independent actions obey their cap.
+ 
+ Enable the queue policy on one controlled backend population and restart. Check
+-that policy and duration metrics match the intended configuration, all four
++that policy and duration metrics match the intended configuration, all five
+ lane gauges initialize, dependency shedding stays at zero, hard expiry remains
+ finite, and oldest age returns to zero after drain. Compare adaptive shedding
+ with actual dispatch sojourn rather than with end-to-end request latency.
  
  The immediate rollback is:
  
@@ -3591,10 +4768,10 @@ index de256682fa5a85b8911129aaaae3d0c82b3fcb69..c1758b246101c69fda5c6a075167fc8f
  If overload continues after rollback, reduce incoming admission or execution
  capacity separately; increasing queue depth alone cannot increase throughput.
 diff --git a/patches/isolate_queue_control/deployment_lane_design_reference.md b/patches/isolate_queue_control/deployment_lane_design_reference.md
-index 0113722fb1931a39583ed988a12e4bc4504e7a8a..e3b53befc6a2f72bccc6427dc76fd3c0a96e3501 100644
+index 0113722fb1931a39583ed988a12e4bc4504e7a8a..c00dc3d8ae25136c700841d1ee3aaae625c7e28a 100644
 --- a/patches/isolate_queue_control/deployment_lane_design_reference.md
 +++ b/patches/isolate_queue_control/deployment_lane_design_reference.md
-@@ -5,8 +5,12 @@
+@@ -5,8 +5,16 @@
  > [`README.md`](README.md). This reference preserves the complete
  > motivation, scheduling proof, deferred-reservation design, rejected alternatives, and test matrix.
  
@@ -3606,10 +4783,14 @@ index 0113722fb1931a39583ed988a12e4bc4504e7a8a..e3b53befc6a2f72bccc6427dc76fd3c0
 +JavaScript admission, plus execution-fenced analysis cancellation. The original
 +non-reservation and phase-only descriptions below describe the baseline, not
 +the extended enabled-lane contract. Production validation remains operator work.
++
++The later [HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority)
++adds bounded high-mutation preference within ordinary capacity. The universal FIFO
++and phase-only descriptions below predate that extension.
  
  This patch classifies backend-known module analysis and configuration
  evaluation requests as a `control_plane` isolate queue lane. These requests
-@@ -243,7 +247,7 @@ oldest eligible entry across the complete buffer. That selection rule remains:
+@@ -243,7 +251,7 @@ oldest eligible entry across the complete buffer. That selection rule remains:
  - an older eligible ordinary request runs before a newer control-plane request;
  - an older eligible control-plane request runs before a newer ordinary request;
  - an ineligible entry can be skipped according to existing global, per-client,
@@ -3618,7 +4799,7 @@ index 0113722fb1931a39583ed988a12e4bc4504e7a8a..e3b53befc6a2f72bccc6427dc76fd3c0
  - dependency overflow remains eligibility, not unconditional priority below
    shared base.
  
-@@ -334,14 +338,16 @@ own deadline until the selected request's later permit deadline. The companion
+@@ -334,14 +342,16 @@ own deadline until the selected request's later permit deadline. The companion
  shares queue state but does not keep admission open after the consuming
  receiver closes.
  
@@ -3643,7 +4824,7 @@ index 0113722fb1931a39583ed988a12e4bc4504e7a8a..e3b53befc6a2f72bccc6427dc76fd3c0
  
  Each post-admission analysis or evaluation retry is a new queue entry with a
  new hard deadline. The patch does not turn three bounded attempts into one
-@@ -451,8 +457,8 @@ The bounded scheduler and lane telemetry includes these closed values:
+@@ -451,8 +461,8 @@ The bounded scheduler and lane telemetry includes these closed values:
  - `capacity_kind="control_plane_lane"` for the configured lane occupancy cap;
  - `config_kind="control_plane_hard_max_age_millis"` for its hard deadline;
  - rejection reasons `lane_full`, `queue_full`, `hard_expired`,
@@ -3654,7 +4835,7 @@ index 0113722fb1931a39583ed988a12e4bc4504e7a8a..e3b53befc6a2f72bccc6427dc76fd3c0
  
  The enabled-state gauge is emitted on both queue policies. The control-plane
  capacity and deadline series are emitted only when the lane-aware queue is
-@@ -495,11 +501,14 @@ cannot create the missing execution capacity.
+@@ -495,11 +505,14 @@ cannot create the missing execution capacity.
  ## Interaction with other maintained patches
  
  [`README.md`](README.md) defines the combined operator contract for all four
@@ -3676,10 +4857,10 @@ index 0113722fb1931a39583ed988a12e4bc4504e7a8a..e3b53befc6a2f72bccc6427dc76fd3c0
  shared-base and dependency-reserve worker and queue model. Control-plane work
 diff --git a/patches/isolate_queue_control/isolate_delay_queue_design_reference.md b/patches/isolate_queue_control/isolate_delay_queue_design_reference.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b3613ab51a1c
+index 0000000000000000000000000000000000000000..6ff3cfb5363ff49681a62a8522410f938f0df12b
 --- /dev/null
 +++ b/patches/isolate_queue_control/isolate_delay_queue_design_reference.md
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,498 @@
 +# Isolate Delay Queue Design Reference
 +
 +> Detailed implementation reference. The operator-facing adoption contract,
@@ -3691,8 +4872,9 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +`IsolateDelayQueue` replaces the isolate scheduler's generic CoDel queue when
 +`ISOLATE_QUEUE_DELAY_CONTROL_ENABLED=true`. The implementation adds lane-local
 +delay observations, adaptive shedding for retryable application work, finite
-+hard deadlines, and scheduler-aware oldest-eligible selection without creating
-+separate physical queues.
++hard deadlines, and scheduler-aware selection without creating separate physical queues.
++The [HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority)
++adds bounded preference among eligible requests within ordinary capacity.
 +
 +The word `lane` refers only to an `IsolateQueueLane` variant. Scheduler labels,
 +active-JavaScript classes, active-permit phases, application gates, and worker
@@ -3719,12 +4901,13 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +
 +### Queue lanes
 +
-+`IsolateQueueLane` contains exactly four variants:
++`IsolateQueueLane` contains exactly five variants:
 +
 +| Rust variant | Metric label | Classification | Queue and scheduler policy |
 +| --- | --- | --- | --- |
 +| `Dependency` | `dependency` | `unblocks_ancestor=true` | Can use dependency-only queue and worker overflow; bypasses adaptive shedding |
 +| `ControlPlane` | `control_plane` | One of the five typed analysis or configuration-evaluation requests while control-plane classification is enabled | Uses shared base, has a lane-local queue sub-cap and longer hard deadline, and bypasses adaptive shedding |
++| `HighPriorityMutation` | `high_priority_mutation` | Mutation with the per-call high hint and no dependency ancestry | Uses ordinary shared-base capacity with bounded preference and participates in adaptive shedding |
 +| `IndependentAction` | `independent_action` | `Action` or `HttpAction` without dependency ancestry | Uses shared base, obeys the independent-action worker cap, and participates in adaptive shedding |
 +| `Ordinary` | `ordinary` | Every request not classified above | Uses shared base and participates in adaptive shedding |
 +
@@ -3732,8 +4915,9 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +
 +1. enabled typed control-plane request;
 +2. ancestor-unblocking dependency;
-+3. independent isolate action;
-+4. ordinary fallback.
++3. high-priority mutation;
++4. independent isolate action;
++5. ordinary fallback.
 +
 +A control-plane request with dependency ancestry is an invariant violation.
 +For every other request, dependency ownership takes precedence over action
@@ -3783,20 +4967,23 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +  ancestor;
 +- `Protected`, for ordinary application work, actions, and every request
 +  without a narrower active class;
++- `HighPriorityMutation`, for a mutation carrying the per-call high hint,
++  sharing the protected group's floor and elastic capacity;
 +- `ControlPlane`, for typed configuration evaluation with the deployment lane
 +  enabled, sharing the protected group's floor and elastic capacity;
 +- `Degradable`, for an admitted independent root query cache-miss leader.
 +
-+Backend-derived dependency ownership overrides `Protected` or `Degradable`.
++Backend-derived dependency ownership overrides every application class.
 +Only the query cache assigns `Degradable`, after a cache recheck confirms that
-+the admitted request still owns the cache miss. A client declaration alone
-+does not assign an active class.
++the admitted request still owns the cache miss. The HTTP mutation hint can assign
++`HighPriorityMutation`; it cannot assign dependency, control-plane, or degradable status.
 +
 +The usual mapping is:
 +
 +| Queue lane | Active-JavaScript class |
 +| --- | --- |
 +| `Dependency` | `Dependency` |
++| `HighPriorityMutation` | `HighPriorityMutation` |
 +| `Ordinary` admitted degradable root query | `Degradable` |
 +| Other `Ordinary` work | `Protected` |
 +| `IndependentAction` | `Protected` |
@@ -3807,17 +4994,19 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +controller, overload state, and shedding policy. Protected ordinary work and
 +independent actions use separate queue-lane controllers even though both use
 +the same active class. Control-plane work has its own lane and active class;
-+its grants alternate with ordinary protected work inside their combined group.
++its grants alternate with the combined ordinary/high-mutation demand inside the
++protected group. Application grants then use bounded high preference.
 +
 +Each active class has an `Initial` waiter queue and a `Resume` waiter queue.
-+The resulting eight limiter queues are not isolate scheduler queues. A resume
++The resulting ten limiter queues are not isolate scheduler queues. A resume
 +retains the request's active class, precedes an initial start within that class,
 +and does not re-enter `IsolateDelayQueue`.
 +
-+When active-class minimums are zero and the control-plane lane is disabled, active-class declarations collapse to the
-+phase-only compatibility policy. The scheduler then exposes only one effective
-+external initial-wait class. Direct internal dependencies and active-permit
-+reacquisitions retain the established resume-phase treatment.
++When active-class minimums are zero and the control-plane lane is disabled,
++non-high classes collapse to the phase-only compatibility policy. High mutations
++retain a separate class and external initial-wait slot with bounded preference.
++Direct internal dependencies and active-permit reacquisitions retain the established
++resume-phase treatment within their effective class.
 +
 +## One physical queue
 +
@@ -3830,8 +5019,7 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +- its absolute hard deadline.
 +
 +Lane-local state contains depth and one `LaneDelayController` per lane. The
-+queue does not maintain a per-lane `VecDeque`, fixed lane priority, round-robin
-+lane selection, or a lane-specific worker pool.
++queue does not maintain a per-lane `VecDeque` or a lane-specific worker pool.
 +
 +### Queue capacity
 +
@@ -3843,7 +5031,7 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +- `C = ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY`, the control-plane sub-cap.
 +
 +Control-plane entries can enqueue while total occupancy is below `Q`.
-+With the lane enabled, ordinary and independent-action entries can enqueue below
++With the lane enabled, ordinary, high-mutation, and independent-action entries can enqueue below
 +`Q - max(0, C - control_plane_depth)`. Dependency entries can enqueue up to `Q + R`.
 +Only a dependency can make `used_reserved_capacity=true`.
 +
@@ -3854,11 +5042,15 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +[deployment admission contract](../non_committing_codegen_analysis/deployment_operations.md)
 +also describes worker reservation and the separate fair JavaScript queue.
 +
-+### Oldest-eligible selection
++### Eligible selection and bounded preference
 +
 +Every receive first removes one hard-expired entry when one exists. Otherwise,
-+the receiver scans the complete `VecDeque` from oldest to newest and selects
-+the first entry with no scheduler ineligibility reason.
++the receiver scans the complete `VecDeque` from oldest to newest, recording the
++first eligible high mutation, ordinary/independent-action request, and
++dependency/control-plane request. High mutations receive at most two turns
++before eligible ordinary work, without crossing an older eligible platform request.
++An ordinary turn also waits for any older eligible platform prefix. Outside this
++bounded preference, selection uses the oldest eligible request.
 +
 +`IsolateQueueEligibility` represents blocking reasons as Boolean fields:
 +
@@ -3873,10 +5065,10 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +reason. The scan records every blocked lane/reason combination for metrics even
 +after finding the oldest eligible request.
 +
-+Selection therefore preserves FIFO among requests eligible in the same worker
-+snapshot. An older blocked request does not hide a younger request that can use
-+available capacity. Dependency entries do not jump older eligible shared-base
-+work while shared-base capacity remains available; dependency entries become
++Within each lane, selection preserves FIFO among eligible requests. An older
++blocked request does not hide a younger request that can use
++available capacity. Dependency entries do not jump older eligible ordinary or
++independent-action work while shared-base capacity remains available; dependency entries become
 +the only externally eligible work after shared base is full.
 +
 +Worker completion is processed before another selection attempt. Completed
@@ -3893,17 +5085,18 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +While one external waiter is exposed, another queued request in the same
 +effective class receives `active_javascript_class_pending=true` and remains in
 +`IsolateDelayQueue`. With both floors and the deployment lane enabled,
-+dependency, protected, control-plane, and degradable external waits are tracked
++dependency, protected, high-mutation, control-plane, and degradable external waits are tracked
 +separately. With zero floors, degradable collapses into protected, but an
-+enabled deployment lane retains its separate slot. Phase-only compatibility
-+mode maps all external requests to one protected pending-class slot.
++enabled deployment lane retains its separate slot. With the deployment lane also
++disabled, non-high external requests share one protected pending-class slot;
++high mutations retain their separate slot.
 +
 +The pending-class slot is shared across queue lanes. One exposed protected
 +waiter can keep protected `Ordinary` and `IndependentAction` entries queued,
-+while eligible degradable `Ordinary`, `ControlPlane`, and external `Dependency`
++while eligible `HighPriorityMutation`, degradable `Ordinary`, `ControlPlane`, and external `Dependency`
 +entries can each expose their own wait when their class is effective. An older request blocked by its
 +pending active class can be skipped for a younger request in another active
-+class. FIFO remains intact among requests eligible in the same snapshot.
++class. Bounded high preference still applies among eligible requests.
 +
 +Each exposed waiter reserves the global and per-client worker eligibility that
 +allowed selection. The reservation prevents concurrent active classes from
@@ -3937,7 +5130,7 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +clears its controller and partial interval state.
 +
 +Overload state does not change scheduler eligibility. After normal selection,
-+an `Ordinary` or `IndependentAction` request is adaptively rejected only when:
++an `Ordinary`, `HighPriorityMutation`, or `IndependentAction` request is adaptively rejected only when:
 +
 +- its lane is overloaded; and
 +- that selected request's own sojourn is greater than
@@ -3949,7 +5142,7 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +
 +## Deadlines, cancellation, and closure
 +
-+Ordinary, independent-action, and dependency entries receive
++Ordinary, high-mutation, independent-action, and dependency entries receive
 +`ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS`. Control-plane entries receive
 +`ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS`. The absolute deadline stored at
 +enqueue continues through initial active-permit acquisition. Worker execution
@@ -4130,7 +5323,7 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +2. application function admission and query-cache coalescing;
 +3. degradable leader admission or deployment-analysis pacing when applicable;
 +4. bounded isolate queue admission;
-+5. hard-expiry enforcement and oldest-eligible selection under worker and
++5. hard-expiry enforcement and bounded-preference selection under worker and
 +   per-client limits;
 +6. adaptive shedding for a selected retryable lane;
 +7. one exposed initial active-JavaScript permit wait for the effective class;
@@ -4148,10 +5341,10 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +
 +The implementation preserves these invariants:
 +
-+- one physical external queue serves all four lanes;
++- one physical external queue serves all five lanes;
 +- only `Dependency` can use queue or worker overflow;
 +- `ControlPlane` never carries dependency ancestry;
-+- only `Ordinary` and `IndependentAction` receive adaptive shedding;
++- only `Ordinary`, `HighPriorityMutation`, and `IndependentAction` receive adaptive shedding;
 +- every external hard deadline continues through initial active-permit wait;
 +- one external initial active-permit waiter is exposed per effective active
 +  class;
@@ -4166,6 +5359,43 @@ index 0000000000000000000000000000000000000000..f9be30698243917e3a8a20637bc3b361
 +when aggregate throughput appears unchanged. Tests and metrics therefore retain
 +the exact lane, scheduler class, active class, phase, rejection reason, and
 +reserve-use distinctions.
+diff --git a/patches/non_committing_codegen_analysis/deployment_operations.md b/patches/non_committing_codegen_analysis/deployment_operations.md
+index 59f898dc4b2740b85800faa46680454881f6d678..72f710f3b4cb31b8e90135fef072a665a595bca0 100644
+--- a/patches/non_committing_codegen_analysis/deployment_operations.md
++++ b/patches/non_committing_codegen_analysis/deployment_operations.md
+@@ -44,8 +44,10 @@ streaming responses do. They retain their separate body-stream deadline.
+ With the control-plane queue enabled, `ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY`
+ reserves space inside `ISOLATE_QUEUE_SIZE` as well as bounding its lane. It must
+ leave ordinary queue capacity. Dependency overflow retains access to the total
+-queue to release ancestors. FIFO selection among eligible requests remains;
+-worker eligibility can skip an ordinary backlog to select configuration work.
++queue to release ancestors. High mutations receive bounded preference without
++crossing older eligible dependency or configuration requests; worker eligibility
++can skip an ordinary backlog to select configuration work. See the
++[HTTP mutation priority contract](../../crates/isolate/README.md#http-mutation-priority).
+ 
+ `ISOLATE_CONTROL_PLANE_WORKER_RESERVE`
+ (default 1) preserves worker capacity inside the existing base limit. It is
+@@ -54,14 +56,15 @@ existing limit. The scheduler reserves a worker before exposing an initial
+ JavaScript waiter, with separate pending slots for effective service classes.
+ 
+ Configuration evaluation uses a distinct `control_plane` JavaScript queue. It
+-alternates grants with ordinary protected work whenever both are waiting, inside
++alternates grants with combined ordinary/high-mutation demand whenever both are waiting, inside
+ the existing protected group's service floor and elastic share. Resumptions
+ precede initial starts within each queue; ordinary resumptions cannot hide
+ deployment demand. Dependency work retains precedence, and the degradable floor
+ is unchanged. Without protected/degradable floors, the enabled control-plane
+-lane still alternates with ordinary work. Disabling the lane restores the prior
+-JavaScript policy. No extra permits or preemption are introduced. For occupancy
+-comparisons against the protected minimum, sum `protected` and `control_plane`.
++lane still alternates with application work. Disabling the lane leaves bounded
++high-mutation preference in place. No extra permits or preemption are introduced.
++For occupancy comparisons against the protected minimum, sum `protected`,
++`high_priority_mutation`, and `control_plane`.
+ 
+ These are non-preemptive service and finite-queue bounds. Existing executions,
+ dependency callbacks, shared query/analysis permits and external resources must
 diff --git a/patches/scheduled_action_admission/README.md b/patches/scheduled_action_admission/README.md
 index 321f7f57bf45bddbea14b32445d89eda952f1c1c..82fac1b82ef73e18ea96acf3815cd5600f6f6e41 100644
 --- a/patches/scheduled_action_admission/README.md
