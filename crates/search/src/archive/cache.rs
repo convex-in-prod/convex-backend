@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    fs as sync_fs,
     io,
     mem,
     ops::Deref,
@@ -155,10 +156,9 @@ impl fmt::Debug for CachedArchive {
 /// retains; directories pinned by outstanding handles (in practice, the entries
 /// of the in-memory segment caches) can add to that.
 ///
-/// In the interest of hot-path performance, any deletion or pruning operations
-/// are best-effort and are spawned to the thread pool rather than occurring in
-/// the calling task. For now, errors in these spawned tasks will panic the
-/// entire process.
+/// Deletion requests are queued to a dedicated thread so recursive filesystem
+/// operations do not block the calling task. Unexpected filesystem errors
+/// panic the cleanup thread.
 pub struct ArchiveCacheManager<RT: Runtime> {
     path: PathBuf,
     max_size: u64,
@@ -501,23 +501,28 @@ async fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
 /// entry needs the bit cleared throughout the tree. Symlinks are skipped so the
 /// walk never leaves the cache directory; paths that disappear mid-walk are
 /// tolerated.
-async fn clear_readonly_recursive(path: &Path) -> io::Result<()> {
+fn clear_readonly_recursive(path: &Path) -> io::Result<()> {
     let mut stack = vec![path.to_owned()];
     while let Some(current) = stack.pop() {
-        let Some(metadata) = ignore_not_found(fs::symlink_metadata(&current).await)? else {
+        let Some(metadata) = ignore_not_found(sync_fs::symlink_metadata(&current))? else {
             continue;
         };
         if metadata.is_symlink() {
             continue;
         }
         if metadata.permissions().readonly() {
-            ignore_not_found(set_readonly(&current, false).await)?;
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            ignore_not_found(sync_fs::set_permissions(&current, permissions))?;
         }
         if metadata.is_dir() {
-            let Some(mut entries) = ignore_not_found(fs::read_dir(&current).await)? else {
+            let Some(entries) = ignore_not_found(sync_fs::read_dir(&current))? else {
                 continue;
             };
-            while let Some(entry) = ignore_not_found(entries.next_entry().await)?.flatten() {
+            for entry in entries {
+                let Some(entry) = ignore_not_found(entry)? else {
+                    continue;
+                };
                 stack.push(entry.path());
             }
         }
@@ -565,18 +570,18 @@ impl CacheCleaner {
 /// Runs on a separate thread to delete archives that have been removed from the
 /// in-memory cache.
 /// Using a separate thread for this is just an optimization, recognizing that a
-/// recursive deletion doesn't need to be in the critical path and may block the
-/// for a meaningful amount of time as opposed to our other filesystem ops which
+/// recursive deletion doesn't need to be in the critical path and may block for
+/// a meaningful amount of time as opposed to our other filesystem ops which
 /// should be quite fast.
 async fn cleanup_thread(mut rx: mpsc::UnboundedReceiver<(PathBuf, SearchFileType, u64)>) {
     while let Some((path, search_file_type, size)) = rx.recv().await {
-        // Yes, we'll panic and restart here. If we actually see panics in
-        // production here, we should investigate further but for now, it's simpler
-        // to disallow inconsistent filesystem state.
+        // Cleanup already has a dedicated thread. Synchronous file operations avoid
+        // Tokio's blocking pool, which may have shut down before the cache is
+        // dropped.
         tracing::debug!("Removing path {} from disk", path.display());
         let result: io::Result<()> = try {
-            clear_readonly_recursive(&path).await?;
-            fs::remove_dir_all(&path).await?;
+            clear_readonly_recursive(&path)?;
+            sync_fs::remove_dir_all(&path)?;
         };
         match result {
             Ok(()) => {
@@ -586,5 +591,28 @@ async fn cleanup_thread(mut rx: mpsc::UnboundedReceiver<(PathBuf, SearchFileType
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
             Err(e) => panic!("ArchiveCacheManager failed to clean up archive directory: {e:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clears_readonly_nested_archive_before_removal() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let archive = parent.path().join("archive");
+        let nested = archive.join("segment");
+        sync_fs::create_dir_all(&nested)?;
+        sync_fs::write(nested.join("data"), b"index")?;
+        let mut permissions = sync_fs::metadata(&nested)?.permissions();
+        permissions.set_readonly(true);
+        sync_fs::set_permissions(&nested, permissions)?;
+
+        clear_readonly_recursive(&archive)?;
+        assert!(!sync_fs::metadata(&nested)?.permissions().readonly());
+        sync_fs::remove_dir_all(&archive)?;
+        assert!(!archive.exists());
+        Ok(())
     }
 }
