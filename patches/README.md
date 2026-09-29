@@ -96,7 +96,26 @@ codegen protocol above remains a smaller adoption unit. Whole-job and HTTP
 admission apply to legacy callers too. Retained operation identity/status/cancel
 requires explicit client negotiation, and its preparation is process-local.
 
-## Log privacy
+### [Supervised native residents](native_residents/README.md)
+
+- Purpose: supervise a digest-bound native executable selected by the committed root source
+  package, with transactional application ownership metadata and bounded process cleanup.
+- Prerequisites: coordinated local executor pools, deployment operations, runtime observability,
+  and the matching CLI native-resident publication envelope. Static Hermes Wasm execution is independent.
+- Activation: configure immutable artifact and configuration directories and an explicit shared
+  Node/native RSS budget, prepare the executable, then publish its descriptor with functions.
+- Rollback: publish an explicit null target or a retained compatible descriptor, preserving the
+  expected-prior check and confirming process drain or termination before incompatible changes.
+
+### [Search archive cleanup after runtime shutdown](search_archive_cleanup/README.md)
+
+- Purpose: let the dedicated archive cleanup thread delete retired directories after the async
+  runtime's blocking pool has stopped.
+- Prerequisites: the upstream archive cache and its dedicated cleanup thread.
+- Activation: automatic; no configuration, schema or storage-format change.
+- Rollback: restore the previous backend binary.
+
+## Logging
 
 ### [Redact validator values from external log sinks](validation_error_log_redaction/README.md)
 
@@ -204,7 +223,9 @@ requires explicit client negotiation, and its preparation is process-local.
   reserve the configured total Node RSS budget when that patch is present.
 - Activation: first set `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` to cover the default
   application slot, internal system slot, every named application slot, and one full application
-  surge allowance, and verify that the complete configured memory
+  surge allowance. When the [native resident adapter](../crates/node_executor/NATIVE_RESIDENTS.md)
+  is enabled, include its steady limit and size that same surge allowance for the largest Node
+  or native replacement. Verify that the complete configured memory
   budget fits the finite cgroup. Replace the backend with one advertising cutover capability
   version 1 before using `--force-node-cutover` from the matching CLI; ordinary requests that omit
   the option remain compatible with older CLIs. Then add `"use node"` and

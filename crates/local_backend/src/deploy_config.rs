@@ -275,7 +275,7 @@ pub async fn push_config(
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     Json(req): Json<ConfigJson>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    push_config_handler(&st.application, request_metadata, req)
+    push_config_handler(&st.application, &st.native_resident, request_metadata, req)
         .await
         .map_err(|e| {
             if e.short_msg() == "NodeExecutorCutoverFailedAfterCommit" {
@@ -291,6 +291,7 @@ pub async fn push_config(
 #[fastrace::trace]
 pub async fn push_config_handler(
     application: &Application<ProdRuntime>,
+    native_resident: &node_executor::native::NativeResidentSupervisor,
     request_metadata: RequestMetadata,
     config: ConfigJson,
 ) -> anyhow::Result<(Identity, PushAnalytics, PushMetrics)> {
@@ -334,6 +335,7 @@ pub async fn push_config_handler(
             config.schema_id,
             config.node_dependencies,
             node_version,
+            native_resident,
             config.force_node_cutover,
         )
         .await?;

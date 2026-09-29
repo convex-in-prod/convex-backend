@@ -36,8 +36,6 @@ use common::{
     try_anyhow,
     types::{
         AllowedVisibility,
-        DeploymentClass,
-        RegionName,
         UdfType,
         WriteTimestamp,
     },
@@ -93,6 +91,7 @@ use serde::{
     Serialize,
 };
 use serde_json::{
+    json,
     value::RawValue,
     Value as JsonValue,
 };
@@ -686,7 +685,7 @@ pub(super) async fn run_async_syscall_batch<RT: Runtime>(
                 "1.0/queryPage" => Box::pin(query_page(provider, args)).await,
                 "1.0/getTransactionMetrics" => tx_metrics(provider),
                 "1.0/getFunctionMetadata" => function_metadata(provider),
-                "1.0/getDeploymentMetadata" => deployment_metadata(provider),
+                "1.0/getDeploymentMetadata" => Box::pin(deployment_metadata(provider)).await,
                 "1.0/getRequestMetadata" => request_metadata(provider),
                 // Auth
                 "1.0/getUserIdentity" => Box::pin(get_user_identity(provider, args)).await,
@@ -804,22 +803,24 @@ fn function_metadata<RT: Runtime>(
 }
 
 /// Returns metadata about the deployment this function is running on.
-fn deployment_metadata<RT: Runtime>(
+async fn deployment_metadata<RT: Runtime>(
     provider: &mut DatabaseUdfSyscallProvider<RT>,
 ) -> anyhow::Result<Box<RawValue>> {
-    let deployment = &provider.deployment;
-    #[allow(non_snake_case)]
-    #[derive(Serialize)]
-    struct DeploymentMetadataJson<'a> {
-        name: &'a String,
-        region: &'a Option<RegionName>,
-        class: &'a DeploymentClass,
-    }
-    Ok(serde_json::value::to_raw_value(&DeploymentMetadataJson {
-        name: &deployment.name,
-        region: &deployment.region,
-        class: &deployment.class,
-    })?)
+    // This read participates in the caller's snapshot and OCC read set. Native
+    // selection cannot race a lease acquisition that checks deployment metadata.
+    let native_resident = model::source_packages::SourcePackageModel::new(
+        provider.phase.tx()?,
+        TableNamespace::Global,
+    )
+    .get_latest_record()
+    .await?
+    .and_then(|package| package.native_resident.clone());
+    Ok(serde_json::value::to_raw_value(&json!({
+        "name": provider.deployment.name,
+        "region": provider.deployment.region,
+        "class": provider.deployment.class,
+        "nativeResident": native_resident,
+    }))?)
 }
 
 /// Returns metadata about the originating HTTP request.
