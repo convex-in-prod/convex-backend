@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 30 Sep 2026 00:54:09 +0800
-Subject: [PATCH 26/28] node-executor: supervise deployment-selected native
+Subject: [PATCH 27/29] node-executor: supervise deployment-selected native
  residents
 
 Bind immutable executable and configuration digests to the committed root source package, compare expected prior selection, and expose transactional deployment metadata for application ownership checks. Retain the newest empty package as deployment authority.
@@ -9,6 +9,8 @@ Bind immutable executable and configuration digests to the committed root source
 Supervise inert preparation, activation, progress and bounded retirement with one native steady slot and the existing shared Node replacement surge owner. Keep process, verified artifact and capacity ownership through cancellation, force, memory pressure and shutdown until direct-child reaping is confirmed.
 
 Add administrative preparation and inspection, publication compatibility guards, durable reconciliation, actual executable lifecycle tests and generic operator adoption documentation.
+
+Forward sanitized resident stderr with bounded framing and rate limits through the shared service tracing output. Report completed drops even when the child becomes quiet, and abort diagnostic reads without waiting during termination. Keep reaping and surge ownership independent of log delivery. Exercise blocked backend stdout, generation attribution, malformed framing, and failure cleanup with isolated fixture process groups.
 ---
  Cargo.lock                                    |    1 +
  crates/application/src/deploy_config.rs       |  162 ++
@@ -26,24 +28,26 @@ Add administrative preparation and inspection, publication compatibility guards,
  crates/model/src/source_packages/native.rs    |  151 ++
  crates/model/src/source_packages/types.rs     |   17 +
  crates/node_executor/Cargo.toml               |    8 +
- crates/node_executor/NATIVE_RESIDENTS.md      |  139 ++
- crates/node_executor/src/lib.rs               |    2 +
+ crates/node_executor/NATIVE_RESIDENTS.md      |  168 ++
+ crates/node_executor/src/lib.rs               |    3 +
  crates/node_executor/src/local.rs             |   73 +-
- crates/node_executor/src/native.rs            | 1520 +++++++++++++++++
+ crates/node_executor/src/native.rs            | 1548 +++++++++++++++++
+ crates/node_executor/src/native_logs.rs       |  200 +++
  crates/node_executor/src/process.rs           |   15 +
  crates/node_executor/src/routed.rs            |   58 +-
- .../node_executor/testdata/native_resident.rs |  104 ++
- crates/node_executor/tests/native_resident.rs |  641 +++++++
+ .../node_executor/testdata/native_resident.rs |  156 ++
+ crates/node_executor/tests/native_resident.rs |  805 +++++++++
  patches/README.md                             |   23 +-
  patches/backend_memory_resilience/README.md   |   13 +-
  .../README.md                                 |    5 +-
- patches/native_residents/README.md            |   29 +
+ patches/native_residents/README.md            |   33 +
  .../README.md                                 |   11 +-
- 29 files changed, 3298 insertions(+), 93 deletions(-)
+ 30 files changed, 3776 insertions(+), 93 deletions(-)
  create mode 100644 crates/local_backend/src/native_resident.rs
  create mode 100644 crates/model/src/source_packages/native.rs
  create mode 100644 crates/node_executor/NATIVE_RESIDENTS.md
  create mode 100644 crates/node_executor/src/native.rs
+ create mode 100644 crates/node_executor/src/native_logs.rs
  create mode 100644 crates/node_executor/src/process.rs
  create mode 100644 crates/node_executor/testdata/native_resident.rs
  create mode 100644 crates/node_executor/tests/native_resident.rs
@@ -1267,10 +1271,10 @@ index ec00d83f718d3dbed076129ea90450c31d65d5e2..598e13269ae0797760d578facc8da829
  value = { workspace = true }
 diff --git a/crates/node_executor/NATIVE_RESIDENTS.md b/crates/node_executor/NATIVE_RESIDENTS.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..79e8f22e02236be3328401d232a2a4e9d7e4d494
+index 0000000000000000000000000000000000000000..fef7a9c8fef280c2966bd75d1261d5e546760568
 --- /dev/null
 +++ b/crates/node_executor/NATIVE_RESIDENTS.md
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,168 @@
 +# Local native residents
 +
 +A native resident is a directly supervised executable, independent of Node source
@@ -1360,6 +1364,32 @@ index 0000000000000000000000000000000000000000..79e8f22e02236be3328401d232a2a4e9
 +64 KiB. `generation` is an opaque string; protocol and nonce are unsigned integers.
 +The child reserves stdout for the protocol.
 +
++Stderr carries application-sanitized diagnostic lines. The supervisor forwards valid UTF-8
++lines of at most 8 KiB, without control characters, at up to 100 lines per second per child.
++Oversized, malformed, incomplete and excess lines are discarded with aggregate drop reporting;
++pipe failure is diagnostic only. Each forwarded line has the `native_resident_log` message
++prefix and a `native_generation` field in backend logs. Application JSON remains within the
++message for the operator's log collector to parse. The reader has bounded buffers, runs
++independently of lifecycle reads, and is canceled at termination rather than delaying reaping.
++Completed losses are summarized at the next one-second window boundary, including when stderr
++stays open without another write. Summary delivery is best effort under output saturation.
++
++[Bounded service logging](../../patches/bounded_service_logging/README.md) uses one shared
++256-record stdout queue and one output thread, so native
++diagnostics and backend lifecycle warnings cannot block runtime workers on the stdout pipe.
++There is no separate native output queue or lazy sink initialization. Output workers are
++required at service startup; failure to create one fails startup visibly before supervision.
++Queue saturation and output write failures discard records and report aggregate loss after
++output resumes. Summary loss does not generate further summaries. The optional trace-file
++writer retains its existing 128,000-record buffer and format/filter policy, with the same
++bounded shutdown behavior. Tool tracing still writes to stderr synchronously.
++
++Each output guard attempts to drain for at most one second without printing, flushing, or
++joining on the caller's thread. A blocked output worker may remain until process exit, and
++queued diagnostics are not guaranteed to survive shutdown. These output bounds do not limit
++bytes read from resident stderr or establish process liveness, completion, or ownership.
++Applications use bounded nonblocking logging when stderr backpressure cannot delay their work.
++
 +| Direction | Message |
 +| --- | --- |
 +| Backend → child | `{type:"initialize",generation,descriptor,configuration}` |
@@ -1406,19 +1436,23 @@ index 0000000000000000000000000000000000000000..79e8f22e02236be3328401d232a2a4e9
 +candidate replacement, forced retirement fencing, graceful drain, canceled preparation
 +and shutdown, RSS enforcement before readiness and after activation, memory pressure
 +during stalled progress and replacement drain, watchdog replacement, parent-death
-+termination, and reaping. Native unit tests additionally cover progress mismatch,
++termination, JSON-formatted stderr forwarding, and reaping. A separate parent-process fixture
++holds backend stdout full during force retirement and shutdown, checks direct-child reaping,
++and applies its deadline outside the supervised backend process. Native unit tests additionally
++cover bounded stderr framing and quiet-stream loss reporting, progress mismatch,
 +disconnect, stalled progress, canceled probe resumption, canceled startup, and incomplete
 +artifact inputs. Follow the checkout's resource-guard instructions when running these
 +commands.
 diff --git a/crates/node_executor/src/lib.rs b/crates/node_executor/src/lib.rs
-index 713ada525d66077f42c61cfdb5cbdd28be98b0e7..d278d51886ec616b83b20acd5b6c6100a8e6c4da 100644
+index 713ada525d66077f42c61cfdb5cbdd28be98b0e7..936941e2b510245922482009bf1ce12b12b8114f 100644
 --- a/crates/node_executor/src/lib.rs
 +++ b/crates/node_executor/src/lib.rs
-@@ -9,7 +9,9 @@
+@@ -9,7 +9,10 @@
  mod executor;
  pub mod local;
  mod metrics;
 +pub mod native;
++mod native_logs;
  pub mod noop;
 +mod process;
  pub mod routed;
@@ -1539,10 +1573,10 @@ index 1303aa0496988a1f52e2fa6a68d3386a3f1d4cdf..1c67f43a99a37d313cec2f32205682d1
              state_before,
 diff --git a/crates/node_executor/src/native.rs b/crates/node_executor/src/native.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba7580200883ae3
+index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2fc4cccb57
 --- /dev/null
 +++ b/crates/node_executor/src/native.rs
-@@ -0,0 +1,1520 @@
+@@ -0,0 +1,1548 @@
 +//! Backend-owned native residents. The executable implements lifecycle protocol
 +//! v1; it is not an action runtime and receives no request or module-loading
 +//! API.
@@ -2009,6 +2043,7 @@ index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba75802
 +    pending_write: Option<ControlWrite>,
 +    pending: Vec<u8>,
 +    cleanup: TaskTracker,
++    logs: tokio::task::JoinHandle<()>,
 +}
 +
 +struct ControlWrite {
@@ -2287,6 +2322,7 @@ index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba75802
 +    }
 +
 +    async fn terminate(&mut self) -> anyhow::Result<()> {
++        self.logs.abort();
 +        if let Some(child) = &mut self.child {
 +            tokio::time::timeout(REAP_TIMEOUT, kill_and_reap(child))
 +                .await
@@ -2302,6 +2338,7 @@ index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba75802
 +
 +impl Drop for ResidentChild {
 +    fn drop(&mut self) {
++        self.logs.abort();
 +        let Some(mut child) = self.child.take() else {
 +            return;
 +        };
@@ -2330,6 +2367,18 @@ index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba75802
 +            );
 +        }
 +    }
++}
++
++fn forward_logs(
++    stderr: tokio::process::ChildStderr,
++    generation: String,
++) -> tokio::task::JoinHandle<()> {
++    tokio::spawn(async move {
++        crate::native_logs::forward(stderr, |record| {
++            crate::native_logs::emit(&generation, record)
++        })
++        .await;
++    })
 +}
 +
 +fn verified_file(path: &Path, expected: &str, limit: u64) -> anyhow::Result<File> {
@@ -2398,7 +2447,7 @@ index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba75802
 +        .env_clear()
 +        .stdin(Stdio::piped())
 +        .stdout(Stdio::piped())
-+        .stderr(Stdio::null())
++        .stderr(Stdio::piped())
 +        .kill_on_drop(true);
 +    #[cfg(target_os = "linux")]
 +    unsafe {
@@ -2430,7 +2479,15 @@ index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba75802
 +            .take()
 +            .context("Native resident stdout missing")?,
 +    );
++    let logs = forward_logs(
++        child
++            .stderr
++            .take()
++            .context("Native resident stderr missing")?,
++        generation.clone(),
++    );
 +    let mut result = ResidentChild {
++        logs,
 +        child: Some(child),
 +        stdin,
 +        stdout,
@@ -2791,6 +2848,9 @@ index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba75802
 +    kind = msg['type']
 +    generation = msg['generation']
 +    if kind == 'initialize':
++        if mode == 'log_flood':
++            sys.stderr.write('x' * 1000000 + '\n' + '{\"event\":\"fixture\"}\n' * 1000)
++            sys.stderr.flush()
 +        print(json.dumps(dict(type='ready', generation=generation, **msg['descriptor'])), flush=True)
 +        if mode == 'blocked_input':
 +            time.sleep(30)
@@ -2806,14 +2866,16 @@ index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba75802
 +    elif kind == 'retire':
 +        print(json.dumps(dict(type='drained', generation=generation)), flush=True)
 +"#, mode])
-+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
 +            .kill_on_drop(true).spawn().unwrap();
 +        if let Some(permit) = &permit {
 +            permit.require_confirmed_cleanup();
 +        }
 +        let stdin = child.stdin.take().unwrap();
 +        let stdout = BufReader::new(child.stdout.take().unwrap());
++        let logs = forward_logs(child.stderr.take().unwrap(), "test-1".into());
 +        let mut child = ResidentChild {
++            logs,
 +            child: Some(child),
 +            stdin,
 +            stdout,
@@ -2840,7 +2902,7 @@ index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba75802
 +        let permit = surge
 +            .acquire(SurgePriority::Deployment, Arc::from("native"))
 +            .await;
-+        let mut child = fixture("healthy", Some(permit)).await;
++        let mut child = fixture("log_flood", Some(permit)).await;
 +        child.activate(usize::MAX).await.unwrap();
 +        child.probe(usize::MAX).await.unwrap();
 +        let (_shutdown, mut shutdown) = watch::channel(false);
@@ -3063,6 +3125,212 @@ index 0000000000000000000000000000000000000000..ff308f6441d1c0f1d2a0790d0ba75802
 +        assert!(verified_file(file.path(), &digest, 1024).is_err());
 +    }
 +}
+diff --git a/crates/node_executor/src/native_logs.rs b/crates/node_executor/src/native_logs.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9b8c170d504cf45c83cf2898d283863a75f21c5
+--- /dev/null
++++ b/crates/node_executor/src/native_logs.rs
+@@ -0,0 +1,200 @@
++//! Bounded diagnostic stderr forwarding, independent of resident lifecycle
++//! progress.
++use std::time::Duration;
++
++use tokio::{
++    io::{
++        AsyncRead,
++        AsyncReadExt,
++    },
++    time::Instant,
++};
++
++const MAX_LINE_BYTES: usize = 8 * 1024;
++const LINES_PER_SECOND: usize = 100;
++
++pub(super) enum Record {
++    Line(String),
++    Dropped(u64),
++    ReadFailed,
++}
++
++pub(super) fn emit(generation: &str, record: Record) {
++    // Service tracing owns the bounded output queue, including lifecycle warnings.
++    match record {
++        Record::Line(line) => {
++            tracing::info!(native_generation = %generation, "native_resident_log {line}")
++        },
++        Record::Dropped(count) => {
++            tracing::warn!(native_generation = %generation, dropped = count, "Native resident logs dropped")
++        },
++        Record::ReadFailed => {
++            tracing::warn!(native_generation = %generation, "Native resident log pipe failed")
++        },
++    }
++}
++
++pub(super) async fn forward(mut reader: impl AsyncRead + Unpin, mut emit: impl FnMut(Record)) {
++    let mut bytes = [0; 4096];
++    let mut line = Vec::with_capacity(MAX_LINE_BYTES);
++    let mut oversized = false;
++    let mut window = Instant::now();
++    let mut emitted = 0;
++    let mut dropped = 0u64;
++    loop {
++        let read = tokio::select! {
++            // Report completed losses even if a healthy resident leaves stderr
++            // open without writing again. No timer is polled without pending loss.
++            _ = tokio::time::sleep_until(window + Duration::from_secs(1)), if dropped > 0 => {
++                emit(Record::Dropped(dropped));
++                dropped = 0;
++                window = Instant::now();
++                emitted = 0;
++                continue;
++            },
++            read = reader.read(&mut bytes) => read,
++        };
++        let count = match read {
++            Ok(0) => break,
++            Ok(count) => count,
++            Err(_) => {
++                // A diagnostic pipe failure supplies no process-liveness or retirement
++                // authority.
++                emit(Record::ReadFailed);
++                break;
++            },
++        };
++        if window.elapsed() >= Duration::from_secs(1) {
++            if dropped > 0 {
++                emit(Record::Dropped(dropped));
++                dropped = 0;
++            }
++            window = Instant::now();
++            emitted = 0;
++        }
++        for &byte in &bytes[..count] {
++            if byte == b'\n' {
++                if oversized || emitted == LINES_PER_SECOND {
++                    dropped = dropped.saturating_add(1);
++                } else if !line.is_empty() {
++                    match std::str::from_utf8(&line) {
++                        Ok(text) if !text.chars().any(char::is_control) => {
++                            emit(Record::Line(text.to_owned()));
++                            emitted += 1;
++                        },
++                        _ => dropped = dropped.saturating_add(1),
++                    }
++                }
++                line.clear();
++                oversized = false;
++            } else if !oversized {
++                if line.len() == MAX_LINE_BYTES {
++                    oversized = true;
++                    line.clear();
++                } else {
++                    line.push(byte);
++                }
++            }
++        }
++        // A continuously writable child cannot monopolize a runtime worker while logs
++        // are dropped.
++        tokio::task::yield_now().await;
++    }
++    if oversized || !line.is_empty() {
++        dropped = dropped.saturating_add(1);
++    }
++    if dropped > 0 {
++        emit(Record::Dropped(dropped));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn framing_preserves_split_utf8_and_rejects_unsafe_or_incomplete_lines() {
++        let exact = format!("{}é", "x".repeat(MAX_LINE_BYTES - 2));
++        let split = exact.len() - 1;
++        let mut rest = exact.as_bytes()[split..].to_vec();
++        rest.push(b'\n');
++        rest.extend(vec![b'x'; MAX_LINE_BYTES + 1]);
++        rest.extend_from_slice(b"\n\xff\n\r\n\t\n\x7f\n\xc2\x85\n\nsafe\nfragment");
++        // The reader ends a read inside the final UTF-8 scalar of an exact-limit
++        // line. Recovery must also discard an oversized line across many reads.
++        let reader = (&exact.as_bytes()[..split]).chain(rest.as_slice());
++        let mut lines = Vec::new();
++        let mut dropped = 0;
++        forward(reader, |record| match record {
++            Record::Line(line) => lines.push(line),
++            Record::Dropped(count) => dropped += count,
++            Record::ReadFailed => panic!("fixture pipe failed"),
++        })
++        .await;
++        assert_eq!(lines, [exact, "safe".to_owned()]);
++        assert_eq!(dropped, 7);
++    }
++
++    #[tokio::test]
++    async fn real_child_logs_are_bounded_and_recover_after_oversized_lines() {
++        let mut child = tokio::process::Command::new("python3")
++            .args([
++                "-c",
++                "import sys; \
++                 sys.stderr.write('x'*1000000+'\\n'+chr(27)+'unsafe\\n'+''.join('{\"event\":\"\
++                 fixture\"}\\n' for _ in range(110)))",
++            ])
++            .stderr(std::process::Stdio::piped())
++            .kill_on_drop(true)
++            .spawn()
++            .unwrap();
++        let mut lines = Vec::new();
++        let mut dropped = 0;
++        tokio::time::timeout(
++            Duration::from_secs(5),
++            forward(child.stderr.take().unwrap(), |record| match record {
++                Record::Line(line) => lines.push(line),
++                Record::Dropped(count) => dropped += count,
++                Record::ReadFailed => panic!("fixture pipe failed"),
++            }),
++        )
++        .await
++        .unwrap();
++        assert!(child.wait().await.unwrap().success());
++        assert!((LINES_PER_SECOND..=110).contains(&lines.len()));
++        assert!(lines.iter().all(|line| line == "{\"event\":\"fixture\"}"));
++        assert_eq!(lines.len() as u64 + dropped, 112);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn rate_limit_resets_and_incomplete_output_has_no_authority() {
++        use tokio::io::AsyncWriteExt;
++        let (mut writer, reader) = tokio::io::duplex(4096);
++        let (records_tx, mut records) = tokio::sync::mpsc::unbounded_channel();
++        let task = tokio::spawn(async move {
++            forward(reader, |record| records_tx.send(record).unwrap()).await;
++        });
++        writer
++            .write_all("line\n".repeat(101).as_bytes())
++            .await
++            .unwrap();
++        // Observe the entire accepted burst before advancing time. The reader
++        // finishes the same read (including the excess line) before yielding.
++        for _ in 0..LINES_PER_SECOND {
++            assert!(matches!(records.recv().await.unwrap(), Record::Line(line) if line == "line"));
++        }
++        tokio::time::advance(Duration::from_secs(1)).await;
++        assert!(matches!(
++            tokio::time::timeout(Duration::from_millis(1), records.recv())
++                .await
++                .unwrap(),
++            Some(Record::Dropped(1))
++        ));
++        writer.write_all(b"recovered\nincomplete").await.unwrap();
++        assert!(matches!(records.recv().await.unwrap(), Record::Line(line) if line == "recovered"));
++        drop(writer);
++        assert!(matches!(records.recv().await.unwrap(), Record::Dropped(1)));
++        task.await.unwrap();
++        assert!(records.recv().await.is_none());
++    }
++}
 diff --git a/crates/node_executor/src/process.rs b/crates/node_executor/src/process.rs
 new file mode 100644
 index 0000000000000000000000000000000000000000..7d6e3b7cc0e0377a668a1fa94674c32e0cc94bbe
@@ -3190,10 +3458,10 @@ index 46ab34d8ca767eeb1e29fa2d393d7eb355b08b16..e56a7761d705b479ee3305f6b86a911d
              &self.shutdown_changed,
 diff --git a/crates/node_executor/testdata/native_resident.rs b/crates/node_executor/testdata/native_resident.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..87aab2924f49bc1f3325ddb4591b36e3b890c91b
+index 0000000000000000000000000000000000000000..a8c46f25b4f71d3d1549db3ea66bb02854466dcf
 --- /dev/null
 +++ b/crates/node_executor/testdata/native_resident.rs
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,156 @@
 +//! Small native lifecycle peer used only by integration tests.
 +use std::io::{
 +    BufRead,
@@ -3207,7 +3475,12 @@ index 0000000000000000000000000000000000000000..87aab2924f49bc1f3325ddb4591b36e3
 +};
 +
 +fn main() -> anyhow::Result<()> {
-+    if std::env::args().nth(1).as_deref() == Some("parent") {
++    let mode_argument = std::env::args().nth(1);
++    if matches!(
++        mode_argument.as_deref(),
++        Some("parent" | "parent_blocked_logs")
++    ) {
++        let _logging = cmd_util::env::config_service();
 +        let arguments = std::env::args().collect::<Vec<_>>();
 +        let descriptor = serde_json::from_slice(&std::fs::read(&arguments[4])?)?;
 +        return tokio::runtime::Builder::new_current_thread()
@@ -3220,7 +3493,33 @@ index 0000000000000000000000000000000000000000..87aab2924f49bc1f3325ddb4591b36e3
 +                )?;
 +                supervisor
 +                    .reconcile(Some(descriptor), common::types::Timestamp::try_from(1u64)?)?;
-+                std::future::pending::<anyhow::Result<()>>().await
++                if mode_argument.as_deref() == Some("parent") {
++                    return std::future::pending::<anyhow::Result<()>>().await;
++                }
++                let commands_result = async {
++                    use tokio::io::AsyncBufReadExt;
++                    let mut commands = tokio::io::BufReader::new(tokio::io::stdin()).lines();
++                    anyhow::ensure!(commands.next_line().await?.as_deref() == Some("force"));
++                    let generation = supervisor
++                        .status()
++                        .active_generation
++                        .context("active missing")?;
++                    supervisor.force_retire(&generation)?;
++                    supervisor.reconcile(None, common::types::Timestamp::try_from(2u64)?)?;
++                    while supervisor.status().phase != "inactive" {
++                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
++                    }
++                    // The external observer checks /proc after this confirmed-reap boundary.
++                    std::fs::write(&arguments[5], b"reaped")?;
++                    anyhow::ensure!(commands.next_line().await?.as_deref() == Some("shutdown"));
++                    anyhow::Ok(())
++                }
++                .await;
++                // A failed observer closes stdin after releasing output backpressure.
++                // Keep cleanup owned before returning that protocol error.
++                let shutdown = supervisor.shutdown().await;
++                commands_result?;
++                shutdown
 +            });
 +    }
 +    let mut events = None;
@@ -3244,14 +3543,7 @@ index 0000000000000000000000000000000000000000..87aab2924f49bc1f3325ddb4591b36e3
 +            );
 +        }
 +        let events = events.as_mut().context("initialize missing")?;
-+        // Candidate and predecessor append concurrently. Serialize first so a
-+        // complete small record is emitted by one append write.
-+        let mut event = serde_json::to_vec(
-+            &json!({"type":kind, "generation":input["generation"], "pid":std::process::id()}),
-+        )?;
-+        event.push(b'\n');
-+        events.write_all(&event)?;
-+        events.flush()?;
++        write_event(events, kind, &input["generation"])?;
 +        if (kind == "initialize" && mode == "rss_before_ready")
 +            || (kind == "activate" && mode == "rss_active")
 +        {
@@ -3267,6 +3559,22 @@ index 0000000000000000000000000000000000000000..87aab2924f49bc1f3325ddb4591b36e3
 +                Some(descriptor)
 +            },
 +            "activate" => {
++                eprintln!("{}", json!({"event":"fixture_activated"}));
++                if mode == "log_backpressure" {
++                    let diagnostic =
++                        json!({"event":"fixture_diagnostic", "padding":"x".repeat(8000)});
++                    // Four finite bursts fit the per-child rate and probe budgets,
++                    // but exceed the service output queue while its pipe is blocked.
++                    for burst in 0..4 {
++                        if burst > 0 {
++                            std::thread::sleep(std::time::Duration::from_millis(1100));
++                        }
++                        for _ in 0..80 {
++                            eprintln!("{diagnostic}");
++                        }
++                    }
++                    write_event(events, "logs_written", &input["generation"])?;
++                }
 +                active = true;
 +                None
 +            },
@@ -3298,23 +3606,38 @@ index 0000000000000000000000000000000000000000..87aab2924f49bc1f3325ddb4591b36e3
 +    }
 +    Ok(())
 +}
++
++fn write_event(events: &mut std::fs::File, kind: &str, generation: &Value) -> anyhow::Result<()> {
++    // Candidate and predecessor append concurrently. Serialize first so a
++    // complete small record is emitted by one append write.
++    let mut event = serde_json::to_vec(
++        &json!({"type":kind, "generation":generation, "pid":std::process::id()}),
++    )?;
++    event.push(b'\n');
++    events.write_all(&event)?;
++    events.flush()?;
++    Ok(())
++}
 diff --git a/crates/node_executor/tests/native_resident.rs b/crates/node_executor/tests/native_resident.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..9a545f12024d137280b397440bfce83b5f91a6bc
+index 0000000000000000000000000000000000000000..a73252dd744dbe707046e31037457b54c5b5311f
 --- /dev/null
 +++ b/crates/node_executor/tests/native_resident.rs
-@@ -0,0 +1,641 @@
+@@ -0,0 +1,805 @@
 +#![cfg(all(feature = "testing", target_os = "linux"))]
 +
 +use std::{
++    panic::AssertUnwindSafe,
 +    path::Path,
 +    time::Duration,
 +};
 +
++use anyhow::Context;
 +use common::{
 +    memory_pressure::MemoryPressureSignal,
 +    types::Timestamp,
 +};
++use futures::FutureExt;
 +use model::source_packages::native::NativeResidentDescriptor;
 +use node_executor::native::{
 +    test_supervisor,
@@ -3593,6 +3916,62 @@ index 0000000000000000000000000000000000000000..9a545f12024d137280b397440bfce83b
 +            );
 +        }
 +    }
++
++    fn parent_command(&self, mode: &str) -> tokio::process::Command {
++        // Subreaping is process-wide. Keep it enabled for this test binary so
++        // parallel parent tests cannot restore it while another owns orphans.
++        static SUBREAPER: std::sync::Once = std::sync::Once::new();
++        SUBREAPER.call_once(|| {
++            assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
++        });
++        let descriptor_path = self.root.path().join("descriptor.json");
++        std::fs::write(
++            &descriptor_path,
++            serde_json::to_vec(&self.descriptor).unwrap(),
++        )
++        .unwrap();
++        let mut command =
++            tokio::process::Command::new(env!("CARGO_BIN_EXE_native_resident_fixture"));
++        command
++            .arg(mode)
++            .arg(&self.artifacts)
++            .arg(&self.configurations)
++            .arg(descriptor_path)
++            .env("LOG_FORMAT", "json")
++            .env("NO_COLOR", "1")
++            .env("RUST_LOG", "info")
++            .env_remove("CONVEX_TRACE_FILE")
++            .process_group(0)
++            .stderr(std::process::Stdio::null())
++            .kill_on_drop(true);
++        command
++    }
++}
++
++async fn reap_parent_group(group: u32) {
++    let group = libc::pid_t::try_from(group).unwrap();
++    // The direct parent has already been reaped. This group selects only its
++    // adopted residents, including children that failed before writing events.
++    tokio::time::timeout(Duration::from_secs(3), async {
++        loop {
++            let waited = unsafe { libc::waitpid(-group, std::ptr::null_mut(), libc::WNOHANG) };
++            if waited == -1 {
++                let error = std::io::Error::last_os_error();
++                if error.kind() == std::io::ErrorKind::Interrupted {
++                    continue;
++                }
++                assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
++                break;
++            }
++            if waited == 0 {
++                // Cleanup must also handle a regression in parent-death signaling.
++                assert_eq!(unsafe { libc::kill(-group, libc::SIGKILL) }, 0);
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        }
++    })
++    .await
++    .expect("fixture process group did not reap");
 +}
 +
 +#[tokio::test]
@@ -3892,61 +4271,166 @@ index 0000000000000000000000000000000000000000..9a545f12024d137280b397440bfce83b
 +
 +#[tokio::test]
 +async fn parent_death_kills_a_resident_that_ignores_pipe_closure() {
-+    struct Subreaper(libc::c_int);
-+    impl Drop for Subreaper {
-+        fn drop(&mut self) {
-+            unsafe {
-+                libc::prctl(libc::PR_SET_CHILD_SUBREAPER, self.0);
-+            }
-+        }
-+    }
-+    let mut prior = 0;
-+    assert_eq!(
-+        unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut prior) },
-+        0
-+    );
-+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
-+    let _subreaper = Subreaper(prior);
 +    let fixture = Fixture::new("ignore_eof");
-+    let descriptor_path = fixture.root.path().join("descriptor.json");
-+    std::fs::write(
-+        &descriptor_path,
-+        serde_json::to_vec(&fixture.descriptor).unwrap(),
-+    )
-+    .unwrap();
-+    let mut parent = tokio::process::Command::new(env!("CARGO_BIN_EXE_native_resident_fixture"))
-+        .arg("parent")
-+        .arg(&fixture.artifacts)
-+        .arg(&fixture.configurations)
-+        .arg(descriptor_path)
++    let mut parent = fixture
++        .parent_command("parent")
 +        .stdin(std::process::Stdio::null())
-+        .stdout(std::process::Stdio::null())
-+        .stderr(std::process::Stdio::null())
-+        .kill_on_drop(true)
++        .stdout(std::process::Stdio::piped())
 +        .spawn()
 +        .unwrap();
-+    let active = fixture.event("activate", 0).await;
-+    parent.kill().await.unwrap();
-+    let pid = libc::pid_t::try_from(active["pid"].as_u64().unwrap()).unwrap();
-+    let status = tokio::time::timeout(Duration::from_secs(3), async {
-+        loop {
-+            let mut status = 0;
-+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-+            if waited == pid {
-+                break status;
++    let group = parent.id().unwrap();
++    let observed = AssertUnwindSafe(async {
++        let active = fixture.event("activate", 0).await;
++        // Capture the actual backend formatter output, including the supervised child's
++        // stderr. The operator's container log collector receives this same record.
++        use tokio::io::AsyncBufReadExt;
++        let mut logs = tokio::io::BufReader::new(parent.stdout.take().unwrap()).lines();
++        let logging = tokio::time::timeout(Duration::from_secs(5), async {
++            loop {
++                let line = logs.next_line().await?.context("parent log pipe closed")?;
++                let record: Value = serde_json::from_str(&line)?;
++                if let Some(message) = record["fields"]["message"].as_str()
++                    && let Some(message) = message.strip_prefix("native_resident_log ")
++                {
++                    anyhow::ensure!(record["fields"]["native_generation"] == active["generation"]);
++                    anyhow::ensure!(
++                        serde_json::from_str::<Value>(message)?
++                            == json!({"event":"fixture_activated"})
++                    );
++                    return anyhow::Ok(());
++                }
 +            }
-+            assert_eq!(waited, 0, "orphaned resident was not adopted for reaping");
++        })
++        .await;
++        // Reap the parent and adopted resident even when the diagnostic assertion
++        // fails.
++        parent.kill().await.unwrap();
++        let pid = libc::pid_t::try_from(active["pid"].as_u64().unwrap()).unwrap();
++        let status = tokio::time::timeout(Duration::from_secs(3), async {
++            loop {
++                let mut status = 0;
++                let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
++                if waited == pid {
++                    break status;
++                }
++                assert_eq!(waited, 0, "orphaned resident was not adopted for reaping");
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .expect("parent loss left an active resident");
++        assert!(libc::WIFSIGNALED(status));
++        assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
++        fixture.assert_reaped();
++        logging
++            .expect("resident stderr did not reach backend logs")
++            .unwrap();
++    })
++    .catch_unwind()
++    .await;
++    parent.kill().await.unwrap();
++    reap_parent_group(group).await;
++    if let Err(panic) = observed {
++        std::panic::resume_unwind(panic);
++    }
++}
++
++#[tokio::test]
++async fn blocked_service_logs_allow_forced_reaping_and_bounded_shutdown() {
++    use std::os::fd::AsRawFd;
++
++    use tokio::io::AsyncWriteExt;
++
++    let fixture = Fixture::new("log_backpressure");
++    let reaped_path = fixture.root.path().join("reaped");
++    // Size the empty pipe before spawn; resizing after the child writes can fail.
++    let (mut logs, log_writer) = std::io::pipe().unwrap();
++    assert!(unsafe { libc::fcntl(logs.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) } > 0);
++    let backpressure_probe = log_writer.try_clone().unwrap();
++    let mut parent = fixture
++        .parent_command("parent_blocked_logs")
++        .arg(&reaped_path)
++        .stdin(std::process::Stdio::piped())
++        .stdout(log_writer)
++        .spawn()
++        .unwrap();
++    let group = parent.id().unwrap();
++    let mut commands = parent.stdin.take().unwrap();
++
++    // This deadline belongs to a different process from the current-thread
++    // supervisor and its output guard, so a blocked writer cannot disable it.
++    let observed = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(15), async {
++        loop {
++            if fixture
++                .events()
++                .iter()
++                .any(|event| event["type"] == "logs_written")
++            {
++                break;
++            }
 +            tokio::time::sleep(Duration::from_millis(10)).await;
 +        }
-+    })
-+    .await
-+    .expect("parent loss left an active resident");
-+    assert!(libc::WIFSIGNALED(status));
-+    assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
++        let mut available = 0;
++        anyhow::ensure!(
++            unsafe { libc::ioctl(logs.as_raw_fd(), libc::FIONREAD, &mut available) } == 0
++        );
++        anyhow::ensure!(
++            available > 0,
++            "native diagnostics did not reach backend stdout"
++        );
++        let mut writable = libc::pollfd {
++            fd: backpressure_probe.as_raw_fd(),
++            events: libc::POLLOUT,
++            revents: 0,
++        };
++        anyhow::ensure!(
++            unsafe { libc::poll(&mut writable, 1, 0) } == 0,
++            "backend stdout was not backpressured"
++        );
++        commands.write_all(b"force\n").await?;
++        while !reaped_path.exists() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++        for event in fixture.events() {
++            let pid = event["pid"].as_u64().context("fixture pid missing")?;
++            anyhow::ensure!(
++                !Path::new(&format!("/proc/{pid}")).exists(),
++                "resident was not reaped"
++            );
++        }
++        commands.write_all(b"shutdown\n").await?;
++        let status = tokio::time::timeout(Duration::from_secs(3), parent.wait())
++            .await
++            .context("logging guard delayed parent shutdown")??;
++        anyhow::ensure!(status.success(), "fixture parent failed");
++        anyhow::Ok(())
++    }))
++    .catch_unwind()
++    .await;
++
++    // Release finite backpressure before cleanup on a failed assertion. No output
++    // is read on the success path until both child reap and parent exit are
++    // observed.
++    drop(backpressure_probe);
++    let drained =
++        tokio::task::spawn_blocking(move || std::io::copy(&mut logs, &mut std::io::sink()));
++    drop(commands);
++    match tokio::time::timeout(Duration::from_secs(7), parent.wait()).await {
++        Ok(status) => {
++            status.unwrap();
++        },
++        Err(_) => parent.kill().await.unwrap(),
++    }
++    reap_parent_group(group).await;
++    drained.await.unwrap().unwrap();
++    let observed = observed.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
++    observed
++        .expect("blocked logging stalled supervision or guard shutdown")
++        .unwrap();
 +    fixture.assert_reaped();
 +}
 diff --git a/patches/README.md b/patches/README.md
-index 8142c60a707dd64ea5f00bf93ceb1cb9b2e165ea..76a1d1af16eec2f38491c91d1f7fa88d4d90be04 100644
+index dd39866979bd89fa824cca9cbd8de3c579abd0ce..5d2ff0b48fc083e690da2adaa97cbdef0a727b92 100644
 --- a/patches/README.md
 +++ b/patches/README.md
 @@ -84,6 +84,25 @@ codegen protocol above remains a smaller adoption unit. Whole-job and HTTP
@@ -3957,8 +4441,8 @@ index 8142c60a707dd64ea5f00bf93ceb1cb9b2e165ea..76a1d1af16eec2f38491c91d1f7fa88d
 +
 +- Purpose: supervise a digest-bound native executable selected by the committed root source
 +  package, with transactional application ownership metadata and bounded process cleanup.
-+- Prerequisites: coordinated local executor pools, deployment operations, and the matching CLI
-+  native-resident publication envelope. Static Hermes Wasm execution is independent.
++- Prerequisites: coordinated local executor pools, deployment operations, bounded service logging,
++  and the matching CLI native-resident publication envelope. Static Hermes Wasm execution is independent.
 +- Activation: configure immutable artifact and configuration directories and an explicit shared
 +  Node/native RSS budget, prepare the executable, then publish its descriptor with functions.
 +- Rollback: publish an explicit null target or a retained compatible descriptor, preserving the
@@ -3972,10 +4456,10 @@ index 8142c60a707dd64ea5f00bf93ceb1cb9b2e165ea..76a1d1af16eec2f38491c91d1f7fa88d
 +- Activation: automatic; no configuration, schema or storage-format change.
 +- Rollback: restore the previous backend binary.
 +
- ## Log privacy
+ ## Logging
  
- ### [Redact validator values from external log sinks](validation_error_log_redaction/README.md)
-@@ -192,7 +211,9 @@ requires explicit client negotiation, and its preparation is process-local.
+ ### [Bounded service logging](bounded_service_logging/README.md)
+@@ -202,7 +221,9 @@ requires explicit client negotiation, and its preparation is process-local.
    reserve the configured total Node RSS budget when that patch is present.
  - Activation: first set `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES` to cover the default
    application slot, internal system slot, every named application slot, and one full application
@@ -4033,10 +4517,10 @@ index 0f0aa3e2cad89c8454c6f6e85e9bd1bef2d8241b..6a7269dcf70097d719e8b5df25a7b0aa
  Invalid threshold ordering or a total below the default/system/surge minimum
 diff --git a/patches/native_residents/README.md b/patches/native_residents/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..41be045e8e541d83799825fec63f67c3d3436956
+index 0000000000000000000000000000000000000000..eb7af3e0056010353fd3e1e3aa94a7539bb5f883
 --- /dev/null
 +++ b/patches/native_residents/README.md
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,33 @@
 +# Supervised native residents
 +
 +This patch extends the coordinated local executor owner with one optional native
@@ -4046,9 +4530,13 @@ index 0000000000000000000000000000000000000000..41be045e8e541d83799825fec63f67c3
 +
 +The [native resident contract](../../crates/node_executor/NATIVE_RESIDENTS.md)
 +defines artifact publication, configuration, deployment envelopes, protocol messages,
-+capacity, shutdown and verification. Apply the coordinated local executor pools and
-+deployment operations patches first. The matching CLI must advertise and validate
-+native-resident protocol 1 before sending a publication envelope.
++capacity, shutdown, bounded stderr forwarding and verification. The
++[bounded service logging patch](../bounded_service_logging/README.md) provides a shared
++output worker for diagnostics and lifecycle warnings; output backpressure and log
++draining do not authorize child cleanup or capacity release. Apply that patch,
++coordinated local executor pools and deployment operations first. The matching CLI
++must advertise and validate native-resident protocol 1 before sending a publication
++envelope.
 +
 +Function publication compares the expected prior descriptor and records the selected
 +descriptor in the root source package. Deployment metadata reads use the function's
