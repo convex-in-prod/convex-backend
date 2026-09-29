@@ -454,6 +454,8 @@ pub struct FinishPushRequest {
     pub dry_run: bool,
     pub message: Option<String>,
     #[serde(default)]
+    pub native_resident: Option<model::source_packages::native::NativeResidentActivation>,
+    #[serde(default)]
     pub force_node_cutover: bool,
 }
 
@@ -523,6 +525,22 @@ pub async fn finish_push_internal(
         return Ok((SerializedFinishPushDiff::try_from(empty_diff)?, None));
     }
 
+    if let Some(operation) = &operation {
+        let mut tx = st.application.begin(identity.clone()).await?;
+        if let Some((diff, ts)) = operation.validate(&mut tx).await? {
+            return Ok((diff, Some(ts)));
+        }
+    }
+
+    if let Some(activation) = &req.native_resident {
+        activation.validate()?;
+        if let Some(target) = &activation.target {
+            st.native_resident
+                .prepare(target, req.force_node_cutover)
+                .await?;
+        }
+    }
+
     let (resp, ts) = st
         .application
         .finish_push(
@@ -530,6 +548,8 @@ pub async fn finish_push_internal(
             request_metadata,
             start_push,
             message,
+            req.native_resident,
+            &st.native_resident,
             req.force_node_cutover,
             operation,
         )
@@ -541,6 +561,9 @@ pub async fn finish_push_internal(
                 e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}"))
             }
         })?;
+    // Read the durable head, including receipt replay and concurrent deployments.
+    // The background reconciler repeats this if the HTTP caller disappears.
+    crate::native_resident::reconcile(&st.application, &st.native_resident).await?;
     Ok((resp, Some(ts)))
 }
 

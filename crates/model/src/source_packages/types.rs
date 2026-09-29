@@ -170,6 +170,7 @@ impl TryFrom<SerializedNodeVersionDiff> for NodeVersionDiff {
 pub struct SourcePackage {
     pub storage_key: ObjectKey,
     pub sha256: Sha256Digest,
+    pub native_resident: Option<super::native::NativeResidentDescriptor>,
     pub external_deps_package_id: Option<ExternalDepsPackageId>,
     pub package_size: PackageSize,
     pub node_version: Option<NodeVersion>,
@@ -184,6 +185,7 @@ impl SourcePackage {
         self.node_version == other.node_version
             && self.external_deps_package_id == other.external_deps_package_id
             && self.node_executor_pool_topology == other.node_executor_pool_topology
+            && self.native_resident == other.native_resident
     }
 }
 
@@ -313,6 +315,7 @@ impl From<SourcePackageId> for DeveloperDocumentId {
 pub struct SerializedSourcePackage {
     storage_key: String,
     sha256: ByteBuf,
+    native_resident: Option<super::native::NativeResidentDescriptor>,
     external_package_id: Option<String>,
     package_size: Option<SerializedPackageSize>,
     node_version: Option<String>,
@@ -344,6 +347,7 @@ impl TryFrom<SourcePackage> for SerializedSourcePackage {
         Ok(SerializedSourcePackage {
             storage_key: value.storage_key.into(),
             sha256: ByteBuf::from(value.sha256.to_vec()),
+            native_resident: value.native_resident,
             external_package_id: value
                 .external_deps_package_id
                 .map(|id| DeveloperDocumentId::from(id).encode()),
@@ -362,6 +366,9 @@ impl TryFrom<SerializedSourcePackage> for SourcePackage {
     fn try_from(value: SerializedSourcePackage) -> Result<Self, Self::Error> {
         let storage_key = value.storage_key.try_into()?;
         let sha256 = value.sha256.into_vec().try_into()?;
+        if let Some(native_resident) = &value.native_resident {
+            native_resident.validate()?;
+        }
         let external_package_id = match value.external_package_id {
             None => None,
             Some(s) => Some(DeveloperDocumentId::decode(&s)?.into()),
@@ -432,6 +439,7 @@ impl TryFrom<SerializedSourcePackage> for SourcePackage {
         Ok(Self {
             storage_key,
             sha256,
+            native_resident: value.native_resident,
             external_deps_package_id: external_package_id,
             package_size,
             node_version,
@@ -450,6 +458,7 @@ mod tests {
         SerializedSourcePackage {
             storage_key: "package.zip".to_owned(),
             sha256: ByteBuf::from(vec![0; 32]),
+            native_resident: None,
             external_package_id: None,
             package_size: None,
             node_version: None,
@@ -489,14 +498,22 @@ mod tests {
         let package = SourcePackage {
             storage_key: "package.zip".try_into().unwrap(),
             sha256: Sha256Digest::from([0; 32]),
+            native_resident: Some(super::super::native::NativeResidentDescriptor {
+                artifact_sha256: "a".repeat(64),
+                configuration_sha256: "b".repeat(64),
+                lifecycle_protocol: 1,
+                application_contract: "example-v1".into(),
+            }),
             external_deps_package_id: None,
             package_size: PackageSize::default(),
             node_version: None,
             node_executor_pool_topology: topology.clone(),
         };
+        let native_resident = package.native_resident.clone();
         let serialized = SerializedSourcePackage::try_from(package).unwrap();
         let round_tripped = SourcePackage::try_from(serialized).unwrap();
         assert_eq!(round_tripped.node_executor_pool_topology, topology);
+        assert_eq!(round_tripped.native_resident, native_resident);
 
         let mut invalid = serialized_source_package();
         invalid.node_pool_module_paths = Some(vec![]);

@@ -206,6 +206,31 @@ pub struct PushMetrics {
     pub occ_stats: OccRetryStats,
 }
 
+pub(crate) async fn validate_native_resident_activation_in_tx<RT: Runtime>(
+    tx: &mut database::Transaction<RT>,
+    activation: Option<&model::source_packages::native::NativeResidentActivation>,
+) -> anyhow::Result<()> {
+    let latest = SourcePackageModel::new(tx, TableNamespace::Global)
+        .get_latest_record()
+        .await?;
+    let prior = latest
+        .as_ref()
+        .and_then(|package| package.native_resident.as_ref());
+    match activation {
+        Some(activation) => activation.validate_prior(prior),
+        None => {
+            anyhow::ensure!(
+                prior.is_none(),
+                ErrorMetadata::bad_request(
+                    "NativeResidentActivationRequired",
+                    "This deployment must explicitly retain or retire its selected native resident",
+                )
+            );
+            Ok(())
+        },
+    }
+}
+
 fn project_source_bytes(config: &ProjectConfig) -> anyhow::Result<usize> {
     let mut source_bytes = 0usize;
     for module in config
@@ -1139,6 +1164,10 @@ impl<RT: Runtime> Application<RT> {
         request_metadata: RequestMetadata,
         mut start_push: StartPushResponse,
         message: Option<PushMessage>,
+        native_resident_activation: Option<
+            model::source_packages::native::NativeResidentActivation,
+        >,
+        native_resident: &node_executor::native::NativeResidentSupervisor,
         force_node_cutover: bool,
         operation: Option<FinishPushOperation>,
     ) -> anyhow::Result<(SerializedFinishPushDiff, Timestamp)> {
@@ -1154,10 +1183,25 @@ impl<RT: Runtime> Application<RT> {
         let prepared = operation
             .as_ref()
             .and_then(|operation| operation.prepared.as_ref());
+        // Selection is installed on the root definition below. The client
+        // round trip cannot redirect that package into a different component.
+        anyhow::ensure!(
+            start_push.app.definition_path.is_root()
+                && start_push
+                    .analysis
+                    .iter()
+                    .all(|(path, definition)| { path == &definition.definition.path }),
+            ErrorMetadata::bad_request(
+                "InvalidDeploymentComponentDefinition",
+                "Deployment component definitions do not match their source packages",
+            )
+        );
         // Resolve source bytes from this server's retained preparation or the
         // uploaded archive. Both paths still validate activation inputs below.
         let mut downloaded_source_packages = BTreeMap::new();
         for (definition_path, source_package) in &mut start_push.component_definition_packages {
+            // The client round trip cannot supply durable native selection.
+            source_package.native_resident = None;
             let package = if let Some(prepared) = prepared {
                 prepared
                     .packages
@@ -1210,6 +1254,17 @@ impl<RT: Runtime> Application<RT> {
         // configured process budget.
         self.runner()
             .validate_node_executor_pool_topology(&committed_pool_topology)?;
+
+        let root_definition_path = ComponentDefinitionPath::root();
+        if let Some(activation) = &native_resident_activation {
+            activation.validate()?;
+            start_push
+                .component_definition_packages
+                .get_mut(&root_definition_path)
+                .context("Missing root source package")?
+                .native_resident = activation.target.clone();
+        }
+
         let cutover_reservation = self
             .runner()
             .reserve_node_executor_pool_cutover(&committed_pool_topology, force_node_cutover)
@@ -1223,6 +1278,16 @@ impl<RT: Runtime> Application<RT> {
         }
 
         let finish_push_write_source = "finish_push";
+        // Capacity waits and post-commit Node drain must not hold this lock:
+        // another operator may need forced cutover to reclaim their surge owner.
+        let native_publication = self
+            .lock_native_resident_publication(
+                native_resident,
+                native_resident_activation
+                    .as_ref()
+                    .and_then(|activation| activation.application_contract.as_deref()),
+            )
+            .await?;
 
         let (diff, ts) = self
             .execute_with_audit_log_events_and_occ_retries_with_timestamp(
@@ -1234,6 +1299,7 @@ impl<RT: Runtime> Application<RT> {
                     let operation = &operation;
                     let start_push = &start_push;
                     let message = &message;
+                    let native_resident_activation = &native_resident_activation;
                     async move {
                         // Reading the bounded receipt table participates in OCC.
                         // Concurrent retries cannot both activate this operation.
@@ -1242,6 +1308,11 @@ impl<RT: Runtime> Application<RT> {
                                 return Ok((FinishPushCommit::Replayed(diff, ts), vec![]));
                             }
                         }
+                        validate_native_resident_activation_in_tx(
+                            tx,
+                            native_resident_activation.as_ref(),
+                        )
+                        .await?;
                         // Validate that environment variables haven't changed since `start_push`.
                         let environment_variables =
                             EnvironmentVariablesModel::new(tx).get_all().await?;
@@ -1390,6 +1461,7 @@ impl<RT: Runtime> Application<RT> {
             },
         };
 
+        drop(native_publication);
         self.complete_node_executor_pool_cutover_after_commit(
             &committed_pool_topology,
             ts,
@@ -1411,6 +1483,7 @@ impl<RT: Runtime> Application<RT> {
         schema_id: Option<String>,
         node_dependencies: Option<Vec<NodeDependencyJson>>,
         node_version: Option<NodeVersion>,
+        native_resident: &node_executor::native::NativeResidentSupervisor,
         force_node_cutover: bool,
     ) -> anyhow::Result<(PushAnalytics, PushMetrics)> {
         use common::query_analysis_admission::{
@@ -1472,6 +1545,7 @@ impl<RT: Runtime> Application<RT> {
                 // Note: This is not transactional with the rest of the deploy to avoid keeping
                 // a transaction open for a long time.
                 let mut tx = self.begin(Identity::system()).await?;
+                validate_native_resident_activation_in_tx(&mut tx, None).await?;
                 let user_environment_variables =
                     EnvironmentVariablesModel::new(&mut tx).get_all().await?;
                 let system_env_var_overrides = system_env_var_overrides(&mut tx).await?;
@@ -1493,6 +1567,9 @@ impl<RT: Runtime> Application<RT> {
                         &committed_pool_topology,
                         force_node_cutover,
                     )
+                    .await?;
+                let native_publication = self
+                    .lock_native_resident_publication(native_resident, None)
                     .await?;
                 let (
                     ConfigMetadataAndSchema {
@@ -1517,6 +1594,7 @@ impl<RT: Runtime> Application<RT> {
                     )
                     .await?;
 
+                drop(native_publication);
                 self.complete_node_executor_pool_cutover_after_commit(
                     &committed_pool_topology,
                     commit_ts,
@@ -1543,6 +1621,24 @@ impl<RT: Runtime> Application<RT> {
                 ))
             })
             .await
+    }
+
+    async fn lock_native_resident_publication<'a>(
+        &self,
+        supervisor: &'a node_executor::native::NativeResidentSupervisor,
+        contract: Option<&str>,
+    ) -> anyhow::Result<tokio::sync::MutexGuard<'a, ()>> {
+        let guard = supervisor.publication_guard().await;
+        // A canceled HTTP caller can commit before notifying supervision. Read
+        // the durable head under the guard before trusting live compatibility.
+        let mut tx = self.begin(Identity::system()).await?;
+        let selected = SourcePackageModel::new(&mut tx, TableNamespace::Global)
+            .get_latest_record()
+            .await?
+            .and_then(|package| package.native_resident.clone());
+        supervisor.reconcile(selected, tx.into_token()?.ts())?;
+        supervisor.validate_publication_contract(contract)?;
+        Ok(guard)
     }
 }
 
@@ -2751,11 +2847,77 @@ mod deployment_receipt_tests {
         SourcePackage {
             storage_key: "deployment-receipt-test".try_into().unwrap(),
             sha256: Sha256Digest::from([1; 32]),
+            native_resident: None,
             external_deps_package_id: None,
             package_size: Default::default(),
             node_version: None,
             node_executor_pool_topology: Default::default(),
         }
+    }
+
+    #[test]
+    fn native_selection_participates_in_publication_occ_and_rejects_omission() -> anyhow::Result<()>
+    {
+        use model::source_packages::native::{
+            NativeResidentActivation,
+            NativeResidentDescriptor,
+        };
+        let tokio = ProdRuntime::init_tokio()?;
+        let rt = ProdRuntime::new(&tokio);
+        tokio.block_on(async {
+            let db =
+                deployment_test_database(rt, Arc::new(sqlite::SqlitePersistence::new(":memory:")?))
+                    .await?;
+            model::initialize_application_system_tables(&db).await?;
+            let descriptor = NativeResidentDescriptor {
+                artifact_sha256: "a".repeat(64),
+                configuration_sha256: "b".repeat(64),
+                lifecycle_protocol: 1,
+                application_contract: "example-v1".into(),
+            };
+            let activation = NativeResidentActivation {
+                expected_prior: None,
+                target: Some(descriptor.clone()),
+                application_contract: Some("example-v1".into()),
+            };
+            let mut stale = db.begin_system().await?;
+            validate_native_resident_activation_in_tx(&mut stale, None).await?;
+            let mut native = db.begin_system().await?;
+            validate_native_resident_activation_in_tx(&mut native, Some(&activation)).await?;
+            let mut package = source();
+            package.native_resident = Some(descriptor.clone());
+            SourcePackageModel::new(&mut native, TableNamespace::Global)
+                .put(package)
+                .await?;
+            db.commit_with_write_source(native, "native_selection_test")
+                .await?;
+            SourcePackageModel::new(&mut stale, TableNamespace::Global)
+                .put(source())
+                .await?;
+            assert!(db
+                .commit_with_write_source(stale, "stale_native_selection_test")
+                .await
+                .unwrap_err()
+                .is_occ());
+            let mut tx = db.begin_system().await?;
+            assert!(validate_native_resident_activation_in_tx(&mut tx, None)
+                .await
+                .is_err());
+            assert!(
+                validate_native_resident_activation_in_tx(&mut tx, Some(&activation))
+                    .await
+                    .is_err()
+            );
+            let retain = NativeResidentActivation {
+                expected_prior: Some(descriptor.clone()),
+                target: Some(descriptor),
+                application_contract: Some("example-v1".into()),
+            };
+            validate_native_resident_activation_in_tx(&mut tx, Some(&retain)).await?;
+            drop(tx);
+            db.shutdown().await?;
+            anyhow::Ok(())
+        })
     }
 
     #[test]

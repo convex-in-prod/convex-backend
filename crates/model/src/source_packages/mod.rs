@@ -30,6 +30,7 @@ use crate::{
     SystemTable,
 };
 
+pub mod native;
 pub mod types;
 pub mod upload_download;
 
@@ -58,6 +59,10 @@ impl<'a, RT: Runtime> SourcePackageModel<'a, RT> {
 
     #[fastrace::trace]
     pub async fn put(&mut self, source_package: SourcePackage) -> anyhow::Result<SourcePackageId> {
+        anyhow::ensure!(
+            self.namespace == TableNamespace::Global || source_package.native_resident.is_none(),
+            "Native resident selection belongs to the root source package"
+        );
         // Latest-record reads are activation authority, including for empty
         // packages. Serialize inserts and advance past the previous record:
         // transaction start times can tie or differ from commit order.

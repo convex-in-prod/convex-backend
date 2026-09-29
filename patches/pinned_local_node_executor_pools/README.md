@@ -442,12 +442,19 @@ allowance. A deployment therefore requires:
 (N + 3) * LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES
 ```
 
-The required product must not exceed `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`.
+With the [native resident adapter](../../crates/node_executor/NATIVE_RESIDENTS.md)
+enabled, also reserve its steady RSS limit and size the existing surge slot for
+the larger of the Node and native limits. The formula above describes Node-only
+capacity. The complete formula, including per-pool overrides, is maintained in
+[Backend Memory Resilience](../backend_memory_resilience/README.md). The native
+resident uses the same surge coordinator and does not add a second surge slot.
+
+The complete requirement must not exceed `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`.
 The backend checks the proposed deployment before commit and the committed
 topology during startup. The Linux startup memory-feasibility calculation
 reserves the configured total Node RSS budget directly, including capacity for
 lazy steady slots and the lazy surge slot that have no child yet. The surge
-reserve is one complete allowance for the largest effective application pool,
+reserve is one complete allowance for the largest effective Node or native resident,
 not the expected smaller RSS of a fresh process. The system slot is a full
 steady allowance even though its child starts lazily.
 This is a planning allowance, not a hard aggregate limit; sampled child RSS
