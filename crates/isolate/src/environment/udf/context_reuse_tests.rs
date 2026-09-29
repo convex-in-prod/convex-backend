@@ -166,6 +166,7 @@ impl Fixture {
             .put(SourcePackage {
                 storage_key: ObjectKey::try_from("context-reuse-test")?,
                 sha256: Sha256Digest::from([0; 32]),
+                native_resident: None,
                 external_deps_package_id: None,
                 package_size: PackageSize::default(),
                 node_version: None,

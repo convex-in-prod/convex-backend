@@ -612,8 +612,10 @@ pub static LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES: LazyLock<usize> = LazyLock::new(||
 /// The default covers the effective default slot, the global system slot, and
 /// one surge slot sized for the effective default allowance. Deployment
 /// topology validation adds each named pool and sizes surge for the largest
-/// application allowance. The value must cover all required slots even when
-/// they are still lazy.
+/// application allowance. Enabling the native resident adapter also adds its
+/// steady limit and includes it when sizing that same surge slot; it does not
+/// increase this default total. The value must cover all required slots even
+/// when they are still lazy.
 pub static LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES: LazyLock<usize> = LazyLock::new(|| {
     let default_rss_bytes = local_node_executor_pool_rss_bytes("default");
     let value = env_config_usize_strict(

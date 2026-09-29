@@ -62,6 +62,13 @@ use function_runner::{
     server::DeploymentStorage,
     FunctionRunner,
 };
+use futures::{
+    future::{
+        BoxFuture,
+        Shared,
+    },
+    FutureExt,
+};
 use governor::Quota;
 use http_client::CachedHttpClient;
 use indexing::index_cache::IndexCache;
@@ -221,6 +228,7 @@ pub mod log_sinks;
 pub mod logs;
 #[cfg(target_os = "linux")]
 pub mod memory_metrics;
+mod native_resident;
 pub mod node_action_callbacks;
 pub mod parse;
 pub mod proxy;
@@ -238,6 +246,8 @@ pub mod usage_limits;
 
 #[derive(Clone)]
 pub struct LocalAppState {
+    pub(crate) native_resident: Arc<node_executor::native::NativeResidentSupervisor>,
+    native_resident_reconciler: Shared<BoxFuture<'static, Result<(), Arc<anyhow::Error>>>>,
     pub(crate) deployment_operations: deployment_operations::DeploymentOperations,
     // Origin for the server (e.g. http://127.0.0.1:3210, https://demo.convex.cloud)
     pub origin: ConvexOrigin,
@@ -251,9 +261,15 @@ pub struct LocalAppState {
 
 impl LocalAppState {
     pub async fn shutdown(self) -> anyhow::Result<()> {
-        self.application.shutdown().await?;
-
-        Ok(())
+        let resident_result = self.native_resident.shutdown().await;
+        // A canceled shutdown waiter leaves the shared join and its result
+        // available to the next caller instead of detaching reconciliation.
+        let reconciliation_result = self.native_resident_reconciler.clone().await;
+        // A failed native cleanup cannot skip the application's own shutdown.
+        let application_result = self.application.shutdown().await;
+        resident_result?;
+        reconciliation_result.map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        application_result
     }
 }
 
@@ -277,6 +293,7 @@ pub async fn make_app(
     zombify_rx: async_broadcast::Receiver<()>,
     preempt_tx: ShutdownSignal,
     memory_reclamation: MemoryPressureSignal,
+    memory_emergency: MemoryPressureSignal,
     node_executor_config: RoutedLocalNodeExecutorConfig,
 ) -> anyhow::Result<LocalAppState> {
     let key_broker = config.key_broker()?;
@@ -339,6 +356,7 @@ pub async fn make_app(
         Arc::new(RoutedLocalNodeExecutor::new_with_configuration(node_executor_config).await?);
     node_executor
         .reconcile_pool_topology(&committed_pool_topology, committed_pool_topology_version)?;
+    let native_resident = node_executor.native_resident_supervisor(memory_emergency)?;
     let node_actions = NodeActions::new(
         node_executor,
         config.convex_origin_url()?,
@@ -433,7 +451,20 @@ pub async fn make_app(
         runtime.spawn_background("beacon_worker", beacon_future);
     }
 
+    native_resident::reconcile(&application, &native_resident).await?;
+    let native_resident_reconciler =
+        native_resident::start(application.clone(), native_resident.clone());
     let app_state = LocalAppState {
+        native_resident,
+        native_resident_reconciler: async move {
+            native_resident_reconciler
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+                .map_err(Arc::new)
+        }
+        .boxed()
+        .shared(),
         deployment_operations: deployment_operations::DeploymentOperations::default(),
         origin,
         site_origin: config.convex_site_url()?,

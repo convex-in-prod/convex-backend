@@ -194,7 +194,7 @@ async fn run_server_inner(
     let (preempt_tx, preempt_rx) = oneshot::channel();
     let preempt_signal = ShutdownSignal::new(preempt_tx);
     #[cfg(target_os = "linux")]
-    let (external_request_shedding, memory_reclamation) = {
+    let (external_request_shedding, memory_reclamation, memory_emergency) = {
         memory_metrics::validate_startup_budget()?;
         let controller = memory_metrics::initialize_memory_pressure_controller()?;
         let external_request_shedding = controller
@@ -204,11 +204,19 @@ async fn run_server_inner(
             .as_ref()
             .map(memory_metrics::CgroupMemoryPressureController::memory_reclamation)
             .unwrap_or_default();
+        let memory_emergency = controller
+            .as_ref()
+            .map(memory_metrics::CgroupMemoryPressureController::memory_emergency)
+            .unwrap_or_default();
         memory_metrics::start(runtime.clone(), controller, preempt_signal.clone());
-        (external_request_shedding, memory_reclamation)
+        (
+            external_request_shedding,
+            memory_reclamation,
+            memory_emergency,
+        )
     };
     #[cfg(not(target_os = "linux"))]
-    let (external_request_shedding, memory_reclamation) = {
+    let (external_request_shedding, memory_reclamation, memory_emergency) = {
         anyhow::ensure!(
             !*LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED
                 && !*LOCAL_BACKEND_MALLOC_TRIM_ENABLED
@@ -217,6 +225,7 @@ async fn run_server_inner(
         );
         (
             None,
+            common::memory_pressure::MemoryPressureSignal::default(),
             common::memory_pressure::MemoryPressureSignal::default(),
         )
     };
@@ -252,6 +261,7 @@ async fn run_server_inner(
         shutdown_rx.clone(),
         preempt_signal.clone(),
         memory_reclamation,
+        memory_emergency,
         node_executor_config,
     )
     .await?;

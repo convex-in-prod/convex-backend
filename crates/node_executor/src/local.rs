@@ -291,6 +291,8 @@ struct SurgeWaitRegistration {
 }
 
 impl SurgeCoordinator {
+    pub(crate) const DEPLOYMENT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(120);
+
     pub(crate) fn new() -> Arc<Self> {
         crate::metrics::set_local_node_surge_phase("unused");
         crate::metrics::set_local_node_surge_queue("routine", 0);
@@ -405,6 +407,41 @@ impl SurgeCoordinator {
         crate::metrics::set_local_node_surge_queue("deployment", state.deployment.len());
     }
 
+    pub(crate) async fn acquire_deployment(self: &Arc<Self>, force: bool) -> SurgePermit {
+        let acquire = self.acquire(SurgePriority::Deployment, Arc::from("deployment"));
+        tokio::pin!(acquire);
+        if force {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut preemption_requested = false;
+            loop {
+                // Register the waiter first. A protected deployment candidate
+                // can later transfer the same permit to a reclaimable drain.
+                tokio::select! {
+                    biased;
+                    permit = &mut acquire => return permit,
+                    _ = interval.tick(), if !preemption_requested => {
+                        if let Some(phase) = self.force_preempt_reclaimable() {
+                            preemption_requested = true;
+                            let event = if phase == "draining" {
+                                "forced_drain_termination"
+                            } else {
+                                "forced_candidate_cancel"
+                            };
+                            crate::metrics::log_local_node_deployment_cutover_event(event);
+                            tracing::warn!(
+                                lifecycle_context = "deployment_cutover",
+                                outcome = event,
+                                "Forced local executor surge reclamation"
+                            );
+                        }
+                    },
+                }
+            }
+        }
+        acquire.await
+    }
+
     pub(crate) fn force_preempt_reclaimable(&self) -> Option<&'static str> {
         let state = self
             .state
@@ -433,7 +470,7 @@ impl SurgeCoordinator {
 }
 
 impl SurgePermit {
-    fn require_confirmed_cleanup(&self) {
+    pub(crate) fn require_confirmed_cleanup(&self) {
         self.inner.cleanup_required.store(true, Ordering::Release);
     }
 
@@ -457,6 +494,12 @@ impl SurgePermit {
         // State publication can still await the generation mutex after reap.
         // From this point, task cancellation may release global surge capacity
         // because no extra direct child remains.
+        self.inner.cleanup_required.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn release_for_steady_promotion(self) {
+        // The caller has transferred the child into its empty, separately
+        // reserved steady slot. It no longer consumes additional surge memory.
         self.inner.cleanup_required.store(false, Ordering::Release);
     }
 
@@ -4396,27 +4439,15 @@ impl InnerLocalNodeExecutor {
                 "probe_failed"
             },
         };
-        let supervisor_kill_requested = match child.start_kill() {
-            Ok(()) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-                // The operator or the process itself may have won the exit
-                // race. Waiting below still reaps the child and records its
-                // exit class.
-                false
-            },
-            Err(error) => {
-                anyhow::bail!(
-                    "Failed to terminate local Node executor generation {generation}: {:?}",
+        let (supervisor_kill_requested, status) = crate::process::kill_and_reap(child)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to terminate and reap local Node executor generation {generation}: \
+                     {:?}",
                     error.kind()
-                );
-            },
-        };
-        let status = child.wait().await.map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to reap local Node executor generation {generation}: {:?}",
-                error.kind()
-            )
-        })?;
+                )
+            })?;
         let exit_class = Self::record_child_exit(pool_name, status);
         Ok(ChildTerminationObservation {
             state_before,
