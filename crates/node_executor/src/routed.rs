@@ -20,6 +20,7 @@ use std::{
     },
 };
 
+use anyhow::Context;
 use async_trait::async_trait;
 use common::{
     execution_start::FunctionExecutionStartGate,
@@ -74,8 +75,6 @@ use crate::{
 const MAX_NAMED_POOLS: usize = 8;
 const MAX_SYSTEM_OPERATION_WAITERS: usize = 8;
 const SYSTEM_OPERATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
-const DEPLOYMENT_CUTOVER_ADMISSION_TIMEOUT: Duration = Duration::from_secs(120);
-const FORCED_CUTOVER_PREEMPTION_INTERVAL: Duration = Duration::from_millis(100);
 const ENVIRONMENT_FINGERPRINT_VERSION: &[u8] = b"local-node-environment-v1";
 
 struct SystemOperationWaiter {
@@ -1477,6 +1476,19 @@ impl RoutedLocalNodeExecutorConfig {
 }
 
 impl RoutedLocalNodeExecutor {
+    pub fn native_resident_supervisor(
+        &self,
+        memory_emergency: MemoryPressureSignal,
+    ) -> anyhow::Result<Arc<crate::native::NativeResidentSupervisor>> {
+        // A native resident owns application work, not optional retained cache.
+        // Use critical cgroup pressure for termination; the Node reclamation
+        // signal becomes active earlier and has a different retirement policy.
+        crate::native::NativeResidentSupervisor::new(
+            self.local_config.surge_coordinator(),
+            memory_emergency,
+        )
+    }
+
     pub async fn new_with_configuration(
         config: RoutedLocalNodeExecutorConfig,
     ) -> anyhow::Result<Self> {
@@ -2353,6 +2365,11 @@ fn calculate_local_node_rss_budget(
             .ok_or_else(|| anyhow::anyhow!("Required Node executor steady RSS budget overflow"))?;
         surge_bytes = surge_bytes.max(named_rss_bytes);
     }
+    let native_rss_bytes = crate::native::configured_rss_bytes()?;
+    steady_bytes = steady_bytes
+        .checked_add(native_rss_bytes)
+        .context("Required native resident steady RSS budget overflow")?;
+    surge_bytes = surge_bytes.max(native_rss_bytes);
     let required_bytes = steady_bytes
         .checked_add(surge_bytes)
         .ok_or_else(|| anyhow::anyhow!("Required Node executor RSS budget overflow"))?;
@@ -2625,44 +2642,7 @@ async fn acquire_deployment_cutover_permit(
     shutting_down: &AtomicBool,
     shutdown_changed: &Notify,
 ) -> anyhow::Result<crate::local::SurgePermit> {
-    let acquire = async {
-        let acquire = coordinator.acquire(
-            crate::local::SurgePriority::Deployment,
-            Arc::from("deployment"),
-        );
-        tokio::pin!(acquire);
-        if force {
-            let mut preemption_interval = tokio::time::interval(FORCED_CUTOVER_PREEMPTION_INTERVAL);
-            preemption_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut preemption_requested = false;
-            loop {
-                // Poll acquisition first so the deployment registers before it
-                // signals the current owner. Recheck because an unstealable
-                // deployment candidate can later become a reclaimable drain.
-                tokio::select! {
-                    biased;
-                    permit = &mut acquire => return permit,
-                    _ = preemption_interval.tick(), if !preemption_requested => {
-                        if let Some(phase) = coordinator.force_preempt_reclaimable() {
-                            preemption_requested = true;
-                            let event = if phase == "draining" {
-                                "forced_drain_termination"
-                            } else {
-                                "forced_candidate_cancel"
-                            };
-                            crate::metrics::log_local_node_deployment_cutover_event(event);
-                            tracing::warn!(
-                                lifecycle_context = "deployment_cutover",
-                                outcome = event,
-                                "Forced local Node executor surge reclamation"
-                            );
-                        }
-                    },
-                }
-            }
-        }
-        acquire.await
-    };
+    let acquire = coordinator.acquire_deployment(force);
     tokio::select! {
         result = tokio::time::timeout(timeout, acquire) => match result {
             Ok(permit) => {
@@ -2982,7 +2962,7 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
         let coordinator = self.local_config.surge_coordinator();
         let permit = acquire_deployment_cutover_permit(
             &coordinator,
-            DEPLOYMENT_CUTOVER_ADMISSION_TIMEOUT,
+            crate::local::SurgeCoordinator::DEPLOYMENT_ADMISSION_TIMEOUT,
             force,
             &self.shutting_down,
             &self.shutdown_changed,
