@@ -10,7 +10,10 @@ pub mod action_tree;
 mod executor;
 pub mod local;
 mod metrics;
+pub mod native;
+mod native_logs;
 pub mod noop;
+mod process;
 pub mod routed;
 pub mod source_package;
 

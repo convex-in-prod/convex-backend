@@ -20,6 +20,7 @@ use std::{
     },
 };
 
+use anyhow::Context;
 use async_trait::async_trait;
 use common::{
     execution_start::FunctionExecutionStartGate,
@@ -74,7 +75,6 @@ use crate::{
 const MAX_NAMED_POOLS: usize = 8;
 const MAX_SYSTEM_OPERATION_WAITERS: usize = 8;
 const SYSTEM_OPERATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
-const DEPLOYMENT_CUTOVER_ADMISSION_TIMEOUT: Duration = Duration::from_secs(120);
 const ENVIRONMENT_FINGERPRINT_VERSION: &[u8] = b"local-node-environment-v1";
 
 struct SystemOperationWaiter {
@@ -1486,6 +1486,19 @@ impl RoutedLocalNodeExecutorConfig {
 }
 
 impl RoutedLocalNodeExecutor {
+    pub fn native_resident_supervisor(
+        &self,
+        memory_emergency: MemoryPressureSignal,
+    ) -> anyhow::Result<Arc<crate::native::NativeResidentSupervisor>> {
+        // A native resident owns application work, not optional retained cache.
+        // Use critical cgroup pressure for termination; the Node reclamation
+        // signal becomes active earlier and has a different retirement policy.
+        crate::native::NativeResidentSupervisor::new(
+            self.local_config.surge_coordinator(),
+            memory_emergency,
+        )
+    }
+
     pub async fn new_with_configuration(
         config: RoutedLocalNodeExecutorConfig,
     ) -> anyhow::Result<Self> {
@@ -2445,6 +2458,11 @@ fn calculate_local_node_rss_budget(
             .ok_or_else(|| anyhow::anyhow!("Required Node executor steady RSS budget overflow"))?;
         surge_bytes = surge_bytes.max(named_rss_bytes);
     }
+    let native_rss_bytes = crate::native::configured_rss_bytes()?;
+    steady_bytes = steady_bytes
+        .checked_add(native_rss_bytes)
+        .context("Required native resident steady RSS budget overflow")?;
+    surge_bytes = surge_bytes.max(native_rss_bytes);
     let required_bytes = steady_bytes
         .checked_add(surge_bytes)
         .ok_or_else(|| anyhow::anyhow!("Required Node executor RSS budget overflow"))?;
@@ -2999,9 +3017,13 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
             !self.shutting_down.load(Ordering::Acquire),
             "Local Node executor router is shutting down"
         );
-        self.reserve_deployment_cutover(topology, force, DEPLOYMENT_CUTOVER_ADMISSION_TIMEOUT)
-            .await
-            .map(Some)
+        self.reserve_deployment_cutover(
+            topology,
+            force,
+            crate::local::SurgeCoordinator::DEPLOYMENT_ADMISSION_TIMEOUT,
+        )
+        .await
+        .map(Some)
     }
 
     async fn complete_pool_cutover(

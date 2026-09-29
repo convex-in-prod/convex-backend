@@ -36,13 +36,20 @@ When application-declared local Node executor pools are available, startup
 memory feasibility reserves `LOCAL_NODE_EXECUTOR_TOTAL_RSS_BUDGET_BYTES`.
 Deploy and startup validation separately require the default application
 steady slot, the internal system steady slot, every named application steady
-slot, and one global application surge slot to fit within that total:
+slot, the configured native resident steady slot, and one shared replacement
+surge slot to fit within that total:
 
 ```text
 effective_default_rss + LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES +
-  sum(effective_named_pool_rss) +
-  max(effective_default_rss, every effective_named_pool_rss)
+  sum(effective_named_pool_rss) + native_resident_rss +
+  max(effective_default_rss, every effective_named_pool_rss, native_resident_rss)
 ```
+
+`native_resident_rss` is `LOCAL_NATIVE_RESIDENT_MAX_RSS_BYTES` when configured,
+and zero otherwise. Enabling the [native resident adapter](../../crates/node_executor/NATIVE_RESIDENTS.md)
+requires an explicit total covering that additional capacity; the default
+total remains sized for the default and system Node slots and a Node replacement.
+Native and Node replacements use the same surge coordinator.
 
 The allowance includes the lazy system and application steady slots and the
 lazy surge slot when they have not started a child. It reserves the complete

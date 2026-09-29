@@ -164,7 +164,10 @@ Apply the routing and scheduled-admission prerequisites first. Configure only
 the pools that need an override. Verify each `maxConcurrency` against the
 application-wide Node limit and each pool's effective memory settings against
 its `maxRssBytes`. Set the total Node RSS budget to cover the effective pools
-in the committed topology and one largest application surge allowance.
+in the committed topology and one largest application surge allowance. When the
+[native resident adapter](../../crates/node_executor/NATIVE_RESIDENTS.md) is enabled,
+include its steady RSS limit and size that same surge allowance for the largest
+Node or native replacement.
 Restart the backend, then verify the configuration, per-pool
 memory-threshold, startup-budget, and queue metrics before increasing traffic.
 Invalid threshold ordering or a total below the default/system/surge minimum

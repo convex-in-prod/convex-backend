@@ -291,6 +291,8 @@ struct SurgeWaitRegistration {
 }
 
 impl SurgeCoordinator {
+    pub(crate) const DEPLOYMENT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(120);
+
     pub(crate) fn new() -> Arc<Self> {
         crate::metrics::set_local_node_surge_phase("unused");
         crate::metrics::set_local_node_surge_queue("routine", 0);
@@ -401,6 +403,14 @@ impl SurgeCoordinator {
         crate::metrics::set_local_node_surge_queue("deployment", state.deployment.len());
     }
 
+    pub(crate) async fn acquire_deployment(self: &Arc<Self>, force: bool) -> SurgePermit {
+        self.with_deployment_preemption(
+            force,
+            self.acquire(SurgePriority::Deployment, Arc::from("deployment")),
+        )
+        .await
+    }
+
     pub(crate) async fn with_deployment_preemption<F: Future>(
         &self,
         force: bool,
@@ -476,7 +486,7 @@ impl SurgeCoordinator {
 }
 
 impl SurgePermit {
-    fn require_confirmed_cleanup(&self) {
+    pub(crate) fn require_confirmed_cleanup(&self) {
         self.inner.cleanup_required.store(true, Ordering::Release);
     }
 
@@ -500,6 +510,12 @@ impl SurgePermit {
         // State publication can still await the generation mutex after reap.
         // From this point, task cancellation may release global surge capacity
         // because no extra direct child remains.
+        self.inner.cleanup_required.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn release_for_steady_promotion(self) {
+        // The caller has transferred the child into its empty, separately
+        // reserved steady slot. It no longer consumes additional surge memory.
         self.inner.cleanup_required.store(false, Ordering::Release);
     }
 
@@ -4461,27 +4477,15 @@ impl InnerLocalNodeExecutor {
                 "probe_failed"
             },
         };
-        let supervisor_kill_requested = match child.start_kill() {
-            Ok(()) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-                // The operator or the process itself may have won the exit
-                // race. Waiting below still reaps the child and records its
-                // exit class.
-                false
-            },
-            Err(error) => {
-                anyhow::bail!(
-                    "Failed to terminate local Node executor generation {generation}: {:?}",
+        let (supervisor_kill_requested, status) = crate::process::kill_and_reap(child)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to terminate and reap local Node executor generation {generation}: \
+                     {:?}",
                     error.kind()
-                );
-            },
-        };
-        let status = child.wait().await.map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to reap local Node executor generation {generation}: {:?}",
-                error.kind()
-            )
-        })?;
+                )
+            })?;
         let exit_class = Self::record_child_exit(pool_name, status);
         Ok(ChildTerminationObservation {
             state_before,
@@ -8394,9 +8398,7 @@ mod tests {
     #[tokio::test]
     async fn rolling_reservation_protects_each_candidate_and_can_force_each_drain() {
         let coordinator = SurgeCoordinator::new();
-        let mut session = coordinator
-            .acquire(SurgePriority::Deployment, Arc::from("deployment"))
-            .await;
+        let mut session = coordinator.acquire_deployment(false).await;
         let first = session.clone();
         first.set_phase("draining");
         let mut waiter = None;

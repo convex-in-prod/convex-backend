@@ -464,6 +464,8 @@ pub struct FinishPushRequest {
     pub dry_run: bool,
     pub message: Option<String>,
     #[serde(default)]
+    pub native_resident: Option<model::source_packages::native::NativeResidentActivation>,
+    #[serde(default)]
     pub force_node_cutover: bool,
 }
 
@@ -558,11 +560,21 @@ pub async fn finish_push_internal(
             identity.clone(),
             operation.as_ref(),
             &start_push,
+            req.native_resident.as_ref(),
             req.force_node_cutover,
         )
         .await?
     {
         return Ok((diff, Some(ts)));
+    }
+
+    if let Some(activation) = &req.native_resident {
+        activation.validate()?;
+        if let Some(target) = &activation.target {
+            st.native_resident
+                .prepare(target, req.force_node_cutover)
+                .await?;
+        }
     }
 
     let st = st.clone();
@@ -577,6 +589,8 @@ pub async fn finish_push_internal(
                 request_context,
                 start_push,
                 message,
+                req.native_resident,
+                &st.native_resident,
                 req.force_node_cutover,
                 operation,
             )
@@ -591,6 +605,17 @@ pub async fn finish_push_internal(
         // A racing replay has the same historical-only meaning as the early
         // return above. Only a fresh commit completes this handler's runtime handoff.
         if !resp.is_activation_replay() {
+            crate::native_resident::reconcile(&st.application, &st.native_resident)
+                .await
+                .with_context(|| {
+                    ErrorMetadata::overloaded(
+                        "NativeResidentReconciliationFailedAfterCommit",
+                        format!(
+                            "Deployment committed at {ts}, but native resident selection \
+                             reconciliation failed."
+                        ),
+                    )
+                })?;
             if let (Some(lease), Some(attempt)) = (prepared_lease, req.finish_attempt) {
                 lease.complete(attempt);
             }

@@ -158,8 +158,8 @@ hide a later activation from this check.
 
 Finish checks retained generation and canonical URL authority before source
 resolution and cutover admission, then repeats those reads in its activation
-transaction. Forced finishes also check the user environment before Node cutover
-admission.
+transaction. Forced finishes also check the user environment and committed native
+selection before native staging and again at Node cutover admission.
 An already-superseded preparation cannot enter force-capable cutover admission.
 A matching receipt is returned before these checks, so a
 newer deployment does not invalidate historical replay.
@@ -175,7 +175,7 @@ admission before the first commit could otherwise force the first owner's
 draining Node generation to stop or wait unnecessarily for its capacity.
 
 Finish identity includes the complete typed `startPush`, `dryRun`, `message`,
-and `forceNodeCutover`.
+`forceNodeCutover`, and the native selection.
 It excludes credentials, the operation ID, the session ID, and the optional
 finish attempt ID.
 Dry-run finishes still require retained preparation with unchanged generation
@@ -203,9 +203,12 @@ When capabilities advertise `finishCompletionProtocol: 1`, a client can send a
 fresh UUID in `finishAttempt` on a non-dry-run finish with both `operationId`
 and `operationSessionId`. Persist all three before sending the request. A
 successful response with `activationReplay` proves only a historical source
-commit. A fresh finish returns success after Node cutover, even if its HTTP waiter
-disconnected. A cutover failure reports `NodeExecutorCutoverFailedAfterCommit`
-without acknowledging the attempt.
+commit. A fresh finish returns success after Node cutover and reconciliation of
+the durable native selection. This records completion of that handler, even if
+its HTTP waiter disconnected. A failed Node cutover reports
+`NodeExecutorCutoverFailedAfterCommit`. A failure to reconcile the native
+selection reports `NativeResidentReconciliationFailedAfterCommit`. Neither
+failure acknowledges the attempt. Native process readiness has its own status.
 
 After a lost response, send the operation and session IDs to `operations/cancel`.
 An `active` finish retains ownership through publication, even after cancellation
