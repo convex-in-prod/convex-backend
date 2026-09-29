@@ -2513,6 +2513,7 @@ impl<RT: Runtime> Application<RT> {
             analyze_results,
         }: ApplyConfigArgs,
     ) -> anyhow::Result<(ConfigMetadataAndSchema, Vec<DeploymentAuditLogEvent>)> {
+        deploy_config::validate_native_resident_activation_in_tx(tx, None).await?;
         let schema_id = schema_id
             .map(|schema_id| {
                 parse_schema_id(
@@ -3037,6 +3038,7 @@ impl<RT: Runtime> Application<RT> {
         Ok(SourcePackage {
             storage_key,
             sha256,
+            native_resident: None,
             external_deps_package_id,
             package_size,
             node_version,

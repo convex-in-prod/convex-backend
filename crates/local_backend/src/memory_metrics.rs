@@ -331,6 +331,7 @@ pub struct CgroupMemoryPressureController {
     deployment_min_headroom_bytes: u64,
     latest_headroom_bytes: u64,
     memory_reclamation: MemoryPressureSignal,
+    memory_emergency: MemoryPressureSignal,
     reclamation_active: bool,
     reclamation_enabled: bool,
     reclamation_enter_headroom_bytes: u64,
@@ -547,11 +548,14 @@ pub fn initialize_memory_pressure_controller(
     let reclamation_exit_headroom_bytes =
         u64::try_from(*LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES)?;
 
+    // Native residents keep serving during optional cache reclamation. Their
+    // termination signal uses the critical headroom policy even when HTTP
+    // shedding is disabled, so both thresholds remain meaningful here.
+    anyhow::ensure!(
+        shedding_enter_headroom_bytes < shedding_exit_headroom_bytes,
+        "Memory pressure shedding exit headroom must exceed enter headroom"
+    );
     if shedding_enabled {
-        anyhow::ensure!(
-            shedding_enter_headroom_bytes < shedding_exit_headroom_bytes,
-            "Memory pressure shedding exit headroom must exceed enter headroom"
-        );
         for (boundary, bytes) in [
             ("enter", shedding_enter_headroom_bytes),
             ("exit", shedding_exit_headroom_bytes),
@@ -595,12 +599,12 @@ pub fn initialize_memory_pressure_controller(
     let max_bytes = cgroup
         .max_bytes
         .context("Memory pressure control requires a finite cgroup v2 memory limit")?;
+    anyhow::ensure!(
+        shedding_exit_headroom_bytes < max_bytes,
+        "Memory pressure shedding exit headroom must be smaller than the finite cgroup memory \
+         limit"
+    );
     if shedding_enabled {
-        anyhow::ensure!(
-            shedding_exit_headroom_bytes < max_bytes,
-            "Memory pressure shedding exit headroom must be smaller than the finite cgroup memory \
-             limit"
-        );
         anyhow::ensure!(
             deployment_min_headroom_bytes < max_bytes,
             "Deployment minimum headroom must be smaller than the finite cgroup memory limit"
@@ -657,6 +661,12 @@ pub fn initialize_memory_pressure_controller(
         // Consumers enter only after the controller has attempted allocator
         // trim for the initial pressure state.
         memory_reclamation: MemoryPressureSignal::default(),
+        memory_emergency: MemoryPressureSignal::new(pressure_state(
+            false,
+            headroom_bytes,
+            shedding_enter_headroom_bytes,
+            shedding_exit_headroom_bytes,
+        )),
         reclamation_active: reclamation_initially_active,
         reclamation_enabled,
         reclamation_enter_headroom_bytes,
@@ -677,12 +687,34 @@ impl CgroupMemoryPressureController {
         self.memory_reclamation.clone()
     }
 
+    pub fn memory_emergency(&self) -> MemoryPressureSignal {
+        self.memory_emergency.clone()
+    }
+
     fn update(&mut self, cgroup: &CgroupMemory) -> anyhow::Result<()> {
         let max_bytes = cgroup
             .max_bytes
             .context("Memory pressure control requires a finite cgroup v2 memory limit")?;
         let headroom_bytes = max_bytes.saturating_sub(cgroup.current_bytes);
         self.latest_headroom_bytes = headroom_bytes;
+        anyhow::ensure!(
+            self.shedding_exit_headroom_bytes < max_bytes,
+            "Memory pressure shedding exit headroom must be smaller than the finite cgroup memory \
+             limit"
+        );
+        let was_emergency = self.memory_emergency.is_active();
+        let is_emergency = pressure_state(
+            was_emergency,
+            headroom_bytes,
+            self.shedding_enter_headroom_bytes,
+            self.shedding_exit_headroom_bytes,
+        );
+        // Publish only transitions: repeatedly sending an unchanged value can
+        // cancel a pending lifecycle operation without a new pressure event.
+        // Emergency termination never waits for allocator trim to finish.
+        if is_emergency != was_emergency {
+            self.memory_emergency.set_active(is_emergency);
+        }
         log_gauge(
             &BACKEND_MEMORY_PRESSURE_HEADROOM_BYTES,
             headroom_bytes as f64,
@@ -738,11 +770,6 @@ impl CgroupMemoryPressureController {
             // finite-memory policy, even while ordinary intake is shed.
             external_request_shedding
                 .set_deployment_hard_stop(headroom_bytes <= self.deployment_min_headroom_bytes);
-            anyhow::ensure!(
-                self.shedding_exit_headroom_bytes < max_bytes,
-                "Memory pressure shedding exit headroom must be smaller than the finite cgroup \
-                 memory limit"
-            );
             let was_active = external_request_shedding.is_active();
             let is_active = pressure_state(
                 was_active,
@@ -2485,6 +2512,7 @@ mod tests {
             deployment_min_headroom_bytes: 2,
             latest_headroom_bytes: 100,
             memory_reclamation: signal.clone(),
+            memory_emergency: MemoryPressureSignal::default(),
             reclamation_active: false,
             reclamation_enabled: true,
             reclamation_enter_headroom_bytes: 6,
@@ -2551,6 +2579,7 @@ mod tests {
             deployment_min_headroom_bytes: 2,
             latest_headroom_bytes: 100,
             memory_reclamation: signal.clone(),
+            memory_emergency: MemoryPressureSignal::default(),
             reclamation_active: false,
             reclamation_enabled: true,
             reclamation_enter_headroom_bytes: 6,
@@ -2581,6 +2610,62 @@ mod tests {
     }
 
     #[test]
+    fn native_emergency_signal_is_independent_of_early_reclamation_and_trim() {
+        for http_shedding in [false, true] {
+            let mut controller = CgroupMemoryPressureController {
+                external_request_shedding: http_shedding
+                    .then(|| ExternalRequestShedding::new(false)),
+                shedding_enter_headroom_bytes: 3,
+                shedding_exit_headroom_bytes: 5,
+                deployment_min_headroom_bytes: 2,
+                latest_headroom_bytes: 10,
+                memory_reclamation: MemoryPressureSignal::default(),
+                memory_emergency: MemoryPressureSignal::default(),
+                reclamation_active: false,
+                reclamation_enabled: true,
+                reclamation_enter_headroom_bytes: 6,
+                reclamation_exit_headroom_bytes: 8,
+                allocator_trim_enabled: true,
+                allocator_trim_min_free_bytes: 1,
+                allocator_trim_cooldown: Duration::from_secs(300),
+                last_allocator_trim_evaluated: None,
+            };
+            let reclamation = controller.memory_reclamation();
+            let emergency = controller.memory_emergency();
+            let mut changes = emergency.subscribe();
+            // Use the actual controller and signals handed to the supervisors.
+            // Early pressure cannot revoke a healthy native resident; critical
+            // pressure interrupts it even while a trim worker remains blocked.
+            for (used, trimming, reclaiming, terminating) in [
+                (94, false, true, false),
+                (95, false, true, false),
+                (97, true, true, true),
+                (96, true, true, true),
+                (95, true, true, false),
+                (93, false, true, false),
+                (92, false, false, false),
+                (98, true, true, true),
+            ] {
+                let previous = emergency.is_active();
+                controller
+                    .update(&CgroupMemory {
+                        current_bytes: used,
+                        max_bytes: Some(100),
+                    })
+                    .unwrap();
+                controller.publish_reclamation_state(trimming);
+                assert_eq!(reclamation.is_active(), reclaiming, "used={used}");
+                assert_eq!(emergency.is_active(), terminating, "used={used}");
+                assert_eq!(changes.has_changed().unwrap(), previous != terminating);
+                changes.borrow_and_update();
+                if let Some(shedding) = &controller.external_request_shedding {
+                    assert_eq!(shedding.is_active(), terminating);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn allocator_trim_eligibility_scan_obeys_the_trim_cooldown() {
         let cooldown = Duration::from_secs(300);
         let mut controller = CgroupMemoryPressureController {
@@ -2590,6 +2675,7 @@ mod tests {
             deployment_min_headroom_bytes: 2,
             latest_headroom_bytes: 3,
             memory_reclamation: MemoryPressureSignal::default(),
+            memory_emergency: MemoryPressureSignal::default(),
             reclamation_active: true,
             reclamation_enabled: true,
             reclamation_enter_headroom_bytes: 6,
