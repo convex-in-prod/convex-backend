@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 15 Jul 2026 19:53:06 +0800
-Subject: [PATCH 08/29] runtime health: correct queueing and scheduler lag
+Subject: [PATCH 08/29] metrics: correct runtime health and export function
+ usage
 
 Describe per-bucket queued values as observed queueing rather than proof that a
 configured function concurrency limit was reached. A transient queued sample
@@ -35,30 +36,59 @@ semantics.
 
 Add focused scheduler, MetricStore, rollback, retained-state, dashboard, and
 queueing regressions plus one operator README for the combined adoption unit.
+
+Add an opt-in function-usage exporter fed by existing completed execution
+records. Keep bounded process-lifetime counters in a dedicated registry so
+frequent infrastructure scrapes do not collect the per-function matrix.
+Record calls, failures, attempts, retries, cache outcomes, execution duration,
+and attributed database, storage, and network work without network writes
+or waiting on map admission in function completion.
+
+Export changed functions on each collection and refresh all retained functions
+hourly. Publish dirty flags after counter updates and clear them before reading
+values, preserving eventual export during concurrent completion. Document the
+single-consumer, missed-response, reset, baseline, and staleness semantics with
+a VictoriaMetrics sparse-counter configuration. Keep registration failures
+explicit and report bounded-admission omissions through exporter-health metrics.
+
+Retain this exporter in the existing runtime-health metrics adoption unit.
+Collection remains disabled unless FUNCTION_USAGE_METRICS_ENABLED=true; usage
+history storage and dashboard integration remain outside the backend patch.
+
+Add focused accounting, identity, concurrency, sparse-refresh, and registry
+isolation regressions. Formatting and consumer integration checks passed;
+final Rust tests, Clippy, and build remain unverified.
 ---
  crates/application/src/cron_jobs/metrics.rs   |   5 +-
  crates/application/src/cron_jobs/mod.rs       |  14 +-
- crates/application/src/function_log.rs        | 372 +++++++++++++++---
+ crates/application/src/function_log.rs        | 376 ++++++++++--
+ .../application/src/function_usage_metrics.rs | 560 ++++++++++++++++++
+ crates/application/src/lib.rs                 |   1 +
  .../application/src/scheduled_jobs/metrics.rs |  10 +-
- crates/application/src/scheduled_jobs/mod.rs  | 134 +++++--
+ crates/application/src/scheduled_jobs/mod.rs  | 134 ++++-
+ crates/common/src/http/mod.rs                 | 104 +++-
+ crates/metrics/src/metrics.rs                 |  10 +-
  crates/udf_metrics/src/lib.rs                 |  33 +-
  .../src/elements/SchedulerStatus.tsx          |  32 +-
  .../ChartForFunctionRate.stories.tsx          |   4 +-
- .../components/ChartForFunctionRate.tsx       | 121 ++++--
- .../components/ConcurrencyStatus.test.tsx     | 185 +++++++++
- .../health/components/ConcurrencyStatus.tsx   |  73 ++--
+ .../components/ChartForFunctionRate.tsx       | 121 ++--
+ .../components/ConcurrencyStatus.test.tsx     | 185 ++++++
+ .../health/components/ConcurrencyStatus.tsx   |  73 ++-
  .../features/health/components/HealthView.tsx |   2 +-
- .../dashboard-common/src/lib/appMetrics.ts    |  66 +++-
+ .../dashboard-common/src/lib/appMetrics.ts    |  66 ++-
  .../HealthSchedulerStatus.stories.tsx         |  12 +-
  .../docs/dashboard/deployments/health.mdx     |   6 +-
  ...mponents_health_scheduler_status_dark.webp | Bin 6868 -> 7304 bytes
  ...ponents_health_scheduler_status_light.webp | Bin 6976 -> 7624 bytes
  patches/dependency_capacity/README.md         |  13 +-
  .../dependency_capacity/design_reference.md   |  17 +-
- patches/runtime_health_dashboard/README.md    | 205 ++++++++++
- 20 files changed, 1079 insertions(+), 225 deletions(-)
+ patches/runtime_health_dashboard/README.md    | 223 +++++++
+ .../function_usage.md                         | 154 +++++
+ 25 files changed, 1924 insertions(+), 231 deletions(-)
+ create mode 100644 crates/application/src/function_usage_metrics.rs
  create mode 100644 npm-packages/dashboard-common/src/features/health/components/ConcurrencyStatus.test.tsx
  create mode 100644 patches/runtime_health_dashboard/README.md
+ create mode 100644 patches/runtime_health_dashboard/function_usage.md
 
 diff --git a/crates/application/src/cron_jobs/metrics.rs b/crates/application/src/cron_jobs/metrics.rs
 index bc5fa3388ac8efa46cd664ddc42dd58f6b29c467..afbac9b30e5bfbdcfbe0d93c7054eb40ae6a9907 100644
@@ -123,7 +153,7 @@ index 204ef94b1cfaa2ade3dc7789783d389614130fb7..c8acf969a53443555f16e5f02cbdc414
              Either::Left(if next_job_ts < now {
                  metrics::log_cron_job_execution_lag(now - next_job_ts);
 diff --git a/crates/application/src/function_log.rs b/crates/application/src/function_log.rs
-index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf073641aa36533 100644
+index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..bc0064ab68621aae35485797e93d72bc3b7b49eb 100644
 --- a/crates/application/src/function_log.rs
 +++ b/crates/application/src/function_log.rs
 @@ -80,6 +80,7 @@ use udf::{
@@ -152,9 +182,11 @@ index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf07364
      usage_tracking: UsageCounter,
      rt: RT,
      concurrency_stats_logger: Arc<Mutex<Box<dyn SpawnHandle>>>,
-@@ -541,22 +546,29 @@ pub struct FunctionExecutionLog<RT: Runtime> {
+@@ -540,23 +545,31 @@ pub struct FunctionExecutionLog<RT: Runtime> {
+ 
  impl<RT: Runtime> FunctionExecutionLog<RT> {
      pub fn new(rt: RT, usage_tracking: UsageCounter, log_manager: Arc<dyn LogSender>) -> Self {
++        crate::function_usage_metrics::initialize();
          let base_ts = rt.system_time();
 +        let metrics_config = MetricStoreConfig {
 +            bucket_width: *knobs::UDF_METRICS_BUCKET_WIDTH,
@@ -192,7 +224,7 @@ index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf07364
          }));
  
          let inner_for_task = inner.clone();
-@@ -610,6 +622,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
+@@ -610,6 +623,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
  
          Self {
              inner,
@@ -200,7 +232,7 @@ index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf07364
              rt,
              usage_tracking,
              concurrency_stats_logger,
-@@ -1282,8 +1295,24 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
+@@ -1282,8 +1296,24 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
          }
      }
  
@@ -227,7 +259,7 @@ index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf07364
      pub fn log_scheduled_job_stats(
          &self,
          next_job_ts: Option<SystemTime>,
-@@ -1886,33 +1915,8 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
+@@ -1886,33 +1916,8 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
      }
  
      pub fn scheduled_job_lag(&self, window: MetricsWindow) -> anyhow::Result<Timeseries> {
@@ -263,7 +295,7 @@ index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf07364
      }
  
      /// Log the current number of outstanding functions as a gauge that tracks
-@@ -1949,10 +1953,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
+@@ -1949,10 +1954,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
          let metric_names = metrics.metric_names_for_type(MetricType::Gauge);
          for metric_name in metric_names {
              if metric_name.starts_with("outstanding_functions:") {
@@ -275,7 +307,7 @@ index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf07364
                  let timeseries = window.resample_gauges(&metrics, buckets)?;
                  result.insert(metric_name.to_string(), timeseries);
              }
-@@ -2019,6 +2020,78 @@ fn cache_hit_percentage(hits: Option<f64>, misses: Option<f64>) -> Option<f64> {
+@@ -2019,6 +2021,78 @@ fn cache_hit_percentage(hits: Option<f64>, misses: Option<f64>) -> Option<f64> {
      }
  }
  
@@ -354,7 +386,17 @@ index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf07364
  struct Inner<RT: Runtime> {
      rt: RT,
  
-@@ -2089,7 +2162,7 @@ impl<RT: Runtime> Inner<RT> {
+@@ -2036,6 +2110,9 @@ impl<RT: Runtime> Inner<RT> {
+         send_console_events: bool,
+         log_app_metrics: bool,
+     ) -> anyhow::Result<()> {
++        if log_app_metrics {
++            crate::function_usage_metrics::record(&execution);
++        }
+         if log_app_metrics && let Err(e) = self.log_execution_app_metrics(&execution) {
+             Self::log_metrics_error(e);
+         }
+@@ -2089,7 +2166,7 @@ impl<RT: Runtime> Inner<RT> {
              return;
          }
          LAST_LOGGED_ERROR.set(Some(now));
@@ -363,7 +405,7 @@ index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf07364
          if let UdfMetricsError::InternalError(mut e) = error {
              report_error_sync(&mut e);
          }
-@@ -2168,7 +2241,6 @@ impl<RT: Runtime> Inner<RT> {
+@@ -2168,7 +2245,6 @@ impl<RT: Runtime> Inner<RT> {
          now: SystemTime,
          num_running_jobs: u64,
      ) -> anyhow::Result<()> {
@@ -371,7 +413,7 @@ index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf07364
          // -Infinity means there is no scheduled job
          let value = next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(now, ts));
          if value > 0.0 {
-@@ -2188,17 +2260,6 @@ impl<RT: Runtime> Inner<RT> {
+@@ -2188,17 +2264,6 @@ impl<RT: Runtime> Inner<RT> {
                  },
              }]);
          }
@@ -389,7 +431,7 @@ index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf07364
          Ok(())
      }
  
-@@ -2227,6 +2288,205 @@ fn signed_duration_since(t1: SystemTime, t2: SystemTime) -> f32 {
+@@ -2227,6 +2292,205 @@ fn signed_duration_since(t1: SystemTime, t2: SystemTime) -> f32 {
      }
  }
  
@@ -595,6 +637,584 @@ index bceb6b977051d1a602c0fdf71ef2fd579ff79d15..52c8eb5d38d9ce44681b41deddf07364
  #[derive(Default)]
  pub struct UdfMetricSummary {
      // Aggregated metrics for backwards compatibility.
+diff --git a/crates/application/src/function_usage_metrics.rs b/crates/application/src/function_usage_metrics.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..918df9623ab4215fd60eefff88bb478c50ee75c7
+--- /dev/null
++++ b/crates/application/src/function_usage_metrics.rs
+@@ -0,0 +1,560 @@
++//! Bounded, process-lifetime function counters for periodic usage scrapes.
++
++use std::{
++    collections::BTreeMap,
++    sync::{
++        atomic::{
++            AtomicBool,
++            Ordering,
++        },
++        Arc,
++        LazyLock,
++    },
++    time::{
++        Duration,
++        Instant,
++    },
++};
++
++use common::types::UdfType;
++use metrics::{
++    prometheus::{
++        core::{
++            Collector,
++            Desc,
++        },
++        proto::MetricFamily,
++        Counter,
++        CounterVec,
++        IntCounterVec,
++        IntGauge,
++        Opts,
++        Registry,
++    },
++    FUNCTION_USAGE_METRICS_REGISTRY,
++};
++use parking_lot::Mutex;
++use usage_tracking::AggregatedFunctionUsageStats;
++
++use crate::function_log::{
++    FunctionExecution,
++    UdfParams,
++};
++
++const MAX_FUNCTIONS: usize = 4096;
++const MAX_LABEL_BYTES: usize = 1024;
++const FULL_SCRAPE_INTERVAL: Duration = Duration::from_secs(60 * 60);
++
++static METRICS: LazyLock<Option<Arc<FunctionUsageMetrics>>> = LazyLock::new(|| {
++    let enabled = match std::env::var("FUNCTION_USAGE_METRICS_ENABLED") {
++        Ok(value) if value == "true" => true,
++        Ok(value) if value == "false" => false,
++        Err(std::env::VarError::NotPresent) => false,
++        _ => panic!("FUNCTION_USAGE_METRICS_ENABLED requires true or false"),
++    };
++    enabled.then(|| {
++        FunctionUsageMetrics::new(&FUNCTION_USAGE_METRICS_REGISTRY, MAX_FUNCTIONS)
++            .expect("Function usage metric initialization failed")
++    })
++});
++
++pub(crate) fn initialize() {
++    LazyLock::force(&METRICS);
++}
++
++pub(crate) fn record(execution: &FunctionExecution) {
++    let Some(metrics) = &*METRICS else { return };
++    let component = match &execution.params {
++        UdfParams::Function { identifier, .. } => {
++            if identifier.udf_path.is_system() {
++                return;
++            }
++            identifier.component.to_string()
++        },
++        UdfParams::Http { identifier, .. } => {
++            // Unmatched HTTP paths contain arbitrary client input, not route labels.
++            if !identifier.matched {
++                return;
++            }
++            String::new()
++        },
++    };
++    let key = FunctionKey {
++        component,
++        function: execution.params.identifier_str(),
++        udf_type: execution.udf_type.to_lowercase_string(),
++    };
++    metrics.record(
++        key,
++        &Observation {
++            udf_type: execution.udf_type,
++            cached: execution.cached_result,
++            failed: execution.params.is_err(),
++            will_retry: execution.will_retry,
++            execution_seconds: execution.execution_time,
++            user_execution_time: execution.user_execution_time,
++            usage: &execution.usage_stats,
++        },
++    );
++}
++
++#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
++struct FunctionKey {
++    component: String,
++    function: String,
++    udf_type: &'static str,
++}
++
++struct Observation<'a> {
++    udf_type: UdfType,
++    cached: bool,
++    failed: bool,
++    will_retry: bool,
++    execution_seconds: f64,
++    user_execution_time: Option<Duration>,
++    usage: &'a AggregatedFunctionUsageStats,
++}
++
++// Keep family registration, retained handles, and updates in one definition.
++// Unlike the ordinary evictable metric vectors, these counters preserve idle
++// functions until restart.
++macro_rules! usage_counters {
++    ($observation:ident; $($field:ident: $help:literal => $value:expr),+ $(,)?) => {
++        struct Families { $($field: CounterVec),+ }
++        #[derive(Clone)]
++        struct Counters { dirty: Arc<AtomicBool>, $($field: Counter),+ }
++        impl Families {
++            fn new() -> anyhow::Result<Self> {
++                $(let $field = CounterVec::new(
++                    Opts::new(concat!("function_usage_", stringify!($field)), $help),
++                    &["component", "function", "udf_type", "label_lengths"],
++                )?;)+
++                Ok(Self { $($field),+ })
++            }
++            fn desc(&self) -> Vec<&Desc> {
++                let mut desc = Vec::new();
++                $(desc.extend(self.$field.desc());)+
++                desc
++            }
++            fn for_function(&self, key: &FunctionKey) -> Counters {
++                // The pinned metric vector hashes concatenated label values without
++                // separators. Lengths distinguish root and component functions whose
++                // concatenated paths are equal while preserving their canonical labels.
++                let label_lengths = format!(
++                    "{}:{}:{}", key.component.len(), key.function.len(), key.udf_type.len(),
++                );
++                let labels = &[
++                    key.component.as_str(), key.function.as_str(), key.udf_type,
++                    label_lengths.as_str(),
++                ];
++                Counters {
++                    dirty: Arc::new(AtomicBool::new(true)),
++                    $($field: self.$field.with_label_values(labels)),+
++                }
++            }
++        }
++        impl Counters {
++            fn record(&self, $observation: &Observation<'_>) {
++                $(self.$field.inc_by($value);)+
++                // Publish after updating counters. A scrape clears this flag before
++                // reading values, so a concurrent update is included now or next time.
++                self.dirty.store(true, Ordering::Release);
++            }
++            fn collect(&self) -> Vec<MetricFamily> {
++                let mut families = Vec::new();
++                $(families.extend(self.$field.collect());)+
++                families
++            }
++        }
++    };
++}
++
++usage_counters!(e;
++    calls_total: "Terminal function completions including cached queries" =>
++        f64::from(u8::from(!e.will_retry)),
++    failures_total: "Terminal function completions with errors" =>
++        f64::from(u8::from(!e.will_retry && e.failed)),
++    attempts_total: "Non-cached function execution attempts" =>
++        f64::from(u8::from(!e.cached)),
++    retries_total: "Function execution attempts requesting a retry" =>
++        f64::from(u8::from(e.will_retry)),
++    cache_hits_total: "Query completions served from cache" =>
++        f64::from(u8::from(e.udf_type == UdfType::Query && e.cached)),
++    cache_misses_total: "Query completions executed without a cache hit" =>
++        f64::from(u8::from(e.udf_type == UdfType::Query && !e.cached)),
++    execution_seconds_total: "Execution seconds across non-cached attempts" =>
++        if e.cached { 0.0 } else { e.execution_seconds },
++    user_execution_seconds_total: "Measured user execution seconds excluding selected waits" =>
++        if e.cached { 0.0 } else { e.user_execution_time.map_or(0.0, |d| d.as_secs_f64()) },
++    user_execution_measurements_total: "Non-cached attempts with measured user execution time" =>
++        f64::from(u8::from(!e.cached && e.user_execution_time.is_some())),
++    database_read_bytes_total: "Attributed database bandwidth bytes read" =>
++        if e.cached { 0.0 } else { e.usage.database_read_bytes as f64 },
++    database_write_bytes_total: "Attributed database bandwidth bytes written" =>
++        if e.cached { 0.0 } else { e.usage.database_write_bytes as f64 },
++    database_io_read_bytes_total: "Attributed database IO bytes read" =>
++        if e.cached { 0.0 } else { e.usage.database_io_read_bytes as f64 },
++    database_io_write_bytes_total: "Attributed database IO bytes written" =>
++        if e.cached { 0.0 } else { e.usage.database_io_write_bytes as f64 },
++    database_read_documents_total: "Attributed database documents read" =>
++        if e.cached { 0.0 } else { e.usage.database_read_documents as f64 },
++    database_write_documents_total: "Attributed database documents written" =>
++        if e.cached { 0.0 } else { e.usage.database_write_documents as f64 },
++    database_write_index_rows_total: "Attributed database index rows written" =>
++        if e.cached { 0.0 } else { e.usage.database_write_index_rows as f64 },
++    storage_read_bytes_total: "Attributed file storage bytes read" =>
++        if e.cached { 0.0 } else { e.usage.storage_read_bytes as f64 },
++    storage_write_bytes_total: "Attributed file storage bytes written" =>
++        if e.cached { 0.0 } else { e.usage.storage_write_bytes as f64 },
++    network_egress_bytes_total: "Attributed network egress bytes" =>
++        if e.cached { 0.0 } else { e.usage.network_egress_bytes as f64 },
++);
++
++struct FunctionUsageMetrics {
++    families: Families,
++    functions: Mutex<BTreeMap<FunctionKey, Counters>>,
++    last_full_scrape: Mutex<Option<Instant>>,
++    max_functions: usize,
++    retained_functions: IntGauge,
++    dropped: IntCounterVec,
++}
++
++impl FunctionUsageMetrics {
++    fn new(registry: &Registry, max_functions: usize) -> anyhow::Result<Arc<Self>> {
++        let families = Families::new()?;
++        let retained_functions = IntGauge::new(
++            "function_usage_retained_functions",
++            "Retained function label combinations",
++        )?;
++        registry.register(Box::new(retained_functions.clone()))?;
++        let dropped = IntCounterVec::new(
++            Opts::new(
++                "function_usage_dropped_observations_total",
++                "Omitted function usage observations",
++            ),
++            &["reason"],
++        )?;
++        for reason in ["capacity", "label_length", "contention", "invalid_duration"] {
++            dropped.with_label_values(&[reason]);
++        }
++        registry.register(Box::new(dropped.clone()))?;
++        let metrics = Arc::new(Self {
++            families,
++            functions: Mutex::new(BTreeMap::new()),
++            last_full_scrape: Mutex::new(None),
++            max_functions,
++            retained_functions,
++            dropped,
++        });
++        registry.register(Box::new(UsageCollector(metrics.clone())))?;
++        Ok(metrics)
++    }
++
++    fn collect_at(&self, now: Instant) -> Vec<MetricFamily> {
++        let counters: Vec<_> = {
++            let mut last_full = self.last_full_scrape.lock();
++            let full =
++                last_full.is_none_or(|last| now.duration_since(last) >= FULL_SCRAPE_INTERVAL);
++            let functions = self.functions.lock();
++            let counters = functions
++                .values()
++                .filter_map(|counters| {
++                    let dirty = counters.dirty.swap(false, Ordering::AcqRel);
++                    (dirty || full).then(|| counters.clone())
++                })
++                .collect();
++            if full {
++                *last_full = Some(now);
++            }
++            counters
++        };
++        // Build metric objects only for selected functions, outside the admission lock.
++        // The hourly snapshot repairs a response lost after clearing the dirty flags.
++        counters.iter().flat_map(Counters::collect).collect()
++    }
++
++    fn record(&self, key: FunctionKey, observation: &Observation<'_>) {
++        if key.component.len() > MAX_LABEL_BYTES || key.function.len() > MAX_LABEL_BYTES {
++            self.dropped.with_label_values(&["label_length"]).inc();
++            return;
++        }
++        // Invalid telemetry never poisons a cumulative counter or fails the function.
++        if !observation.execution_seconds.is_finite() || observation.execution_seconds < 0.0 {
++            self.dropped.with_label_values(&["invalid_duration"]).inc();
++            return;
++        }
++        let counters = {
++            // Usage is best effort: admission contention cannot stall function completion.
++            let Some(mut functions) = self.functions.try_lock() else {
++                self.dropped.with_label_values(&["contention"]).inc();
++                return;
++            };
++            if let Some(counters) = functions.get(&key) {
++                counters.clone()
++            } else {
++                if functions.len() == self.max_functions {
++                    self.dropped.with_label_values(&["capacity"]).inc();
++                    return;
++                }
++                let counters = self.families.for_function(&key);
++                functions.insert(key, counters.clone());
++                self.retained_functions.inc();
++                counters
++            }
++        };
++        counters.record(observation);
++    }
++}
++
++struct UsageCollector(Arc<FunctionUsageMetrics>);
++
++impl Collector for UsageCollector {
++    fn desc(&self) -> Vec<&Desc> {
++        self.0.families.desc()
++    }
++
++    fn collect(&self) -> Vec<MetricFamily> {
++        self.0.collect_at(Instant::now())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::sync::Arc;
++
++    use metrics::prometheus::{
++        Encoder,
++        TextEncoder,
++    };
++
++    use super::*;
++
++    fn key(function: &str) -> FunctionKey {
++        FunctionKey {
++            component: String::new(),
++            function: function.into(),
++            udf_type: "query",
++        }
++    }
++
++    fn observation(usage: &AggregatedFunctionUsageStats) -> Observation<'_> {
++        Observation {
++            udf_type: UdfType::Query,
++            cached: false,
++            failed: false,
++            will_retry: false,
++            execution_seconds: 2.0,
++            user_execution_time: Some(Duration::from_millis(500)),
++            usage,
++        }
++    }
++
++    fn calls(families: &[MetricFamily]) -> BTreeMap<String, f64> {
++        families
++            .iter()
++            .filter(|family| family.name() == "function_usage_calls_total")
++            .flat_map(|family| family.get_metric())
++            .map(|metric| {
++                let function = metric
++                    .get_label()
++                    .iter()
++                    .find(|label| label.name() == "function")
++                    .unwrap()
++                    .value()
++                    .to_owned();
++                (function, metric.get_counter().value())
++            })
++            .collect()
++    }
++
++    #[test]
++    fn sparse_scrapes_skip_idle_functions_and_hourly_snapshots_repair_lost_responses() {
++        let metrics = FunctionUsageMetrics::new(&Registry::new(), 2).unwrap();
++        let usage = AggregatedFunctionUsageStats::default();
++        let e = observation(&usage);
++        let now = Instant::now();
++        metrics.record(key("active:run"), &e);
++        metrics.record(key("idle:run"), &e);
++        assert_eq!(
++            calls(&metrics.collect_at(now)),
++            BTreeMap::from([("active:run".into(), 1.0), ("idle:run".into(), 1.0),])
++        );
++        assert!(metrics
++            .collect_at(now + Duration::from_secs(300))
++            .is_empty());
++        metrics.record(key("active:run"), &e);
++        assert_eq!(
++            calls(&metrics.collect_at(now + Duration::from_secs(600))),
++            BTreeMap::from([("active:run".into(), 2.0)])
++        );
++        metrics.record(key("idle:run"), &e);
++        // The response is collected but never received by the scraper.
++        metrics.collect_at(now + Duration::from_secs(900));
++        assert_eq!(
++            calls(&metrics.collect_at(now + FULL_SCRAPE_INTERVAL)),
++            BTreeMap::from([("active:run".into(), 2.0), ("idle:run".into(), 2.0),])
++        );
++        assert!(metrics
++            .collect_at(now + FULL_SCRAPE_INTERVAL + Duration::from_secs(300))
++            .is_empty());
++    }
++
++    #[test]
++    fn cached_results_do_not_repeat_original_work() {
++        let registry = Registry::new();
++        let metrics = FunctionUsageMetrics::new(&registry, 2).unwrap();
++        let usage = AggregatedFunctionUsageStats {
++            database_read_bytes: 900,
++            storage_read_bytes: 80,
++            network_egress_bytes: 70,
++            ..Default::default()
++        };
++        let mut e = observation(&usage);
++        metrics.record(key("orders:list"), &e);
++        e.cached = true;
++        metrics.record(key("orders:list"), &e);
++        let functions = metrics.functions.lock();
++        let c = &functions[&key("orders:list")];
++        assert_eq!(c.calls_total.get(), 2.0);
++        assert_eq!(c.attempts_total.get(), 1.0);
++        assert_eq!(c.cache_hits_total.get(), 1.0);
++        assert_eq!(c.cache_misses_total.get(), 1.0);
++        assert_eq!(c.execution_seconds_total.get(), 2.0);
++        assert_eq!(c.user_execution_seconds_total.get(), 0.5);
++        assert_eq!(c.user_execution_measurements_total.get(), 1.0);
++        assert_eq!(c.database_read_bytes_total.get(), 900.0);
++        assert_eq!(c.storage_read_bytes_total.get(), 80.0);
++        assert_eq!(c.network_egress_bytes_total.get(), 70.0);
++    }
++
++    #[test]
++    fn retries_and_missing_timing_have_separate_denominators() {
++        let metrics = FunctionUsageMetrics::new(&Registry::new(), 2).unwrap();
++        let usage = AggregatedFunctionUsageStats::default();
++        let mut e = observation(&usage);
++        e.udf_type = UdfType::Mutation;
++        e.failed = true;
++        e.will_retry = true;
++        metrics.record(key("orders:update"), &e);
++        e.will_retry = false;
++        e.user_execution_time = None;
++        metrics.record(key("orders:update"), &e);
++        let functions = metrics.functions.lock();
++        let c = &functions[&key("orders:update")];
++        assert_eq!(c.calls_total.get(), 1.0);
++        assert_eq!(c.failures_total.get(), 1.0);
++        assert_eq!(c.attempts_total.get(), 2.0);
++        assert_eq!(c.retries_total.get(), 1.0);
++        assert_eq!(c.user_execution_measurements_total.get(), 1.0);
++        assert_eq!(c.cache_misses_total.get(), 0.0);
++    }
++
++    #[test]
++    fn capacity_preserves_existing_series_and_labels_are_escaped() {
++        let registry = Registry::new();
++        let metrics = FunctionUsageMetrics::new(&registry, 1).unwrap();
++        let usage = AggregatedFunctionUsageStats::default();
++        let e = observation(&usage);
++        let function = "module:quoted\"function";
++        metrics.record(key(function), &e);
++        metrics.record(key("other:call"), &e);
++        metrics.record(key(function), &e);
++        metrics.record(key(&"x".repeat(MAX_LABEL_BYTES + 1)), &e);
++        assert_eq!(metrics.retained_functions.get(), 1);
++        assert_eq!(metrics.dropped.with_label_values(&["capacity"]).get(), 1);
++        assert_eq!(
++            metrics.dropped.with_label_values(&["label_length"]).get(),
++            1
++        );
++        assert_eq!(
++            metrics.functions.lock()[&key(function)].calls_total.get(),
++            2.0
++        );
++        let mut text = Vec::new();
++        TextEncoder::new()
++            .encode(&registry.gather(), &mut text)
++            .unwrap();
++        let text = String::from_utf8(text).unwrap();
++        assert!(text.contains("function=\"module:quoted\\\"function\""));
++        assert!(!text.contains("other:call"));
++        // Repeated scrapes do not clear retained cumulative values.
++        registry.gather();
++        assert_eq!(
++            metrics.functions.lock()[&key(function)].calls_total.get(),
++            2.0
++        );
++    }
++
++    #[test]
++    fn component_and_root_paths_with_equal_concatenations_remain_separate() {
++        let registry = Registry::new();
++        let metrics = FunctionUsageMetrics::new(&registry, 2).unwrap();
++        let root = key("orderslist:run");
++        let component = FunctionKey {
++            component: "orders".into(),
++            function: "list:run".into(),
++            udf_type: "query",
++        };
++        let usage = AggregatedFunctionUsageStats::default();
++        metrics.record(root.clone(), &observation(&usage));
++        metrics.record(component.clone(), &observation(&usage));
++        metrics.record(component.clone(), &observation(&usage));
++        let functions = metrics.functions.lock();
++        assert_eq!(functions[&root].calls_total.get(), 1.0);
++        assert_eq!(functions[&component].calls_total.get(), 2.0);
++        drop(functions);
++        let family = registry
++            .gather()
++            .into_iter()
++            .find(|family| family.name() == "function_usage_calls_total")
++            .unwrap();
++        assert_eq!(family.get_metric().len(), 2);
++    }
++
++    #[test]
++    fn concurrent_updates_are_counted_or_explicitly_dropped() {
++        let metrics = FunctionUsageMetrics::new(&Registry::new(), 1).unwrap();
++        let usage = AggregatedFunctionUsageStats::default();
++        metrics.record(key("orders:list"), &observation(&usage));
++        let done = Arc::new(AtomicBool::new(false));
++        let scraper = {
++            let metrics = metrics.clone();
++            let done = done.clone();
++            std::thread::spawn(move || {
++                let mut largest: f64 = 0.0;
++                while !done.load(Ordering::Acquire) {
++                    for value in calls(&metrics.collect_at(Instant::now())).values() {
++                        largest = largest.max(*value);
++                    }
++                    std::thread::yield_now();
++                }
++                largest
++            })
++        };
++        let threads: Vec<_> = (0..8)
++            .map(|_| {
++                let metrics = metrics.clone();
++                std::thread::spawn(move || {
++                    let usage = AggregatedFunctionUsageStats::default();
++                    for _ in 0..1000 {
++                        metrics.record(key("orders:list"), &observation(&usage));
++                    }
++                })
++            })
++            .collect();
++        for thread in threads {
++            thread.join().unwrap();
++        }
++        done.store(true, Ordering::Release);
++        let mut exported = scraper.join().unwrap();
++        for value in calls(&metrics.collect_at(Instant::now())).values() {
++            exported = exported.max(*value);
++        }
++        let accepted = metrics.functions.lock()[&key("orders:list")]
++            .calls_total
++            .get();
++        let dropped = metrics.dropped.with_label_values(&["contention"]).get();
++        assert_eq!(accepted + dropped as f64, 8001.0);
++        assert_eq!(exported, accepted);
++    }
++}
+diff --git a/crates/application/src/lib.rs b/crates/application/src/lib.rs
+index 1b33f41d0e3620afaa0d5be5d47ebf980ef4176a..6ddf87f3f3f171ef71fbb0be37a187594db0b51e 100644
+--- a/crates/application/src/lib.rs
++++ b/crates/application/src/lib.rs
+@@ -439,6 +439,7 @@ pub mod deployment_state;
+ mod execute_query_timestamp;
+ mod exports;
+ pub mod function_log;
++mod function_usage_metrics;
+ pub mod log_streaming;
+ pub mod log_visibility;
+ mod metrics;
 diff --git a/crates/application/src/scheduled_jobs/metrics.rs b/crates/application/src/scheduled_jobs/metrics.rs
 index 22d787c2d126089b78e6bb8a1509e179576fc196..645125a9a38d0af011aa42da919136120f452d77 100644
 --- a/crates/application/src/scheduled_jobs/metrics.rs
@@ -820,6 +1440,184 @@ index 26c500677289548fb07b794c7dd009b62991f817..325a18d4502d6fcab5ceb482b8030c0c
 +        ));
 +    }
 +}
+diff --git a/crates/common/src/http/mod.rs b/crates/common/src/http/mod.rs
+index 5e3de1af16c45af4dc4209127cc23fa7a1b18a6a..481f1dffc65d0e2499e9c81d091fa3bcde0cfe36 100644
+--- a/crates/common/src/http/mod.rs
++++ b/crates/common/src/http/mod.rs
+@@ -26,6 +26,7 @@ use std::{
+ 
+ use ::metrics::{
+     CONVEX_METRICS_REGISTRY,
++    FUNCTION_USAGE_METRICS_REGISTRY,
+     SERVER_VERSION_STR,
+     SERVICE_NAME,
+ };
+@@ -80,6 +81,7 @@ use http_body_util::BodyExt;
+ use itertools::Itertools;
+ use prometheus::{
+     PullingGauge,
++    Registry,
+     TextEncoder,
+ };
+ use regex::Regex;
+@@ -760,6 +762,10 @@ impl ConvexHttpService {
+         Router::new()
+             .route("/version", get(move || async move { version }))
+             .route("/metrics", get(metrics))
++            .route(
++                "/metrics/function_usage",
++                get(|| async { encode_metrics(&FUNCTION_USAGE_METRICS_REGISTRY) }),
++            )
+     }
+ 
+     pub async fn serve<F: Future<Output = ()> + Send + 'static>(
+@@ -1557,17 +1563,22 @@ pub fn platform_api_cors() -> CorsLayer {
+ /// Note that registered metrics will not show here until recorded at least
+ /// once.
+ pub async fn metrics() -> Result<impl IntoResponse, HttpResponseError> {
++    let output = encode_metrics(&CONVEX_METRICS_REGISTRY)?;
++    // Idempotent; starts the sweeper on the first infrastructure scrape.
++    ::metrics::spawn_sweep_task(None);
++    Ok(output)
++}
++
++fn encode_metrics(registry: &Registry) -> Result<String, HttpResponseError> {
+     if *DISABLE_METRICS_ENDPOINT {
+         return Err(anyhow::anyhow!(ErrorMetadata::not_found(
+             "MetricsDisabled",
+-            "/metrics endpoint disabled"
++            "Metrics endpoints disabled"
+         ))
+         .into());
+     }
+-    // Idempotent; starts the sweeper on the first scrape.
+-    ::metrics::spawn_sweep_task(None);
+     let encoder = TextEncoder::new();
+-    let metrics = CONVEX_METRICS_REGISTRY.gather();
++    let metrics = registry.gather();
+     let output = encoder
+         .encode_to_string(&metrics)
+         .map_err(anyhow::Error::from)?;
+@@ -1630,6 +1641,91 @@ mod tests {
+     };
+     use crate::dependency_overflow::DependencyOverflowGate;
+ 
++    #[tokio::test]
++    async fn infrastructure_scrapes_do_not_collect_function_usage() {
++        use std::sync::atomic::{
++            AtomicUsize,
++            Ordering,
++        };
++
++        use ::metrics::{
++            CONVEX_METRICS_REGISTRY,
++            FUNCTION_USAGE_METRICS_REGISTRY,
++        };
++        use prometheus::{
++            IntCounter,
++            PullingGauge,
++        };
++
++        let collections = Arc::new(AtomicUsize::new(0));
++        let observed = collections.clone();
++        let usage = PullingGauge::new(
++            "function_usage_scrape_isolation_test",
++            "Usage collection probe",
++            Box::new(move || {
++                observed.fetch_add(1, Ordering::Relaxed);
++                7.0
++            }),
++        )
++        .unwrap();
++        let infrastructure = IntCounter::new(
++            "infrastructure_scrape_isolation_test_total",
++            "Infrastructure collection probe",
++        )
++        .unwrap();
++        FUNCTION_USAGE_METRICS_REGISTRY
++            .register(Box::new(usage.clone()))
++            .unwrap();
++        CONVEX_METRICS_REGISTRY
++            .register(Box::new(infrastructure.clone()))
++            .unwrap();
++        let service = super::ConvexHttpService {
++            router: Router::new(),
++            meta_routes_enabled: true,
++            version: "test".into(),
++            service_name: "scrape_isolation_test",
++            _concurrency_gauge: None,
++            _base_concurrency_gauge: None,
++        };
++        let before = collections.load(Ordering::Relaxed);
++        for (path, present, absent) in [
++            (
++                "/metrics",
++                "infrastructure_scrape_isolation_test_total",
++                "function_usage_scrape_isolation_test",
++            ),
++            (
++                "/metrics/function_usage",
++                "function_usage_scrape_isolation_test",
++                "infrastructure_scrape_isolation_test_total",
++            ),
++        ] {
++            let response = service
++                .meta_routes()
++                .oneshot(Request::get(path).body(Body::empty()).unwrap())
++                .await
++                .unwrap();
++            assert_eq!(response.status(), StatusCode::OK);
++            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
++                .await
++                .unwrap();
++            let body = std::str::from_utf8(&body).unwrap();
++            assert!(body.contains(present));
++            assert!(!body.contains(absent));
++            if path == "/metrics" {
++                // Filtering after gather would hide the text but still incur collection cost.
++                assert_eq!(collections.load(Ordering::Relaxed), before);
++            }
++        }
++        assert!(collections.load(Ordering::Relaxed) > before);
++        FUNCTION_USAGE_METRICS_REGISTRY
++            .unregister(Box::new(usage))
++            .unwrap();
++        CONVEX_METRICS_REGISTRY
++            .unregister(Box::new(infrastructure))
++            .unwrap();
++    }
++
+     #[test]
+     fn concurrency_gauges_strip_only_the_matching_executable_prefix() {
+         for metric_name in [
+diff --git a/crates/metrics/src/metrics.rs b/crates/metrics/src/metrics.rs
+index 6330e60a3cefb6e44912998380f83961f71c9373..107f87b58c52370fa33c78ad6ddb17fea2783ddc 100644
+--- a/crates/metrics/src/metrics.rs
++++ b/crates/metrics/src/metrics.rs
+@@ -83,7 +83,13 @@ pub static SERVICE_NAME: LazyLock<String> = LazyLock::new(|| {
+         .replace('-', "_")
+ });
+ 
+-pub static CONVEX_METRICS_REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
++pub static CONVEX_METRICS_REGISTRY: LazyLock<Registry> = LazyLock::new(new_registry);
++
++// Frequent infrastructure scrapes must not gather the per-function usage
++// matrix.
++pub static FUNCTION_USAGE_METRICS_REGISTRY: LazyLock<Registry> = LazyLock::new(new_registry);
++
++fn new_registry() -> Registry {
+     let labels = env::var("CONVEX_SITE").ok().map(|instance_name| {
+         [("instance_name".to_owned(), instance_name)]
+             .into_iter()
+@@ -91,7 +97,7 @@ pub static CONVEX_METRICS_REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
+     });
+     Registry::new_custom(Some(SERVICE_NAME.clone()), labels)
+         .expect("Failed to initialize Prometheus metrics registry")
+-});
++}
+ 
+ #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+ pub struct MetricName(&'static str);
 diff --git a/crates/udf_metrics/src/lib.rs b/crates/udf_metrics/src/lib.rs
 index 3978b00258f7e28940e6a9587a31f720a37fae4e..d62a151e81795fecde3fa70cee19261dac744ba5 100644
 --- a/crates/udf_metrics/src/lib.rs
@@ -2302,11 +3100,11 @@ index ce6a9121da7afa6468b5fd3c1af0c1164f69de0c..8369327acb61b7b7ee216b5f2ac0f77f
  evidence that an ancestor-unblocking request was dispatched while pre-dispatch
 diff --git a/patches/runtime_health_dashboard/README.md b/patches/runtime_health_dashboard/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..60f841d11aef0c8a0665977971866b10a82f3bcb
+index 0000000000000000000000000000000000000000..04b3930d27bea1c70088432818541c0e34c6f34f
 --- /dev/null
 +++ b/patches/runtime_health_dashboard/README.md
-@@ -0,0 +1,205 @@
-+# Runtime health dashboard semantics
+@@ -0,0 +1,223 @@
++# Runtime health and function usage metrics
 +
 +## Summary
 +
@@ -2314,6 +3112,13 @@ index 0000000000000000000000000000000000000000..60f841d11aef0c8a0665977971866b10
 +scheduled-function lag without claiming stronger capacity failures than the
 +available metrics establish. It also separates scheduler-state sampling from
 +rate-limited log publication and records direct scheduled-job admission lag.
++
++An independently enabled backend exporter supplies bounded per-function usage
++counters for an external statistics store. Its sparse scrape protocol, metric
++meanings, and consumer configuration are described in
++[Function usage counters](function_usage.md). The exporter and runtime-health
++corrections form one metrics adoption patch; enabling the exporter does not
++require a dashboard change.
 +
 +It is a generic self-hosting patch. It does not contain application function
 +names, route names, or deployment-specific limits.
@@ -2439,7 +3244,18 @@ index 0000000000000000000000000000000000000000..60f841d11aef0c8a0665977971866b10
 +one writable source bucket. A backward-time reset discards at most 240 buckets,
 +and neither path emits an external log event.
 +
++These bounds describe scheduler-lag collection. The optional function-usage
++exporter has separate bounds and a separate registry, as described in its
++linked configuration contract.
++
 +## Deployment
++
++Function-usage collection is disabled by default. Set
++`FUNCTION_USAGE_METRICS_ENABLED=true` and configure a private sparse-counter
++consumer as described in [Function usage counters](function_usage.md). This
++patch does not install a time-series database or add usage-history charts.
++Disabling collection or restoring the previous backend stops new usage input;
++history retained by an external store is unaffected.
 +
 +The backend and dashboard changes should normally be shipped together. The
 +backend change improves the app-metrics timeseries for every dashboard client.
@@ -2511,3 +3327,163 @@ index 0000000000000000000000000000000000000000..60f841d11aef0c8a0665977971866b10
 +Queueing can be a normal asynchronous handoff. Saturation requires
 +configured-limit and failure or wait evidence that the dashboard endpoint does
 +not currently carry.
+diff --git a/patches/runtime_health_dashboard/function_usage.md b/patches/runtime_health_dashboard/function_usage.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac0d11fa464b0d71f59b85f2aa634a43c0833019
+--- /dev/null
++++ b/patches/runtime_health_dashboard/function_usage.md
+@@ -0,0 +1,154 @@
++# Function usage counters
++
++The runtime-health metrics patch includes an optional exporter for per-function
++usage history. Completed execution records update cumulative counters in backend
++memory. An external collector pulls those counters; function completion performs
++no network requests and does not depend on the collector or its storage.
++
++## Activation and access
++
++`FUNCTION_USAGE_METRICS_ENABLED=true` enables collection. An unset value or
++`false` disables collection; other values fail initialization. The exporter uses
++`/metrics/function_usage` and its own registry. Ordinary `/metrics` scrapes do
++not collect or serialize the function counters. `DISABLE_METRICS_ENDPOINT`
++disables both routes.
++
++The endpoint uses the existing unauthenticated metrics route mechanism. Operators
++restrict `/metrics` and `/metrics/*` to trusted local or private-network clients
++before enabling collection. Function and component labels disclose application
++structure. No admin key protects this endpoint.
++
++## Sparse collection contract
++
++The first scrape includes every retained function. Subsequent scrapes include
++only functions updated since the preceding collection. Once an hour, the next
++scrape includes every retained function again, including idle functions. Every
++included function exports all its counter families. Global exporter-health
++metrics remain present on every response.
++
++Counters retain their cumulative values when collected. Only the pending-export
++flags are cleared. Flags are cleared before reading atomic counters, and each
++completion publishes its flag after updating counters. A concurrent update is
++therefore visible in that collection or a subsequent collection.
++
++The endpoint has one intended consumer. A manual scrape also clears pending
++flags. A failed response can consume flags without delivering counters; a later
++function update or hourly snapshot sends the cumulative values again. There is
++no acknowledgement or replay queue. This is best-effort operational telemetry.
++
++Omission means unchanged, so ordinary Prometheus staleness handling does not
++implement this protocol. A consumer retains the latest counter state between
++updates and handles observed counter decreases as process resets.
++
++For example, single-node VictoriaMetrics v1.153.0 can use these scrape settings:
++
++```yaml
++scrape_configs:
++  - job_name: convex-function-usage
++    scrape_interval: 5m
++    scrape_timeout: 10s
++    metrics_path: /metrics/function_usage
++    no_stale_markers: true
++    max_scrape_size: 256MiB
++    stream_parse: true
++    static_configs:
++      - targets: ["127.0.0.1:3210"]
++```
++
++The corresponding `-streamAggr.config` file reconstructs counters with their
++original names and labels:
++
++```yaml
++- match: '{__name__=~"convex_local_backend_function_usage_.+_total", function!=""}'
++  interval: 5m
++  staleness_interval: 24h
++  outputs: [total_prometheus]
++  keep_metric_names: true
++  flush_on_shutdown: true
++```
++
++The namespace above is for the local backend. Other service binaries use their
++own metric namespace. The function label matcher excludes exporter-health
++counters from aggregation. Unmatched metrics use ordinary storage behavior.
++
++`total_prometheus` establishes a baseline from the first received sample, then
++stores a derived cumulative counter every five minutes, including intervals with
++no input. State expires after 24 hours without input; hourly snapshots refresh
++idle functions retained by the backend. A VM restart or changed aggregation rule
++also loses aggregation state. The first sample after state loss becomes a new
++baseline instead of recounting prior process-lifetime work. Stored history is
++independent of aggregation state; `-retentionPeriod=30d` retains it for thirty
++days without enterprise downsampling.
++
++Full and partial responses share the same scrape limit. Stream parsing limits
++VM's response-buffering cost, but the backend still builds selected metric
++objects and response text in memory. The default 16 MiB scrape limit can reject
++a full snapshot; collection does not automatically split oversized responses.
++
++## Identity, measurements, and bounds
++
++Names start with `function_usage_` after the service namespace. Domain labels
++are `component`, `function`, and `udf_type`. An internal `label_lengths` label
++separates otherwise ambiguous concatenations in the pinned metric vector's
++label hash. Group queries by the domain labels.
++
++The root component label is empty. Function labels use canonical module paths
++without `.js`, followed by `:export`; default exports use the module path alone.
++HTTP actions use the matched method and route pattern. System functions and
++unmatched HTTP requests are excluded. Request IDs, arguments, document IDs,
++identity data, and error text are not labels.
++
++The exporter retains at most 4,096 function label combinations per process.
++Component and function labels are each limited to 1,024 bytes. Existing counters,
++including counters for removed functions, remain until process exit. Recording
++uses nonblocking map admission; scrapes hold that map only while selecting and
++cloning counter handles. Capacity, label-length, contention, and invalid-duration
++omissions increment `dropped_observations_total{reason="..."}`.
++`retained_functions` reports retained identities.
++
++The counter families measure:
++
++- Calls and failures from terminal completion records, including query cache
++  hits and subscription reruns; attempts requesting a retry are not terminal.
++- Non-cached attempts, retries, query cache hits, and query cache misses.
++- Execution seconds, available user-execution seconds, and the count of attempts
++  with user-execution timing. These are elapsed durations, not operating-system
++  CPU time. Node actions do not provide user-execution timing.
++- Database bandwidth bytes, database I/O bytes, document counts, and written index
++  rows, following the existing execution record's accounting.
++- Attributed file-storage read/write bytes and network egress bytes.
++
++Cache hits do not repeat the cached execution's time or resource usage. Nested
++transaction work follows existing function attribution; action callbacks have
++their own completion records. Existing system-error exclusions remain in effect.
++HTTP error responses chosen by application code are not execution failures.
++
++Backend restarts lose unsampled increments. A reset is invisible if the new
++counter exceeds its previous value before collection; multiple intervening
++resets cannot be reconstructed. Initial usage before a consumer baseline is
++also omitted. Derived counters repeat during failed scrapes, so a flat series
++does not establish zero activity while scrape health is missing or failing.
++Aggregation can add another output interval of delay. These counters describe
++approximate usage, not billing or a durable event ledger.
++
++Queries use `increase()` or `rate()` over the derived counters. For example:
++
++```promql
++sum by (component, function, udf_type) (
++  increase(convex_local_backend_function_usage_calls_total[7d])
++)
++```
++
++## Verification and rollback
++
++The focused Rust tests are `application`'s `function_usage_metrics::tests` and
++`common`'s `infrastructure_scrapes_do_not_collect_function_usage`. They exercise
++cache/retry accounting, bounded admission, label separation, concurrent updates,
++sparse collection, hourly response repair, and infrastructure-scrape isolation.
++Consumer verification includes empty successful responses, visible resets,
++restart baselines, expiry, and full snapshots larger than the default scrape cap.
++
++Disable collection and restart, or restore a backend without the exporter, to
++stop new usage input. Consumer state expires according to its configured policy;
++stored history follows the external store's retention. No schema migration or
++dashboard rollback is required for the exporter.
