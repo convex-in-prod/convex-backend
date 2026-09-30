@@ -11,6 +11,12 @@ Supervise inert preparation, activation, progress and bounded retirement with on
 Add administrative preparation and inspection, publication compatibility guards, durable reconciliation, actual executable lifecycle tests and generic operator adoption documentation.
 
 Forward sanitized resident stderr with bounded framing and rate limits through the shared service tracing output. Report completed drops even when the child becomes quiet, and abort diagnostic reads without waiting during termination. Keep reaping and surge ownership independent of log delivery. Exercise blocked backend stdout, generation attribution, malformed framing, and failure cleanup with isolated fixture process groups.
+
+Route native termination through a separate critical cgroup-pressure signal.
+Keep early optional-cache reclamation with its existing consumers, publish
+only emergency state transitions, and preserve critical termination while
+allocator trim is pending or HTTP shedding is disabled. Cover hysteresis and
+unchanged-sample notifications in the memory-controller tests.
 ---
  Cargo.lock                                    |    1 +
  crates/application/src/deploy_config.rs       |  162 ++
@@ -21,28 +27,30 @@ Forward sanitized resident stderr with bounded framing and rate limits through t
  crates/local_backend/src/deploy_config.rs     |    4 +-
  crates/local_backend/src/deploy_config2.rs    |   23 +
  .../src/deployment_operations.rs              |    1 +
- crates/local_backend/src/lib.rs               |   36 +-
+ crates/local_backend/src/lib.rs               |   37 +-
+ crates/local_backend/src/main.rs              |   16 +-
+ crates/local_backend/src/memory_metrics.rs    |  114 +-
  crates/local_backend/src/native_resident.rs   |  125 ++
  crates/local_backend/src/router.rs            |    4 +
  crates/model/src/source_packages/mod.rs       |    5 +
  crates/model/src/source_packages/native.rs    |  151 ++
  crates/model/src/source_packages/types.rs     |   17 +
  crates/node_executor/Cargo.toml               |    8 +
- crates/node_executor/NATIVE_RESIDENTS.md      |  168 ++
+ crates/node_executor/NATIVE_RESIDENTS.md      |  178 ++
  crates/node_executor/src/lib.rs               |    3 +
  crates/node_executor/src/local.rs             |   73 +-
  crates/node_executor/src/native.rs            | 1548 +++++++++++++++++
  crates/node_executor/src/native_logs.rs       |  200 +++
  crates/node_executor/src/process.rs           |   15 +
- crates/node_executor/src/routed.rs            |   58 +-
+ crates/node_executor/src/routed.rs            |   62 +-
  .../node_executor/testdata/native_resident.rs |  156 ++
  crates/node_executor/tests/native_resident.rs |  805 +++++++++
  patches/README.md                             |   25 +-
  patches/backend_memory_resilience/README.md   |   13 +-
  .../README.md                                 |    5 +-
- patches/native_residents/README.md            |   33 +
+ patches/native_residents/README.md            |   41 +
  .../README.md                                 |   11 +-
- 30 files changed, 3777 insertions(+), 94 deletions(-)
+ 32 files changed, 3913 insertions(+), 111 deletions(-)
  create mode 100644 crates/local_backend/src/native_resident.rs
  create mode 100644 crates/model/src/source_packages/native.rs
  create mode 100644 crates/node_executor/NATIVE_RESIDENTS.md
@@ -750,7 +758,7 @@ index 57cd74ea4d54da7a289f1ca90672416b16b1c263..96f90b459f93df709d20cb41dd4c0c1f
          "lifetimeSeconds": LIFETIME.as_secs(),
          "maxOperations": MAX_OPERATIONS,
 diff --git a/crates/local_backend/src/lib.rs b/crates/local_backend/src/lib.rs
-index 510f89179a1f690c5d4743809b16e778976a53a9..37570e7e06a5f0fce58100b4b5d8dee167394c81 100644
+index 510f89179a1f690c5d4743809b16e778976a53a9..33776e774f23173f6bcadcad4351128b3031feef 100644
 --- a/crates/local_backend/src/lib.rs
 +++ b/crates/local_backend/src/lib.rs
 @@ -62,6 +62,13 @@ use function_runner::{
@@ -803,15 +811,23 @@ index 510f89179a1f690c5d4743809b16e778976a53a9..37570e7e06a5f0fce58100b4b5d8dee1
      }
  }
  
-@@ -339,6 +355,7 @@ pub async fn make_app(
+@@ -277,6 +293,7 @@ pub async fn make_app(
+     zombify_rx: async_broadcast::Receiver<()>,
+     preempt_tx: ShutdownSignal,
+     memory_reclamation: MemoryPressureSignal,
++    memory_emergency: MemoryPressureSignal,
+     node_executor_config: RoutedLocalNodeExecutorConfig,
+ ) -> anyhow::Result<LocalAppState> {
+     let key_broker = config.key_broker()?;
+@@ -339,6 +356,7 @@ pub async fn make_app(
          Arc::new(RoutedLocalNodeExecutor::new_with_configuration(node_executor_config).await?);
      node_executor
          .reconcile_pool_topology(&committed_pool_topology, committed_pool_topology_version)?;
-+    let native_resident = node_executor.native_resident_supervisor()?;
++    let native_resident = node_executor.native_resident_supervisor(memory_emergency)?;
      let node_actions = NodeActions::new(
          node_executor,
          config.convex_origin_url()?,
-@@ -433,7 +450,20 @@ pub async fn make_app(
+@@ -433,7 +451,20 @@ pub async fn make_app(
          runtime.spawn_background("beacon_worker", beacon_future);
      }
  
@@ -832,6 +848,253 @@ index 510f89179a1f690c5d4743809b16e778976a53a9..37570e7e06a5f0fce58100b4b5d8dee1
          deployment_operations: deployment_operations::DeploymentOperations::default(),
          origin,
          site_origin: config.convex_site_url()?,
+diff --git a/crates/local_backend/src/main.rs b/crates/local_backend/src/main.rs
+index dcf9c1c564b59eff222cb505c31cb4050b346c8e..c052e9abaa3356acd5abf403f1f65dc33ccdadca 100644
+--- a/crates/local_backend/src/main.rs
++++ b/crates/local_backend/src/main.rs
+@@ -194,7 +194,7 @@ async fn run_server_inner(
+     let (preempt_tx, preempt_rx) = oneshot::channel();
+     let preempt_signal = ShutdownSignal::new(preempt_tx);
+     #[cfg(target_os = "linux")]
+-    let (external_request_shedding, memory_reclamation) = {
++    let (external_request_shedding, memory_reclamation, memory_emergency) = {
+         memory_metrics::validate_startup_budget()?;
+         let controller = memory_metrics::initialize_memory_pressure_controller()?;
+         let external_request_shedding = controller
+@@ -204,11 +204,19 @@ async fn run_server_inner(
+             .as_ref()
+             .map(memory_metrics::CgroupMemoryPressureController::memory_reclamation)
+             .unwrap_or_default();
++        let memory_emergency = controller
++            .as_ref()
++            .map(memory_metrics::CgroupMemoryPressureController::memory_emergency)
++            .unwrap_or_default();
+         memory_metrics::start(runtime.clone(), controller, preempt_signal.clone());
+-        (external_request_shedding, memory_reclamation)
++        (
++            external_request_shedding,
++            memory_reclamation,
++            memory_emergency,
++        )
+     };
+     #[cfg(not(target_os = "linux"))]
+-    let (external_request_shedding, memory_reclamation) = {
++    let (external_request_shedding, memory_reclamation, memory_emergency) = {
+         anyhow::ensure!(
+             !*LOCAL_BACKEND_MEMORY_RECLAMATION_ENABLED
+                 && !*LOCAL_BACKEND_MALLOC_TRIM_ENABLED
+@@ -218,6 +226,7 @@ async fn run_server_inner(
+         (
+             None,
+             common::memory_pressure::MemoryPressureSignal::default(),
++            common::memory_pressure::MemoryPressureSignal::default(),
+         )
+     };
+ 
+@@ -252,6 +261,7 @@ async fn run_server_inner(
+         shutdown_rx.clone(),
+         preempt_signal.clone(),
+         memory_reclamation,
++        memory_emergency,
+         node_executor_config,
+     )
+     .await?;
+diff --git a/crates/local_backend/src/memory_metrics.rs b/crates/local_backend/src/memory_metrics.rs
+index ccbc555a7406dba19d5b349a31ab06da31e24848..5b2e2a5bea35d96160bb0dae3cc3ca96a2ac92ff 100644
+--- a/crates/local_backend/src/memory_metrics.rs
++++ b/crates/local_backend/src/memory_metrics.rs
+@@ -331,6 +331,7 @@ pub struct CgroupMemoryPressureController {
+     deployment_min_headroom_bytes: u64,
+     latest_headroom_bytes: u64,
+     memory_reclamation: MemoryPressureSignal,
++    memory_emergency: MemoryPressureSignal,
+     reclamation_active: bool,
+     reclamation_enabled: bool,
+     reclamation_enter_headroom_bytes: u64,
+@@ -547,11 +548,14 @@ pub fn initialize_memory_pressure_controller(
+     let reclamation_exit_headroom_bytes =
+         u64::try_from(*LOCAL_BACKEND_MEMORY_RECLAMATION_EXIT_HEADROOM_BYTES)?;
+ 
++    // Native residents keep serving during optional cache reclamation. Their
++    // termination signal uses the critical headroom policy even when HTTP
++    // shedding is disabled, so both thresholds remain meaningful here.
++    anyhow::ensure!(
++        shedding_enter_headroom_bytes < shedding_exit_headroom_bytes,
++        "Memory pressure shedding exit headroom must exceed enter headroom"
++    );
+     if shedding_enabled {
+-        anyhow::ensure!(
+-            shedding_enter_headroom_bytes < shedding_exit_headroom_bytes,
+-            "Memory pressure shedding exit headroom must exceed enter headroom"
+-        );
+         for (boundary, bytes) in [
+             ("enter", shedding_enter_headroom_bytes),
+             ("exit", shedding_exit_headroom_bytes),
+@@ -595,12 +599,12 @@ pub fn initialize_memory_pressure_controller(
+     let max_bytes = cgroup
+         .max_bytes
+         .context("Memory pressure control requires a finite cgroup v2 memory limit")?;
++    anyhow::ensure!(
++        shedding_exit_headroom_bytes < max_bytes,
++        "Memory pressure shedding exit headroom must be smaller than the finite cgroup memory \
++         limit"
++    );
+     if shedding_enabled {
+-        anyhow::ensure!(
+-            shedding_exit_headroom_bytes < max_bytes,
+-            "Memory pressure shedding exit headroom must be smaller than the finite cgroup memory \
+-             limit"
+-        );
+         anyhow::ensure!(
+             deployment_min_headroom_bytes < max_bytes,
+             "Deployment minimum headroom must be smaller than the finite cgroup memory limit"
+@@ -657,6 +661,12 @@ pub fn initialize_memory_pressure_controller(
+         // Consumers enter only after the controller has attempted allocator
+         // trim for the initial pressure state.
+         memory_reclamation: MemoryPressureSignal::default(),
++        memory_emergency: MemoryPressureSignal::new(pressure_state(
++            false,
++            headroom_bytes,
++            shedding_enter_headroom_bytes,
++            shedding_exit_headroom_bytes,
++        )),
+         reclamation_active: reclamation_initially_active,
+         reclamation_enabled,
+         reclamation_enter_headroom_bytes,
+@@ -677,12 +687,34 @@ impl CgroupMemoryPressureController {
+         self.memory_reclamation.clone()
+     }
+ 
++    pub fn memory_emergency(&self) -> MemoryPressureSignal {
++        self.memory_emergency.clone()
++    }
++
+     fn update(&mut self, cgroup: &CgroupMemory) -> anyhow::Result<()> {
+         let max_bytes = cgroup
+             .max_bytes
+             .context("Memory pressure control requires a finite cgroup v2 memory limit")?;
+         let headroom_bytes = max_bytes.saturating_sub(cgroup.current_bytes);
+         self.latest_headroom_bytes = headroom_bytes;
++        anyhow::ensure!(
++            self.shedding_exit_headroom_bytes < max_bytes,
++            "Memory pressure shedding exit headroom must be smaller than the finite cgroup memory \
++             limit"
++        );
++        let was_emergency = self.memory_emergency.is_active();
++        let is_emergency = pressure_state(
++            was_emergency,
++            headroom_bytes,
++            self.shedding_enter_headroom_bytes,
++            self.shedding_exit_headroom_bytes,
++        );
++        // Publish only transitions: repeatedly sending an unchanged value can
++        // cancel a pending lifecycle operation without a new pressure event.
++        // Emergency termination never waits for allocator trim to finish.
++        if is_emergency != was_emergency {
++            self.memory_emergency.set_active(is_emergency);
++        }
+         log_gauge(
+             &BACKEND_MEMORY_PRESSURE_HEADROOM_BYTES,
+             headroom_bytes as f64,
+@@ -738,11 +770,6 @@ impl CgroupMemoryPressureController {
+             // finite-memory policy, even while ordinary intake is shed.
+             external_request_shedding
+                 .set_deployment_hard_stop(headroom_bytes <= self.deployment_min_headroom_bytes);
+-            anyhow::ensure!(
+-                self.shedding_exit_headroom_bytes < max_bytes,
+-                "Memory pressure shedding exit headroom must be smaller than the finite cgroup \
+-                 memory limit"
+-            );
+             let was_active = external_request_shedding.is_active();
+             let is_active = pressure_state(
+                 was_active,
+@@ -2485,6 +2512,7 @@ mod tests {
+             deployment_min_headroom_bytes: 2,
+             latest_headroom_bytes: 100,
+             memory_reclamation: signal.clone(),
++            memory_emergency: MemoryPressureSignal::default(),
+             reclamation_active: false,
+             reclamation_enabled: true,
+             reclamation_enter_headroom_bytes: 6,
+@@ -2551,6 +2579,7 @@ mod tests {
+             deployment_min_headroom_bytes: 2,
+             latest_headroom_bytes: 100,
+             memory_reclamation: signal.clone(),
++            memory_emergency: MemoryPressureSignal::default(),
+             reclamation_active: false,
+             reclamation_enabled: true,
+             reclamation_enter_headroom_bytes: 6,
+@@ -2580,6 +2609,62 @@ mod tests {
+         assert!(signal.is_active());
+     }
+ 
++    #[test]
++    fn native_emergency_signal_is_independent_of_early_reclamation_and_trim() {
++        for http_shedding in [false, true] {
++            let mut controller = CgroupMemoryPressureController {
++                external_request_shedding: http_shedding
++                    .then(|| ExternalRequestShedding::new(false)),
++                shedding_enter_headroom_bytes: 3,
++                shedding_exit_headroom_bytes: 5,
++                deployment_min_headroom_bytes: 2,
++                latest_headroom_bytes: 10,
++                memory_reclamation: MemoryPressureSignal::default(),
++                memory_emergency: MemoryPressureSignal::default(),
++                reclamation_active: false,
++                reclamation_enabled: true,
++                reclamation_enter_headroom_bytes: 6,
++                reclamation_exit_headroom_bytes: 8,
++                allocator_trim_enabled: true,
++                allocator_trim_min_free_bytes: 1,
++                allocator_trim_cooldown: Duration::from_secs(300),
++                last_allocator_trim_evaluated: None,
++            };
++            let reclamation = controller.memory_reclamation();
++            let emergency = controller.memory_emergency();
++            let mut changes = emergency.subscribe();
++            // Use the actual controller and signals handed to the supervisors.
++            // Early pressure cannot revoke a healthy native resident; critical
++            // pressure interrupts it even while a trim worker remains blocked.
++            for (used, trimming, reclaiming, terminating) in [
++                (94, false, true, false),
++                (95, false, true, false),
++                (97, true, true, true),
++                (96, true, true, true),
++                (95, true, true, false),
++                (93, false, true, false),
++                (92, false, false, false),
++                (98, true, true, true),
++            ] {
++                let previous = emergency.is_active();
++                controller
++                    .update(&CgroupMemory {
++                        current_bytes: used,
++                        max_bytes: Some(100),
++                    })
++                    .unwrap();
++                controller.publish_reclamation_state(trimming);
++                assert_eq!(reclamation.is_active(), reclaiming, "used={used}");
++                assert_eq!(emergency.is_active(), terminating, "used={used}");
++                assert_eq!(changes.has_changed().unwrap(), previous != terminating);
++                changes.borrow_and_update();
++                if let Some(shedding) = &controller.external_request_shedding {
++                    assert_eq!(shedding.is_active(), terminating);
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn allocator_trim_eligibility_scan_obeys_the_trim_cooldown() {
+         let cooldown = Duration::from_secs(300);
+@@ -2590,6 +2675,7 @@ mod tests {
+             deployment_min_headroom_bytes: 2,
+             latest_headroom_bytes: 3,
+             memory_reclamation: MemoryPressureSignal::default(),
++            memory_emergency: MemoryPressureSignal::default(),
+             reclamation_active: true,
+             reclamation_enabled: true,
+             reclamation_enter_headroom_bytes: 6,
 diff --git a/crates/local_backend/src/native_resident.rs b/crates/local_backend/src/native_resident.rs
 new file mode 100644
 index 0000000000000000000000000000000000000000..732abd0607e50b8797bd0739df140df4b8ff2dbc
@@ -1271,10 +1534,10 @@ index ec00d83f718d3dbed076129ea90450c31d65d5e2..598e13269ae0797760d578facc8da829
  value = { workspace = true }
 diff --git a/crates/node_executor/NATIVE_RESIDENTS.md b/crates/node_executor/NATIVE_RESIDENTS.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..fef7a9c8fef280c2966bd75d1261d5e546760568
+index 0000000000000000000000000000000000000000..21491c45c838c6870e1b25a0d7e9294b867cfb73
 --- /dev/null
 +++ b/crates/node_executor/NATIVE_RESIDENTS.md
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,178 @@
 +# Local native residents
 +
 +A native resident is a directly supervised executable, independent of Node source
@@ -1418,6 +1681,16 @@ index 0000000000000000000000000000000000000000..fef7a9c8fef280c2966bd75d1261d5e5
 +writes retain their offsets and deadlines across cancellation and receive RSS checks;
 +retirement interrupts cover blocked writes too. A failed inert candidate is terminated
 +even if it subsequently sends a valid reply.
++
++The local backend supplies the critical cgroup pressure signal to native supervision,
++separate from early optional-cache reclamation. Critical pressure uses
++`LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES` and
++`LOCAL_BACKEND_MEMORY_PRESSURE_EXIT_HEADROOM_BYTES`, with the same hysteresis as HTTP
++shedding. It applies when either backend reclamation or HTTP shedding is enabled,
++including when HTTP shedding itself is disabled, and never waits for allocator trim.
++Early reclamation alone leaves a healthy native process running. Critical pressure
++terminates owned native children and prevents activation until headroom recovers.
++The independent native RSS limit and progress watchdog remain active at either level.
 +
 +Generation identities remain distinct across backend restarts and PID reuse. Stale replies
 +cannot name a successor. Canceled startup and cleanup retain the child and
@@ -3353,7 +3626,7 @@ index 0000000000000000000000000000000000000000..7d6e3b7cc0e0377a668a1fa94674c32e
 +    Ok((requested, child.wait().await?))
 +}
 diff --git a/crates/node_executor/src/routed.rs b/crates/node_executor/src/routed.rs
-index 46ab34d8ca767eeb1e29fa2d393d7eb355b08b16..e56a7761d705b479ee3305f6b86a911daae52835 100644
+index 46ab34d8ca767eeb1e29fa2d393d7eb355b08b16..3970deccbc45f1ab0042df16c5675381e6d84099 100644
 --- a/crates/node_executor/src/routed.rs
 +++ b/crates/node_executor/src/routed.rs
 @@ -20,6 +20,7 @@ use std::{
@@ -3373,23 +3646,27 @@ index 46ab34d8ca767eeb1e29fa2d393d7eb355b08b16..e56a7761d705b479ee3305f6b86a911d
  const ENVIRONMENT_FINGERPRINT_VERSION: &[u8] = b"local-node-environment-v1";
  
  struct SystemOperationWaiter {
-@@ -1477,6 +1476,15 @@ impl RoutedLocalNodeExecutorConfig {
+@@ -1477,6 +1476,19 @@ impl RoutedLocalNodeExecutorConfig {
  }
  
  impl RoutedLocalNodeExecutor {
 +    pub fn native_resident_supervisor(
 +        &self,
++        memory_emergency: MemoryPressureSignal,
 +    ) -> anyhow::Result<Arc<crate::native::NativeResidentSupervisor>> {
++        // A native resident owns application work, not optional retained cache.
++        // Use critical cgroup pressure for termination; the Node reclamation
++        // signal becomes active earlier and has a different retirement policy.
 +        crate::native::NativeResidentSupervisor::new(
 +            self.local_config.surge_coordinator(),
-+            self.memory_pressure.clone(),
++            memory_emergency,
 +        )
 +    }
 +
      pub async fn new_with_configuration(
          config: RoutedLocalNodeExecutorConfig,
      ) -> anyhow::Result<Self> {
-@@ -2353,6 +2361,11 @@ fn calculate_local_node_rss_budget(
+@@ -2353,6 +2365,11 @@ fn calculate_local_node_rss_budget(
              .ok_or_else(|| anyhow::anyhow!("Required Node executor steady RSS budget overflow"))?;
          surge_bytes = surge_bytes.max(named_rss_bytes);
      }
@@ -3401,7 +3678,7 @@ index 46ab34d8ca767eeb1e29fa2d393d7eb355b08b16..e56a7761d705b479ee3305f6b86a911d
      let required_bytes = steady_bytes
          .checked_add(surge_bytes)
          .ok_or_else(|| anyhow::anyhow!("Required Node executor RSS budget overflow"))?;
-@@ -2625,44 +2638,7 @@ async fn acquire_deployment_cutover_permit(
+@@ -2625,44 +2642,7 @@ async fn acquire_deployment_cutover_permit(
      shutting_down: &AtomicBool,
      shutdown_changed: &Notify,
  ) -> anyhow::Result<crate::local::SurgePermit> {
@@ -3447,7 +3724,7 @@ index 46ab34d8ca767eeb1e29fa2d393d7eb355b08b16..e56a7761d705b479ee3305f6b86a911d
      tokio::select! {
          result = tokio::time::timeout(timeout, acquire) => match result {
              Ok(permit) => {
-@@ -2982,7 +2958,7 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
+@@ -2982,7 +2962,7 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
          let coordinator = self.local_config.surge_coordinator();
          let permit = acquire_deployment_cutover_permit(
              &coordinator,
@@ -4519,10 +4796,10 @@ index 0f0aa3e2cad89c8454c6f6e85e9bd1bef2d8241b..6a7269dcf70097d719e8b5df25a7b0aa
  Invalid threshold ordering or a total below the default/system/surge minimum
 diff --git a/patches/native_residents/README.md b/patches/native_residents/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..b2b4af9f7bbf7867306e28b2486749cc81608f7d
+index 0000000000000000000000000000000000000000..5e02a94f26d0777d3a301b4b9807b6275a6016cd
 --- /dev/null
 +++ b/patches/native_residents/README.md
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,41 @@
 +# Supervised native residents
 +
 +This patch extends the coordinated local executor owner with one optional native
@@ -4556,6 +4833,14 @@ index 0000000000000000000000000000000000000000..b2b4af9f7bbf7867306e28b2486749cc
 +retirement, forced replacement, memory pressure and shutdown. The process fixture
 +checks these boundaries using an actual local executable. It does not exercise a
 +particular application's external side effects or establish production throughput.
++
++Native termination uses the backend's critical cgroup headroom signal, not the earlier
++optional-cache reclamation signal supplied to Node pools. The controller retains the
++existing HTTP-shedding thresholds and hysteresis without a native-specific timer or
++new capacity knobs. Critical pressure remains effective while allocator trim is pending
++and when HTTP shedding is disabled but reclamation is enabled. Controller tests cover
++both signals, recovery hysteresis and unchanged-sample notification behavior; native
++process tests retain interruption, restart and confirmed-reaping coverage.
 diff --git a/patches/pinned_local_node_executor_pools/README.md b/patches/pinned_local_node_executor_pools/README.md
 index 49ac276dc50ca8f13a01e6b700f406e8eecc569d..fcbbaa7849b17afcbfd047e7a57df2d2ae1fda14 100644
 --- a/patches/pinned_local_node_executor_pools/README.md
