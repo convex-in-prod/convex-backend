@@ -41,6 +41,8 @@ semantics still require explicit ABI versions.
 Compose source-keyed activation with retained preparation, exclusive finish ownership and durable replay receipts. Keep engine-specific observer hooks here while sharing the bounded runtime observer with context reuse. Preserve the independent Wasm admission budget when adding fair configuration admission to V8.
 
 Integrate client-selected mutation priority into routed Wasm CPU admission and keep shadow verification at ordinary priority. Preserve native selection in shared deployment metadata, source identity fixtures and cleanup tests. Keep the non-Wasm trap diagnostic type uninhabited when the feature is disabled.
+
+Keep the build-owned compiler cache server alive until explicit cleanup. Disable its idle timeout before startup so a long optimized compilation cannot orphan the compiler and trigger a duplicate fallback. Exercise startup and exit cleanup with an inherited short timeout.
 ---
  .github/workflows/build_local_backend.yml     |     7 +-
  Cargo.lock                                    | 14387 ++++++-----
@@ -259,16 +261,16 @@ Integrate client-selected mutation priority into routed Wasm CPU admission and k
  .../design_reference.md                       |    15 +-
  patches/static_hermes_wasm_udfs/README.md     |   387 +
  .../compiler_and_artifact_contract.md         |   322 +
- patches/static_hermes_wasm_udfs/operations.md |   696 +
+ patches/static_hermes_wasm_udfs/operations.md |   701 +
  patches/static_hermes_wasm_udfs/value_abi.md  |   381 +
  scripts/run_cargo.sh                          |    96 +-
  scripts/run_cargo.test.mjs                    |   194 +
  self-hosted/advanced/knobs.md                 |     7 +
- self-hosted/docker-build/Dockerfile.backend   |   280 +-
- .../docker-build/Dockerfile.backend.test.mjs  |   233 +
+ self-hosted/docker-build/Dockerfile.backend   |   284 +-
+ .../docker-build/Dockerfile.backend.test.mjs  |   250 +
  self-hosted/docker-build/README.md            |    84 +
  self-hosted/docker-build/run_backend.sh       |     3 +-
- 226 files changed, 151126 insertions(+), 6989 deletions(-)
+ 226 files changed, 151152 insertions(+), 6989 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/query_shadow.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
  create mode 100644 crates/application/src/bin/source_package_preactivation_authority.rs
@@ -165816,10 +165818,10 @@ index 0000000000000000000000000000000000000000..b3f0a1e5b5812b21c9de870931c6f0f7
 +inputs.
 diff --git a/patches/static_hermes_wasm_udfs/operations.md b/patches/static_hermes_wasm_udfs/operations.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..b67f126b3ffd69be4285878e9d58f82998d2a6b7
+index 0000000000000000000000000000000000000000..c0d126f013849dfe7c2b16353f4176a0eee44329
 --- /dev/null
 +++ b/patches/static_hermes_wasm_udfs/operations.md
-@@ -0,0 +1,696 @@
+@@ -0,0 +1,701 @@
 +# Static Hermes Wasm UDF Operations and Validation
 +
 +This is a generic self-hosted adoption guide for the
@@ -165843,6 +165845,11 @@ index 0000000000000000000000000000000000000000..b67f126b3ffd69be4285878e9d58f829
 +```
 +
 +Normal images omit the runtime unless the feature is selected.
++
++The build starts its own sccache server before Cargo and stops it when the build
++exits. It disables the server's idle timeout because the interval between cache
++requests can include a long active compilation. Expiring that interval can
++orphan the compiler and make the client launch a duplicate compilation.
 +
 +## Maintained operating mode
 +
@@ -167226,7 +167233,7 @@ index 22dd36bd502ffd19abfb3f31133ca9a092bb2378..1a85042eaa4cffd9d301021d03756adf
  these processes. With `Rdefault` as the effective default-pool threshold,
  `Rsystem` as the global threshold, and `Rpool` as each effective named-pool
 diff --git a/self-hosted/docker-build/Dockerfile.backend b/self-hosted/docker-build/Dockerfile.backend
-index 54f0058f9a02fbf8ee1a530553d4a11d38639fe7..1af08cdac9be676a3ab9df785827edf5bc5352b1 100644
+index 54f0058f9a02fbf8ee1a530553d4a11d38639fe7..c747a74c23e1ccb3952075eb21fe418efb405e9d 100644
 --- a/self-hosted/docker-build/Dockerfile.backend
 +++ b/self-hosted/docker-build/Dockerfile.backend
 @@ -8,7 +8,9 @@ ARG VERGEN_GIT_COMMIT_TIMESTAMP
@@ -167443,7 +167450,7 @@ index 54f0058f9a02fbf8ee1a530553d4a11d38639fe7..1af08cdac9be676a3ab9df785827edf5
  if [[ -n "$CARGO_PROFILE_RELEASE_DEBUG" ]]; then
    export CARGO_PROFILE_RELEASE_DEBUG
  else
-@@ -159,24 +257,125 @@ if [[ -n "$CARGO_PROFILE_RELEASE_STRIP" ]]; then
+@@ -159,24 +257,129 @@ if [[ -n "$CARGO_PROFILE_RELEASE_STRIP" ]]; then
  else
    unset CARGO_PROFILE_RELEASE_STRIP
  fi
@@ -167456,6 +167463,10 @@ index 54f0058f9a02fbf8ee1a530553d4a11d38639fe7..1af08cdac9be676a3ab9df785827edf5
  export PATH="$(dirname "$(mise which uv)"):$PATH"
 +# Start before Cargo creates build-script pipes: a lazily spawned server can
 +# retain their write descriptors and prevent Cargo from observing EOF.
++# Idle time measures the gap between requests, including an active compilation.
++# Long optimized crates can exceed that timer; shutdown then orphans rustc and
++# the client starts a duplicate. The build owns explicit server shutdown.
++export SCCACHE_IDLE_TIMEOUT=0
 +sccache --start-server
 +trap 'sccache --stop-server' EXIT
  artifact_dir=/convex/backend-artifacts
@@ -167581,7 +167592,7 @@ index 54f0058f9a02fbf8ee1a530553d4a11d38639fe7..1af08cdac9be676a3ab9df785827edf5
  EOF
  ARG debug
  RUN <<EOF
-@@ -191,6 +390,9 @@ if [[ -z "${debug:-}" &&
+@@ -191,6 +394,9 @@ if [[ -z "${debug:-}" &&
      ""|false|0|none)
        strip ./backend-artifacts/convex-local-backend
        strip ./backend-artifacts/generate_key
@@ -167593,10 +167604,10 @@ index 54f0058f9a02fbf8ee1a530553d4a11d38639fe7..1af08cdac9be676a3ab9df785827edf5
  fi
 diff --git a/self-hosted/docker-build/Dockerfile.backend.test.mjs b/self-hosted/docker-build/Dockerfile.backend.test.mjs
 new file mode 100644
-index 0000000000000000000000000000000000000000..d48045a3206d39e79749a25761b2a85a8a6da3b9
+index 0000000000000000000000000000000000000000..62ad0735d8dfa3dd20c4a6adc4645f6095ddcb15
 --- /dev/null
 +++ b/self-hosted/docker-build/Dockerfile.backend.test.mjs
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,250 @@
 +import assert from "node:assert/strict";
 +import { spawnSync } from "node:child_process";
 +import { readFileSync } from "node:fs";
@@ -167608,6 +167619,23 @@ index 0000000000000000000000000000000000000000..d48045a3206d39e79749a25761b2a85a
 +  join(dirname(fileURLToPath(import.meta.url)), "Dockerfile.backend"),
 +  "utf8",
 +);
++
++test("build-owned sccache disables idle shutdown before starting the server", () => {
++  const lifecycle = dockerfile.slice(
++    dockerfile.indexOf("# Start before Cargo"),
++    dockerfile.indexOf("artifact_dir=/convex/backend-artifacts"),
++  );
++  const result = spawnSync("bash", ["-c", `
++set -euo pipefail
++sccache() { printf '%s %s\\n' "$1" "$SCCACHE_IDLE_TIMEOUT"; }
++${lifecycle}
++`], {
++    encoding: "utf8",
++    env: { ...process.env, SCCACHE_IDLE_TIMEOUT: "1" },
++  });
++  assert.equal(result.status, 0, result.stderr);
++  assert.equal(result.stdout, "--start-server 0\n--stop-server 0\n");
++});
 +
 +test("optional source authority helper shares Cargo selection and explicit gate features", () => {
 +  const selection = dockerfile.slice(
