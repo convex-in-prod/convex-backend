@@ -1,0 +1,1305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Tue, 29 Sep 2026 04:02:39 +0800
+Subject: [PATCH 25/29] mutations: preserve terminal OCC across transport
+ layers
+
+The mutation runner already applies its bounded OCC retry policy before
+returning an exhausted OptimisticConcurrencyControlFailure. Retrying that
+HTTP 503 in a Node callback loop or closing a sync socket starts another
+mutation retry cycle and delays unrelated pending work.
+
+Inspect intermediate callback 503 bodies for the structured OCC code and
+propagate a positively identified error through the existing caller error
+handler. Keep ordinary 5xx and transport retries, including the stable
+mutation identifier used to deduplicate committed results.
+
+Bound body inspection by size and time, consume the original stream rather
+than cloning it, and honor action disposal without waiting for cancellation
+to finish. Unclassifiable responses retain the transient retry policy.
+
+Return exhausted public and admin sync mutations as an identified
+MutationResponse with the original request ID. Keep the socket alive,
+omit the commit timestamp and diagnostic table/document details, and send
+empty log lines. Preserve successful and redacted function responses and
+propagate non-OCC application failures through their existing path. HTTP
+OCC remains 503 and is not reclassified as a deterministic user error.
+
+Retain focused callback tests for OCC propagation, retry budgets and
+identifiers, malformed and stalled bodies, UTF-8 boundaries, and action
+disposal. Add real sync-worker public/admin boundary tests for injected
+exhausted OCC, same-worker progress, redaction and non-OCC classification.
+Those worker tests do not induce database conflicts or establish
+committed-result retention. Document adoption and rollback without adding
+retry APIs, scheduler priority or process supervision policy.
+---
+ Cargo.lock                                    |   4 +
+ crates/sync/Cargo.toml                        |   4 +
+ crates/sync/src/occ_tests.rs                  | 457 ++++++++++++++++++
+ crates/sync/src/worker.rs                     |  67 ++-
+ .../node-executor/src/syscalls.test.ts        | 404 +++++++++++++++-
+ npm-packages/node-executor/src/syscalls.ts    |  88 +++-
+ patches/README.md                             |  12 +
+ patches/terminal_occ/README.md                |  48 ++
+ 8 files changed, 1057 insertions(+), 27 deletions(-)
+ create mode 100644 crates/sync/src/occ_tests.rs
+ create mode 100644 patches/terminal_occ/README.md
+
+diff --git a/Cargo.lock b/Cargo.lock
+index ba4a89c132a744aa7e4a9529c1d34c84822c3d28..7e95ca2ba44cda9e2a5c0f3854c0a638027a141c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10164,6 +10164,7 @@ dependencies = [
+  "anyhow",
+  "application",
+  "async-trait",
++ "bytes",
+  "cmd_util",
+  "common",
+  "convex_macro",
+@@ -10171,7 +10172,9 @@ dependencies = [
+  "database",
+  "errors",
+  "fastrace",
++ "file_storage",
+  "futures",
++ "headers",
+  "keybroker",
+  "metrics",
+  "model",
+@@ -10185,6 +10188,7 @@ dependencies = [
+  "tokio",
+  "tokio-stream",
+  "tracing",
++ "udf",
+ ]
+ 
+ [[package]]
+diff --git a/crates/sync/Cargo.toml b/crates/sync/Cargo.toml
+index f92a39618496df54d6fc69ea3f407d89470064af..e95ee29a8d58e6017f6d38938f9d29c4ac528625 100644
+--- a/crates/sync/Cargo.toml
++++ b/crates/sync/Cargo.toml
+@@ -44,10 +44,13 @@ tracing = { workspace = true }
+ [dev-dependencies]
+ application = { workspace = true, features = ["testing"] }
+ async-trait = { workspace = true }
++bytes = { workspace = true }
+ common = { workspace = true, features = ["testing"] }
+ convex_macro = { workspace = true, features = ["testing"] }
+ database = { workspace = true }
+ errors = { workspace = true, features = ["testing"] }
++file_storage = { workspace = true }
++headers = { workspace = true }
+ keybroker = { workspace = true, features = ["testing"] }
+ metrics = { workspace = true, features = ["testing"] }
+ model = { workspace = true, features = ["testing"] }
+@@ -55,6 +58,7 @@ must-let = { workspace = true }
+ proptest = { workspace = true }
+ proptest-derive = { workspace = true }
+ runtime = { workspace = true, features = ["testing"] }
++udf = { workspace = true }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/sync/src/occ_tests.rs b/crates/sync/src/occ_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..4e450aac0c9ba489bbc1029eba7bb4ba005170e9
+--- /dev/null
++++ b/crates/sync/src/occ_tests.rs
+@@ -0,0 +1,457 @@
++//! Exercise the real sync worker with exhausted errors injected at its
++//! application boundary. Database conflict execution and result retention are
++//! separate integration properties.
++use std::{
++    collections::BTreeMap,
++    ops::Bound,
++    sync::{
++        Arc,
++        Mutex,
++    },
++    time::Duration,
++};
++
++use anyhow::Context;
++use application::{
++    api::{
++        ApplicationApi,
++        ExecuteQueryTimestamp,
++        SubscriptionClient,
++        SubscriptionTrait,
++    },
++    FunctionError,
++    FunctionReturn,
++    RedactedActionError,
++    RedactedActionReturn,
++    RedactedMutationError,
++    RedactedMutationReturn,
++    RedactedQueryReturn,
++};
++use async_trait::async_trait;
++use bytes::Bytes;
++use common::{
++    components::{
++        CanonicalizedComponentFunctionPath,
++        ComponentId,
++        ExportPath,
++    },
++    http::{
++        RequestDestination,
++        ResolvedHostname,
++        ResolvedHostnameSource,
++    },
++    types::{
++        ConvexOrigin,
++        FunctionCaller,
++        QueryInvocation,
++        RepeatableTimestamp,
++    },
++    value::{
++        sha256::Sha256Digest,
++        DeveloperDocumentId,
++    },
++    RequestContext,
++    RequestId,
++};
++use database::Token;
++use file_storage::FileStream;
++use futures::stream::BoxStream;
++use headers::{
++    ContentLength,
++    ContentType,
++};
++use model::file_storage::FileStorageId;
++use runtime::prod::ProdRuntime;
++use sync_types::{
++    types::SerializedArgs,
++    QueryWorkloadClass,
++};
++use udf::{
++    HttpActionRequest,
++    HttpActionResponseStreamer,
++};
++
++use super::*;
++
++#[derive(Default)]
++struct MutationApi {
++    calls: Mutex<BTreeMap<u32, bool>>,
++}
++
++impl MutationApi {
++    fn execute(
++        &self,
++        identifier: Option<SessionRequestIdentifier>,
++        admin: bool,
++    ) -> anyhow::Result<Result<RedactedMutationReturn, RedactedMutationError>> {
++        let identifier = identifier.expect("worker omitted mutation identity");
++        assert_eq!(
++            identifier.session_id,
++            "00000000-0000-0000-0000-000000000000"
++                .parse::<SessionId>()
++                .unwrap()
++        );
++        assert!(
++            self.calls
++                .lock()
++                .unwrap()
++                .insert(identifier.request_id, admin)
++                .is_none(),
++            "worker resubmitted a terminal mutation"
++        );
++        match identifier.request_id {
++            0 => Err(ErrorMetadata::system_occ(None, Some("private diagnostic".into())).into()),
++            1 => Err(ErrorMetadata::user_occ(None, Some("private diagnostic".into()), None).into()),
++            2 => Ok(Ok(RedactedMutationReturn {
++                value: JsonPackedValue::pack(common::value::ConvexValue::Int64(7)),
++                ts: Timestamp::MIN,
++                log_lines: RedactedLogLines::empty(),
++            })),
++            _ => panic!("unexpected mutation identity"),
++        }
++    }
++}
++
++#[async_trait]
++#[allow(unused_variables)]
++impl ApplicationApi for MutationApi {
++    async fn authenticate(
++        &self,
++        host: &ResolvedHostname,
++        request_context: RequestContext,
++        auth_token: AuthenticationToken,
++    ) -> anyhow::Result<Identity> {
++        Ok(Identity::system())
++    }
++
++    async fn execute_public_query(
++        &self,
++        host: &ResolvedHostname,
++        request_context: RequestContext,
++        identity: Identity,
++        path: ExportPath,
++        args: SerializedArgs,
++        caller: FunctionCaller,
++        query_workload_class: Option<QueryWorkloadClass>,
++        ts: ExecuteQueryTimestamp,
++        journal: Option<SerializedQueryJournal>,
++        invocation: Option<QueryInvocation>,
++    ) -> anyhow::Result<RedactedQueryReturn> {
++        panic!("unexpected application call")
++    }
++
++    async fn execute_admin_query(
++        &self,
++        host: &ResolvedHostname,
++        request_context: RequestContext,
++        identity: Identity,
++        path: CanonicalizedComponentFunctionPath,
++        args: SerializedArgs,
++        caller: FunctionCaller,
++        query_workload_class: Option<QueryWorkloadClass>,
++        ts: ExecuteQueryTimestamp,
++        journal: Option<SerializedQueryJournal>,
++        invocation: Option<QueryInvocation>,
++    ) -> anyhow::Result<RedactedQueryReturn> {
++        panic!("unexpected application call")
++    }
++
++    async fn execute_public_mutation(
++        &self,
++        host: &ResolvedHostname,
++        request_context: RequestContext,
++        identity: Identity,
++        path: ExportPath,
++        args: SerializedArgs,
++        caller: FunctionCaller,
++        mutation_identifier: Option<SessionRequestIdentifier>,
++        mutation_queue_length: Option<usize>,
++    ) -> anyhow::Result<Result<RedactedMutationReturn, RedactedMutationError>> {
++        self.execute(mutation_identifier, false)
++    }
++
++    async fn execute_admin_mutation(
++        &self,
++        host: &ResolvedHostname,
++        request_context: RequestContext,
++        identity: Identity,
++        path: CanonicalizedComponentFunctionPath,
++        args: SerializedArgs,
++        caller: FunctionCaller,
++        mutation_identifier: Option<SessionRequestIdentifier>,
++        mutation_queue_length: Option<usize>,
++    ) -> anyhow::Result<Result<RedactedMutationReturn, RedactedMutationError>> {
++        self.execute(mutation_identifier, true)
++    }
++
++    async fn execute_public_action(
++        &self,
++        host: &ResolvedHostname,
++        request_context: RequestContext,
++        identity: Identity,
++        path: ExportPath,
++        args: SerializedArgs,
++        caller: FunctionCaller,
++    ) -> anyhow::Result<Result<RedactedActionReturn, RedactedActionError>> {
++        panic!("unexpected application call")
++    }
++
++    async fn execute_admin_action(
++        &self,
++        host: &ResolvedHostname,
++        request_context: RequestContext,
++        identity: Identity,
++        path: CanonicalizedComponentFunctionPath,
++        args: SerializedArgs,
++        caller: FunctionCaller,
++    ) -> anyhow::Result<Result<RedactedActionReturn, RedactedActionError>> {
++        panic!("unexpected application call")
++    }
++
++    async fn execute_http_action(
++        &self,
++        host: &ResolvedHostname,
++        request_context: RequestContext,
++        http_request_metadata: HttpActionRequest,
++        identity: Identity,
++        caller: FunctionCaller,
++        response_streamer: HttpActionResponseStreamer,
++    ) -> anyhow::Result<()> {
++        panic!("unexpected application call")
++    }
++
++    async fn execute_any_function(
++        &self,
++        host: &ResolvedHostname,
++        request_context: RequestContext,
++        identity: Identity,
++        path: CanonicalizedComponentFunctionPath,
++        args: SerializedArgs,
++        caller: FunctionCaller,
++    ) -> anyhow::Result<Result<FunctionReturn, FunctionError>> {
++        panic!("unexpected application call")
++    }
++
++    async fn latest_timestamp(
++        &self,
++        host: &ResolvedHostname,
++        request_id: RequestId,
++    ) -> anyhow::Result<RepeatableTimestamp> {
++        Ok(RepeatableTimestamp::MIN)
++    }
++
++    async fn check_store_file_authorization(
++        &self,
++        host: &ResolvedHostname,
++        request_id: RequestId,
++        token: &str,
++        validity: Duration,
++    ) -> anyhow::Result<ComponentId> {
++        panic!("unexpected application call")
++    }
++
++    async fn store_file(
++        &self,
++        host: &ResolvedHostname,
++        request_id: RequestId,
++        origin: ConvexOrigin,
++        component: ComponentId,
++        content_length: Option<ContentLength>,
++        content_type: Option<ContentType>,
++        expected_sha256: Option<Sha256Digest>,
++        body: BoxStream<'_, anyhow::Result<Bytes>>,
++    ) -> anyhow::Result<DeveloperDocumentId> {
++        panic!("unexpected application call")
++    }
++
++    async fn get_file_range(
++        &self,
++        host: &ResolvedHostname,
++        request_id: RequestId,
++        origin: ConvexOrigin,
++        component: ComponentId,
++        file_storage_id: FileStorageId,
++        range: (Bound<u64>, Bound<u64>),
++    ) -> anyhow::Result<FileStream> {
++        panic!("unexpected application call")
++    }
++
++    async fn get_file(
++        &self,
++        host: &ResolvedHostname,
++        request_id: RequestId,
++        origin: ConvexOrigin,
++        component: ComponentId,
++        file_storage_id: FileStorageId,
++    ) -> anyhow::Result<FileStream> {
++        panic!("unexpected application call")
++    }
++
++    async fn subscription_client(
++        &self,
++        host: &ResolvedHostname,
++    ) -> anyhow::Result<Box<dyn SubscriptionClient>> {
++        Ok(Box::new(EmptySubscriptions))
++    }
++
++    async fn partition_id(&self, host: &ResolvedHostname) -> anyhow::Result<u64> {
++        Ok(0)
++    }
++}
++
++struct EmptySubscriptions;
++#[async_trait]
++impl SubscriptionClient for EmptySubscriptions {
++    async fn subscribe(&self, _token: Token) -> anyhow::Result<Arc<dyn SubscriptionTrait>> {
++        panic!("empty query set unexpectedly subscribed");
++    }
++}
++
++#[test]
++fn exhausted_occ_keeps_public_and_admin_mutations_on_one_worker() -> anyhow::Result<()> {
++    let tokio = ProdRuntime::init_tokio()?;
++    let rt = ProdRuntime::new(&tokio);
++    let worker_rt = rt.clone();
++    rt.block_on("sync_terminal_occ", async move {
++        tokio::time::timeout(Duration::from_secs(10), async move {
++            for admin in [false, true] {
++                let api = Arc::new(MutationApi::default());
++                let (client_tx, client_rx) = mpsc::unbounded_channel();
++                let (server_tx, mut server_rx) = measurable_unbounded_channel();
++                let connected = Arc::new(AtomicUsize::new(0));
++                let on_connect = connected.clone();
++                let mut worker = SyncWorker::new(
++                    api.clone(),
++                    worker_rt.clone(),
++                    ResolvedHostname {
++                        deployment_name: String::new(),
++                        destination: RequestDestination::ConvexCloud,
++                        source: ResolvedHostnameSource::Local,
++                    },
++                    SyncWorkerConfig::default(),
++                    client_rx,
++                    server_tx,
++                    Box::new(move |_| {
++                        on_connect.fetch_add(1, Ordering::SeqCst);
++                    }),
++                    0,
++                    RequestMetadata::system(),
++                );
++                let peer = async {
++                    client_tx.send((
++                        ClientMessage::Connect {
++                            session_id: "00000000-0000-0000-0000-000000000000".parse()?,
++                            connection_count: 0,
++                            last_close_reason: "InitialConnect".to_owned(),
++                            max_observed_timestamp: None,
++                            client_ts: None,
++                            query_workload_class: None,
++                            degradable_query_pressure_version: None,
++                        },
++                        worker_rt.monotonic_now(),
++                    ))?;
++                    if admin {
++                        client_tx.send((
++                            ClientMessage::Authenticate {
++                                base_version: 0.into(),
++                                token: AuthenticationToken::Admin("fixture".into(), None),
++                            },
++                            worker_rt.monotonic_now(),
++                        ))?;
++                    }
++                    for request_id in 0..3 {
++                        client_tx.send((
++                            ClientMessage::Mutation {
++                                request_id,
++                                udf_path: "fixture:write".parse()?,
++                                args: SerializedArgs::from_args(vec![serde_json::json!({})])?,
++                                component_path: admin.then(String::new),
++                            },
++                            worker_rt.monotonic_now(),
++                        ))?;
++                    }
++                    let mut responses = Vec::new();
++                    while responses.len() < 3 {
++                        let (message, _) =
++                            server_rx.next().await.context("worker closed on OCC")?;
++                        match message {
++                            ServerMessage::MutationResponse {
++                                request_id,
++                                result,
++                                ts,
++                                log_lines,
++                            } => {
++                                assert_eq!(request_id as usize, responses.len());
++                                assert!(log_lines.0.is_empty());
++                                if request_id < 2 {
++                                    assert_eq!(ts, None);
++                                    let Err(ErrorPayload::Message(message)) = result else {
++                                        panic!("exhausted OCC did not become a terminal error");
++                                    };
++                                    assert_eq!(
++                                        message,
++                                        format!("{}: {}", errors::OCC_ERROR, errors::OCC_ERROR_MSG)
++                                    );
++                                } else {
++                                    assert!(result.is_ok(), "following mutation failed");
++                                    assert_eq!(ts, Some(Timestamp::MIN));
++                                }
++                                responses.push(request_id);
++                            },
++                            ServerMessage::Transition { .. } | ServerMessage::Ping => {},
++                            other => panic!("unexpected worker response: {other:?}"),
++                        }
++                    }
++                    // A query-set change after both rejections still reaches the same worker.
++                    client_tx.send((
++                        ClientMessage::ModifyQuerySet {
++                            base_version: 0.into(),
++                            new_version: 1.into(),
++                            modifications: vec![],
++                        },
++                        worker_rt.monotonic_now(),
++                    ))?;
++                    loop {
++                        let (message, _) = server_rx
++                            .next()
++                            .await
++                            .context("worker stopped after mutation")?;
++                        match message {
++                            ServerMessage::Transition { end_version, .. }
++                                if end_version.query_set == 1.into() =>
++                            {
++                                break
++                            },
++                            ServerMessage::Transition { .. } | ServerMessage::Ping => {},
++                            other => panic!("unexpected extra response: {other:?}"),
++                        }
++                    }
++                    assert_eq!(
++                        api.calls.lock().unwrap().clone(),
++                        BTreeMap::from([(0, admin), (1, admin), (2, admin)])
++                    );
++                    assert_eq!(connected.load(Ordering::SeqCst), 1);
++                    drop(client_tx);
++                    Ok::<_, anyhow::Error>(())
++                };
++                futures::try_join!(worker.go(), peer)?;
++            }
++            Ok::<_, anyhow::Error>(())
++        })
++        .await?
++    })
++}
++
++#[test]
++fn terminal_occ_classification_does_not_change_other_failures_or_http() {
++    let occ: anyhow::Error = ErrorMetadata::system_occ(None, None).into();
++    assert_eq!(occ.http_status().as_u16(), 503);
++    assert!(!occ.is_deterministic_user_error());
++    for error in [
++        anyhow::anyhow!(errors::OCC_ERROR),
++        ErrorMetadata::overloaded("Overloaded", errors::OCC_ERROR).into(),
++        ErrorMetadata::rejected_before_execution("ExpiredInQueue", "expired").into(),
++    ] {
++        assert!(mutation_response(9, Err(error)).is_err());
++    }
++}
+diff --git a/crates/sync/src/worker.rs b/crates/sync/src/worker.rs
+index 5dc384c753620423ca5a969ff4636cd87e58095d..01c49c85e8bbe01110f67b5851e3e96909ff7397 100644
+--- a/crates/sync/src/worker.rs
++++ b/crates/sync/src/worker.rs
+@@ -31,6 +31,7 @@ use application::{
+     },
+     RedactedActionError,
+     RedactedMutationError,
++    RedactedMutationReturn,
+ };
+ use common::{
+     backoff::Backoff,
+@@ -94,6 +95,7 @@ use futures::{
+ use keybroker::Identity;
+ use model::session_requests::types::SessionRequestIdentifier;
+ use sync_types::{
++    types::ErrorPayload,
+     AuthenticationToken,
+     ClientMessage,
+     DegradableQueryPressureEpoch,
+@@ -106,6 +108,7 @@ use sync_types::{
+     SerializedQueryJournal,
+     ServerPressure,
+     SessionId,
++    SessionRequestSeqNumber,
+     StateModification,
+     StateVersion,
+     Timestamp,
+@@ -972,7 +975,7 @@ impl<RT: Runtime> SyncWorker<RT> {
+                                     Some(mutation_queue_size),
+                                 )
+                                 .in_span(root)
+-                                .await?
++                                .await
+                             },
+                             Some(ref p) => {
+                                 let path =
+@@ -988,26 +991,10 @@ impl<RT: Runtime> SyncWorker<RT> {
+                                     Some(mutation_queue_size),
+                                 )
+                                 .in_span(root)
+-                                .await?
++                                .await
+                             },
+                         };
+-                        let response = match result {
+-                            Ok(udf_return) => ServerMessage::MutationResponse {
+-                                request_id,
+-                                result: Ok(udf_return.value),
+-                                ts: Some(udf_return.ts),
+-                                log_lines: udf_return.log_lines.into(),
+-                            },
+-                            Err(RedactedMutationError { error, log_lines }) => {
+-                                ServerMessage::MutationResponse {
+-                                    request_id,
+-                                    result: Err(error.into_error_payload()),
+-                                    ts: None,
+-                                    log_lines: log_lines.into(),
+-                                }
+-                            },
+-                        };
+-                        Ok(response)
++                        mutation_response(request_id, result)
+                     })
+                     .await
+                 }
+@@ -1693,6 +1680,44 @@ impl<RT: Runtime> SyncWorker<RT> {
+     }
+ }
+ 
++fn mutation_response(
++    request_id: SessionRequestSeqNumber,
++    result: anyhow::Result<Result<RedactedMutationReturn, RedactedMutationError>>,
++) -> anyhow::Result<ServerMessage> {
++    let (result, ts, log_lines) = match result {
++        Ok(Ok(udf_return)) => (
++            Ok(udf_return.value),
++            Some(udf_return.ts),
++            udf_return.log_lines,
++        ),
++        Ok(Err(RedactedMutationError {
++            error, log_lines, ..
++        })) => (Err(error.into_error_payload()), None, log_lines),
++        Err(error) if error.is_occ() => {
++            // The executor has exhausted this mutation's retry budget without a
++            // commit. Closing the socket would replay unrelated pending writes
++            // and restart that budget. Return an identified terminal result;
++            // omit diagnostic table/document details regardless of log visibility.
++            (
++                Err(ErrorPayload::Message(format!(
++                    "{}: {}",
++                    errors::OCC_ERROR,
++                    errors::OCC_ERROR_MSG,
++                ))),
++                None,
++                RedactedLogLines::empty(),
++            )
++        },
++        Err(error) => return Err(error),
++    };
++    Ok(ServerMessage::MutationResponse {
++        request_id,
++        result,
++        ts,
++        log_lines: log_lines.into(),
++    })
++}
++
+ fn is_retriable_sync_worker_error(err: &anyhow::Error) -> bool {
+     err.is_misdirected_request()
+         || err.is_operational_internal_server_error()
+@@ -1711,6 +1736,10 @@ pub(crate) fn authentication_update_error(error: anyhow::Error) -> anyhow::Error
+     ErrorMetadata::auth_update_failed(error.short_msg().to_string(), error.msg().to_string()).into()
+ }
+ 
++#[cfg(test)]
++#[path = "occ_tests.rs"]
++mod occ_tests;
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/npm-packages/node-executor/src/syscalls.test.ts b/npm-packages/node-executor/src/syscalls.test.ts
+index 5fa5b2638bab548a38c97f418ea980237bd6d6d4..671d90b6846f31658e54e2ed4fcd8654b08999f7 100644
+--- a/npm-packages/node-executor/src/syscalls.test.ts
++++ b/npm-packages/node-executor/src/syscalls.test.ts
+@@ -1,4 +1,5 @@
+-import { expect, test } from "vitest";
++import { getEventListeners } from "node:events";
++import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+ 
+ import { SyscallsImpl } from "./syscalls";
+ 
+@@ -33,3 +34,404 @@ test("action callbacks propagate isolate-worker ancestry", () => {
+     "Convex-Isolate-Worker-Ancestor",
+   );
+ });
++
++describe("action callback retries", () => {
++  const fetchMock = vi.fn<typeof fetch>();
++  const syscallArgs = JSON.stringify({
++    requestId: "lambda-execute-id",
++    name: "functions:run",
++    args: [{ input: "value" }],
++    version: "1.0",
++  });
++  const occBody = JSON.stringify(
++    {
++      code: "OptimisticConcurrencyControlFailure",
++      message: "Documents changed on every retry: café.",
++    },
++    null,
++    2,
++  );
++
++  beforeEach(() => {
++    vi.useFakeTimers();
++    vi.spyOn(Math, "random").mockReturnValue(0.5);
++    fetchMock.mockReset();
++    fetchMock.mockImplementation(
++      async () =>
++        new Response(
++          JSON.stringify({ status: "success", value: { result: "ok" } }),
++        ),
++    );
++    vi.stubGlobal("fetch", fetchMock);
++  });
++
++  afterEach(() => {
++    vi.useRealTimers();
++    vi.restoreAllMocks();
++    vi.unstubAllGlobals();
++  });
++
++  test.each(["query", "mutation"])(
++    "%s forwards exhausted OCC without restarting the backend retry budget",
++    async (operation) => {
++      fetchMock.mockResolvedValueOnce(new Response(occBody, { status: 503 }));
++      const syscalls = makeSyscalls(false);
++
++      await expect(
++        syscalls.asyncSyscall(`1.0/actions/${operation}`, syscallArgs),
++      ).rejects.toEqual(new Error(occBody));
++
++      expect(fetchMock).toHaveBeenCalledTimes(1);
++      expect(vi.getTimerCount()).toBe(0);
++      expect(syscalls.pendingSyscallCount[`1.0/actions/${operation}`]).toBe(0);
++    },
++  );
++
++  test.each([500, 502, 503, 504, 599])(
++    "retries HTTP %i and preserves the mutation result and deduplication identifier",
++    async (status) => {
++      fetchMock.mockResolvedValueOnce(
++        new Response(
++          JSON.stringify({ code: "Overloaded", message: "Try again" }),
++          { status },
++        ),
++      );
++      fetchMock.mockRejectedValueOnce(
++        new TypeError("fetch failed", { cause: { code: "ECONNRESET" } }),
++      );
++      const syscalls = makeSyscalls(false);
++      const result = expect(
++        syscalls.asyncSyscall("1.0/actions/mutation", syscallArgs),
++      ).resolves.toBe(JSON.stringify({ result: "ok" }));
++      await vi.runAllTimersAsync();
++      await result;
++
++      await expect(
++        syscalls.asyncSyscall("1.0/actions/mutation", syscallArgs),
++      ).resolves.toBe(JSON.stringify({ result: "ok" }));
++      expect(fetchMock).toHaveBeenCalledTimes(4);
++      const requests: unknown[] = fetchMock.mock.calls.map(([url, init]) => {
++        expect(String(url)).toBe("http://127.0.0.1:3210/api/actions/mutation");
++        expect(init?.signal).toBe(syscalls.abortController.signal);
++        expect(typeof init?.body).toBe("string");
++        return JSON.parse(init!.body as string);
++      });
++      expect(requests[0]).toEqual({
++        path: "functions:run",
++        args: [{ input: "value" }],
++        mutationIdentifier: {
++          sessionId: syscalls.mutationSessionId,
++          requestId: 0,
++        },
++      });
++      expect(requests[1]).toEqual(requests[0]);
++      expect(requests[2]).toEqual(requests[0]);
++      expect(requests[3]).toMatchObject({
++        mutationIdentifier: {
++          sessionId: syscalls.mutationSessionId,
++          requestId: 1,
++        },
++      });
++    },
++  );
++
++  test("queries retry ordinary 503 responses without mutation identifiers", async () => {
++    fetchMock.mockResolvedValueOnce(
++      new Response("Unavailable", { status: 503 }),
++    );
++    const result = expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/query", syscallArgs),
++    ).resolves.toBe(JSON.stringify({ result: "ok" }));
++    await vi.runAllTimersAsync();
++    await result;
++
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    for (const [url, init] of fetchMock.mock.calls) {
++      expect(String(url)).toBe("http://127.0.0.1:3210/api/actions/query");
++      expect(JSON.parse(init!.body as string)).not.toHaveProperty(
++        "mutationIdentifier",
++      );
++    }
++  });
++
++  test("ordinary 503 failures retain the five-attempt limit and final error body", async () => {
++    fetchMock.mockImplementation(
++      async () => new Response("Proxy unavailable", { status: 503 }),
++    );
++    const result = expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).rejects.toEqual(new Error("Proxy unavailable"));
++    await vi.runAllTimersAsync();
++    await result;
++
++    expect(fetchMock).toHaveBeenCalledTimes(5);
++    expect(vi.getTimerCount()).toBe(0);
++  });
++
++  test.each([
++    ["empty body", null],
++    ["HTML", "<html>Service unavailable</html>"],
++    ["plain OCC text", "OptimisticConcurrencyControlFailure"],
++    ["truncated JSON", '{"code":"OptimisticConcurrencyControlFailure",'],
++    ["JSON null", "null"],
++    ["JSON string", JSON.stringify("OptimisticConcurrencyControlFailure")],
++    ["array", `[${occBody}]`],
++    ["nested code", JSON.stringify({ error: JSON.parse(occBody) })],
++    ["missing message", '{"code":"OptimisticConcurrencyControlFailure"}'],
++    [
++      "nonstring message",
++      '{"code":"OptimisticConcurrencyControlFailure","message":null}',
++    ],
++    ["nonstring code", '{"code":503,"message":"Unavailable"}'],
++    [
++      "code suffix",
++      '{"code":"OptimisticConcurrencyControlFailureExtra","message":"Unavailable"}',
++    ],
++    [
++      "wrong code case",
++      '{"code":"optimisticConcurrencyControlFailure","message":"Unavailable"}',
++    ],
++    [
++      "OCC mentioned in another error",
++      '{"code":"Overloaded","message":"OptimisticConcurrencyControlFailure"}',
++    ],
++  ])("retries a 503 with %s", async (_description, body) => {
++    fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++    const result = expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).resolves.toBe(JSON.stringify({ result: "ok" }));
++    await vi.runAllTimersAsync();
++    await result;
++
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  test("does not infer OCC from its code on a different HTTP status", async () => {
++    fetchMock.mockResolvedValueOnce(new Response(occBody, { status: 502 }));
++    const result = expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).resolves.toBe(JSON.stringify({ result: "ok" }));
++    await vi.runAllTimersAsync();
++    await result;
++
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  test("forwards OCC after a transient failure and permits a separate caller retry", async () => {
++    fetchMock.mockResolvedValueOnce(
++      new Response("Unavailable", { status: 503 }),
++    );
++    fetchMock.mockResolvedValueOnce(new Response(occBody, { status: 503 }));
++    const syscalls = makeSyscalls(false);
++    const result = expect(
++      syscalls.asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).rejects.toEqual(new Error(occBody));
++    await vi.runAllTimersAsync();
++    await result;
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    expect(fetchMock.mock.calls[0][1]?.body).toBe(
++      fetchMock.mock.calls[1][1]?.body,
++    );
++
++    await expect(
++      syscalls.asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).resolves.toBe(JSON.stringify({ result: "ok" }));
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++    expect(
++      JSON.parse(fetchMock.mock.calls[2][1]!.body as string),
++    ).toMatchObject({
++      mutationIdentifier: {
++        sessionId: syscalls.mutationSessionId,
++        requestId: 1,
++      },
++    });
++  });
++
++  test.each(["query", "mutation", "action"])(
++    "%s preserves structured UDF errors without retrying",
++    async (operation) => {
++      fetchMock.mockResolvedValueOnce(
++        new Response(
++          JSON.stringify({ status: "error", errorMessage: "Function failed" }),
++          { status: 560 },
++        ),
++      );
++      await expect(
++        makeSyscalls(false).asyncSyscall(
++          `1.0/actions/${operation}`,
++          syscallArgs,
++        ),
++      ).rejects.toEqual(new Error("Function failed"));
++      expect(fetchMock).toHaveBeenCalledTimes(1);
++    },
++  );
++
++  test("does not retry non-idempotent action 503 responses", async () => {
++    fetchMock.mockResolvedValueOnce(
++      new Response("Unavailable", { status: 503 }),
++    );
++    await expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/action", syscallArgs),
++    ).rejects.toEqual(new Error("Unavailable"));
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++  });
++
++  test("accepts an OCC error split across response chunks", async () => {
++    const bytes = new TextEncoder().encode("\uFEFF" + occBody);
++    const body = new ReadableStream<Uint8Array>({
++      start(controller) {
++        for (const byte of bytes) {
++          controller.enqueue(Uint8Array.of(byte));
++        }
++        controller.close();
++      },
++    });
++    fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++    await expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).rejects.toEqual(new Error(occBody));
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++  });
++
++  test("retries after a response stream fails during OCC inspection", async () => {
++    const body = new ReadableStream<Uint8Array>({
++      start(controller) {
++        controller.enqueue(new TextEncoder().encode(occBody));
++      },
++      pull(controller) {
++        controller.error(
++          new Error("Connection reset before response completed"),
++        );
++      },
++    });
++    fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++    const result = expect(
++      makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++    ).resolves.toBe(JSON.stringify({ result: "ok" }));
++    await vi.runAllTimersAsync();
++    await result;
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  test.each(["oversized", "stalled"])(
++    "bounds inspection and cancels an %s 503 response before retrying",
++    async (kind) => {
++      const cancel = vi.fn(() => new Promise<void>(() => {}));
++      const body = new ReadableStream<Uint8Array>({
++        start(controller) {
++          const text =
++            kind === "oversized" ? occBody + " ".repeat(128 * 1024) : occBody;
++          controller.enqueue(new TextEncoder().encode(text));
++        },
++        cancel,
++      });
++      fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++      const result = expect(
++        makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++      ).resolves.toBe(JSON.stringify({ result: "ok" }));
++      await vi.advanceTimersByTimeAsync(0);
++      expect(cancel).toHaveBeenCalledTimes(kind === "oversized" ? 1 : 0);
++      expect(fetchMock).toHaveBeenCalledTimes(1);
++      await vi.runAllTimersAsync();
++      await result;
++      expect(cancel).toHaveBeenCalledTimes(1);
++      expect(body.locked).toBe(false);
++      expect(fetchMock).toHaveBeenCalledTimes(2);
++      expect(vi.getTimerCount()).toBe(0);
++    },
++  );
++
++  test("disposing during OCC inspection parks the callback and cancels its stream", async () => {
++    const cancel = vi.fn();
++    const body = new ReadableStream<Uint8Array>({
++      start(controller) {
++        controller.enqueue(new TextEncoder().encode(occBody));
++      },
++      cancel,
++    });
++    fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++    const syscalls = makeSyscalls(false);
++    const settled = vi.fn();
++    void syscalls
++      .asyncSyscall("1.0/actions/mutation", syscallArgs)
++      .then(settled, settled);
++    await vi.advanceTimersByTimeAsync(0);
++    expect(body.locked).toBe(true);
++
++    syscalls.dispose();
++    await vi.runAllTimersAsync();
++
++    expect(cancel).toHaveBeenCalledTimes(1);
++    expect(body.locked).toBe(false);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(settled).not.toHaveBeenCalled();
++    expect(vi.getTimerCount()).toBe(0);
++  });
++
++  test("disposing during backoff stops retries and parks the callback", async () => {
++    fetchMock.mockResolvedValueOnce(
++      new Response("Unavailable", { status: 503 }),
++    );
++    const syscalls = makeSyscalls(false);
++    const settled = vi.fn();
++    void syscalls
++      .asyncSyscall("1.0/actions/mutation", syscallArgs)
++      .then(settled, settled);
++    await vi.advanceTimersByTimeAsync(0);
++
++    syscalls.dispose();
++    await vi.runAllTimersAsync();
++
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(settled).not.toHaveBeenCalled();
++    expect(vi.getTimerCount()).toBe(0);
++  });
++
++  test.each(["timeout", "dispose"])(
++    "handles a late stream cancellation failure after inspection ends by %s",
++    async (stop) => {
++      let rejectCancellation!: (reason: Error) => void;
++      const cancellation = new Promise<void>((_resolve, reject) => {
++        rejectCancellation = reject;
++      });
++      const cancel = vi.fn(() => cancellation);
++      const body = new ReadableStream<Uint8Array>({
++        start(controller) {
++          controller.enqueue(new TextEncoder().encode(occBody));
++        },
++        cancel,
++      });
++      fetchMock.mockResolvedValueOnce(new Response(body, { status: 503 }));
++      const syscalls = makeSyscalls(false);
++      const settled = vi.fn();
++      void syscalls
++        .asyncSyscall("1.0/actions/mutation", syscallArgs)
++        .then(settled, settled);
++      await vi.advanceTimersByTimeAsync(0);
++      expect(body.locked).toBe(true);
++
++      if (stop === "dispose") {
++        syscalls.dispose();
++      }
++      await vi.runAllTimersAsync();
++      expect(settled).toHaveBeenCalledTimes(stop === "timeout" ? 1 : 0);
++      expect(cancel).toHaveBeenCalledTimes(1);
++      expect(body.locked).toBe(false);
++      expect(
++        getEventListeners(syscalls.abortController.signal, "abort"),
++      ).toEqual([]);
++
++      syscalls.dispose();
++      // Rejection must remain observed after the inspection race and action end,
++      // when an unhandled rejection could affect another invocation.
++      rejectCancellation(new Error("Response cancellation failed"));
++      await vi.runAllTimersAsync();
++      await expect(
++        makeSyscalls(false).asyncSyscall("1.0/actions/mutation", syscallArgs),
++      ).resolves.toBe(JSON.stringify({ result: "ok" }));
++      expect(settled).toHaveBeenCalledTimes(stop === "timeout" ? 1 : 0);
++      expect(fetchMock).toHaveBeenCalledTimes(stop === "timeout" ? 3 : 2);
++      expect(vi.getTimerCount()).toBe(0);
++    },
++  );
++});
+diff --git a/npm-packages/node-executor/src/syscalls.ts b/npm-packages/node-executor/src/syscalls.ts
+index 661b9a077fe625adee5e4c6185cb4f184724d02e..eae3cf5b78653bc1c48515560e873bb5b8ce547e 100644
+--- a/npm-packages/node-executor/src/syscalls.ts
++++ b/npm-packages/node-executor/src/syscalls.ts
+@@ -25,6 +25,13 @@ const CALLBACK_INITIAL_BACKOFF_MS = process.env.CALLBACK_INITIAL_BACKOFF_MS
+   ? parseInt(process.env.CALLBACK_INITIAL_BACKOFF_MS)
+   : 1000;
+ const CALLBACK_MAX_BACKOFF_MS = 20000;
++const CALLBACK_ERROR_BODY_MAX_BYTES = 64 * 1024;
++const CALLBACK_ERROR_BODY_TIMEOUT_MS = 1000;
++
++const callbackOccError = z.object({
++  code: z.literal("OptimisticConcurrencyControlFailure"),
++  message: z.string(),
++});
+ 
+ type CachedServiceToken = {
+   token: string;
+@@ -97,12 +104,72 @@ async function parkIfAborted<T>(
+ }
+ 
+ // A 5xx status other than STATUS_CODE_UDF_FAILED (which represents a real
+-// error thrown by the called function) is a transient backend/proxy failure
+-// that is safe to retry.
++// error thrown by the called function) may be a transient backend/proxy failure.
++// An exhausted OCC error is identified separately from its response body.
+ function isTransientStatus(status: number): boolean {
+   return status >= 500 && status < 600 && status !== STATUS_CODE_UDF_FAILED;
+ }
+ 
++async function readCallbackOccError(
++  response: Response,
++  signal: AbortSignal,
++): Promise<string | null> {
++  if (response.status !== 503 || response.body === null) {
++    return null;
++  }
++  // These intermediate error bodies would otherwise be discarded. Bound both
++  // buffering and waiting so a large or stalled proxy response cannot delay
++  // the existing transient retry loop indefinitely. Read the original stream:
++  // cloning it would leave an unread tee buffering the same response.
++  const reader = response.body.getReader();
++  const readBody = async (): Promise<string | null> => {
++    const chunks: Uint8Array[] = [];
++    let bytes = 0;
++    for (;;) {
++      const { done, value } = await reader.read();
++      if (done) {
++        return new TextDecoder().decode(Buffer.concat(chunks, bytes));
++      }
++      bytes += value.byteLength;
++      if (bytes > CALLBACK_ERROR_BODY_MAX_BYTES) {
++        return null;
++      }
++      if (value.byteLength > 0) {
++        chunks.push(value);
++      }
++    }
++  };
++  let stopInspection!: () => void;
++  const stopped = new Promise<null>((resolve) => {
++    stopInspection = () => resolve(null);
++  });
++  const timer = setTimeout(stopInspection, CALLBACK_ERROR_BODY_TIMEOUT_MS);
++  signal.addEventListener("abort", stopInspection, { once: true });
++  try {
++    if (signal.aborted) {
++      return null;
++    }
++    const text = await Promise.race([readBody(), stopped]);
++    if (
++      text === null ||
++      !callbackOccError.safeParse(JSON.parse(text)).success
++    ) {
++      return null;
++    }
++    return text;
++  } catch {
++    // An incomplete body or non-JSON proxy error does not identify an OCC
++    // failure, so retain the existing transient retry behavior.
++    return null;
++  } finally {
++    clearTimeout(timer);
++    signal.removeEventListener("abort", stopInspection);
++    // Cleanup must not wait for a stalled stream or mask the callback outcome.
++    void reader.cancel().catch(() => {});
++    reader.releaseLock();
++  }
++}
++
+ // Failures during connection establishment: no bytes were sent, so the
+ // request provably never ran and even a non-idempotent callback is safe to
+ // retry. Mid-flight codes (ECONNRESET, EPIPE, ...) stay non-retryable here
+@@ -358,6 +425,14 @@ export class SyscallsImpl {
+       if (!isTransientStatus(response.status) || attempt >= maxAttempts) {
+         break;
+       }
++      const occError = await readCallbackOccError(response, signal);
++      if (occError !== null) {
++        // The backend owns OCC retries and has already exhausted its budget.
++        // Replaying this callback would restart it. Preserve the raw error for
++        // the existing handler so the caller can decide whether to retry.
++        response = new Response(occError, response);
++        break;
++      }
+       await abortableSleep(callbackBackoffMs(attempt - 1), signal);
+       // The action settled while we were backing off; stop retrying a dangling
+       // call rather than holding it open (and out of the next invocation).
+@@ -367,11 +442,10 @@ export class SyscallsImpl {
+     }
+     const errorHandler =
+       args.handleResponseErrorCode ?? defaultHandleResponseError;
+-    // Reading the response body (here and in `response.json()` below) is tied to
+-    // the same abort signal as the fetch, so a `dispose()` mid-read rejects with
+-    // an `AbortError`. On a dangling call whose action already settled, never
+-    // settle instead — otherwise that rejection would leak into a later,
+-    // unrelated invocation just like an aborted fetch would.
++    // Reading a network response body (here and in `response.json()` below) is
++    // tied to the fetch abort signal, so a `dispose()` mid-read rejects with an
++    // `AbortError`. Park any error on a dangling call, including an OCC error
++    // from the buffered response, so it cannot leak into a later invocation.
+     try {
+       // errorHandler is a no-op
+       await errorHandler(response, args.operationName);
+diff --git a/patches/README.md b/patches/README.md
+index 8142c60a707dd64ea5f00bf93ceb1cb9b2e165ea..500c4f0137420a5becad6e4008b2200509a565a8 100644
+--- a/patches/README.md
++++ b/patches/README.md
+@@ -52,6 +52,18 @@ adoption contract documented in the backend essay.
+ - Activation: only through the privileged repair endpoint; dry-run is the default.
+ - Rollback: do not execute a stale plan. There is no generic undo after destructive finalization.
+ 
++## Mutation error propagation
++
++### [Terminal OCC across transport layers](terminal_occ/README.md)
++
++- Purpose: return exhausted per-mutation optimistic concurrency control (OCC) to its caller without
++  restarting the mutation retry budget in a Node callback loop or by closing its sync socket.
++- Prerequisites: the existing application mutation runner and Node callback retry loop; no scheduler,
++  priority, or native-resident supervision changes.
++- Activation: automatic for identified exhausted OCC errors; no new configuration or wire message.
++- Rollback: restore the previous backend and Node executor together; exhausted sync mutations can
++  close the socket again, and exhausted callback mutations can receive additional retry cycles.
++
+ ## Deployment and code generation
+ 
+ ### [Non-committing codegen analysis](non_committing_codegen_analysis/README.md)
+diff --git a/patches/terminal_occ/README.md b/patches/terminal_occ/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..e053beb8f227d8d13b177b6c38c6b3b3b65e4455
+--- /dev/null
++++ b/patches/terminal_occ/README.md
+@@ -0,0 +1,48 @@
++# Terminal OCC across transport layers
++
++## Purpose
++
++The application mutation runner owns the bounded optimistic concurrency control (OCC) retry
++budget. Once it returns an exhausted OCC error, the transport must return that error to the caller.
++A Node callback retry loop or sync socket reconnect would otherwise begin another mutation retry
++cycle and delay unrelated pending work.
++
++## Behavior
++
++The Node callback half recognizes HTTP 503 responses with the exact structured
++`OptimisticConcurrencyControlFailure` code and a string message. It passes a positively identified
++body to the existing response error handler without another callback attempt. Inspection consumes
++the original stream, is limited to 64 KiB and one second, and respects action disposal. Ordinary
++5xx, transport, oversized, incomplete, malformed, and unclassified responses retain the existing
++retry policy and stable per-callback mutation identifier. Non-idempotent action callbacks retain
++their existing retry rules.
++
++The sync half handles exhausted OCC returned by either the public or admin application mutation
++API. It sends the existing `MutationResponse` with the original request ID, a generic identified
++OCC error message, no commit timestamp, and empty log lines. Table and document diagnostics are
++excluded regardless of log visibility. The worker remains connected so following mutations and
++query-set changes can progress. Successful mutations, redacted function errors, and non-OCC
++application failures keep their existing response or failure behavior. HTTP OCC errors remain 503
++and do not become deterministic user errors.
++
++The patch adds no retry API, protocol message, configuration, scheduler priority, or process
++supervision policy. A caller may choose to submit a separate mutation after receiving the error;
++that choice remains with the caller.
++
++## Adoption and rollback
++
++The Node half extends the existing callback retry loop; the sync half uses the ordinary application
++and sync interfaces. Neither requires the scheduler or native-resident supervision patches.
++Apply the backend and its Node executor source together. Activation is automatic for positively
++identified exhausted OCC. Restore the previous backend and Node executor together to roll back;
++that restores callback retry amplification and socket closure on these failures.
++
++## Verification
++
++The focused Node syscall tests cover terminal OCC propagation, ordinary retry budgets and
++identifiers, malformed and stalled bodies, UTF-8 boundaries, and action disposal. The sync tests
++inject exhausted system and user OCC at the application API boundary into the real worker's
++public and admin mutation paths. They assert identified, redacted responses, no resubmission,
++following mutation and query-set progress on the same worker, and unchanged non-OCC/HTTP
++classification. These worker tests do not induce database conflicts or prove committed-result
++retention or deduplication.
