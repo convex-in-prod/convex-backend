@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 15 Jul 2026 19:53:06 +0800
-Subject: [PATCH 08/29] metrics: correct runtime health and export function
- usage
+Subject: [PATCH 08/28] observability: bound metrics and service logging
 
 Describe per-bucket queued values as observed queueing rather than proof that a
 configured function concurrency limit was reached. A transient queued sample
@@ -51,13 +50,29 @@ single-consumer, missed-response, reset, baseline, and staleness semantics with
 a VictoriaMetrics sparse-counter configuration. Keep registration failures
 explicit and report bounded-admission omissions through exporter-health metrics.
 
-Retain this exporter in the existing runtime-health metrics adoption unit.
+Retain function usage and bounded service logging in one runtime observability
+adoption unit.
 Collection remains disabled unless FUNCTION_USAGE_METRICS_ENABLED=true; usage
 history storage and dashboard integration remain outside the backend patch.
 
 Add focused accounting, identity, concurrency, sparse-refresh, and registry
 isolation regressions. Formatting and consumer integration checks passed;
 final Rust tests, Clippy, and build remain unverified.
+
+Move service stdout writes to one bounded output worker so a stalled collector
+cannot block runtime threads on the shared stdout lock. Preserve formatter
+selection, filters and breadcrumb handling, and keep tool stderr synchronous.
+
+Drop records when output capacity is exhausted and summarize losses after
+recovery without recursively counting lost summaries. Initialize workers before
+service work and bound each output guard to one second of draining without a
+synchronous write, flush or join. Apply the same shutdown contract to the
+existing optional trace-file buffer.
+
+Native diagnostic forwarding reuses this output behavior for lifecycle
+progress. Keep its implementation and adoption documentation in this
+observability patch without requiring native-resident supervision to enable
+bounded service logging.
 ---
  crates/application/src/cron_jobs/metrics.rs   |   5 +-
  crates/application/src/cron_jobs/mod.rs       |  14 +-
@@ -66,6 +81,7 @@ final Rust tests, Clippy, and build remain unverified.
  crates/application/src/lib.rs                 |   1 +
  .../application/src/scheduled_jobs/metrics.rs |  10 +-
  crates/application/src/scheduled_jobs/mod.rs  | 134 ++++-
+ crates/cmd_util/src/env.rs                    | 169 +++++-
  crates/common/src/http/mod.rs                 | 104 +++-
  crates/metrics/src/metrics.rs                 |  10 +-
  crates/udf_metrics/src/lib.rs                 |  33 +-
@@ -80,13 +96,15 @@ final Rust tests, Clippy, and build remain unverified.
  .../docs/dashboard/deployments/health.mdx     |   6 +-
  ...mponents_health_scheduler_status_dark.webp | Bin 6868 -> 7304 bytes
  ...ponents_health_scheduler_status_light.webp | Bin 6976 -> 7624 bytes
+ patches/bounded_service_logging/README.md     |  40 ++
  patches/dependency_capacity/README.md         |  13 +-
  .../dependency_capacity/design_reference.md   |  17 +-
- patches/runtime_health_dashboard/README.md    | 223 +++++++
+ patches/runtime_health_dashboard/README.md    | 233 ++++++++
  .../function_usage.md                         | 154 +++++
- 25 files changed, 1924 insertions(+), 231 deletions(-)
+ 27 files changed, 2136 insertions(+), 238 deletions(-)
  create mode 100644 crates/application/src/function_usage_metrics.rs
  create mode 100644 npm-packages/dashboard-common/src/features/health/components/ConcurrencyStatus.test.tsx
+ create mode 100644 patches/bounded_service_logging/README.md
  create mode 100644 patches/runtime_health_dashboard/README.md
  create mode 100644 patches/runtime_health_dashboard/function_usage.md
 
@@ -1440,6 +1458,215 @@ index 26c500677289548fb07b794c7dd009b62991f817..325a18d4502d6fcab5ceb482b8030c0c
 +        ));
 +    }
 +}
+diff --git a/crates/cmd_util/src/env.rs b/crates/cmd_util/src/env.rs
+index f58eef1b46ecd1fde1874d3d93d1e8ea9e231d22..55962359463771d41b5e84f32f050f66b5d1cfd9 100644
+--- a/crates/cmd_util/src/env.rs
++++ b/crates/cmd_util/src/env.rs
+@@ -4,7 +4,21 @@ use std::{
+     fs::File,
+     io,
+     str::FromStr,
+-    sync::LazyLock,
++    sync::{
++        atomic::{
++            AtomicBool,
++            AtomicU64,
++            Ordering,
++        },
++        mpsc::{
++            self,
++            Receiver,
++            SyncSender,
++        },
++        Arc,
++        LazyLock,
++    },
++    time::Duration,
+ };
+ 
+ use sentry_tracing::EventFilter;
+@@ -66,10 +80,139 @@ pub static CONVEX_TRACE_FILE: LazyLock<Option<File>> = LazyLock::new(|| {
+     Some(file)
+ });
+ 
+-/// Guard object. Hold onto it for as long as you'd like to keep tracing to a
+-/// file specified by `CONVEX_TRACE_FILE`
++enum OutputRecord {
++    Bytes { bytes: Vec<u8>, report_loss: bool },
++    Finish,
++}
++
++struct OutputState {
++    sender: SyncSender<OutputRecord>,
++    closing: AtomicBool,
++    dropped: AtomicU64,
++}
++
++#[derive(Clone)]
++struct BufferedWriter {
++    state: Arc<OutputState>,
++    report_loss: bool,
++}
++
++impl<'a> MakeWriter<'a> for BufferedWriter {
++    type Writer = Self;
++
++    fn make_writer(&'a self) -> Self {
++        self.clone()
++    }
++
++    fn make_writer_for(&'a self, metadata: &tracing::Metadata<'_>) -> Self {
++        Self {
++            state: self.state.clone(),
++            // Both stdout and the optional file receive this event. Losing a
++            // summary must not create further summaries in either output.
++            report_loss: metadata.target() != "cmd_util::tracing_output",
++        }
++    }
++}
++
++impl io::Write for BufferedWriter {
++    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++        if !self.state.closing.load(Ordering::Acquire)
++            && self
++                .state
++                .sender
++                .try_send(OutputRecord::Bytes {
++                    bytes: bytes.to_vec(),
++                    report_loss: self.report_loss,
++                })
++                .is_err()
++            && self.report_loss
++        {
++            self.state.dropped.fetch_add(1, Ordering::Relaxed);
++        }
++        // The formatter can synchronously report writer errors on stderr.
++        // Diagnostic loss must not move output back onto the caller's thread.
++        Ok(bytes.len())
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++struct OutputGuard {
++    state: Arc<OutputState>,
++    finished: Receiver<()>,
++}
++
++impl Drop for OutputGuard {
++    fn drop(&mut self) {
++        self.state.closing.store(true, Ordering::Release);
++        // A full queue already wakes the worker. A blocked output can outlive this
++        // guard; never log, join, or flush synchronously on this cleanup path.
++        let _ = self.state.sender.try_send(OutputRecord::Finish);
++        let _ = self.finished.recv_timeout(Duration::from_secs(1));
++    }
++}
++
++fn buffered_writer(
++    mut output: impl io::Write + Send + 'static,
++    name: &'static str,
++    capacity: usize,
++) -> (BufferedWriter, OutputGuard) {
++    let (sender, receiver) = mpsc::sync_channel(capacity);
++    let state = Arc::new(OutputState {
++        sender,
++        closing: AtomicBool::new(false),
++        dropped: AtomicU64::new(0),
++    });
++    let (finished_tx, finished) = mpsc::sync_channel(1);
++    let worker_state = state.clone();
++    std::thread::Builder::new()
++        .name(format!("tracing-{name}"))
++        .spawn(move || {
++            loop {
++                let record = if worker_state.closing.load(Ordering::Acquire) {
++                    receiver.try_recv().ok()
++                } else {
++                    receiver.recv().ok()
++                };
++                match record {
++                    Some(OutputRecord::Bytes { bytes, report_loss }) => {
++                        if output.write_all(&bytes).and_then(|()| output.flush()).is_err() {
++                            if report_loss {
++                                worker_state.dropped.fetch_add(1, Ordering::Relaxed);
++                            }
++                            continue;
++                        }
++                        let dropped = worker_state.dropped.swap(0, Ordering::Relaxed);
++                        if dropped > 0 && !worker_state.closing.load(Ordering::Acquire) {
++                            // Report only after output resumes. This event uses the same
++                            // bounded queues; a failed output never recursively reports itself.
++                            tracing::warn!(target: "cmd_util::tracing_output", output = name, dropped, "Tracing output dropped records");
++                        }
++                    },
++                    Some(OutputRecord::Finish) | None => break,
++                }
++            }
++            let _ = finished_tx.send(());
++        })
++        // Logging is initialized before service work starts. Fail visibly at
++        // startup instead of caching an unavailable diagnostic worker forever.
++        .expect("Failed to start tracing output writer");
++    (
++        BufferedWriter {
++            state: state.clone(),
++            report_loss: true,
++        },
++        OutputGuard { state, finished },
++    )
++}
++
++/// Hold for the service lifetime. Shutdown attempts to drain each output for at
++/// most one second; pending records may be lost when an output remains blocked.
+ pub struct TracingGuard {
+-    _guard: Option<tracing_appender::non_blocking::WorkerGuard>,
++    _stdout_guard: Option<OutputGuard>,
++    _file_guard: Option<OutputGuard>,
+ }
+ 
+ /// Call this from scripts at startup.
+@@ -81,7 +224,10 @@ pub fn config_tool() -> TracingGuard {
+ /// Call this from services at startup.
+ #[must_use]
+ pub fn config_service() -> TracingGuard {
+-    config_tracing(io::stdout, Level::INFO)
++    let (writer, stdout_guard) = buffered_writer(io::stdout(), "stdout", 256);
++    let mut guard = config_tracing(writer, Level::INFO);
++    guard._stdout_guard = Some(stdout_guard);
++    guard
+ }
+ 
+ fn config_tracing<W>(writer: W, level: Level) -> TracingGuard
+@@ -115,7 +261,13 @@ where
+     layers.push(sentry_layer.boxed());
+ 
+     let guard = if let Some(ref file) = *CONVEX_TRACE_FILE {
+-        let (file_writer, guard) = tracing_appender::non_blocking(file);
++        // Preserve the existing optional file buffer, but use bounded cleanup:
++        // the appender's guard prints to stdout if its shutdown queue is full.
++        let (file_writer, guard) = buffered_writer(
++            file,
++            "file",
++            tracing_appender::non_blocking::DEFAULT_BUFFERED_LINES_LIMIT,
++        );
+         let file_writer_layer = tracing_subscriber::fmt::layer()
+             .with_writer(file_writer)
+             .with_filter(
+@@ -131,7 +283,10 @@ where
+     };
+     tracing_subscriber::registry().with(layers).init();
+ 
+-    TracingGuard { _guard: guard }
++    TracingGuard {
++        _stdout_guard: None,
++        _file_guard: guard,
++    }
+ }
+ 
+ pub fn config_test() {
 diff --git a/crates/common/src/http/mod.rs b/crates/common/src/http/mod.rs
 index 5e3de1af16c45af4dc4209127cc23fa7a1b18a6a..481f1dffc65d0e2499e9c81d091fa3bcde0cfe36 100644
 --- a/crates/common/src/http/mod.rs
@@ -3039,6 +3266,52 @@ z9_9veTNyGb!FLgZ-&;}8a5tz{IAHJR!klxTT0LE2mOl>6o9~B#rrNCxgzTzG!?Wb=
 zgPa9GLj~yWs%2{jfRVA7ZwKaF_Rb$F3-4RyTvfjqxL@V#6-Rm4P5`5l`}THwZE2^*
 YsJ3s0ov>?coqc@7|3gZVJdGOv7pAVMi~s-t
 
+diff --git a/patches/bounded_service_logging/README.md b/patches/bounded_service_logging/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..86ab1ca5c9abfd671beb9e110205a1fc511af4c3
+--- /dev/null
++++ b/patches/bounded_service_logging/README.md
+@@ -0,0 +1,40 @@
++# Bounded service logging
++
++The [runtime observability patch](../runtime_health_dashboard/README.md) sends
++service tracing output through a shared bounded stdout queue.
++An output worker owns the blocking write, so a stalled collector cannot block a
++runtime worker that emits a lifecycle warning. It applies to `config_service()`
++callers independently of native-resident supervision. Tool tracing keeps its
++synchronous stderr behavior.
++
++The stdout queue holds at most 256 records. Saturation and output write failures
++discard records; aggregate loss is reported after output resumes. Loss summaries
++use the same queues, are best effort, and do not generate more summaries when
++they are dropped. The optional trace-file output retains its existing format,
++filter and 128,000-record capacity. These are record bounds, not byte or RSS
++limits, and diagnostic delivery does not establish application progress.
++
++Output workers are created during logging initialization. Failure to start one
++fails service startup instead of silently disabling an output. Keep the returned
++tracing guard alive until service work and its runtime have shut down. Each
++output guard waits at most one second for draining, without writing, flushing or
++joining on the caller's thread. A blocked worker may remain until process exit;
++pending records are not guaranteed to survive shutdown.
++
++The pinned tracing appender's shutdown guard can synchronously print to stdout
++when its queue is full. The bounded writer here avoids that fallback for both
++service stdout and the optional file output.
++
++## Adoption and rollback
++
++Bounded service logging is part of the runtime observability adoption unit,
++not a separate patch. It is active for service tracing without an environment
++switch or schema change and does not require function-usage collection or a
++dashboard rollout. Formatter selection, filtering and Sentry breadcrumb policy
++are unchanged.
++
++Apply runtime observability before enabling native-resident stderr forwarding. The native-resident
++integration test exercises forced reaping and shutdown with backend stdout held
++full, using an external process deadline. Reverting the writer restores
++synchronous service output and its backpressure; remove native diagnostic
++forwarding first if that lifecycle isolation must be retained.
 diff --git a/patches/dependency_capacity/README.md b/patches/dependency_capacity/README.md
 index 431b34959bf8d71e0a1e0aa94e31c147a17b09a2..12cd4248074635782d775a7742752039006df153 100644
 --- a/patches/dependency_capacity/README.md
@@ -3100,11 +3373,11 @@ index ce6a9121da7afa6468b5fd3c1af0c1164f69de0c..8369327acb61b7b7ee216b5f2ac0f77f
  evidence that an ancestor-unblocking request was dispatched while pre-dispatch
 diff --git a/patches/runtime_health_dashboard/README.md b/patches/runtime_health_dashboard/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..04b3930d27bea1c70088432818541c0e34c6f34f
+index 0000000000000000000000000000000000000000..15c5b44f394f0a2aeb48817300be747d3437675d
 --- /dev/null
 +++ b/patches/runtime_health_dashboard/README.md
-@@ -0,0 +1,223 @@
-+# Runtime health and function usage metrics
+@@ -0,0 +1,233 @@
++# Runtime observability
 +
 +## Summary
 +
@@ -3116,9 +3389,14 @@ index 0000000000000000000000000000000000000000..04b3930d27bea1c70088432818541c0e
 +An independently enabled backend exporter supplies bounded per-function usage
 +counters for an external statistics store. Its sparse scrape protocol, metric
 +meanings, and consumer configuration are described in
-+[Function usage counters](function_usage.md). The exporter and runtime-health
-+corrections form one metrics adoption patch; enabling the exporter does not
++[Function usage counters](function_usage.md). Enabling the exporter does not
 +require a dashboard change.
++
++[Bounded service logging](../bounded_service_logging/README.md) keeps stalled
++stdout or trace-file output from blocking runtime workers or shutdown callers.
++The exporter, runtime-health corrections, and bounded service logging form one
++observability adoption patch. Their activation remains independent: service
++logging is automatic, while function-usage collection is explicitly enabled.
 +
 +It is a generic self-hosting patch. It does not contain application function
 +names, route names, or deployment-specific limits.
@@ -3250,6 +3528,11 @@ index 0000000000000000000000000000000000000000..04b3930d27bea1c70088432818541c0e
 +
 +## Deployment
 +
++Service logging uses a shared bounded stdout queue and bounded shutdown draining
++after the backend rollout. The optional trace-file output retains its existing
++format, filtering, and queue capacity; tool stderr remains synchronous. Native
++resident diagnostics require this output behavior before supervision is enabled.
++
 +Function-usage collection is disabled by default. Set
 +`FUNCTION_USAGE_METRICS_ENABLED=true` and configure a private sparse-counter
 +consumer as described in [Function usage counters](function_usage.md). This
@@ -3329,13 +3612,13 @@ index 0000000000000000000000000000000000000000..04b3930d27bea1c70088432818541c0e
 +not currently carry.
 diff --git a/patches/runtime_health_dashboard/function_usage.md b/patches/runtime_health_dashboard/function_usage.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..ac0d11fa464b0d71f59b85f2aa634a43c0833019
+index 0000000000000000000000000000000000000000..1184f0b45082dbd6f3596cf3658ad93c404a19cc
 --- /dev/null
 +++ b/patches/runtime_health_dashboard/function_usage.md
 @@ -0,0 +1,154 @@
 +# Function usage counters
 +
-+The runtime-health metrics patch includes an optional exporter for per-function
++The runtime observability patch includes an optional exporter for per-function
 +usage history. Completed execution records update cumulative counters in backend
 +memory. An external collector pulls those counters; function completion performs
 +no network requests and does not depend on the collector or its storage.
