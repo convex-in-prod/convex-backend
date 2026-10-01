@@ -73,6 +73,21 @@ Native diagnostic forwarding reuses this output behavior for lifecycle
 progress. Keep its implementation and adoption documentation in this
 observability patch without requiring native-resident supervision to enable
 bounded service logging.
+
+Keep audit-history query bounds stable across retention updates so split
+cursors do not trigger repeated reactive pagination resets. Return compact
+creation-time markers to health charts instead of transferring full schema
+and component diffs. Preserve the detailed audit-history API and enforce the
+existing audit-log permission on both queries.
+
+Use completed action/time, member/time, and action/member/time system indexes
+for singleton filters. Backfill new system indexes automatically and use a
+less specific completed index while backfills run. Multiple-value filters
+retain their matching behavior. Document backend-first marker-query rollout
+and dashboard-first rollback.
+
+System-UDF and dashboard builds, focused lint, and the model library build
+and Clippy passed for these additions. Tests for these additions were not run.
 ---
  crates/application/src/cron_jobs/metrics.rs   |   5 +-
  crates/application/src/cron_jobs/mod.rs       |  14 +-
@@ -84,28 +99,35 @@ bounded service logging.
  crates/cmd_util/src/env.rs                    | 169 +++++-
  crates/common/src/http/mod.rs                 | 104 +++-
  crates/metrics/src/metrics.rs                 |  10 +-
+ crates/model/src/deployment_audit_log/mod.rs  |  27 +-
  crates/udf_metrics/src/lib.rs                 |  33 +-
  .../src/elements/SchedulerStatus.tsx          |  32 +-
- .../ChartForFunctionRate.stories.tsx          |   4 +-
- .../components/ChartForFunctionRate.tsx       | 121 ++--
+ .../ChartForFunctionRate.stories.tsx          |   6 +-
+ .../components/ChartForFunctionRate.tsx       | 127 ++--
  .../components/ConcurrencyStatus.test.tsx     | 185 ++++++
  .../health/components/ConcurrencyStatus.tsx   |  73 ++-
  .../features/health/components/HealthView.tsx |   2 +-
  .../dashboard-common/src/lib/appMetrics.ts    |  66 ++-
+ .../src/lib/useDeploymentAuditLog.ts          |  34 ++
  .../HealthSchedulerStatus.stories.tsx         |  12 +-
  .../docs/dashboard/deployments/health.mdx     |   6 +-
  ...mponents_health_scheduler_status_dark.webp | Bin 6868 -> 7304 bytes
  ...ponents_health_scheduler_status_light.webp | Bin 6976 -> 7624 bytes
+ .../convex/_system/frontend/indexes.ts        |   2 +-
+ .../frontend/paginatedDeploymentEvents.ts     | 249 ++++++--
+ .../tableDefs/deploymentAuditLogTable.ts      |   5 +-
  patches/bounded_service_logging/README.md     |  40 ++
  patches/dependency_capacity/README.md         |  13 +-
  .../dependency_capacity/design_reference.md   |  17 +-
- patches/runtime_health_dashboard/README.md    | 233 ++++++++
+ patches/runtime_health_dashboard/README.md    | 242 ++++++++
+ .../deployment_markers.md                     |  58 ++
  .../function_usage.md                         | 154 +++++
- 27 files changed, 2136 insertions(+), 238 deletions(-)
+ 33 files changed, 2469 insertions(+), 297 deletions(-)
  create mode 100644 crates/application/src/function_usage_metrics.rs
  create mode 100644 npm-packages/dashboard-common/src/features/health/components/ConcurrencyStatus.test.tsx
  create mode 100644 patches/bounded_service_logging/README.md
  create mode 100644 patches/runtime_health_dashboard/README.md
+ create mode 100644 patches/runtime_health_dashboard/deployment_markers.md
  create mode 100644 patches/runtime_health_dashboard/function_usage.md
 
 diff --git a/crates/application/src/cron_jobs/metrics.rs b/crates/application/src/cron_jobs/metrics.rs
@@ -1845,6 +1867,58 @@ index 6330e60a3cefb6e44912998380f83961f71c9373..107f87b58c52370fa33c78ad6ddb17fe
  
  #[derive(Clone, Debug, Eq, PartialEq, Hash)]
  pub struct MetricName(&'static str);
+diff --git a/crates/model/src/deployment_audit_log/mod.rs b/crates/model/src/deployment_audit_log/mod.rs
+index a5ba5834b746fcfdc219c22251b870d422e109f2..640e7d112a7bfbcf723fa4efceafb4cb827e3517 100644
+--- a/crates/model/src/deployment_audit_log/mod.rs
++++ b/crates/model/src/deployment_audit_log/mod.rs
+@@ -54,6 +54,9 @@ pub const DEPLOYMENT_AUDIT_LOG_TABLE: TableName = TableName::const_new("_deploym
+ pub static ACTION_FIELD: LazyLock<FieldPath> =
+     LazyLock::new(|| "action".parse().expect("invalid action field"));
+ 
++pub static MEMBER_ID_FIELD: LazyLock<FieldPath> =
++    LazyLock::new(|| "member_id".parse().expect("invalid member_id field"));
++
+ /// By action, then creation time. Lets callers that only care about a single
+ /// action (e.g. the usage-limit worker priming from `usage_limit_exceeded`
+ /// events) scan just that action's entries instead of every audit log event.
+@@ -66,6 +69,24 @@ pub static AUDIT_LOG_INDEX_BY_ACTION: LazyLock<SystemIndex<DeploymentAuditLogsTa
+         .unwrap()
+     });
+ 
++pub static AUDIT_LOG_INDEX_BY_MEMBER: LazyLock<SystemIndex<DeploymentAuditLogsTable>> =
++    LazyLock::new(|| {
++        SystemIndex::new(
++            "by_member_id_and_creation_time",
++            [&MEMBER_ID_FIELD, &CREATION_TIME_FIELD_PATH],
++        )
++        .unwrap()
++    });
++
++pub static AUDIT_LOG_INDEX_BY_ACTION_AND_MEMBER: LazyLock<SystemIndex<DeploymentAuditLogsTable>> =
++    LazyLock::new(|| {
++        SystemIndex::new(
++            "by_action_and_member_id_and_creation_time",
++            [&ACTION_FIELD, &MEMBER_ID_FIELD, &CREATION_TIME_FIELD_PATH],
++        )
++        .unwrap()
++    });
++
+ pub struct DeploymentAuditLogsTable;
+ impl SystemTable for DeploymentAuditLogsTable {
+     type Metadata = DeploymentAuditLogEvent;
+@@ -73,7 +94,11 @@ impl SystemTable for DeploymentAuditLogsTable {
+     const TABLE_NAME: TableName = DEPLOYMENT_AUDIT_LOG_TABLE;
+ 
+     fn indexes() -> Vec<SystemIndex<Self>> {
+-        vec![AUDIT_LOG_INDEX_BY_ACTION.clone()]
++        vec![
++            AUDIT_LOG_INDEX_BY_ACTION.clone(),
++            AUDIT_LOG_INDEX_BY_MEMBER.clone(),
++            AUDIT_LOG_INDEX_BY_ACTION_AND_MEMBER.clone(),
++        ]
+     }
+ }
+ 
 diff --git a/crates/udf_metrics/src/lib.rs b/crates/udf_metrics/src/lib.rs
 index 3978b00258f7e28940e6a9587a31f720a37fae4e..d62a151e81795fecde3fa70cee19261dac744ba5 100644
 --- a/crates/udf_metrics/src/lib.rs
@@ -1994,9 +2068,18 @@ index f6cd39ab15b2e893cc704218c3b1d878ee3d23a2..66ea2946f0d54f631612051f39d817e9
        <ChartForFunctionRate chartData={lag} kind="schedulerStatus" />
      </HealthCard>
 diff --git a/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.stories.tsx b/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.stories.tsx
-index 88305d1e8f6a6ddd4751410c572e5a4f25b91aec..aa32a0c6c4b9afb09d8340e12821a0dff4607403 100644
+index 88305d1e8f6a6ddd4751410c572e5a4f25b91aec..d678e2dcda8ef9a6211a5d7ec4b7fa4b7f92d270 100644
 --- a/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.stories.tsx
 +++ b/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.stories.tsx
+@@ -11,7 +11,7 @@ import { HealthCard } from "@common/elements/HealthCard";
+ import { ChartForFunctionRate } from "./ChartForFunctionRate";
+ 
+ const mockClient = mockConvexReactClient().registerQueryFake(
+-  udfs.paginatedDeploymentEvents.default,
++  udfs.paginatedDeploymentEvents.listDeploymentMarkers,
+   () => ({
+     page: [],
+     isDone: true,
 @@ -81,8 +81,8 @@ export const SchedulerStatus: Story = {
      chartData: {
        ...chartData,
@@ -2009,12 +2092,15 @@ index 88305d1e8f6a6ddd4751410c572e5a4f25b91aec..aa32a0c6c4b9afb09d8340e12821a0df
        lineKeys: [
          { key: "scheduler", name: "scheduler", color: "var(--chart-line-1)" },
 diff --git a/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.tsx b/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.tsx
-index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc649993174 100644
+index fb25082f1805a685326362e603ca677355d0142d..36396037249dcbfed80d52a78d39b501af63aadf 100644
 --- a/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.tsx
 +++ b/npm-packages/dashboard-common/src/features/health/components/ChartForFunctionRate.tsx
-@@ -16,6 +16,10 @@ import {
+@@ -14,8 +14,12 @@ import {
+   CartesianGrid,
+ } from "recharts";
  import { ChartTooltip } from "@common/elements/ChartTooltip";
- import { useDeploymentAuditLogs } from "@common/lib/useDeploymentAuditLog";
+-import { useDeploymentAuditLogs } from "@common/lib/useDeploymentAuditLog";
++import { useDeploymentMarkers } from "@common/lib/useDeploymentAuditLog";
  import { timeLabelForMinute, formatNumberCompact } from "@common/lib/format";
 +import {
 +  formatSchedulerLag,
@@ -2023,15 +2109,19 @@ index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc6
  import { ChartData } from "@common/lib/charts/types";
  import { DeploymentTimes } from "@common/features/health/components/DeploymentTimes";
  import { Button } from "@ui/Button";
-@@ -147,17 +151,24 @@ export function ChartForFunctionRate({
-   const auditLogs = useDeploymentAuditLogs(startDate.getTime(), {
-     actions: ["push_config", "push_config_with_components"],
-   });
+@@ -144,20 +148,25 @@ export function ChartForFunctionRate({
+   const [shown, setShown] = useState<string | null>(null);
+   const [startDate] = useState(new Date(Date.now() - 3600 * 1000));
+   const chartRef = useRef<HTMLDivElement>(null);
+-  const auditLogs = useDeploymentAuditLogs(startDate.getTime(), {
+-    actions: ["push_config", "push_config_with_components"],
+-  });
 -  const deploysByMinute = auditLogs?.map(
 -    (log) => {
 -      const creationDate = new Date(log._creationTime);
-+  const deployments = auditLogs?.map((log) => {
-+    const creationDate = new Date(log._creationTime);
++  const deploymentMarkers = useDeploymentMarkers(startDate.getTime());
++  const deployments = deploymentMarkers.map((timestamp) => {
++    const creationDate = new Date(timestamp);
 +    const bucketedCreationDate =
 +      kind === "schedulerStatus"
 +        ? new Date(
@@ -2052,13 +2142,13 @@ index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc6
 +        bucketedCreationDate,
 +        kind === "schedulerStatus" ? "h:mm:ss a" : "h:mm a",
 +      ),
-+      timestamp: log._creationTime,
++      timestamp,
 +    };
 +  });
    return (
      <div className="size-full min-h-52 **:outline-none!">
        <LoadingTransition
-@@ -174,7 +185,9 @@ export function ChartForFunctionRate({
+@@ -174,7 +183,9 @@ export function ChartForFunctionRate({
        >
          {chartData === null ? (
            <div className="flex h-45 w-full items-center justify-center px-12 text-center text-sm text-content-secondary">
@@ -2069,7 +2159,7 @@ index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc6
            </div>
          ) : chartData === undefined ? null : (
            <div ref={chartRef} style={{ width: "99%", height: "99%" }}>
-@@ -186,7 +199,7 @@ export function ChartForFunctionRate({
+@@ -186,7 +197,7 @@ export function ChartForFunctionRate({
                  }}
                >
                  {/* Show a reference line for each time bucket that had a deployment */}
@@ -2078,7 +2168,7 @@ index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc6
                    <ReferenceLine
                      key={timestamp}
                      x={hour}
-@@ -211,10 +224,11 @@ export function ChartForFunctionRate({
+@@ -211,10 +222,11 @@ export function ChartForFunctionRate({
                      kind === "functionCalls" ||
                      kind === "subscriptionInvalidations"
                        ? formatNumberCompact(value as number)
@@ -2094,7 +2184,7 @@ index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc6
                    }
                    domain={
                      kind !== "schedulerStatus" &&
-@@ -276,10 +290,16 @@ export function ChartForFunctionRate({
+@@ -276,10 +288,16 @@ export function ChartForFunctionRate({
                              kind === "subscriptionInvalidations" ? (
                                "Other"
                              ) : (
@@ -2113,7 +2203,7 @@ index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc6
                            ) : kind === "functionConcurrency" ? (
                              line.key
                            ) : kind === "subscriptionInvalidations" ? (
-@@ -306,7 +326,7 @@ export function ChartForFunctionRate({
+@@ -306,7 +324,7 @@ export function ChartForFunctionRate({
                        {...props}
                        chartRef={chartRef}
                        content={({ active, payload, label }: any) => {
@@ -2122,7 +2212,7 @@ index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc6
                            ?.filter((deploy) => deploy.hour === label)
                            .map((deploy) =>
                              format(new Date(deploy.timestamp), "pp"),
-@@ -323,8 +343,8 @@ export function ChartForFunctionRate({
+@@ -323,8 +341,8 @@ export function ChartForFunctionRate({
                                  a.dataKey === "_rest"
                                    ? 1
                                    : b.dataKey === "_rest"
@@ -2133,7 +2223,7 @@ index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc6
                                )
                                .map((dataPoint: any) => ({
                                  ...dataPoint,
-@@ -335,7 +355,13 @@ export function ChartForFunctionRate({
+@@ -335,7 +353,13 @@ export function ChartForFunctionRate({
                                          kind === "subscriptionInvalidations" ? (
                                            "Other"
                                          ) : (
@@ -2148,7 +2238,7 @@ index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc6
                                          )
                                        ) : kind === "schedulerStatus" ? (
                                          "Lag Time"
-@@ -356,21 +382,38 @@ export function ChartForFunctionRate({
+@@ -356,21 +380,38 @@ export function ChartForFunctionRate({
                                      </div>
                                      <div className="shrink-0 text-right">
                                        {kind === "schedulerStatus"
@@ -2201,7 +2291,7 @@ index fb25082f1805a685326362e603ca677355d0142d..9221797565a5087f3fa61774ee019bc6
                                      </div>
                                    </span>
                                  ),
-@@ -380,7 +423,11 @@ export function ChartForFunctionRate({
+@@ -380,7 +421,11 @@ export function ChartForFunctionRate({
                                  deploymentTimes={deploymentTimes}
                                />
                              }
@@ -2661,6 +2751,51 @@ index 135f58abfa920b28b420505e6eaeb34a223c360f..3e9f7e69a0142bc0a58e8a1c81ec029f
  
    const fetcher = async () => {
      const start = new Date(Date.now() - 60 * 60 * 1000);
+diff --git a/npm-packages/dashboard-common/src/lib/useDeploymentAuditLog.ts b/npm-packages/dashboard-common/src/lib/useDeploymentAuditLog.ts
+index 7ba32f3550231a823224cbbe81ca25c4205d37e5..395956fb40e6f707efe853a484ccbe54a2e41c9d 100644
+--- a/npm-packages/dashboard-common/src/lib/useDeploymentAuditLog.ts
++++ b/npm-packages/dashboard-common/src/lib/useDeploymentAuditLog.ts
+@@ -102,6 +102,40 @@ function processDeploymentEvents(
+     .filter((v): v is DeploymentAuditLogEvent => v !== null);
+ }
+ 
++export function useDeploymentMarkers(fromTimestamp: number): number[] {
++  const pushConfig = useDeploymentMarkersForAction(
++    fromTimestamp,
++    "push_config",
++  );
++  const pushConfigWithComponents = useDeploymentMarkersForAction(
++    fromTimestamp,
++    "push_config_with_components",
++  );
++  return [...pushConfig, ...pushConfigWithComponents].sort((a, b) => a - b);
++}
++
++function useDeploymentMarkersForAction(
++  fromTimestamp: number,
++  action: "push_config" | "push_config_with_components",
++): number[] {
++  const { useIsOperationAllowed } = useContext(PermissionsContext);
++  const canViewAuditLog = useIsOperationAllowed("ViewAuditLog");
++  const initialNumItems = 50;
++  const { results, loadMore, status } = usePaginatedQuery(
++    udfs.paginatedDeploymentEvents.listDeploymentMarkers,
++    canViewAuditLog ? { minDate: fromTimestamp, action } : "skip",
++    { initialNumItems },
++  );
++
++  useEffect(() => {
++    if (status === "CanLoadMore") {
++      loadMore(initialNumItems);
++    }
++  }, [loadMore, status]);
++
++  return results;
++}
++
+ export function useDeploymentAuditLogs(
+   fromTimestamp?: number,
+   filters?: {
 diff --git a/npm-packages/dashboard/src/docs/components/HealthSchedulerStatus.stories.tsx b/npm-packages/dashboard/src/docs/components/HealthSchedulerStatus.stories.tsx
 index d154be2a0b1c6ec95e5cd10e15f9b182d30a7249..b3293db88a0ea89edb8b53907025f4679337cf08 100644
 --- a/npm-packages/dashboard/src/docs/components/HealthSchedulerStatus.stories.tsx
@@ -3266,6 +3401,306 @@ z9_9veTNyGb!FLgZ-&;}8a5tz{IAHJR!klxTT0LE2mOl>6o9~B#rrNCxgzTzG!?Wb=
 zgPa9GLj~yWs%2{jfRVA7ZwKaF_Rb$F3-4RyTvfjqxL@V#6-Rm4P5`5l`}THwZE2^*
 YsJ3s0ov>?coqc@7|3gZVJdGOv7pAVMi~s-t
 
+diff --git a/npm-packages/system-udfs/convex/_system/frontend/indexes.ts b/npm-packages/system-udfs/convex/_system/frontend/indexes.ts
+index d9d7d50cb219a26cf4f7f002a277ca0b9cbea06a..30cce00eb874ffdb79e6d3f8259ad7e728f81390 100644
+--- a/npm-packages/system-udfs/convex/_system/frontend/indexes.ts
++++ b/npm-packages/system-udfs/convex/_system/frontend/indexes.ts
+@@ -4,7 +4,7 @@ import { decodeId } from "id-encoding";
+ import { DataModel } from "../../_generated/dataModel";
+ import { GenericDatabaseReader } from "convex/server";
+ 
+-async function getTableId(
++export async function getTableId(
+   db: GenericDatabaseReader<DataModel>,
+   tableName: string,
+   tableNamespace: string | null,
+diff --git a/npm-packages/system-udfs/convex/_system/frontend/paginatedDeploymentEvents.ts b/npm-packages/system-udfs/convex/_system/frontend/paginatedDeploymentEvents.ts
+index 8b4a2f0592ce0a2b5393816d4a7ad96844126472..a0b3b16d4c9e640b4d692e8b7e1848e75d05f9c4 100644
+--- a/npm-packages/system-udfs/convex/_system/frontend/paginatedDeploymentEvents.ts
++++ b/npm-packages/system-udfs/convex/_system/frontend/paginatedDeploymentEvents.ts
+@@ -1,69 +1,216 @@
+-import { paginationOptsValidator } from "convex/server";
++import {
++  paginationOptsValidator,
++  PaginationOptions,
++  IndexRangeBuilder,
++} from "convex/server";
+ import { queryPrivateSystem } from "../secretSystemTables";
+-import { v } from "convex/values";
++import { Infer, v } from "convex/values";
+ import { maximumBytesRead, maximumRowsRead } from "../paginationLimits";
+ import { DatabaseReader } from "../../_generated/server";
++import { Doc } from "../../_generated/dataModel";
++import { getTableId } from "./indexes";
+ 
+-/**
+- * Paginated query for the deployment events from most recent to least recent
+- */
++const deploymentEventFilters = v.object({
++  minDate: v.number(),
++  maxDate: v.optional(v.number()),
++  authorMemberIds: v.optional(v.array(v.int64())),
++  actions: v.optional(v.array(v.string())),
++});
++
++/** Paginated deployment events, from most recent to least recent. */
+ export default queryPrivateSystem("ViewAuditLog")({
+   args: {
+     paginationOpts: paginationOptsValidator,
+-    filters: v.object({
+-      minDate: v.number(),
+-      maxDate: v.optional(v.number()),
+-      authorMemberIds: v.optional(v.array(v.int64())),
+-      actions: v.optional(v.array(v.string())),
+-    }),
++    filters: deploymentEventFilters,
+   },
+   handler: async function ({ db }, { paginationOpts, filters }) {
+-    filters.minDate = await clampForAuditLogRetention(db, filters.minDate);
++    return paginateDeploymentEvents(db, paginationOpts, filters);
++  },
++});
+ 
+-    const paginatedResults = await db
+-      .query("_deployment_audit_log")
+-      .withIndex("by_creation_time", (q) => {
+-        const partial = q.gte("_creationTime", filters.minDate);
++export const listDeploymentMarkers = queryPrivateSystem("ViewAuditLog")({
++  args: {
++    paginationOpts: paginationOptsValidator,
++    minDate: v.number(),
++    action: v.union(
++      v.literal("push_config"),
++      v.literal("push_config_with_components"),
++    ),
++  },
++  handler: async function ({ db }, { paginationOpts, minDate, action }) {
++    const results = await paginateDeploymentEvents(db, paginationOpts, {
++      minDate,
++      actions: [action],
++    });
++    // Charts only need deployment times, not schema or component diffs.
++    return {
++      ...results,
++      page: results.page.map((event) => event._creationTime),
++    };
++  },
++});
+ 
+-        return filters.maxDate
+-          ? partial.lte("_creationTime", filters.maxDate)
+-          : partial;
+-      })
+-      .order("desc")
+-      // eslint-disable-next-line @convex-dev/no-filter-in-query -- we allow filtering by multiple member IDs/actions
+-      .filter((q) => {
+-        // FIXME: Note that here, we could use an index for the case where we filter for a single member ID and/or a single action
++async function paginateDeploymentEvents(
++  db: DatabaseReader,
++  paginationOpts: PaginationOptions,
++  filters: Infer<typeof deploymentEventFilters>,
++) {
++  const minRetainedDate = await clampForAuditLogRetention(db, filters.minDate);
++  // Unknown action strings are valid filter inputs; index equality matches no rows.
++  const singleAction =
++    filters.actions?.length === 1
++      ? (filters.actions[0] as Doc<"_deployment_audit_log">["action"])
++      : undefined;
++  const singleMember =
++    filters.authorMemberIds?.length === 1
++      ? filters.authorMemberIds[0]
++      : undefined;
+ 
+-        const queryFilters = [];
+-        if (filters.authorMemberIds !== undefined) {
+-          queryFilters.push(
+-            q.or(
+-              ...filters.authorMemberIds.map((memberId) =>
+-                q.eq(memberId, q.field("member_id")),
+-              ),
++  const candidateIndexes: (
++    | "by_action_and_member_id_and_creation_time"
++    | "by_action_and_creation_time"
++    | "by_member_id_and_creation_time"
++  )[] = [];
++  if (singleAction !== undefined && singleMember !== undefined) {
++    candidateIndexes.push("by_action_and_member_id_and_creation_time");
++  }
++  if (singleAction !== undefined) {
++    candidateIndexes.push("by_action_and_creation_time");
++  }
++  if (singleMember !== undefined) {
++    candidateIndexes.push("by_member_id_and_creation_time");
++  }
++  let indexName: "by_creation_time" | (typeof candidateIndexes)[number] =
++    "by_creation_time";
++  if (candidateIndexes.length > 0) {
++    const tableId = await getTableId(db, "_deployment_audit_log", null);
++    if (tableId === undefined) {
++      throw new Error("Deployment audit log table is missing");
++    }
++    const indexes = await db
++      .query("_index")
++      // eslint-disable-next-line @convex-dev/no-filter-in-query -- index metadata has no table/descriptor index
++      .filter((q) =>
++        q.and(
++          q.eq(q.field("table_id"), tableId),
++          q.or(
++            ...candidateIndexes.map((descriptor) =>
++              q.eq(q.field("descriptor"), descriptor),
+             ),
+-          );
+-        }
+-        if (filters.actions !== undefined) {
+-          queryFilters.push(
+-            q.or(
+-              ...filters.actions.map((action) =>
+-                q.eq(action, q.field("action")),
+-              ),
++          ),
++        ),
++      )
++      .collect();
++    for (const descriptor of candidateIndexes) {
++      const matches = indexes.filter(
++        (entry) => entry.descriptor === descriptor,
++      );
++      if (matches.length !== 1) {
++        throw new Error("Deployment audit log index is missing or duplicated");
++      }
++      const index = matches[0];
++      if (index.config.type !== "database") {
++        throw new Error("Deployment audit log index is missing or invalid");
++      }
++      const state = index.config.onDiskState;
++      if (state.type === "Enabled") {
++        indexName = descriptor;
++        break;
++      }
++      if (state.type !== "Backfilling") {
++        throw new Error("Deployment audit log index has an unexpected state");
++      }
++      // Upgrades backfill system indexes asynchronously. Keep reading through
++      // a completed index until a more specific one becomes available.
++    }
++  }
++
++  const withDateBounds = (
++    q: Pick<
++      IndexRangeBuilder<Doc<"_deployment_audit_log">, ["_creationTime"]>,
++      "gte"
++    >,
++  ) => {
++    // Cursor fingerprints must retain the caller's bounds. A moving retention cutoff
++    // makes split and continuation requests reject the previous page's cursors.
++    const partial = q.gte("_creationTime", filters.minDate);
++    return filters.maxDate !== undefined
++      ? partial.lte("_creationTime", filters.maxDate)
++      : partial;
++  };
++  const query = db.query("_deployment_audit_log");
++  const indexedQuery =
++    indexName === "by_action_and_member_id_and_creation_time" &&
++    singleAction !== undefined &&
++    singleMember !== undefined
++      ? query.withIndex("by_action_and_member_id_and_creation_time", (q) =>
++          withDateBounds(
++            q.eq("action", singleAction).eq("member_id", singleMember),
++          ),
++        )
++      : indexName === "by_action_and_creation_time" &&
++        singleAction !== undefined
++      ? query.withIndex("by_action_and_creation_time", (q) =>
++          withDateBounds(q.eq("action", singleAction)),
++        )
++      : indexName === "by_member_id_and_creation_time" &&
++        singleMember !== undefined
++      ? query.withIndex("by_member_id_and_creation_time", (q) =>
++          withDateBounds(q.eq("member_id", singleMember)),
++        )
++      : query.withIndex("by_creation_time", withDateBounds);
++
++  const paginatedResults = await indexedQuery
++    .order("desc")
++    // eslint-disable-next-line @convex-dev/no-filter-in-query -- remaining filters can contain multiple member IDs/actions
++    .filter((q) => {
++      const queryFilters = [];
++      if (
++        filters.authorMemberIds !== undefined &&
++        indexName !== "by_member_id_and_creation_time" &&
++        indexName !== "by_action_and_member_id_and_creation_time"
++      ) {
++        queryFilters.push(
++          q.or(
++            ...filters.authorMemberIds.map((memberId) =>
++              q.eq(memberId, q.field("member_id")),
+             ),
+-          );
+-        }
+-        return q.and(...queryFilters);
+-      })
+-      .paginate({
+-        ...paginationOpts,
+-        maximumBytesRead,
+-        maximumRowsRead,
+-      });
++          ),
++        );
++      }
++      if (
++        filters.actions !== undefined &&
++        indexName !== "by_action_and_creation_time" &&
++        indexName !== "by_action_and_member_id_and_creation_time"
++      ) {
++        queryFilters.push(
++          q.or(
++            ...filters.actions.map((action) => q.eq(action, q.field("action"))),
++          ),
++        );
++      }
++      return q.and(...queryFilters);
++    })
++    .paginate({
++      ...paginationOpts,
++      maximumBytesRead,
++      maximumRowsRead,
++    });
+ 
+-    return paginatedResults;
+-  },
+-});
++  const page = paginatedResults.page.filter(
++    (event) => event._creationTime >= minRetainedDate,
++  );
++  // Descending pages cannot contain eligible rows after reaching expired history.
++  // Do not split or load more pages solely to read records outside retention.
++  const retentionEnded = page.length < paginatedResults.page.length;
++  return {
++    ...paginatedResults,
++    page,
++    ...(retentionEnded
++      ? { isDone: true, splitCursor: null, pageStatus: null }
++      : {}),
++  };
++}
+ 
+ export async function clampForAuditLogRetention(
+   db: DatabaseReader,
+diff --git a/npm-packages/system-udfs/convex/tableDefs/deploymentAuditLogTable.ts b/npm-packages/system-udfs/convex/tableDefs/deploymentAuditLogTable.ts
+index d883d2880f6afa03441fb9e28df70b7a18f0b05f..bcb477e9f03e87b4f6110608f819b3d413ff1348 100644
+--- a/npm-packages/system-udfs/convex/tableDefs/deploymentAuditLogTable.ts
++++ b/npm-packages/system-udfs/convex/tableDefs/deploymentAuditLogTable.ts
+@@ -426,6 +426,9 @@ const deploymentAuditLogTable = defineTable(
+     generateUploadUrl,
+     createDataSync,
+   ),
+-);
++)
++  .index("by_action_and_creation_time", ["action"])
++  .index("by_member_id_and_creation_time", ["member_id"])
++  .index("by_action_and_member_id_and_creation_time", ["action", "member_id"]);
+ 
+ export default deploymentAuditLogTable;
 diff --git a/patches/bounded_service_logging/README.md b/patches/bounded_service_logging/README.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..86ab1ca5c9abfd671beb9e110205a1fc511af4c3
@@ -3373,10 +3808,10 @@ index ce6a9121da7afa6468b5fd3c1af0c1164f69de0c..8369327acb61b7b7ee216b5f2ac0f77f
  evidence that an ancestor-unblocking request was dispatched while pre-dispatch
 diff --git a/patches/runtime_health_dashboard/README.md b/patches/runtime_health_dashboard/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..15c5b44f394f0a2aeb48817300be747d3437675d
+index 0000000000000000000000000000000000000000..d4674514e213721b23cfc20e901250cd52dee61a
 --- /dev/null
 +++ b/patches/runtime_health_dashboard/README.md
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,242 @@
 +# Runtime observability
 +
 +## Summary
@@ -3385,6 +3820,11 @@ index 0000000000000000000000000000000000000000..15c5b44f394f0a2aeb48817300be747d
 +scheduled-function lag without claiming stronger capacity failures than the
 +available metrics establish. It also separates scheduler-state sampling from
 +rate-limited log publication and records direct scheduled-job admission lag.
++
++Health charts receive compact deployment timestamps instead of full audit
++records. Stable pagination bounds prevent retention updates from repeatedly
++invalidating split cursors. Indexed audit-history filters and the deployment
++marker query are described in [Deployment marker pagination](deployment_markers.md).
 +
 +An independently enabled backend exporter supplies bounded per-function usage
 +counters for an external statistics store. Its sparse scrape protocol, metric
@@ -3540,17 +3980,21 @@ index 0000000000000000000000000000000000000000..15c5b44f394f0a2aeb48817300be747d
 +Disabling collection or restoring the previous backend stops new usage input;
 +history retained by an external store is unaffected.
 +
-+The backend and dashboard changes should normally be shipped together. The
-+backend change improves the app-metrics timeseries for every dashboard client.
-+The dashboard change is wire-compatible with an older backend because the
-+endpoint already returns seconds, but an older backend still has one-minute
-+source buckets and can temporarily extrapolate a stale ready time. The full
-+15-second contract therefore requires both halves.
++Build the backend with the updated system UDFs and publish it before or
++together with the dashboard. The dashboard requires the new compact deployment
++marker query. New audit-history system indexes backfill and enable automatically;
++filtered queries use an available completed index while backfills run. No manual
++data migration or configuration change is required. For rollback, restore the
++dashboard before the backend so clients do not request a removed query. See
++[Deployment marker pagination](deployment_markers.md) for the index and cursor
++contracts.
 +
-+Deploying the dashboard image does not require replacing the Convex backend.
-+Deploying the backend half follows the normal self-hosted backend image rollout
-+and should be grouped with another needed backend release rather than performed
-+solely for this display correction.
++The app-metrics timeseries changes improve scheduler observations for every
++dashboard client. That endpoint already returns seconds, so its display changes
++are wire-compatible with an older backend. An older backend still has one-minute
++source buckets and can temporarily extrapolate a stale ready time. The full
++15-second contract requires both halves, independently of the marker query's
++backend-first rollout requirement.
 +
 +## Verification
 +
@@ -3610,6 +4054,70 @@ index 0000000000000000000000000000000000000000..15c5b44f394f0a2aeb48817300be747d
 +Queueing can be a normal asynchronous handoff. Saturation requires
 +configured-limit and failure or wait evidence that the dashboard endpoint does
 +not currently carry.
+diff --git a/patches/runtime_health_dashboard/deployment_markers.md b/patches/runtime_health_dashboard/deployment_markers.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..fbc53071ea8d3dfa084a0390198d564ba6f5f22d
+--- /dev/null
++++ b/patches/runtime_health_dashboard/deployment_markers.md
+@@ -0,0 +1,58 @@
++# Deployment marker pagination
++
++Health charts need deployment timestamps, but the full audit-history query also
++returns schema and component diffs. Large deployment records can force reactive
++pagination to split a page. Applying a retention cutoff derived from the current
++time to the index bounds changes the query fingerprint between requests, so the
++split cursor is rejected and the client restarts pagination. Repeated restarts
++can repeatedly transfer large audit records from an already-open dashboard.
++
++The paginated audit-history query keeps the caller's index bounds unchanged and
++applies the current retention cutoff to returned rows. Expired records stay
++hidden. Descending pagination ends when a page reaches expired history, and its
++split hints are cleared because no later records are eligible. Action and author
++filters and the existing row and byte limits remain in effect.
++
++Single-action filters use the existing action/time index, which is now also
++declared in the TypeScript system-table schema. New member/time and
++action/member/time indexes serve single-author filters, including a single
++action combined with a single author. Multiple-value filters use the remaining
++index prefix where possible and filter within that range.
++
++Health charts use a separate permission-checked paginated query that returns
++only creation-time numbers for deployment events. Each deployment action uses
++its own indexed paginated stream; the dashboard merges their timestamps in
++chronological order. Detailed audit-history views continue to receive full
++records. The compact response reduces network transfer and browser memory;
++database reads still include full audit records and remain subject to the
++existing pagination limits.
++
++## Adoption
++
++Build the backend with the updated system UDFs, then publish the updated
++dashboard. The new dashboard requires the compact marker query, so publish the
++backend before or together with the dashboard. New system indexes backfill and
++enable automatically on backend upgrade. Filtered queries use their best
++available completed index while backfills run. Switching to a more specific
++completed index can reset an active pagination session; time advancing does not
++keep invalidating its cursors. This also covers upgrades from versions without
++the existing action index. Confirm that all three indexes are enabled after
++rollout. No configuration change, document-field change, or manual data
++migration is required. Rebuilding only application functions does not publish
++these system UDFs.
++
++The backend change preserves the existing full audit-history API and can serve
++an older dashboard. To roll back both halves, restore the dashboard before the
++backend so clients do not request a missing query.
++
++## Verification
++
++Use deployment history containing a record large enough to split a page and a
++time window older than the audit retention cutoff. Split and continuation
++requests should complete without cursor errors, and no expired rows should be
++returned. Health charts should receive timestamp-only pages and show deployment
++markers without transferring schema or component diffs. Check the detailed
++history view separately to confirm that its event details remain available.
++Single-action, single-author, and combined single-action/author filters should
++use their respective indexes after backfill completes. Multiple-value filters
++should retain their existing matching behavior.
 diff --git a/patches/runtime_health_dashboard/function_usage.md b/patches/runtime_health_dashboard/function_usage.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..1184f0b45082dbd6f3596cf3658ad93c404a19cc
