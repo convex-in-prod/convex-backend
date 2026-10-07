@@ -79,6 +79,26 @@ numbers through Wasmtime conversion, shadow classification, response evidence,
 and failure cleanup. Omit guest values and raw error text. Exercise boundary and
 stale-handle failures through actual guest execution, preserving terminal cause
 and releasing runtime and memory ownership.
+
+Load authenticated graph AOT artifacts through private owned file snapshots.
+Stream and hash the exact source bytes before mapping the snapshot with
+Wasmtime, retaining core-module kind and ordered import/export validation.
+Existing artifacts reserve one AOT image and the bounded 64 KiB copy buffer;
+missing-artifact reconstruction keeps its larger in-memory peak reservation.
+This removes a full serialized-image copy during generation transitions
+without increasing memory budgets or mapping mutable registry paths.
+
+Verify admission beside a retained module charge, snapshot isolation from
+source mutation, private-directory enforcement, missing/corrupt artifact
+rejection, and shared module-cache ownership and retirement behavior.
+
+Authenticate source-keyed candidates before making room in residency, then
+retire the least-recently-used generation before preloading the candidate.
+The serialized cold loader reserves the slot through publication, keeping
+the two-generation bound from transiently requiring three full preloads.
+Existing invocation owners remain valid, and failed candidate loading
+retains the other resident. Focused source-keyed tests pass, including
+preload-slot reservation and retirement with pinned invocation owners.
 ---
  .github/workflows/build_local_backend.yml     |     7 +-
  Cargo.lock                                    | 14278 ++++++-----
@@ -172,15 +192,15 @@ and releasing runtime and memory ownership.
  .../static_hermes_wasmtime_gate/host_state.rs |  1441 ++
  .../invocation_timestamp_tests.rs             |   299 +
  .../module_contract.rs                        |  1434 ++
- .../module_graph_registry.rs                  |  5605 ++++
+ .../module_graph_registry.rs                  |  5622 ++++
  .../performance_now_tests.rs                  |   180 +
  .../process_env_application_tests.rs          |   492 +
  .../static_hermes_wasmtime_gate/query_abi.rs  |   461 +
  .../query_operations.rs                       |   281 +
  .../query_operations_tests.rs                 |  1354 +
  .../randomness_tests.rs                       |   543 +
- .../routed_module_cache.rs                    |  2365 ++
- .../routing_runtime.rs                        |  5961 +++++
+ .../routed_module_cache.rs                    |  2411 ++
+ .../routing_runtime.rs                        |  6030 +++++
  .../runtime_acceptance_tests.rs               | 12274 +++++++++
  ...database_get_conformance_boundary_tests.rs |  1034 +
  .../runtime_hotpath_benchmark.rs              |   255 +
@@ -195,7 +215,7 @@ and releasing runtime and memory ownership.
  .../isolate/src/environment/udf/wasm/tests.rs |   258 +
  .../src/environment/udf/wasm_udf_abi.rs       |  3694 +++
  .../src/environment/udf/wasm_udf_manifest.rs  |  3087 +++
- .../src/environment/udf/wasm_udf_package.rs   | 21210 ++++++++++++++++
+ .../src/environment/udf/wasm_udf_package.rs   | 21216 ++++++++++++++++
  crates/isolate/src/execution_observation.rs   |   432 +-
  crates/isolate/src/isolate.rs                 |     2 +
  crates/isolate/src/lib.rs                     |    69 +
@@ -309,7 +329,7 @@ and releasing runtime and memory ownership.
  .../docker-build/Dockerfile.backend.test.mjs  |   250 +
  self-hosted/docker-build/README.md            |    84 +
  self-hosted/docker-build/run_backend.sh       |     3 +-
- 229 files changed, 152803 insertions(+), 6932 deletions(-)
+ 229 files changed, 152941 insertions(+), 6932 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/query_shadow.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
  create mode 100644 crates/application/src/bin/source_package_preactivation_authority.rs
@@ -84546,10 +84566,10 @@ index 0000000000000000000000000000000000000000..edd36db4555fdf0dcae421194fc6b65a
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/module_graph_registry.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/module_graph_registry.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..5fac22443541b2f7d98a9bf6c069fb05d80daadc
+index 0000000000000000000000000000000000000000..75066c00b89336dd09ae4ae99954aa9e2306bcd3
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/module_graph_registry.rs
-@@ -0,0 +1,5605 @@
+@@ -0,0 +1,5622 @@
 +use std::{
 +    collections::{
 +        BTreeMap,
@@ -88663,13 +88683,30 @@ index 0000000000000000000000000000000000000000..5fac22443541b2f7d98a9bf6c069fb05
 +        ) -> anyhow::Result<()>,
 +    ) -> anyhow::Result<()> {
 +        let root = TempDir::new()?;
-+        let core_wasm = wasm_encoder::Module::new().finish();
++        let mut core_wasm = wasm_encoder::Module::new();
++        let mut memories = wasm_encoder::MemorySection::new();
++        memories.memory(wasm_encoder::MemoryType {
++            minimum: 4,
++            maximum: Some(4),
++            memory64: false,
++            shared: false,
++            page_size_log2: None,
++        });
++        core_wasm.section(&memories);
++        let mut data = wasm_encoder::DataSection::new();
++        data.active(
++            0,
++            &wasm_encoder::ConstExpr::i32_const(0),
++            vec![0x5a; 128 << 10],
++        );
++        core_wasm.section(&data);
++        let core_wasm = core_wasm.finish();
 +        let aot = engine
 +            .precompile_module(&core_wasm)
 +            .map_err(|error| anyhow::anyhow!("{error}"))?;
 +        let artifact = |kind: ArtifactKind, bytes: &[u8]| -> anyhow::Result<_> {
 +            let path = root.path().join(kind.file());
-+            fs::write(&path, bytes)?;
++            write_private(&path, bytes)?;
 +            Ok(super::AuthenticatedGraphArtifact {
 +                artifact_path: path,
 +                _cache_key: sha256(bytes),
@@ -93504,16 +93541,20 @@ index 0000000000000000000000000000000000000000..48cdb07325514624213a497a565c76b7
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routed_module_cache.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routed_module_cache.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..009f10ee6bcf764590ea5340787f66c5b0a7a76f
+index 0000000000000000000000000000000000000000..208bd77b0e714d6217dbfb9e70c9444384f56dbc
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routed_module_cache.rs
-@@ -0,0 +1,2365 @@
+@@ -0,0 +1,2411 @@
 +use value::Size;
 +
 +use super::*;
 +use crate::environment::udf::{
 +    wasm_udf_manifest::UdfKind,
-+    wasm_udf_package::ValidatedRuntimeRegistryGenerationDescriptor,
++    wasm_udf_package::{
++        snapshot_validated_serialized_module_file,
++        ValidatedRuntimeRegistryGenerationDescriptor,
++        SERIALIZED_MODULE_SNAPSHOT_BUFFER_BYTES,
++    },
 +};
 +
 +/// Immutable shadow route selection authenticated with one deployment
@@ -94827,6 +94868,7 @@ index 0000000000000000000000000000000000000000..009f10ee6bcf764590ea5340787f66c5
 +    Ok(())
 +}
 +
++#[cfg(test)]
 +pub(super) fn deserialize_authenticated_graph_module(
 +    engine: &Engine,
 +    aot: &[u8],
@@ -94925,12 +94967,17 @@ index 0000000000000000000000000000000000000000..009f10ee6bcf764590ea5340787f66c5
 +        }
 +    }
 +    // Different graph routes can reach the same immutable shared member at
-+    // once. Serialize only that identity's cold load so one admitted
-+    // Core-plus-two-AOT peak produces one deserialization and one cache entry.
++    // once. Serialize only that identity's cold load so it owns one snapshot,
++    // deserialization and memory charge.
 +    let load_lock = generated_shared_aot_load_lock(&identity);
 +    let _load_guard = load_lock.lock();
-+    let initial_fixed_bytes =
-+        generated_in_memory_module_initial_fixed_bytes(module.core_wasm_size(), module.aot_size())?;
++    let initial_fixed_bytes = if module.aot_payload_available() {
++        generated_module_initial_fixed_bytes(module.core_wasm_size(), module.aot_size())?
++            .checked_add(SERIALIZED_MODULE_SNAPSHOT_BUFFER_BYTES)
++            .context("generated Wasm snapshot peak estimate overflow")?
++    } else {
++        generated_in_memory_module_initial_fixed_bytes(module.core_wasm_size(), module.aot_size())?
++    };
 +    let mut charge = {
 +        let mut cache = GENERATED_ROUTED_MODULES.lock();
 +        if let Some(cached) = cache.get_shared_aot_module(&identity) {
@@ -94953,44 +95000,47 @@ index 0000000000000000000000000000000000000000..009f10ee6bcf764590ea5340787f66c5
 +            })?;
 +            return Ok(cached);
 +        }
-+        // Module::deserialize copies the authenticated Vec into Wasmtime's code
-+        // mapping. Reserve both AOT copies before the read so the complete cold
-+        // load remains inside aggregate admission.
++        // Existing AOT streams into an owned file that becomes the code mapping.
++        // Destination recompilation still retains its input/output buffers and
++        // must reserve the larger peak before it starts.
 +        cache
 +            .reserve(controller, initial_fixed_bytes)
 +            .map_err(module_memory_admission_error)?
 +    };
-+    let (deserialized, retained_aot) = if module.aot_payload_available() {
++    let deserialized = if module.aot_payload_available() {
 +        authenticate_graph_artifact(
 +            module.core_wasm_path(),
 +            module.core_wasm_size(),
 +            module.core_wasm_sha256(),
 +        )?;
-+        let aot = read_authenticated_graph_artifact(
++        let snapshot = snapshot_validated_serialized_module_file(
 +            module.aot_path(),
++            "graph AOT module",
 +            module.aot_size(),
 +            module.aot_sha256(),
-+        )?;
-+        let deserialized = deserialize_authenticated_graph_module(
-+            engine,
-+            &aot,
++            serialized_module_snapshot_directory,
++        )
++        .with_context(|| format!("snapshot authenticated {} module graph AOT", module.role()))?;
++        // SAFETY: The bounded streaming copy authenticated every byte before
++        // deserialization. Only this unlinked, privately owned snapshot is
++        // mapped; mutations of the registry path cannot change executable code.
++        // Wasmtime checks the core-module object kind while loading the mapping;
++        // a separate detector would buffer the full snapshot on non-Linux hosts.
++        let deserialized = unsafe { Module::deserialize_open_file(engine, snapshot) }
++            .map_err(wasmtime_anyhow)
++            .with_context(|| format!("deserialize {} module graph AOT", module.role()))?;
++        validate_external_graph_module_contract(
++            &deserialized,
 +            module.contract(),
 +            module.providers(),
-+        )
-+        .with_context(|| format!("deserialize {} module graph AOT", module.role()))?;
-+        (deserialized, Some(aot))
++        )?;
++        deserialized
 +    } else {
-+        let deserialized = precompile_authenticated_graph_module(
-+            engine,
-+            serialized_module_snapshot_directory,
-+            module,
-+        )
-+        .with_context(|| format!("precompile {} module graph AOT", module.role()))?;
-+        (deserialized, None)
++        precompile_authenticated_graph_module(engine, serialized_module_snapshot_directory, module)
++            .with_context(|| format!("precompile {} module graph AOT", module.role()))?
 +    };
 +    let fixed_module_bytes =
 +        generated_module_fixed_bytes(module.core_wasm_size(), module.aot_size(), &deserialized)?;
-+    drop(retained_aot);
 +    let mut cache = GENERATED_ROUTED_MODULES.lock();
 +    if let Some(cached) = cache.get_shared_aot_module(&identity) {
 +        resize_shared_aot_charge(
@@ -95037,7 +95087,25 @@ index 0000000000000000000000000000000000000000..009f10ee6bcf764590ea5340787f66c5
 +
 +                std::fs::set_permissions(snapshots.path(), std::fs::Permissions::from_mode(0o700))?;
 +            }
-+            let controller = generated_module_cache_test_controller(8 << 20, 12 << 20)?;
++            let retained_bytes = 256 << 10;
++            let snapshot_peak =
++                generated_module_initial_fixed_bytes(module.core_wasm_size(), module.aot_size())?
++                    + SERIALIZED_MODULE_SNAPSHOT_BUFFER_BYTES;
++            assert!(module.aot_size() > SERIALIZED_MODULE_SNAPSHOT_BUFFER_BYTES as u64);
++            let controller = generated_module_cache_test_controller(
++                retained_bytes + snapshot_peak + 8,
++                retained_bytes + snapshot_peak + module.aot_size() as usize + 8,
++            )?;
++            let retained_charge = controller.try_charge_module(retained_bytes)?;
++            // A retained generation and the replacement's final mapping fit, while
++            // buffering another complete AOT before mapping would reject the load.
++            assert!(matches!(
++                controller.try_charge_module(generated_in_memory_module_initial_fixed_bytes(
++                    module.core_wasm_size(),
++                    module.aot_size(),
++                )?),
++                Err(ModuleMemoryAdmissionError::SoftBudget)
++            ));
 +            let first = cache_authenticated_graph_shared_module(
 +                &controller,
 +                &engine,
@@ -95046,6 +95114,7 @@ index 0000000000000000000000000000000000000000..009f10ee6bcf764590ea5340787f66c5
 +                &module,
 +                AuthenticatedGraphAotResolution::PreloadedOnly,
 +            )?;
++            drop(retained_charge);
 +            let charged_bytes = first
 +                .module_charge
 +                .lock()
@@ -95119,7 +95188,9 @@ index 0000000000000000000000000000000000000000..009f10ee6bcf764590ea5340787f66c5
 +                )
 +                .err()
 +                .context("cold module load accepted a missing artifact")?;
-+                assert!(format!("{missing:#}").contains("open authenticated module graph artifact"));
++                assert!(missing.chain().any(|cause| cause
++                    .downcast_ref::<std::io::Error>()
++                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)));
 +                std::fs::rename(path.with_file_name(withheld), path)?;
 +                let original = std::fs::read(path)?;
 +                let mut corrupted = original.clone();
@@ -95135,8 +95206,20 @@ index 0000000000000000000000000000000000000000..009f10ee6bcf764590ea5340787f66c5
 +                )
 +                .err()
 +                .context("cold module load accepted artifact corruption")?;
-+                assert!(format!("{changed:#}")
-+                    .contains("module graph artifact changed after registry authentication"));
++                if path == module.aot_path() {
++                    assert!(matches!(
++                        changed
++                            .downcast_ref::<super::super::wasm_udf_package::WasmUdfPackageError>(),
++                        Some(
++                            super::super::wasm_udf_package::WasmUdfPackageError::ArtifactDigest(
++                                "graph AOT module"
++                            )
++                        )
++                    ));
++                } else {
++                    assert!(format!("{changed:#}")
++                        .contains("module graph artifact changed after registry authentication"));
++                }
 +                std::fs::write(path, original)?;
 +                assert!(GENERATED_ROUTED_MODULES
 +                    .lock()
@@ -95875,10 +95958,10 @@ index 0000000000000000000000000000000000000000..009f10ee6bcf764590ea5340787f66c5
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..5fd51122f4289ff389e368f51861553f1fa2a7a6
+index 0000000000000000000000000000000000000000..83a3f7694dbe9b84c624194b077b58a660c581e7
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs
-@@ -0,0 +1,5961 @@
+@@ -0,0 +1,6030 @@
 +use common::types::ActiveJavascriptClass;
 +use futures::{
 +    future::{
@@ -96070,6 +96153,24 @@ index 0000000000000000000000000000000000000000..5fd51122f4289ff389e368f51861553f
 +}
 +
 +impl SourceKeyedResidencyState {
++    fn evict_lru_before_preload(&mut self) -> Option<SourceKeyedResidentGeneration> {
++        if self.resident.len() < 2 {
++            return None;
++        }
++        assert_eq!(
++            self.resident.len(),
++            2,
++            "source-keyed residency exceeds its bound"
++        );
++        let victim = self
++            .resident
++            .iter()
++            .min_by_key(|(_, resident)| resident.last_used)
++            .map(|(selector, _)| selector.clone())
++            .expect("full source-keyed residency has no LRU victim");
++        self.resident.remove(&victim)
++    }
++
 +    fn insert_and_evict_lru(
 +        &mut self,
 +        selector: SourceKeyedGenerationSelector,
@@ -96262,24 +96363,53 @@ index 0000000000000000000000000000000000000000..5fd51122f4289ff389e368f51861553f
 +        let controller = Arc::clone(&context.controller);
 +        let snapshot_directory = context.serialized_module_snapshot_directory.clone();
 +        let registry_use = self.registry_use;
++        let generation = tokio_spawn_blocking("source_keyed_exact_generation_load", move || {
++            let retained_catalogs = retained
++                .iter()
++                .filter_map(|generation| generation.module_graph_catalog.as_ref())
++                .collect::<Vec<_>>();
++            let generation = load_runtime_registry_generation_with_retained_graphs(
++                &root,
++                &descriptor_for_load,
++                &retained_catalogs,
++            )
++            .map(DeploymentGeneration::from_validated)
++            .context("failed to load exact source-keyed runtime generation")?;
++            ensure_registry_admission(
++                registry_use == RegistryUse::Primary,
++                registry_use == RegistryUse::Shadow,
++                &generation,
++            )?;
++            Ok::<_, anyhow::Error>(generation)
++        })
++        .await
++        .context("exact source-keyed generation load task failed")??;
++        if !registry.descriptor_is_current(&selector, &descriptor) {
++            discard_unpublished_generation(generation);
++            anyhow::bail!("source-keyed runtime descriptor changed during exact generation load");
++        }
++
++        // Authenticate the candidate before changing residency, then release
++        // the old LRU before preloading. Keeping two old generations through
++        // preload otherwise requires capacity for a third full generation.
++        // The cold-load semaphore reserves this slot until publication; Arc
++        // owners of the retired incarnation can still finish their invocations.
++        let victim = self.state.lock().evict_lru_before_preload();
++        if let Some(victim) = victim {
++            retire_source_keyed_generation(&victim.generation);
++            self.state
++                .lock()
++                .retired
++                .push(Arc::downgrade(&victim.generation));
++            // Drop residency's owner before the idle sweep; retained module
++            // owners must not make an otherwise unused AOT entry appear busy.
++            drop(victim);
++            GENERATED_ROUTED_MODULES
++                .lock()
++                .evict_all_idle_shared_aot_modules();
++        }
 +        let (generation, preloaded_graph_modules) =
-+            tokio_spawn_blocking("source_keyed_exact_generation_load", move || {
-+                let retained_catalogs = retained
-+                    .iter()
-+                    .filter_map(|generation| generation.module_graph_catalog.as_ref())
-+                    .collect::<Vec<_>>();
-+                let generation = load_runtime_registry_generation_with_retained_graphs(
-+                    &root,
-+                    &descriptor_for_load,
-+                    &retained_catalogs,
-+                )
-+                .map(DeploymentGeneration::from_validated)
-+                .context("failed to load exact source-keyed runtime generation")?;
-+                ensure_registry_admission(
-+                    registry_use == RegistryUse::Primary,
-+                    registry_use == RegistryUse::Shadow,
-+                    &generation,
-+                )?;
++            tokio_spawn_blocking("source_keyed_exact_generation_preload", move || {
 +                let preloaded_graph_modules = match preload_generation_routes(
 +                    &controller,
 +                    &snapshot_directory,
@@ -96294,7 +96424,7 @@ index 0000000000000000000000000000000000000000..5fd51122f4289ff389e368f51861553f
 +                Ok::<_, anyhow::Error>((generation, preloaded_graph_modules))
 +            })
 +            .await
-+            .context("exact source-keyed generation load task failed")??;
++            .context("exact source-keyed generation preload task failed")??;
 +        if !registry.descriptor_is_current(&selector, &descriptor) {
 +            drop(preloaded_graph_modules);
 +            discard_unpublished_generation(generation);
@@ -96308,24 +96438,11 @@ index 0000000000000000000000000000000000000000..5fd51122f4289ff389e368f51861553f
 +
 +        let mut state = self.state.lock();
 +        let victim = state.insert_and_evict_lru(selector.clone(), Arc::clone(&generation));
++        assert!(
++            victim.is_none(),
++            "source-keyed preload lost its residency slot"
++        );
 +        drop(state);
-+        if let Some(victim) = victim {
-+            retire_source_keyed_generation(&victim.generation);
-+            self.state
-+                .lock()
-+                .retired
-+                .push(Arc::downgrade(&victim.generation));
-+            // `retire_source_keyed_generation` must run while the victim Arc is
-+            // still live so active owners can finish. Drop that residency
-+            // owner before the final idle shared-AOT sweep; otherwise the
-+            // generation's preloaded modules keep their cache entries
-+            // artificially non-idle and a dead weak retirement record can no
-+            // longer trigger cleanup.
-+            drop(victim);
-+            GENERATED_ROUTED_MODULES
-+                .lock()
-+                .evict_all_idle_shared_aot_modules();
-+        }
 +        registry.record_source_keyed_shadow_evidence(&selector, &generation);
 +        Ok(generation)
 +    }
@@ -98732,7 +98849,7 @@ index 0000000000000000000000000000000000000000..5fd51122f4289ff389e368f51861553f
 +    result.map(|_| ()).map_err(Into::into)
 +}
 +
-+/// Residency eviction is synchronous with publication: mark the exact
++/// Residency eviction is synchronous with admission: mark the exact
 +/// incarnation retired and remove its routed-module cache entries before a
 +/// future incarnation can reuse the same semantic route identity. Existing
 +/// Arc owners continue to execute; maintenance and return paths discard idle
@@ -101450,6 +101567,41 @@ index 0000000000000000000000000000000000000000..5fd51122f4289ff389e368f51861553f
 +        assert!(Arc::ptr_eq(&victim.generation, &pinned_first));
 +        assert_eq!(state.resident.len(), 2);
 +        assert!(!pinned_first.is_retired());
++    }
++
++    #[test]
++    fn source_keyed_admission_releases_the_lru_slot_before_candidate_publication() {
++        let mut state = SourceKeyedResidencyState::default();
++        let first = residency_generation('1');
++        let pinned_first = Arc::clone(&first);
++        let second = residency_generation('2');
++        let pinned_second = Arc::clone(&second);
++        assert!(state.evict_lru_before_preload().is_none());
++        assert!(state
++            .insert_and_evict_lru(residency_selector('1'), first)
++            .is_none());
++        assert!(state.evict_lru_before_preload().is_none());
++        assert!(state
++            .insert_and_evict_lru(residency_selector('2'), second)
++            .is_none());
++
++        let victim = state.evict_lru_before_preload().unwrap();
++        assert!(Arc::ptr_eq(&victim.generation, &pinned_first));
++        drop(victim);
++        assert_eq!(state.resident.len(), 1);
++        assert!(Arc::ptr_eq(
++            &state.resident[&residency_selector('2')].generation,
++            &pinned_second
++        ));
++        assert_eq!(Arc::strong_count(&pinned_first), 1);
++
++        // A failed candidate leaves the remaining resident usable. A retry
++        // uses the already available slot instead of evicting that resident.
++        assert!(state.evict_lru_before_preload().is_none());
++        assert!(state
++            .insert_and_evict_lru(residency_selector('3'), residency_generation('3'))
++            .is_none());
++        assert_eq!(state.resident.len(), 2);
 +    }
 +
 +    struct GeneratedRouteCacheCleanup {
@@ -130517,10 +130669,10 @@ index 0000000000000000000000000000000000000000..527eed039bccc9e7672d51e24d243ae4
 +}
 diff --git a/crates/isolate/src/environment/udf/wasm_udf_package.rs b/crates/isolate/src/environment/udf/wasm_udf_package.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..6290adcd3872ea2c46b6549051834fd0702baf7d
+index 0000000000000000000000000000000000000000..d364e443c5fde8852d93e85cef8955255c049f51
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/wasm_udf_package.rs
-@@ -0,0 +1,21210 @@
+@@ -0,0 +1,21216 @@
 +use std::{
 +    collections::{
 +        BTreeMap,
@@ -137995,7 +138147,8 @@ index 0000000000000000000000000000000000000000..6290adcd3872ea2c46b6549051834fd0
 +    let serialized_module_snapshot = snapshot_validated_serialized_module_file(
 +        &package_path.join("module.cwasm"),
 +        "module.cwasm",
-+        serialized_module,
++        serialized_module.size,
++        &serialized_module.sha256,
 +        serialized_module_snapshot_directory,
 +    )?;
 +    validate_directory_entries(package_path)?;
@@ -138211,7 +138364,8 @@ index 0000000000000000000000000000000000000000..6290adcd3872ea2c46b6549051834fd0
 +        let serialized_module_snapshot = snapshot_validated_serialized_module_file(
 +            &package_path.join(&graph_manifest.leaf.artifacts.serialized_module.path),
 +            "graph leaf AOT module",
-+            &leaf_serialized,
++            leaf_serialized.size,
++            &leaf_serialized.sha256,
 +            serialized_module_snapshot_directory,
 +        )?;
 +
@@ -138284,7 +138438,8 @@ index 0000000000000000000000000000000000000000..6290adcd3872ea2c46b6549051834fd0
 +        let serialized_module_snapshot = snapshot_validated_serialized_module_file(
 +            &package_path.join(&module.artifacts.serialized_module.path),
 +            "graph dependency AOT module",
-+            &serialized,
++            serialized.size,
++            &serialized.sha256,
 +            serialized_module_snapshot_directory,
 +        )?;
 +        Ok(ValidatedCapabilityGraphDependency {
@@ -138985,7 +139140,8 @@ index 0000000000000000000000000000000000000000..6290adcd3872ea2c46b6549051834fd0
 +    let serialized_module_snapshot = snapshot_validated_serialized_module_file(
 +        &package_path.join("module.cwasm"),
 +        "module.cwasm",
-+        serialized_module,
++        serialized_module.size,
++        &serialized_module.sha256,
 +        serialized_module_snapshot_directory,
 +    )?;
 +
@@ -139209,7 +139365,8 @@ index 0000000000000000000000000000000000000000..6290adcd3872ea2c46b6549051834fd0
 +    let serialized_module_snapshot = snapshot_validated_serialized_module_file(
 +        &package_path.join("module.cwasm"),
 +        "module.cwasm",
-+        serialized_module,
++        serialized_module.size,
++        &serialized_module.sha256,
 +        serialized_module_snapshot_directory,
 +    )?;
 +    validate_directory_entries_exact(package_path, &CAPABILITY_ENTRY_PACKAGE_FILES)?;
@@ -144205,21 +144362,24 @@ index 0000000000000000000000000000000000000000..6290adcd3872ea2c46b6549051834fd0
 +    Ok(())
 +}
 +
-+fn snapshot_validated_serialized_module_file(
++pub(crate) const SERIALIZED_MODULE_SNAPSHOT_BUFFER_BYTES: usize = 64 * 1024;
++
++pub(crate) fn snapshot_validated_serialized_module_file(
 +    path: &Path,
 +    name: &'static str,
-+    expected: &PackageArtifact,
++    expected_size: u64,
++    expected_sha256: &str,
 +    serialized_module_snapshot_directory: &Path,
 +) -> Result<File, WasmUdfPackageError> {
 +    let mut source_file = open_private_regular_file(path)?;
 +    let source_metadata = source_file
 +        .metadata()
 +        .map_err(|source| io_error(path, source))?;
-+    if source_metadata.len() != expected.size {
++    if source_metadata.len() != expected_size {
 +        return Err(WasmUdfPackageError::ArtifactSize {
 +            name,
 +            actual_bytes: source_metadata.len(),
-+            expected_bytes: expected.size,
++            expected_bytes: expected_size,
 +        });
 +    }
 +
@@ -144228,10 +144388,10 @@ index 0000000000000000000000000000000000000000..6290adcd3872ea2c46b6549051834fd0
 +        .map_err(|source| io_error(serialized_module_snapshot_directory, source))?;
 +    validate_serialized_module_snapshot_file(&snapshot, serialized_module_snapshot_directory)?;
 +    let mut digest = Sha256::new();
-+    let mut buffer = [0; 64 * 1024];
++    let mut buffer = [0; SERIALIZED_MODULE_SNAPSHOT_BUFFER_BYTES];
 +    let mut actual_bytes = 0;
 +    loop {
-+        let remaining = expected.size.saturating_add(1).saturating_sub(actual_bytes);
++        let remaining = expected_size.saturating_add(1).saturating_sub(actual_bytes);
 +        if remaining == 0 {
 +            break;
 +        }
@@ -144251,14 +144411,14 @@ index 0000000000000000000000000000000000000000..6290adcd3872ea2c46b6549051834fd0
 +            .checked_add(bytes_read as u64)
 +            .expect("bounded serialized module size overflowed while snapshotting");
 +    }
-+    if actual_bytes != expected.size {
++    if actual_bytes != expected_size {
 +        return Err(WasmUdfPackageError::ArtifactSize {
 +            name,
 +            actual_bytes,
-+            expected_bytes: expected.size,
++            expected_bytes: expected_size,
 +        });
 +    }
-+    if format!("{:x}", digest.finalize()) != expected.sha256 {
++    if format!("{:x}", digest.finalize()) != expected_sha256 {
 +        return Err(WasmUdfPackageError::ArtifactDigest(name));
 +    }
 +    snapshot.rewind().map_err(|source| io_error(path, source))?;
@@ -151472,10 +151632,8 @@ index 0000000000000000000000000000000000000000..6290adcd3872ea2c46b6549051834fd0
 +        let mut snapshot = snapshot_validated_serialized_module_file(
 +            &source_path,
 +            "module.cwasm",
-+            &PackageArtifact {
-+                sha256: sha256(&module_bytes),
-+                size: module_bytes.len() as u64,
-+            },
++            module_bytes.len() as u64,
++            &sha256(&module_bytes),
 +            &snapshot_directory,
 +        )?;
 +
