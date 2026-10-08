@@ -99,6 +99,15 @@ the two-generation bound from transiently requiring three full preloads.
 Existing invocation owners remain valid, and failed candidate loading
 retains the other resident. Focused source-keyed tests pass, including
 preload-slot reservation and retirement with pinned invocation owners.
+
+Reclaim another resident generation when invocation admission reaches its soft
+or hard memory budget. Two authenticated generations can fit readiness while
+leaving too little space for executable work. Protect the requested Arc
+incarnation, preserve existing invocation owners, retire through the ordinary
+cache and idle-instance path, and retry admission before dropping shadow work.
+Keep the configured memory budgets unchanged. Cover admission retirement of
+the other generation and preservation of the least-recently-used requested
+incarnation with a focused regression.
 ---
  .github/workflows/build_local_backend.yml     |     7 +-
  Cargo.lock                                    | 14278 ++++++-----
@@ -200,7 +209,7 @@ preload-slot reservation and retirement with pinned invocation owners.
  .../query_operations_tests.rs                 |  1354 +
  .../randomness_tests.rs                       |   543 +
  .../routed_module_cache.rs                    |  2411 ++
- .../routing_runtime.rs                        |  6030 +++++
+ .../routing_runtime.rs                        |  6106 +++++
  .../runtime_acceptance_tests.rs               | 12274 +++++++++
  ...database_get_conformance_boundary_tests.rs |  1034 +
  .../runtime_hotpath_benchmark.rs              |   255 +
@@ -329,7 +338,7 @@ preload-slot reservation and retirement with pinned invocation owners.
  .../docker-build/Dockerfile.backend.test.mjs  |   250 +
  self-hosted/docker-build/README.md            |    84 +
  self-hosted/docker-build/run_backend.sh       |     3 +-
- 229 files changed, 152941 insertions(+), 6932 deletions(-)
+ 229 files changed, 153017 insertions(+), 6932 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/query_shadow.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
  create mode 100644 crates/application/src/bin/source_package_preactivation_authority.rs
@@ -95958,10 +95967,10 @@ index 0000000000000000000000000000000000000000..208bd77b0e714d6217dbfb9e70c94443
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..83a3f7694dbe9b84c624194b077b58a660c581e7
+index 0000000000000000000000000000000000000000..910427784f4726edba6c06967964c1553748c244
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs
-@@ -0,0 +1,6030 @@
+@@ -0,0 +1,6106 @@
 +use common::types::ActiveJavascriptClass;
 +use futures::{
 +    future::{
@@ -96284,6 +96293,37 @@ index 0000000000000000000000000000000000000000..83a3f7694dbe9b84c624194b077b58a6
 +            .values()
 +            .map(|resident| Arc::clone(&resident.generation))
 +            .collect()
++    }
++
++    fn retire_other_generation_for_admission(&self, protected: &Arc<DeploymentGeneration>) -> bool {
++        let victim = {
++            let mut state = self.state.lock();
++            let selector = state
++                .resident
++                .iter()
++                .filter(|(_, resident)| !Arc::ptr_eq(&resident.generation, protected))
++                .min_by_key(|(_, resident)| resident.last_used)
++                .map(|(selector, _)| selector.clone());
++            let Some(selector) = selector else {
++                return false;
++            };
++            let victim = state
++                .resident
++                .remove(&selector)
++                .expect("admission eviction victim disappeared while locked");
++            state.retired.push(Arc::downgrade(&victim.generation));
++            victim
++        };
++        // Readiness may retain two generations that fit the module budget but
++        // leave no room for an invocation. Reclaim the other incarnation only
++        // when admission needs memory. Existing invocations keep their Arcs;
++        // their idle instances drain through the ordinary retirement path.
++        retire_source_keyed_generation(&victim.generation);
++        drop(victim);
++        GENERATED_ROUTED_MODULES
++            .lock()
++            .evict_all_idle_shared_aot_modules();
++        true
 +    }
 +
 +    async fn ensure(
@@ -99569,6 +99609,18 @@ index 0000000000000000000000000000000000000000..83a3f7694dbe9b84c624194b077b58a6
 +                anyhow::bail!("generated Wasm invocation forecast exceeds its hard memory budget")
 +            },
 +            Err(TryAdmissionError::Wait(reason)) => {
++                if matches!(
++                    reason,
++                    AdmissionWaitReason::SoftBudget | AdmissionWaitReason::HardBudget
++                ) && let Some(generation) = routed.generation.as_ref()
++                    && let Some(residency) = route_configuration()?
++                        .deployment_registry
++                        .as_ref()
++                        .and_then(|registry| registry.source_keyed_residency.as_ref())
++                    && residency.retire_other_generation_for_admission(generation)
++                {
++                    continue;
++                }
 +                if immediate {
 +                    if reason == AdmissionWaitReason::InstanceCountCeiling {
 +                        if evict_generated_idle_instance_for_new_slot::<RT>(
@@ -101602,6 +101654,39 @@ index 0000000000000000000000000000000000000000..83a3f7694dbe9b84c624194b077b58a6
 +            .insert_and_evict_lru(residency_selector('3'), residency_generation('3'))
 +            .is_none());
 +        assert_eq!(state.resident.len(), 2);
++    }
++
++    #[test]
++    fn source_keyed_memory_admission_retires_only_the_other_incarnation() {
++        let residency = SourceKeyedResidency::new(
++            PathBuf::from("/unused/source-keyed-residency"),
++            RegistryUse::Shadow,
++        );
++        let selected = residency_generation('1');
++        let other = residency_generation('2');
++        {
++            let mut state = residency.state.lock();
++            assert!(state
++                .insert_and_evict_lru(residency_selector('1'), Arc::clone(&selected))
++                .is_none());
++            assert!(state
++                .insert_and_evict_lru(residency_selector('2'), Arc::clone(&other))
++                .is_none());
++        }
++
++        // The selected incarnation remains usable even when it is the LRU.
++        assert!(residency.retire_other_generation_for_admission(&selected));
++        assert!(!selected.is_retired());
++        assert!(other.is_retired());
++        assert!(Arc::ptr_eq(
++            &residency.resident(&residency_selector('1')).unwrap(),
++            &selected,
++        ));
++        assert!(residency.resident(&residency_selector('2')).is_none());
++        assert!(!residency.retire_other_generation_for_admission(&selected));
++        let retired = residency.take_retired();
++        assert_eq!(retired.len(), 1);
++        assert!(Arc::ptr_eq(&retired[0], &other));
 +    }
 +
 +    struct GeneratedRouteCacheCleanup {
