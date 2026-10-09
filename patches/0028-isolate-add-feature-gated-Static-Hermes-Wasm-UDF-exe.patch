@@ -108,6 +108,12 @@ cache and idle-instance path, and retry admission before dropping shadow work.
 Keep the configured memory budgets unchanged. Cover admission retirement of
 the other generation and preservation of the least-recently-used requested
 incarnation with a focused regression.
+
+Accumulate WASI thread CPU time across executor polls so suspension and
+resumption on another worker do not corrupt guest clock accounting. Preserve
+monotonic elapsed time across reused instances, close invocation clock scopes
+on cancellation, and retain explicit unavailable observations. Cover executor
+migration, cancellation and reused guest instances with focused clock tests.
 ---
  .github/workflows/build_local_backend.yml     |     7 +-
  Cargo.lock                                    | 14311 ++++++-----
@@ -189,7 +195,7 @@ incarnation with a focused regression.
  .../udf/host_operation_error_cause.rs         |   224 +
  crates/isolate/src/environment/udf/mod.rs     |   292 +-
  crates/isolate/src/environment/udf/phase.rs   |   103 +-
- .../udf/static_hermes_wasmtime_gate.rs        |  2745 ++
+ .../udf/static_hermes_wasmtime_gate.rs        |  2748 ++
  .../application_capability_entry_tests.rs     |  1063 +
  .../artifact_registry_contract_tests.rs       |  5794 +++++
  .../async_operations.rs                       |  6136 +++++
@@ -200,7 +206,7 @@ incarnation with a focused regression.
  .../generic_query_application_tests.rs        |   388 +
  .../graph_runtime.rs                          |   705 +
  .../host_imports.rs                           |  1617 ++
- .../static_hermes_wasmtime_gate/host_state.rs |  1442 ++
+ .../static_hermes_wasmtime_gate/host_state.rs |  1443 ++
  .../invocation_timestamp_tests.rs             |   299 +
  .../module_contract.rs                        |  1434 ++
  .../module_graph_registry.rs                  |  5622 ++++
@@ -215,12 +221,13 @@ incarnation with a focused regression.
  .../runtime_acceptance_tests.rs               | 12275 +++++++++
  ...database_get_conformance_boundary_tests.rs |  1034 +
  .../runtime_hotpath_benchmark.rs              |   255 +
- .../runtime_lifecycle.rs                      |  2752 ++
+ .../runtime_lifecycle.rs                      |  2760 ++
  .../source_keyed_deployment_catalog.rs        |   143 +
  .../test_support.rs                           |   570 +
  .../test_support/fixtures.rs                  |  2801 ++
  .../test_support/harness.rs                   |   445 +
- .../wasi_clock_tests.rs                       |   769 +
+ .../wasi_clock_tests.rs                       |   779 +
+ .../wasi_cpu_clock.rs                         |   193 +
  crates/isolate/src/environment/udf/syscall.rs |   118 +-
  crates/isolate/src/environment/udf/wasm.rs    |   338 +
  .../isolate/src/environment/udf/wasm/tests.rs |   259 +
@@ -331,7 +338,7 @@ incarnation with a focused regression.
  .../design_reference.md                       |    15 +-
  patches/static_hermes_wasm_udfs/README.md     |   387 +
  .../compiler_and_artifact_contract.md         |   322 +
- patches/static_hermes_wasm_udfs/operations.md |   760 +
+ patches/static_hermes_wasm_udfs/operations.md |   765 +
  patches/static_hermes_wasm_udfs/value_abi.md  |   444 +
  scripts/run_cargo.sh                          |    96 +-
  scripts/run_cargo.test.mjs                    |   194 +
@@ -340,7 +347,7 @@ incarnation with a focused regression.
  .../docker-build/Dockerfile.backend.test.mjs  |   250 +
  self-hosted/docker-build/README.md            |    84 +
  self-hosted/docker-build/run_backend.sh       |     3 +-
- 231 files changed, 153103 insertions(+), 7020 deletions(-)
+ 232 files changed, 153323 insertions(+), 7020 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/query_shadow.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
  create mode 100644 crates/application/src/bin/source_package_preactivation_authority.rs
@@ -382,6 +389,7 @@ incarnation with a focused regression.
  create mode 100644 crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/test_support/fixtures.rs
  create mode 100644 crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/test_support/harness.rs
  create mode 100644 crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/wasi_clock_tests.rs
+ create mode 100644 crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/wasi_cpu_clock.rs
  create mode 100644 crates/isolate/src/environment/udf/wasm.rs
  create mode 100644 crates/isolate/src/environment/udf/wasm/tests.rs
  create mode 100644 crates/isolate/src/environment/udf/wasm_udf_abi.rs
@@ -59223,10 +59231,10 @@ index 0439932994f78316142f7bb0cea718ff0f86e5e5..6f3043de6f35821c25ead0cbc384c1bc
              performance_api,
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..f647212273488d5266e43b3d5fe161f9d35f4759
+index 0000000000000000000000000000000000000000..d7c299c9384743966e9f30052e9c02529d997633
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate.rs
-@@ -0,0 +1,2745 @@
+@@ -0,0 +1,2748 @@
 +use std::{
 +    any::Any,
 +    collections::{
@@ -59727,6 +59735,7 @@ index 0000000000000000000000000000000000000000..f647212273488d5266e43b3d5fe161f9
 +mod host_imports;
 +mod host_state;
 +mod module_contract;
++mod wasi_cpu_clock;
 +pub use module_contract::generated_runtime_abi_capabilities;
 +mod query_abi;
 +mod query_operations;
@@ -59867,6 +59876,7 @@ index 0000000000000000000000000000000000000000..f647212273488d5266e43b3d5fe161f9
 +    routed_module_cache::*,
 +    routing_runtime::*,
 +    runtime_lifecycle::*,
++    wasi_cpu_clock::WasiCpuClock,
 +};
 +pub use super::generated_wasm_memory::{
 +    StaticHermesGeneratedMemoryRouteStatistics,
@@ -61899,6 +61909,7 @@ index 0000000000000000000000000000000000000000..f647212273488d5266e43b3d5fe161f9
 +        provider,
 +        udf_callback,
 +        wasi_monotonic_epoch,
++        wasi_cpu_clock: WasiCpuClock::default(),
 +        timeout: Some(Timeout::for_static_hermes_gate(rt, permit)),
 +        active_wasm_cpu_limiter,
 +        teardown_cpu_permit: None,
@@ -79940,7 +79951,7 @@ index 0000000000000000000000000000000000000000..b9fdcc4fffb796d01ec99a1c8625e246
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/host_imports.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/host_imports.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..9b5a95e7794d4db5bd2ebdeba50c3d99aa2c9fd8
+index 0000000000000000000000000000000000000000..974f4a8696b5f6a2970d8ff485b4f6ce7a9b2631
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/host_imports.rs
 @@ -0,0 +1,1617 @@
@@ -81497,10 +81508,10 @@ index 0000000000000000000000000000000000000000..9b5a95e7794d4db5bd2ebdeba50c3d99
 +                    u64::try_from(duration.as_nanos()).map_err(|_| host_invariant_error())?
 +                },
 +                WASI_CLOCK_ID_THREAD_CPUTIME => {
-+                    // Hermes measures synchronous GC sections on the current
-+                    // executor thread. This clock is not invocation time and
-+                    // must never be compared across a suspended guest call.
-+                    let Some(nanos) = crate::execution_observation::thread_cpu() else {
++                    // Epoch yields can migrate even a synchronous GC section.
++                    // Read the guest's accumulated poll CPU, not its executor's
++                    // thread-lifetime CPU clock.
++                    let Some(nanos) = caller.data().wasi_cpu_clock.current() else {
 +                        return Ok::<i32, WasmtimeError>(WASI_ERRNO_NOTSUP);
 +                    };
 +                    nanos
@@ -81563,10 +81574,10 @@ index 0000000000000000000000000000000000000000..9b5a95e7794d4db5bd2ebdeba50c3d99
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/host_state.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/host_state.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..b73b87adbaef0d852767e43a71c561b0f9b20b1c
+index 0000000000000000000000000000000000000000..aa2c69250518b007e67939f61e37560783c611a2
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/host_state.rs
-@@ -0,0 +1,1442 @@
+@@ -0,0 +1,1443 @@
 +use super::{
 +    super::{
 +        syscall::SyscallProviderInternal,
@@ -82231,6 +82242,7 @@ index 0000000000000000000000000000000000000000..b73b87adbaef0d852767e43a71c561b0
 +    // WASI monotonic time has an arbitrary epoch, but retained guest state can
 +    // compare readings across invocations when its Store is reused.
 +    pub(super) wasi_monotonic_epoch: tokio::time::Instant,
++    pub(super) wasi_cpu_clock: WasiCpuClock,
 +    pub(super) timeout: Option<Timeout<RT>>,
 +    pub(super) active_wasm_cpu_limiter: ConcurrencyLimiter,
 +    pub(super) teardown_cpu_permit: Option<ConcurrencyPermit>,
@@ -115843,10 +115855,10 @@ index 0000000000000000000000000000000000000000..b3367a090c93b1624dce3131f06233cd
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..c556c3a3ddd98576e5e021884a1344fb27a03a5c
+index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57e0f89601
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle.rs
-@@ -0,0 +1,2752 @@
+@@ -0,0 +1,2760 @@
 +use std::io::{
 +    self,
 +    Write,
@@ -116281,7 +116293,8 @@ index 0000000000000000000000000000000000000000..c556c3a3ddd98576e5e021884a1344fb
 +        .set_fuel(routed.manifest.limits().execution_fuel())
 +        .map_err(wasmtime_anyhow)?;
 +    let result = {
-+        let destroy_call = instance.destroy.call_async(&mut instance.store, ());
++        let cpu_clock = instance.store.data().wasi_cpu_clock.clone();
++        let destroy_call = cpu_clock.measure(instance.destroy.call_async(&mut instance.store, ()));
 +        tokio::pin!(destroy_call);
 +        tokio::select! {
 +            result = &mut destroy_call => result,
@@ -116754,6 +116767,7 @@ index 0000000000000000000000000000000000000000..c556c3a3ddd98576e5e021884a1344fb
 +            }
 +            let mut state = state;
 +            state.wasi_monotonic_epoch = reusable_instance.store.data().wasi_monotonic_epoch;
++            state.wasi_cpu_clock = reusable_instance.store.data().wasi_cpu_clock.clone();
 +            let previous_state = std::mem::replace(reusable_instance.store.data_mut(), state);
 +            drop(previous_state);
 +            if !reusable_instance.execution_hook_installed {
@@ -116802,46 +116816,50 @@ index 0000000000000000000000000000000000000000..c556c3a3ddd98576e5e021884a1344fb
 +                .as_mut()
 +                .ok_or_else(|| host_invariant_error())?
 +                .mark_execution_started(false);
-+            let (instance, selector_export, emscripten_graph_instances) = match &routed
-+                .emscripten_graph
-+            {
-+                Some(graph) => {
-+                    let instances =
-+                        instantiate_generated_emscripten_graph(&linker, &mut store, graph).await?;
-+                    (
-+                        instances.modules[0],
-+                        "convex_wasm_graph_select_entry",
-+                        Some((instances, graph.initialization.clone())),
-+                    )
-+                },
-+                None => {
-+                    let graph_instances = match &routed.graph {
-+                        Some(graph) => Some(
-+                            instantiate_generated_graph_dependencies(
-+                                &mut linker,
-+                                &mut store,
-+                                graph,
++            let cpu_clock = store.data().wasi_cpu_clock.clone();
++            let (instance, selector_export, emscripten_graph_instances) = cpu_clock
++                .measure(async {
++                    Ok::<_, anyhow::Error>(match &routed.emscripten_graph {
++                        Some(graph) => {
++                            let instances =
++                                instantiate_generated_emscripten_graph(&linker, &mut store, graph)
++                                    .await?;
++                            (
++                                instances.modules[0],
++                                "convex_wasm_graph_select_entry",
++                                Some((instances, graph.initialization.clone())),
 +                            )
-+                            .await?,
-+                        ),
-+                        None => None,
-+                    };
-+                    let instance = linker
-+                        .instantiate_async(&mut store, &routed.module)
-+                        .await
-+                        .map_err(wasmtime_anyhow)?;
-+                    if let (Some(graph), Some(instances)) =
-+                        (&routed.graph, graph_instances.as_ref())
-+                    {
-+                        validate_generated_graph_instance_layout(
-+                            &mut store,
-+                            instances,
-+                            &graph.layout,
-+                        )?;
-+                    }
-+                    (instance, "convex_wasm_select_entry", None)
-+                },
-+            };
++                        },
++                        None => {
++                            let graph_instances = match &routed.graph {
++                                Some(graph) => Some(
++                                    instantiate_generated_graph_dependencies(
++                                        &mut linker,
++                                        &mut store,
++                                        graph,
++                                    )
++                                    .await?,
++                                ),
++                                None => None,
++                            };
++                            let instance = linker
++                                .instantiate_async(&mut store, &routed.module)
++                                .await
++                                .map_err(wasmtime_anyhow)?;
++                            if let (Some(graph), Some(instances)) =
++                                (&routed.graph, graph_instances.as_ref())
++                            {
++                                validate_generated_graph_instance_layout(
++                                    &mut store,
++                                    instances,
++                                    &graph.layout,
++                                )?;
++                            }
++                            (instance, "convex_wasm_select_entry", None)
++                        },
++                    })
++                })
++                .await?;
 +            let initialize = instance
 +                .get_typed_func::<(), ()>(&mut store, "_initialize")
 +                .map_err(wasmtime_anyhow)?;
@@ -116977,6 +116995,7 @@ index 0000000000000000000000000000000000000000..c556c3a3ddd98576e5e021884a1344fb
 +        Ok(GeneratedLifecycleBarrierOutcome::Continue) => {
 +            let initialization_started = initialize.is_some();
 +            let call_result = {
++                let cpu_clock = reusable_instance.store.data().wasi_cpu_clock.clone();
 +                let call = async {
 +                    let preparation_timer = GatePhaseTimer::new(
 +                        GATE_PHASE_GUEST_INITIALIZATION_SELECTED_ENTRY_PREPARATION,
@@ -117318,6 +117337,7 @@ index 0000000000000000000000000000000000000000..c556c3a3ddd98576e5e021884a1344fb
 +                    }
 +                    result
 +                };
++                let call = cpu_clock.measure(call);
 +                tokio::pin!(call);
 +                tokio::select! {
 +                    biased;
@@ -122584,24 +122604,31 @@ index 0000000000000000000000000000000000000000..36cacd754f1d586ad382bb7cff6422e1
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/wasi_clock_tests.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/wasi_clock_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..7267e6be6581f6912b725a721eb0a7b0070637f8
+index 0000000000000000000000000000000000000000..ab214db9520be8a8e23382b2f73886018b74002b
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/wasi_clock_tests.rs
-@@ -0,0 +1,769 @@
+@@ -0,0 +1,779 @@
 +use wasm_encoder::MemArg as EncodedMemArg;
 +
 +use super::*;
 +
 +const CLOCK_RESULT_POINTER: i32 = 32;
 +const SECOND_CLOCK_RESULT_POINTER: i32 = 40;
-+const PERSISTED_MONOTONIC_POINTER: i32 = 48;
-+const PERSISTED_MONOTONIC_INITIALIZED_POINTER: i32 = 56;
++const PERSISTED_ELAPSED_POINTER: i32 = 48;
++const PERSISTED_ELAPSED_INITIALIZED_POINTER: i32 = 56;
 +const UNSUPPORTED_CLOCK_SENTINEL: i64 = 0x5a5a;
 +
 +enum WasiClockTestOperation {
-+    RealtimeAcrossSuspension { expected_timestamp_nanos: u64 },
-+    MonotonicAcrossSuspension { realtime_timestamp_nanos: u64 },
-+    MonotonicAcrossReusedInvocation,
++    RealtimeAcrossSuspension {
++        expected_timestamp_nanos: u64,
++    },
++    ElapsedAcrossSuspension {
++        clock_id: i32,
++        realtime_timestamp_nanos: u64,
++    },
++    ElapsedAcrossReusedInvocation {
++        clock_id: i32,
++    },
 +    CpuAndUnsupportedClockIds,
 +}
 +
@@ -122712,7 +122739,7 @@ index 0000000000000000000000000000000000000000..7267e6be6581f6912b725a721eb0a7b0
 +        align: 3,
 +        memory_index: 0,
 +    };
-+    let persisted_monotonic_initialized = EncodedMemArg {
++    let persisted_elapsed_initialized = EncodedMemArg {
 +        offset: 0,
 +        align: 2,
 +        memory_index: 0,
@@ -122785,12 +122812,13 @@ index 0000000000000000000000000000000000000000..7267e6be6581f6912b725a721eb0a7b0
 +            run.instruction(&EncodedInstruction::Return);
 +            run.instruction(&EncodedInstruction::End);
 +        },
-+        WasiClockTestOperation::MonotonicAcrossSuspension {
++        WasiClockTestOperation::ElapsedAcrossSuspension {
++            clock_id,
 +            realtime_timestamp_nanos,
 +        } => {
 +            let realtime_timestamp_nanos = i64::try_from(realtime_timestamp_nanos)
 +                .expect("test invocation timestamp exceeds signed Wasm i64");
-+            run.instruction(&EncodedInstruction::I32Const(WASI_CLOCK_ID_MONOTONIC));
++            run.instruction(&EncodedInstruction::I32Const(clock_id));
 +            run.instruction(&EncodedInstruction::I64Const(0));
 +            run.instruction(&EncodedInstruction::I32Const(CLOCK_RESULT_POINTER));
 +            run.instruction(&EncodedInstruction::Call(5));
@@ -122829,7 +122857,7 @@ index 0000000000000000000000000000000000000000..7267e6be6581f6912b725a721eb0a7b0
 +            run.instruction(&EncodedInstruction::LocalGet(0));
 +            run.instruction(&EncodedInstruction::Call(2));
 +
-+            run.instruction(&EncodedInstruction::I32Const(WASI_CLOCK_ID_MONOTONIC));
++            run.instruction(&EncodedInstruction::I32Const(clock_id));
 +            run.instruction(&EncodedInstruction::I64Const(0));
 +            run.instruction(&EncodedInstruction::I32Const(CLOCK_RESULT_POINTER));
 +            run.instruction(&EncodedInstruction::Call(5));
@@ -122859,13 +122887,11 @@ index 0000000000000000000000000000000000000000..7267e6be6581f6912b725a721eb0a7b0
 +            run.instruction(&EncodedInstruction::Return);
 +            run.instruction(&EncodedInstruction::End);
 +        },
-+        WasiClockTestOperation::MonotonicAcrossReusedInvocation => {
++        WasiClockTestOperation::ElapsedAcrossReusedInvocation { clock_id } => {
 +            run.instruction(&EncodedInstruction::I32Const(
-+                PERSISTED_MONOTONIC_INITIALIZED_POINTER,
++                PERSISTED_ELAPSED_INITIALIZED_POINTER,
 +            ));
-+            run.instruction(&EncodedInstruction::I32Load(
-+                persisted_monotonic_initialized,
-+            ));
++            run.instruction(&EncodedInstruction::I32Load(persisted_elapsed_initialized));
 +            run.instruction(&EncodedInstruction::I32Eqz);
 +            run.instruction(&EncodedInstruction::If(EncodedBlockType::Empty));
 +            run.instruction(&EncodedInstruction::I32Const(1));
@@ -122884,7 +122910,7 @@ index 0000000000000000000000000000000000000000..7267e6be6581f6912b725a721eb0a7b0
 +            run.instruction(&EncodedInstruction::LocalGet(0));
 +            run.instruction(&EncodedInstruction::Call(2));
 +
-+            run.instruction(&EncodedInstruction::I32Const(WASI_CLOCK_ID_MONOTONIC));
++            run.instruction(&EncodedInstruction::I32Const(clock_id));
 +            run.instruction(&EncodedInstruction::I64Const(0));
 +            run.instruction(&EncodedInstruction::I32Const(CLOCK_RESULT_POINTER));
 +            run.instruction(&EncodedInstruction::Call(5));
@@ -122896,19 +122922,17 @@ index 0000000000000000000000000000000000000000..7267e6be6581f6912b725a721eb0a7b0
 +            run.instruction(&EncodedInstruction::I32Const(2));
 +            run.instruction(&EncodedInstruction::Return);
 +            run.instruction(&EncodedInstruction::End);
-+            run.instruction(&EncodedInstruction::I32Const(PERSISTED_MONOTONIC_POINTER));
++            run.instruction(&EncodedInstruction::I32Const(PERSISTED_ELAPSED_POINTER));
 +            run.instruction(&EncodedInstruction::I32Const(CLOCK_RESULT_POINTER));
 +            run.instruction(&EncodedInstruction::I64Load(clock_result));
 +            run.instruction(&EncodedInstruction::I64Store(clock_result));
 +            run.instruction(&EncodedInstruction::I32Const(
-+                PERSISTED_MONOTONIC_INITIALIZED_POINTER,
++                PERSISTED_ELAPSED_INITIALIZED_POINTER,
 +            ));
 +            run.instruction(&EncodedInstruction::I32Const(1));
-+            run.instruction(&EncodedInstruction::I32Store(
-+                persisted_monotonic_initialized,
-+            ));
++            run.instruction(&EncodedInstruction::I32Store(persisted_elapsed_initialized));
 +            run.instruction(&EncodedInstruction::Else);
-+            run.instruction(&EncodedInstruction::I32Const(WASI_CLOCK_ID_MONOTONIC));
++            run.instruction(&EncodedInstruction::I32Const(clock_id));
 +            run.instruction(&EncodedInstruction::I64Const(0));
 +            run.instruction(&EncodedInstruction::I32Const(CLOCK_RESULT_POINTER));
 +            run.instruction(&EncodedInstruction::Call(5));
@@ -122923,7 +122947,7 @@ index 0000000000000000000000000000000000000000..7267e6be6581f6912b725a721eb0a7b0
 +            run.instruction(&EncodedInstruction::I32Const(CLOCK_RESULT_POINTER));
 +            run.instruction(&EncodedInstruction::I64Load(clock_result));
 +            run.instruction(&EncodedInstruction::LocalSet(2));
-+            run.instruction(&EncodedInstruction::I32Const(PERSISTED_MONOTONIC_POINTER));
++            run.instruction(&EncodedInstruction::I32Const(PERSISTED_ELAPSED_POINTER));
 +            run.instruction(&EncodedInstruction::I64Load(clock_result));
 +            run.instruction(&EncodedInstruction::LocalSet(3));
 +            run.instruction(&EncodedInstruction::LocalGet(2));
@@ -123074,181 +123098,187 @@ index 0000000000000000000000000000000000000000..7267e6be6581f6912b725a721eb0a7b0
 +    assert!(realtime.invocation.observed_time);
 +    drop(realtime.invocation.transaction);
 +
-+    let monotonic_routed = generated_test_routed_module_from_bytes(
-+        Arc::clone(&manifest),
-+        wasi_clock_test_module(WasiClockTestOperation::MonotonicAcrossSuspension {
-+            realtime_timestamp_nanos: expected_timestamp_nanos,
-+        }),
-+    )?;
-+    let (control, mut host) = read_control();
-+    let mut monotonic_state = generated_test_state(
-+        rt.clone(),
-+        database.begin_system().await?,
-+        Arc::clone(&manifest),
-+        json!({ "id": id.encode() }),
-+        UdfType::Query,
-+        invocation_timestamp,
-+        CancellationSignal::new_for_test(),
-+        Some(control),
-+        Arc::new(GateMetrics::default()),
-+        None,
-+    )
-+    .await?;
-+    arm_generated_timeout(
-+        rt.clone(),
-+        &mut monotonic_state,
-+        Duration::from_secs(5),
-+        *DATABASE_UDF_SYSTEM_TIMEOUT,
-+    )?;
-+    let execution = tokio::spawn(execute_generated(
-+        Arc::clone(&monotonic_routed),
-+        monotonic_state,
-+        None,
-+        false,
-+    ));
-+    tokio::time::timeout(Duration::from_secs(5), &mut host.entered)
-+        .await
-+        .context("WASI monotonic test database read did not suspend")??;
-+    tokio::time::sleep(Duration::from_millis(10)).await;
-+    host.release
-+        .take()
-+        .context("WASI monotonic test database read release missing")?
-+        .send(())
-+        .map_err(|_| anyhow::anyhow!("WASI monotonic test database read already completed"))?;
-+    let monotonic = tokio::time::timeout(Duration::from_secs(5), execution)
-+        .await
-+        .context("WASI monotonic test did not resume")???;
-+    assert_eq!(monotonic.invocation.outcome, InvocationOutcome::Success);
-+    assert_eq!(monotonic.invocation.function_result, Some(json!(1.0)));
-+    assert!(!monotonic.invocation.observed_time);
-+    drop(monotonic.invocation.transaction);
++    for clock_id in [WASI_CLOCK_ID_MONOTONIC, WASI_CLOCK_ID_THREAD_CPUTIME] {
++        if clock_id == WASI_CLOCK_ID_THREAD_CPUTIME
++            && crate::execution_observation::thread_cpu().is_none()
++        {
++            continue;
++        }
++        let elapsed_routed = generated_test_routed_module_from_bytes(
++            Arc::clone(&manifest),
++            wasi_clock_test_module(WasiClockTestOperation::ElapsedAcrossSuspension {
++                clock_id,
++                realtime_timestamp_nanos: expected_timestamp_nanos,
++            }),
++        )?;
++        let (control, mut host) = read_control();
++        let mut elapsed_state = generated_test_state(
++            rt.clone(),
++            database.begin_system().await?,
++            Arc::clone(&manifest),
++            json!({ "id": id.encode() }),
++            UdfType::Query,
++            invocation_timestamp,
++            CancellationSignal::new_for_test(),
++            Some(control),
++            Arc::new(GateMetrics::default()),
++            None,
++        )
++        .await?;
++        arm_generated_timeout(
++            rt.clone(),
++            &mut elapsed_state,
++            Duration::from_secs(5),
++            *DATABASE_UDF_SYSTEM_TIMEOUT,
++        )?;
++        let execution = tokio::spawn(execute_generated(
++            Arc::clone(&elapsed_routed),
++            elapsed_state,
++            None,
++            false,
++        ));
++        tokio::time::timeout(Duration::from_secs(5), &mut host.entered)
++            .await
++            .context("WASI elapsed clock test database read did not suspend")??;
++        tokio::time::sleep(Duration::from_millis(10)).await;
++        host.release
++            .take()
++            .context("WASI elapsed clock test database read release missing")?
++            .send(())
++            .map_err(|_| {
++                anyhow::anyhow!("WASI elapsed clock test database read already completed")
++            })?;
++        let elapsed = tokio::time::timeout(Duration::from_secs(5), execution)
++            .await
++            .context("WASI elapsed clock test did not resume")???;
++        assert_eq!(elapsed.invocation.outcome, InvocationOutcome::Success);
++        assert_eq!(elapsed.invocation.function_result, Some(json!(1.0)));
++        assert!(!elapsed.invocation.observed_time);
++        drop(elapsed.invocation.transaction);
 +
-+    let monotonic_reused_routed = generated_test_routed_module_from_bytes(
-+        Arc::clone(&manifest),
-+        wasi_clock_test_module(WasiClockTestOperation::MonotonicAcrossReusedInvocation),
-+    )?;
-+    let controller = Arc::clone(&route_configuration()?.generated_memory_controller);
-+    let route_identity = GeneratedRouteIdentity::Singleton {
-+        package_key: "generated-wasi-monotonic-reuse-test".to_owned(),
-+    };
-+    let (control, mut host) = read_control();
-+    let mut first_monotonic_state = generated_test_state(
-+        rt.clone(),
-+        database.begin_system().await?,
-+        Arc::clone(&manifest),
-+        json!({ "id": id.encode() }),
-+        UdfType::Query,
-+        invocation_timestamp,
-+        CancellationSignal::new_for_test(),
-+        Some(control),
-+        Arc::new(GateMetrics::default()),
-+        Some(GeneratedTestMemorySetup {
-+            controller: Arc::clone(&controller),
-+            route_identity: route_identity.clone(),
-+            existing_slot: None,
-+            values: None,
-+            maximum_guest_memory_bytes: 1 << 20,
-+        }),
-+    )
-+    .await?;
-+    arm_generated_timeout(
-+        rt.clone(),
-+        &mut first_monotonic_state,
-+        Duration::from_secs(5),
-+        *DATABASE_UDF_SYSTEM_TIMEOUT,
-+    )?;
-+    let execution = tokio::spawn(execute_generated(
-+        Arc::clone(&monotonic_reused_routed),
-+        first_monotonic_state,
-+        None,
-+        true,
-+    ));
-+    tokio::time::timeout(Duration::from_secs(5), &mut host.entered)
-+        .await
-+        .context("WASI reused monotonic test database read did not suspend")??;
-+    tokio::time::sleep(Duration::from_millis(10)).await;
-+    host.release
-+        .take()
-+        .context("WASI reused monotonic test database read release missing")?
-+        .send(())
-+        .map_err(|_| {
-+            anyhow::anyhow!("WASI reused monotonic test database read already completed")
-+        })?;
-+    let mut first_monotonic = tokio::time::timeout(Duration::from_secs(5), execution)
-+        .await
-+        .context("WASI reused monotonic first invocation did not resume")???;
-+    assert_eq!(
-+        first_monotonic.invocation.outcome,
-+        InvocationOutcome::Success
-+    );
-+    assert_eq!(first_monotonic.invocation.function_result, Some(json!(1.0)));
-+    assert!(!first_monotonic.invocation.observed_time);
-+    let reusable_instance = first_monotonic
-+        .reusable_instance
-+        .take()
-+        .context("WASI monotonic first invocation was not retained")?;
-+    let memory_permit = first_monotonic
-+        .memory_permit
-+        .take()
-+        .context("WASI monotonic first invocation lost its memory permit")?;
-+    let memory_slot_id = memory_permit.slot_id();
-+    drop(first_monotonic.invocation.transaction);
-+    memory_permit.finish(TerminalMemoryOutcome::Success, true);
-+
-+    let mut second_monotonic_state = generated_test_state(
-+        rt.clone(),
-+        database.begin_system().await?,
-+        Arc::clone(&manifest),
-+        json!({ "id": id.encode() }),
-+        UdfType::Query,
-+        invocation_timestamp,
-+        CancellationSignal::new_for_test(),
-+        None,
-+        Arc::new(GateMetrics::default()),
-+        Some(GeneratedTestMemorySetup {
-+            controller,
-+            route_identity,
-+            existing_slot: Some(memory_slot_id),
-+            values: None,
-+            maximum_guest_memory_bytes: 1 << 20,
-+        }),
-+    )
-+    .await?;
-+    arm_generated_timeout(
-+        rt.clone(),
-+        &mut second_monotonic_state,
-+        Duration::from_secs(5),
-+        *DATABASE_UDF_SYSTEM_TIMEOUT,
-+    )?;
-+    let mut second_monotonic = execute_generated(
-+        monotonic_reused_routed,
-+        second_monotonic_state,
-+        Some(reusable_instance),
-+        true,
-+    )
-+    .await?;
-+    assert_eq!(
-+        second_monotonic.invocation.outcome,
-+        InvocationOutcome::Success
-+    );
-+    assert_eq!(
-+        second_monotonic.invocation.function_result,
-+        Some(json!(1.0))
-+    );
-+    assert!(!second_monotonic.invocation.observed_time);
-+    drop(second_monotonic.invocation.transaction);
-+    discard_generated_instance(
-+        second_monotonic
++        let elapsed_reused_routed = generated_test_routed_module_from_bytes(
++            Arc::clone(&manifest),
++            wasi_clock_test_module(WasiClockTestOperation::ElapsedAcrossReusedInvocation {
++                clock_id,
++            }),
++        )?;
++        let controller = Arc::clone(&route_configuration()?.generated_memory_controller);
++        let route_identity = GeneratedRouteIdentity::Singleton {
++            package_key: format!("generated-wasi-elapsed-reuse-test-{clock_id}"),
++        };
++        let (control, mut host) = read_control();
++        let mut first_elapsed_state = generated_test_state(
++            rt.clone(),
++            database.begin_system().await?,
++            Arc::clone(&manifest),
++            json!({ "id": id.encode() }),
++            UdfType::Query,
++            invocation_timestamp,
++            CancellationSignal::new_for_test(),
++            Some(control),
++            Arc::new(GateMetrics::default()),
++            Some(GeneratedTestMemorySetup {
++                controller: Arc::clone(&controller),
++                route_identity: route_identity.clone(),
++                existing_slot: None,
++                values: None,
++                maximum_guest_memory_bytes: 1 << 20,
++            }),
++        )
++        .await?;
++        arm_generated_timeout(
++            rt.clone(),
++            &mut first_elapsed_state,
++            Duration::from_secs(5),
++            *DATABASE_UDF_SYSTEM_TIMEOUT,
++        )?;
++        let execution = tokio::spawn(execute_generated(
++            Arc::clone(&elapsed_reused_routed),
++            first_elapsed_state,
++            None,
++            true,
++        ));
++        tokio::time::timeout(Duration::from_secs(5), &mut host.entered)
++            .await
++            .context("WASI reused elapsed test database read did not suspend")??;
++        tokio::time::sleep(Duration::from_millis(10)).await;
++        host.release
++            .take()
++            .context("WASI reused elapsed test database read release missing")?
++            .send(())
++            .map_err(|_| {
++                anyhow::anyhow!("WASI reused elapsed test database read already completed")
++            })?;
++        let mut first_elapsed = tokio::time::timeout(Duration::from_secs(5), execution)
++            .await
++            .context("WASI reused elapsed first invocation did not resume")???;
++        assert_eq!(first_elapsed.invocation.outcome, InvocationOutcome::Success);
++        assert_eq!(first_elapsed.invocation.function_result, Some(json!(1.0)));
++        assert!(!first_elapsed.invocation.observed_time);
++        let reusable_instance = first_elapsed
 +            .reusable_instance
 +            .take()
-+            .context("WASI monotonic second invocation was not retained")?,
-+    )
-+    .await?;
-+    second_monotonic
-+        .memory_permit
-+        .take()
-+        .context("WASI monotonic second invocation lost its memory permit")?
-+        .finish(TerminalMemoryOutcome::Success, false);
++            .context("WASI elapsed first invocation was not retained")?;
++        let memory_permit = first_elapsed
++            .memory_permit
++            .take()
++            .context("WASI elapsed first invocation lost its memory permit")?;
++        let memory_slot_id = memory_permit.slot_id();
++        drop(first_elapsed.invocation.transaction);
++        memory_permit.finish(TerminalMemoryOutcome::Success, true);
++
++        let mut second_elapsed_state = generated_test_state(
++            rt.clone(),
++            database.begin_system().await?,
++            Arc::clone(&manifest),
++            json!({ "id": id.encode() }),
++            UdfType::Query,
++            invocation_timestamp,
++            CancellationSignal::new_for_test(),
++            None,
++            Arc::new(GateMetrics::default()),
++            Some(GeneratedTestMemorySetup {
++                controller,
++                route_identity,
++                existing_slot: Some(memory_slot_id),
++                values: None,
++                maximum_guest_memory_bytes: 1 << 20,
++            }),
++        )
++        .await?;
++        arm_generated_timeout(
++            rt.clone(),
++            &mut second_elapsed_state,
++            Duration::from_secs(5),
++            *DATABASE_UDF_SYSTEM_TIMEOUT,
++        )?;
++        let mut second_elapsed = execute_generated(
++            elapsed_reused_routed,
++            second_elapsed_state,
++            Some(reusable_instance),
++            true,
++        )
++        .await?;
++        assert_eq!(
++            second_elapsed.invocation.outcome,
++            InvocationOutcome::Success
++        );
++        assert_eq!(second_elapsed.invocation.function_result, Some(json!(1.0)));
++        assert!(!second_elapsed.invocation.observed_time);
++        drop(second_elapsed.invocation.transaction);
++        discard_generated_instance(
++            second_elapsed
++                .reusable_instance
++                .take()
++                .context("WASI elapsed second invocation was not retained")?,
++        )
++        .await?;
++        second_elapsed
++            .memory_permit
++            .take()
++            .context("WASI elapsed second invocation lost its memory permit")?
++            .finish(TerminalMemoryOutcome::Success, false);
++    }
 +
 +    let unsupported_routed = generated_test_routed_module_from_bytes(
 +        Arc::clone(&manifest),
@@ -123356,6 +123386,205 @@ index 0000000000000000000000000000000000000000..7267e6be6581f6912b725a721eb0a7b0
 +            block_rt.block_on("generated_wasm_wasi_clock", run_wasi_clock_tests(rt))
 +        },
 +    )
++}
+diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/wasi_cpu_clock.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/wasi_cpu_clock.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..71e582ccfebab9016c9aeb9af71ad07e4833d7aa
+--- /dev/null
++++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/wasi_cpu_clock.rs
+@@ -0,0 +1,193 @@
++use std::{
++    future::{
++        poll_fn,
++        Future,
++    },
++    pin::pin,
++    sync::Arc,
++};
++
++use parking_lot::Mutex;
++
++use crate::execution_observation::thread_cpu;
++
++/// A guest thread can move between executor threads at an epoch yield,
++/// including in the middle of a synchronous GC section. Accumulate CPU within
++/// each poll; executor-thread clocks cannot be compared across those suspension
++/// boundaries.
++#[derive(Clone)]
++pub(super) struct WasiCpuClock(Arc<Mutex<ClockState>>);
++
++struct ClockState {
++    elapsed: Option<u64>,
++    poll_started: Option<u64>,
++    polling: bool,
++}
++
++impl Default for WasiCpuClock {
++    fn default() -> Self {
++        Self(Arc::new(Mutex::new(ClockState {
++            elapsed: Some(0),
++            poll_started: None,
++            polling: false,
++        })))
++    }
++}
++
++impl ClockState {
++    fn current(&self) -> Option<u64> {
++        let elapsed = self.elapsed?;
++        let started = self.poll_started?;
++        let delta = thread_cpu()?
++            .checked_sub(started)
++            .expect("thread CPU clock regressed within a poll");
++        Some(elapsed.checked_add(delta).expect("WASI CPU clock overflow"))
++    }
++}
++
++impl WasiCpuClock {
++    /// An unavailable platform clock or a call outside a metered guest poll has
++    /// no CPU reading. The WASI boundary reports NOTSUP for those cases.
++    pub(super) fn current(&self) -> Option<u64> {
++        self.0.lock().current()
++    }
++
++    pub(super) async fn measure<T>(&self, future: impl Future<Output = T>) -> T {
++        let mut future = pin!(future);
++        poll_fn(|context| {
++            {
++                let mut state = self.0.lock();
++                assert!(!state.polling, "nested polls of the same WASI CPU clock");
++                state.poll_started = thread_cpu();
++                state.polling = true;
++            }
++            let _poll = ClockPoll(self);
++            future.as_mut().poll(context)
++        })
++        .await
++    }
++}
++
++struct ClockPoll<'a>(&'a WasiCpuClock);
++
++impl Drop for ClockPoll<'_> {
++    fn drop(&mut self) {
++        let mut state = self.0 .0.lock();
++        assert!(state.polling, "WASI CPU clock poll was not active");
++        state.elapsed = state.current();
++        state.poll_started = None;
++        state.polling = false;
++    }
++}
++
++#[cfg(all(test, target_os = "linux"))]
++mod tests {
++    use std::{
++        task::{
++            Context,
++            Poll,
++            Waker,
++        },
++        thread,
++    };
++
++    use super::*;
++
++    fn consume_cpu(nanos: u64) {
++        let started = thread_cpu().expect("Linux thread CPU clock");
++        while thread_cpu().unwrap() - started < nanos {
++            std::hint::spin_loop();
++        }
++    }
++
++    #[test]
++    fn wasi_cpu_clock_survives_executor_migration() {
++        let clock = WasiCpuClock::default();
++        let guest_clock = clock.clone();
++        let mut future = Box::pin(async move {
++            guest_clock
++                .measure(async {
++                    let before = clock.current().unwrap();
++                    let raw_before = thread_cpu().unwrap();
++                    let mut yielded = false;
++                    poll_fn(|_| {
++                        if yielded {
++                            Poll::Ready(())
++                        } else {
++                            yielded = true;
++                            Poll::Pending
++                        }
++                    })
++                    .await;
++                    consume_cpu(2_000_000);
++                    (
++                        before,
++                        clock.current().unwrap(),
++                        raw_before,
++                        thread_cpu().unwrap(),
++                    )
++                })
++                .await
++        });
++        let future = thread::spawn(move || {
++            consume_cpu(30_000_000);
++            assert!(future
++                .as_mut()
++                .poll(&mut Context::from_waker(Waker::noop()))
++                .is_pending());
++            // CPU spent on unrelated work while this guest is suspended must
++            // not enter its clock, even on the same executor thread.
++            consume_cpu(30_000_000);
++            future
++        })
++        .join()
++        .unwrap();
++        let (before, after, raw_before, raw_after) = thread::spawn(move || {
++            let mut future = future;
++            match future
++                .as_mut()
++                .poll(&mut Context::from_waker(Waker::noop()))
++            {
++                Poll::Ready(result) => result,
++                Poll::Pending => panic!("guest did not resume"),
++            }
++        })
++        .join()
++        .unwrap();
++        assert!(
++            raw_after < raw_before,
++            "raw executor clocks must expose the regression"
++        );
++        assert!(after >= before + 2_000_000);
++        assert!(
++            after - before < 30_000_000,
++            "suspended CPU entered the guest clock"
++        );
++    }
++
++    #[test]
++    fn wasi_cpu_clock_retains_only_polled_time_after_cancellation() {
++        let clock = WasiCpuClock::default();
++        let mut pending = Box::pin(clock.measure(async {
++            consume_cpu(2_000_000);
++            std::future::pending::<()>().await;
++        }));
++        assert!(pending
++            .as_mut()
++            .poll(&mut Context::from_waker(Waker::noop()))
++            .is_pending());
++        drop(pending);
++        assert!(clock.current().is_none());
++        consume_cpu(30_000_000);
++        let mut next = pin!(clock.measure(async { clock.current().unwrap() }));
++        let elapsed = match next.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
++            Poll::Ready(elapsed) => elapsed,
++            Poll::Pending => panic!("clock read suspended"),
++        };
++        assert!(elapsed >= 2_000_000);
++        assert!(
++            elapsed < 30_000_000,
++            "idle executor CPU entered the retained clock"
++        );
++    }
 +}
 diff --git a/crates/isolate/src/environment/udf/syscall.rs b/crates/isolate/src/environment/udf/syscall.rs
 index 129e01d3c538992423b2e99154f99829fa7e1bff..647be70e6d4ed1ce5dad5472b6302275e285617b 100644
@@ -168023,10 +168252,10 @@ index 0000000000000000000000000000000000000000..b3f0a1e5b5812b21c9de870931c6f0f7
 +inputs.
 diff --git a/patches/static_hermes_wasm_udfs/operations.md b/patches/static_hermes_wasm_udfs/operations.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..c1f1647b35fe3b3adee1f414fed447c001013bf0
+index 0000000000000000000000000000000000000000..382be359e36254f33ced84576d5bf07dbec65a1f
 --- /dev/null
 +++ b/patches/static_hermes_wasm_udfs/operations.md
-@@ -0,0 +1,760 @@
+@@ -0,0 +1,765 @@
 +# Static Hermes Wasm UDF Operations and Validation
 +
 +This is a generic self-hosted adoption guide for the
@@ -168480,7 +168709,12 @@ index 0000000000000000000000000000000000000000..c1f1647b35fe3b3adee1f414fed447c0
 +observed synchronous callbacks; they do not measure background worker CPU.
 +Hermes heap counters cover the handler and cleanup, excluding preparation, and
 +can be absent after a trap. GC CPU uses the WASI thread CPU clock for synchronous
-+collection sections; `gcCpuNanos` is absent on hosts without that clock.
++collection sections; `gcCpuNanos` is absent on hosts without that clock. The WASI
++CPU clock accumulates synchronous poll CPU for the retained guest Store. Epoch
++yields can suspend a GC section and resume it on another executor thread, so raw
++executor-thread lifetime clocks must not be exposed to the guest. Suspended time
++and unrelated executor work are excluded, and pooled invocation reuse retains the
++clock's accumulated value.
 +GC spans are included in enclosing execution time;
 +do not add them again. The collectors' counts and CPU scopes differ.
 +
