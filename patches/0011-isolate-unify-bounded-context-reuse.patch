@@ -16,50 +16,77 @@ Add optional capacity-aware idle placement without increasing ownership budgets.
 Keep MRU growth placement but spread probationary replacements across older idle caches when capacity placement is enabled. Observe selected and best available retention classes under both policies with bounded labels, without reserving tokens or changing ownership budgets. Document cold-scan tradeoffs and extend cache replay and scheduler-affinity coverage.
 
 Prefer the most recently completed empty same-client idle cache for non-reusing V8 and HTTP actions. Separate fresh contexts prevent resident replacement, but an action still makes saved contexts inaccessible while it holds their worker. Preserve MRU fallback and all worker, dependency, and cache ownership bounds; never create workers or wait for cache diversity. Count accepted placement observations with bounded labels and document idle-expiration and memory tradeoffs.
+
+Support fixed initialization groups for opted-in database entry modules. Carry
+an optional canonical dependency-module path through analysis, persistence and
+validated requests, then use it consistently for cache lookup, publication and
+scheduler affinity. Cold initialization loads the entire fixed graph inside
+the existing read-snooping boundary; warm calls cannot add new members.
+
+Keep invocation identity, request state, execution-kind permissions, component
+boundaries and action keys unchanged. Older consumers retain per-entry reuse.
+Validate canonical initializer paths and cover protocol permission boundaries,
+cross-entry execution and invalidation of members that were never called.
 ---
+ Cargo.lock                                    |    1 +
  .../src/application_function_runner/mod.rs    |  179 +-
  crates/application/src/lib.rs                 |    1 +
  crates/application/src/runtime_diagnostics.rs |  204 ++
  crates/common/src/knobs.rs                    |  146 ++
  crates/common/src/memory_pressure.rs          |   58 +-
  .../src/in_process_function_runner.rs         |   46 +-
- crates/isolate/src/client.rs                  |  899 ++++++-
- crates/isolate/src/context_cache.rs           | 2136 ++++++++++++++++-
+ crates/isolate/Cargo.toml                     |    2 +
+ crates/isolate/src/client.rs                  |  912 ++++++-
+ crates/isolate/src/context_cache.rs           | 2140 ++++++++++++++++-
  crates/isolate/src/environment/action/mod.rs  |  457 +++-
  .../isolate/src/environment/action/phase.rs   |  193 +-
- crates/isolate/src/environment/analyze.rs     |   37 +-
- crates/isolate/src/environment/udf/mod.rs     |  403 ++--
+ crates/isolate/src/environment/analyze.rs     |  126 +-
+ .../environment/udf/context_reuse_tests.rs    |  373 +++
+ crates/isolate/src/environment/udf/mod.rs     |  459 ++--
  crates/isolate/src/execution_observation.rs   |  678 ++++++
  crates/isolate/src/isolate.rs                 |   41 +-
  crates/isolate/src/isolate_worker.rs          |  112 +-
  crates/isolate/src/lib.rs                     |    1 +
  crates/isolate/src/metrics.rs                 |  483 +++-
  crates/isolate/src/request_scope.rs           |   32 +
- crates/isolate/src/strings.rs                 |    4 +
+ crates/isolate/src/strings.rs                 |    5 +
  crates/isolate/src/termination.rs             |    3 +
  crates/isolate/src/timeout.rs                 |  151 ++
  crates/local_backend/src/lib.rs               |    3 +-
- crates/model/src/modules/module_versions.rs   |  186 +-
- crates/node_executor/src/executor.rs          |    2 +-
- crates/pb/protos/common.proto                 |   15 +
+ crates/model/src/modules/module_versions.rs   |  222 +-
+ crates/node_executor/src/executor.rs          |    3 +-
+ crates/pb/protos/common.proto                 |   17 +
  crates/udf/src/execution_observation.rs       |  108 +
  crates/udf/src/lib.rs                         |    1 +
  crates/udf/src/metrics.rs                     |   32 +
- crates/udf/src/validation.rs                  |  316 ++-
+ crates/udf/src/validation.rs                  |  394 ++-
  patches/README.md                             |   54 +-
  patches/backend_memory_resilience/README.md   |   23 +-
- patches/context_reuse/README.md               |  195 ++
- patches/context_reuse/design_reference.md     |  187 ++
+ patches/context_reuse/README.md               |  222 ++
+ patches/context_reuse/design_reference.md     |  203 ++
  .../dependency_capacity/design_reference.md   |   17 +-
  self-hosted/advanced/knobs.md                 |   67 +-
  self-hosted/docker/docker-compose.yml         |    3 +-
- 36 files changed, 6944 insertions(+), 529 deletions(-)
+ 39 files changed, 7636 insertions(+), 536 deletions(-)
  create mode 100644 crates/application/src/runtime_diagnostics.rs
+ create mode 100644 crates/isolate/src/environment/udf/context_reuse_tests.rs
  create mode 100644 crates/isolate/src/execution_observation.rs
  create mode 100644 crates/udf/src/execution_observation.rs
  create mode 100644 patches/context_reuse/README.md
  create mode 100644 patches/context_reuse/design_reference.md
 
+diff --git a/Cargo.lock b/Cargo.lock
+index d539912e231621b0d46d328db927501ca5ba4092..ba45d255857abbd1347a64298ab1011cd0434b56 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5448,6 +5448,7 @@ dependencies = [
+  "serde_json",
+  "sha2 0.10.8",
+  "shape_inference",
++ "sqlite",
+  "slab",
+  "sourcemap",
+  "storage",
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
 index d2f516795f1eb848d3df6310ea2a068b881f8a63..5309043d8b099707824dfb959097359b9ffe3e75 100644
 --- a/crates/application/src/application_function_runner/mod.rs
@@ -948,8 +975,28 @@ index 6e25ae4e32a9feabc6095c58b2b450efef450e25..7e979d12e851894fa4839c9913c0eed0
          let isolate_worker = FunctionRunnerIsolateWorker::new(rt.clone(), isolate_config);
          let server = FunctionRunnerCore::new(rt, storage, max_percent_per_client, isolate_worker)?;
          Ok(Self {
+diff --git a/crates/isolate/Cargo.toml b/crates/isolate/Cargo.toml
+index 4ecb9c1f46319727a75506b59a333c2e83066067..615d6818c5e21ed824a23b386d14328b453b7f8b 100644
+--- a/crates/isolate/Cargo.toml
++++ b/crates/isolate/Cargo.toml
+@@ -145,6 +145,7 @@ divan = { workspace = true }
+ errors = { workspace = true, features = ["testing"] }
+ http-body-util = { workspace = true }
+ hyper = { workspace = true }
++indexing = { workspace = true, features = ["testing"] }
+ keybroker = { workspace = true, features = ["testing"] }
+ maplit = { workspace = true }
+ metrics = { workspace = true, features = ["testing"] }
+@@ -158,6 +159,7 @@ runtime = { workspace = true, features = ["testing"] }
+ search = { workspace = true, features = ["testing"] }
+ search_index_workers = { workspace = true, features = ["testing"] }
+ shape_inference = { workspace = true, features = ["testing"] }
++sqlite = { workspace = true }
+ storage = { workspace = true, features = ["testing"] }
+ udf = { workspace = true, features = ["testing"] }
+ usage_tracking = { workspace = true, features = ["testing"] }
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d660c939678 100644
+index 942bc9864157f71717552e1c9379ab5870edf772..e02c87d3928aabe4846ca23c5eb0a19dd28b970e 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -9,6 +9,7 @@ use std::{
@@ -1157,7 +1204,26 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
  }
  
  pub struct UdfRequest<RT: Runtime> {
-@@ -781,12 +907,45 @@ impl<RT: Runtime> Request<RT> {
+@@ -771,22 +897,60 @@ impl<RT: Runtime> Request<RT> {
+     }
+ 
+     pub fn module(&self) -> Option<CanonicalizedComponentModulePath> {
+-        let function_path = match &self.inner {
+-            RequestType::Udf { request, .. } => request.path_and_args.path(),
+-            RequestType::Action { request, .. } => request.params.path_and_args.path(),
+-            RequestType::HttpAction { request, .. } => request.http_module_path.path(),
++        let (function_path, initialization_module) = match &self.inner {
++            RequestType::Udf { request, .. } => (
++                request.path_and_args.path(),
++                request
++                    .path_and_args
++                    .context_initialization_module(request.udf_type),
++            ),
++            RequestType::Action { request, .. } => (request.params.path_and_args.path(), None),
++            RequestType::HttpAction { request, .. } => (request.http_module_path.path(), None),
+             RequestType::Analyze { .. }
+             | RequestType::EvaluateSchema { .. }
+             | RequestType::EvaluateAuthConfig { .. }
              | RequestType::EvaluateAppDefinitions { .. }
              | RequestType::EvaluateComponentInitializer { .. } => return None,
              #[cfg(test)]
@@ -1168,7 +1234,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
 -            component: function_path.component,
 -            module_path: function_path.udf_path.module().clone(),
 -        })
-+        Some(context_cache_key(function_path))
++        Some(context_cache_key(function_path, initialization_module))
 +    }
 +
 +    pub(crate) fn reusable_context_kind(&self) -> Option<ReusableContextKind> {
@@ -1208,7 +1274,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
      }
  
      fn scheduling_properties(
-@@ -820,6 +979,8 @@ impl<RT: Runtime> Request<RT> {
+@@ -820,6 +984,8 @@ impl<RT: Runtime> Request<RT> {
  pub enum RequestType<RT: Runtime> {
      Udf {
          request: UdfRequest<RT>,
@@ -1217,7 +1283,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          response: oneshot::Sender<anyhow::Result<(Transaction<RT>, FunctionOutcome)>>,
          queue_timer: Timer<VMHistogram>,
          rng_seed: [u8; 32],
-@@ -829,6 +990,8 @@ pub enum RequestType<RT: Runtime> {
+@@ -829,6 +995,8 @@ pub enum RequestType<RT: Runtime> {
      },
      Action {
          request: ActionRequest<RT>,
@@ -1226,7 +1292,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          response: oneshot::Sender<anyhow::Result<ActionOutcome>>,
          queue_timer: Timer<VMHistogram>,
          action_callbacks: Arc<dyn ActionCallbacks>,
-@@ -888,6 +1051,8 @@ pub enum RequestType<RT: Runtime> {
+@@ -888,6 +1056,8 @@ pub enum RequestType<RT: Runtime> {
          can_block_on_descendant: bool,
          is_isolate_action: bool,
          is_control_plane: bool,
@@ -1235,7 +1301,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          fail_worker: bool,
          started: mpsc::UnboundedSender<usize>,
          completion: oneshot::Receiver<()>,
-@@ -910,6 +1075,19 @@ impl<RT: Runtime> RequestType<RT> {
+@@ -910,6 +1080,19 @@ impl<RT: Runtime> RequestType<RT> {
              } => *is_control_plane,
          }
      }
@@ -1255,7 +1321,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
  }
  
  #[allow(async_fn_in_trait)]
-@@ -1134,16 +1312,29 @@ pub struct IsolateClient<RT: Runtime> {
+@@ -1134,16 +1317,29 @@ pub struct IsolateClient<RT: Runtime> {
  }
  
  impl<RT: Runtime> IsolateClient<RT> {
@@ -1289,7 +1355,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          anyhow::ensure!(
              *ISOLATE_QUEUE_SIZE > 0,
              "ISOLATE_QUEUE_SIZE must be greater than zero"
-@@ -1187,9 +1378,39 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1187,9 +1383,39 @@ impl<RT: Runtime> IsolateClient<RT> {
              *ANALYZE_CONCURRENCY,
          )?;
          let delay_control_config = (*ISOLATE_QUEUE_DELAY_CONTROL_ENABLED).then_some(queue_config);
@@ -1330,7 +1396,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
  
          initialize_v8();
          // NB: We don't call V8::Dispose or V8::ShutdownPlatform since we just assume a
-@@ -1275,7 +1496,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1275,7 +1501,11 @@ impl<RT: Runtime> IsolateClient<RT> {
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          let (tx, rx) = oneshot::channel();
@@ -1342,7 +1408,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
              request: UdfRequest {
                  path_and_args,
                  udf_type,
-@@ -1285,6 +1510,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1285,6 +1515,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                  context,
                  environment_data,
              },
@@ -1350,7 +1416,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
              response: tx,
              queue_timer: queue_timer(),
              rng_seed,
-@@ -1302,7 +1528,13 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1302,7 +1533,13 @@ impl<RT: Runtime> IsolateClient<RT> {
              EncodedSpan::from_parent(),
              scheduler_dependency,
          ))?;
@@ -1365,7 +1431,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
  
          Ok((tx, outcome))
      }
-@@ -1322,7 +1554,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1322,7 +1559,11 @@ impl<RT: Runtime> IsolateClient<RT> {
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
@@ -1377,7 +1443,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
              request: ActionRequest {
                  params: ActionRequestParams { path_and_args },
                  identity: transaction.identity().clone(),
-@@ -1330,6 +1566,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1330,6 +1571,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                  context,
                  environment_data,
              },
@@ -1385,7 +1451,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
              response: tx,
              queue_timer: queue_timer(),
              action_callbacks,
-@@ -1343,7 +1580,14 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1343,7 +1585,14 @@ impl<RT: Runtime> IsolateClient<RT> {
              EncodedSpan::from_parent(),
              scheduler_dependency,
          ))?;
@@ -1401,7 +1467,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
              Ok(outcome) => Ok(outcome),
              Err(e) => Err(recapture_stacktrace(e).await),
          }
-@@ -1754,8 +1998,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1754,8 +2003,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
      ) -> anyhow::Result<(Transaction<RT>, NestedUdfOutcome)> {
          let subquery_path = udf_request.path_and_args.path().clone();
          let (tx, rx) = oneshot::channel();
@@ -1415,7 +1481,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
              response: tx,
              queue_timer: queue_timer(),
              rng_seed,
-@@ -1777,7 +2026,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1777,7 +2031,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
              .ok()
              .context("scheduler shut down")?;
          metrics::log_scheduler_request_enqueued(self.pool_name, scheduling_properties.as_label());
@@ -1430,7 +1496,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          let outcome = match outcome {
              FunctionOutcome::Query(outcome) | FunctionOutcome::Mutation(outcome) => {
                  NestedUdfOutcome {
-@@ -1814,6 +2069,15 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -1814,6 +2074,15 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      worker: W,
      /// Vec of channels for sending work to individual workers.
      worker_senders: Vec<mpsc::Sender<IsolateWorkerRequest<RT>>>,
@@ -1446,7 +1512,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
      /// Map from client_id to stack of workers (implemented with a deque). The
      /// most recently used worker for a given client is at the front of the
      /// deque. These workers were previously used by this client, but may
-@@ -1866,6 +2130,14 @@ struct ActiveWorkerState {
+@@ -1866,6 +2135,14 @@ struct ActiveWorkerState {
      scheduling_properties: RequestSchedulingProperties,
  }
  
@@ -1461,7 +1527,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
  impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      pub fn new(
          rt: RT,
-@@ -1895,6 +2167,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1895,6 +2172,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              in_progress_counts_by_client: HashMap::new(),
              in_progress_counts: ActiveRequestCounts::default(),
              active_workers,
@@ -1470,7 +1536,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
              available_workers: HashMap::new(),
              max_workers,
              base_worker_capacity,
-@@ -1911,6 +2185,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1911,6 +2190,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          completed_worker: ActiveWorkerState,
          info: IdleWorkerInfo,
      ) {
@@ -1479,7 +1545,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          let new_count = match self
              .in_progress_counts_by_client
              .remove_entry(&completed_worker.client_id)
-@@ -2165,8 +2441,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2165,8 +2446,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      let dispatch_state = self.state_snapshot();
                      let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
                          && dispatch_state.dependency_dispatch_uses_reserve();
@@ -1496,7 +1562,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
                          Err(reason) => {
                              metrics::log_scheduler_request_rejected(
                                  self.worker.config().name,
-@@ -2189,6 +2471,28 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2189,6 +2476,28 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          self.worker.config().name,
                          scheduling_properties,
                      );
@@ -1525,7 +1591,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
                      if self.worker_senders[worker_id]
                          .try_send(IsolateWorkerRequest {
                              request,
-@@ -2206,6 +2510,50 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2206,6 +2515,50 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          );
                          return;
                      }
@@ -1576,7 +1642,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
                      if let Some((lane, sojourn)) = dispatch_sojourn {
                          metrics::log_isolate_queue_sojourn(
                              self.worker.config().name,
-@@ -2274,16 +2622,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2274,16 +2627,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  _ = &mut report_stats => {
                      let heap_stats = self.aggregate_heap_stats();
                      log_aggregated_heap_stats(&heap_stats);
@@ -1599,7 +1665,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
      /// `self.available_workers` state, so the caller is responsible for using
      /// the worker and returning it back to `self.available_workers` after it is
      /// done.
-@@ -2291,7 +2643,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2291,7 +2648,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          &mut self,
          request: &Request<RT>,
          state: &SchedulerStateSnapshot,
@@ -1608,7 +1674,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          let client_id = request.client_id.as_str();
          let eligibility = state.request_eligibility(
              request.scheduling_properties(self.control_plane_lane_enabled),
-@@ -2304,28 +2656,96 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2304,28 +2661,96 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              );
              return Err(reason);
          }
@@ -1721,7 +1787,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          }
          // If we've recently started up and haven't yet created `max_workers` threads,
          // create a new worker instead of "stealing" some other client's worker.
-@@ -2346,7 +2766,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2346,7 +2771,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  self.worker.config().name,
                  self.worker_senders.len() - 1
              );
@@ -1737,7 +1803,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          }
          // No existing worker for this client and we've already started the max number
          // of workers -- just grab the least recently used worker. This worker is least
-@@ -2370,13 +2797,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2370,13 +2802,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              .pop_back()
              .expect("Available worker map should never contain an empty list");
          log_worker_stolen(worker.last_used_ts.elapsed());
@@ -1761,7 +1827,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
      }
  
      fn aggregate_heap_stats(&self) -> IsolateHeapStats {
-@@ -2421,6 +2857,7 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2421,6 +2862,7 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
              max_user_timeout, ..
          } = self.config();
          let mut reqs = std::pin::pin!(ReceiverStream::new(reqs).peekable());
@@ -1769,7 +1835,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          let mut ready: Option<(oneshot::Sender<_>, ActiveRequestGuard)> = None;
          'recreate_isolate: loop {
              let mut last_client_id: Option<String> = None;
-@@ -2431,9 +2868,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2431,9 +2873,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                  *ISOLATE_MAX_USER_HEAP_SIZE,
              );
              isolate.set_heap_stats_handle(heap_stats.clone());
@@ -1786,7 +1852,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
                  context_cache.prepare(isolate.isolate());
                  // Check again whether the isolate has enough free heap memory
                  // before starting the next request
-@@ -2453,6 +2896,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2453,6 +2901,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                      });
                  }
                  tokio::select! {
@@ -1802,7 +1868,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
                      // If the isolate isn't "tainted", no need to wait for the idle timeout.
                      _ = self.rt().wait(*ISOLATE_IDLE_TIMEOUT), if last_client_id.is_some() => {
                          tracing::debug!("Restarting isolate for {last_client_id:?} due to idle timeout");
-@@ -2590,6 +3042,7 @@ mod tests {
+@@ -2590,6 +3047,7 @@ mod tests {
          collections::{
              BTreeMap,
              HashMap,
@@ -1810,7 +1876,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          },
          future::Future,
          pin::Pin,
-@@ -2609,7 +3062,9 @@ mod tests {
+@@ -2609,7 +3067,9 @@ mod tests {
      use ::metrics::IntoLabel as _;
      use common::{
          components::{
@@ -1820,7 +1886,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
              ComponentName,
          },
          fastrace_helpers::EncodedSpan,
-@@ -2624,6 +3079,7 @@ mod tests {
+@@ -2624,6 +3084,7 @@ mod tests {
          types::{
              ModuleEnvironment,
              SchedulerDependencyClass,
@@ -1828,7 +1894,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          },
      };
      use errors::ErrorMetadataAnyhowExt as _;
-@@ -2641,14 +3097,18 @@ mod tests {
+@@ -2641,14 +3102,18 @@ mod tests {
      };
  
      use super::{
@@ -1847,7 +1913,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          IsolateConfig,
          IsolateWorker,
          IsolateWorkerHandle,
-@@ -2663,14 +3123,22 @@ mod tests {
+@@ -2663,14 +3128,22 @@ mod tests {
          SharedIsolateScheduler,
      };
      use crate::{
@@ -1872,7 +1938,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
          ConcurrencyLimiter,
          ConcurrencyPermit,
      };
-@@ -2765,6 +3233,8 @@ mod tests {
+@@ -2765,6 +3238,8 @@ mod tests {
                          can_block_on_descendant: _,
                          is_isolate_action: _,
                          is_control_plane: _,
@@ -1881,7 +1947,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
                          fail_worker,
                          started,
                          completion,
-@@ -2875,6 +3345,8 @@ mod tests {
+@@ -2875,6 +3350,8 @@ mod tests {
              ),
              is_isolate_action: matches!(kind, TestRequestKind::Action),
              is_control_plane: matches!(kind, TestRequestKind::ControlPlane),
@@ -1890,7 +1956,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
              fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
              started,
              completion: completion_receiver,
-@@ -2996,6 +3468,7 @@ mod tests {
+@@ -2996,6 +3473,7 @@ mod tests {
          ) -> Self {
              Self::new_with_policy(
                  rt,
@@ -1898,7 +1964,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
                  max_workers,
                  base_worker_capacity,
                  max_independent_actions,
-@@ -3025,6 +3498,7 @@ mod tests {
+@@ -3025,6 +3503,7 @@ mod tests {
              .unwrap();
              Self::new_with_policy(
                  rt,
@@ -1906,7 +1972,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
                  max_workers,
                  base_worker_capacity,
                  max_independent_actions,
-@@ -3038,6 +3512,7 @@ mod tests {
+@@ -3038,6 +3517,7 @@ mod tests {
          #[allow(clippy::too_many_arguments)]
          fn new_with_policy(
              rt: SchedulerTestRuntime,
@@ -1914,7 +1980,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
              max_workers: usize,
              base_worker_capacity: usize,
              max_independent_actions: usize,
-@@ -3048,7 +3523,7 @@ mod tests {
+@@ -3048,7 +3528,7 @@ mod tests {
          ) -> Self {
              let (sender, receiver) = new_scheduler_queue::<_, Request<_>>(
                  rt.clone(),
@@ -1923,7 +1989,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
                  queue_capacity,
                  max_workers - base_worker_capacity,
                  queue_config,
-@@ -3062,6 +3537,7 @@ mod tests {
+@@ -3062,6 +3542,7 @@ mod tests {
                  TestIsolateWorker {
                      rt: rt.clone(),
                      config: IsolateConfig::new(pool_name, ConcurrencyLimiter::unlimited()),
@@ -1931,7 +1997,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
                  },
                  max_workers,
                  base_worker_capacity,
-@@ -3240,6 +3716,20 @@ mod tests {
+@@ -3240,6 +3721,20 @@ mod tests {
          }
      }
  
@@ -1952,7 +2018,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
      #[test]
      fn dependency_and_descendant_capability_are_independent() {
          assert_eq!(properties(false, false, false).as_label(), "independent");
-@@ -3484,6 +3974,16 @@ mod tests {
+@@ -3484,6 +3979,16 @@ mod tests {
          );
      }
  
@@ -1969,7 +2035,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
      #[test]
      fn per_client_capacity_uses_total_occupancy() {
          let global = ActiveRequestCounts {
-@@ -3512,6 +4012,290 @@ mod tests {
+@@ -3512,6 +4017,290 @@ mod tests {
          assert!(!state.can_start_request(properties(true, false, false), "deployment"));
      }
  
@@ -2260,7 +2326,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
      #[test]
      fn action_cap_does_not_cap_queries_or_dependency_actions() {
          let active = ActiveRequestCounts {
-@@ -3538,6 +4322,40 @@ mod tests {
+@@ -3538,6 +4327,40 @@ mod tests {
          assert!(error.to_string().contains("greater than zero"));
      }
  
@@ -2301,7 +2367,7 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
      #[test]
      fn congested_scheduler_preserves_worker_and_queue_dependency_reserves() {
          let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
-@@ -3770,6 +4588,7 @@ mod tests {
+@@ -3770,6 +4593,7 @@ mod tests {
                  // ineligible behind A's active request.
                  let mut harness = SchedulerHarness::new_with_policy(
                      scheduler_rt,
@@ -2310,10 +2376,10 @@ index 942bc9864157f71717552e1c9379ab5870edf772..e7b8f77eaa9ac5a632227c9df8ad6d66
                      2,
                      2,
 diff --git a/crates/isolate/src/context_cache.rs b/crates/isolate/src/context_cache.rs
-index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..2db51593ddd327d0f9745d8d53ec9dafeb13ccb8 100644
+index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..814f7d4d54bb743561281f7bfd32449eccca85f0 100644
 --- a/crates/isolate/src/context_cache.rs
 +++ b/crates/isolate/src/context_cache.rs
-@@ -1,20 +1,37 @@
+@@ -1,21 +1,39 @@
 -use std::sync::Arc;
 +use std::{
 +    collections::HashMap,
@@ -2356,9 +2422,11 @@ index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..2db51593ddd327d0f9745d8d53ec9daf
 -};
 +use fastrace::local::LocalSpan;
  use parking_lot::Mutex;
++use sync_types::CanonicalizedModulePath;
  use value::{
      sha256::Sha256Digest,
-@@ -23,27 +40,64 @@ use value::{
+     TableName,
+@@ -23,27 +41,64 @@ use value::{
  };
  
  use crate::{
@@ -2436,7 +2504,7 @@ index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..2db51593ddd327d0f9745d8d53ec9daf
  }
  
  /// A mirror of the cache keys present in a `ContextCache`.
-@@ -54,7 +108,471 @@ pub struct CachedContexts {
+@@ -54,7 +109,471 @@ pub struct CachedContexts {
  }
  
  struct CachedContextsInner {
@@ -2909,16 +2977,19 @@ index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..2db51593ddd327d0f9745d8d53ec9daf
  }
  
  pub struct ContextReadSet {
-@@ -68,45 +586,149 @@ pub struct ContextReadSet {
+@@ -68,45 +587,152 @@ pub struct ContextReadSet {
      )>,
  }
  
 +pub(crate) fn context_cache_key(
 +    function_path: &ResolvedComponentFunctionPath,
++    initialization_module: Option<&CanonicalizedModulePath>,
 +) -> CanonicalizedComponentModulePath {
 +    CanonicalizedComponentModulePath {
 +        component: function_path.component,
-+        module_path: function_path.udf_path.module().clone(),
++        module_path: initialization_module
++            .unwrap_or_else(|| function_path.udf_path.module())
++            .clone(),
 +    }
 +}
 +
@@ -3075,7 +3146,7 @@ index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..2db51593ddd327d0f9745d8d53ec9daf
              v8::Local::new(scope, context)
          } else {
              make_context(scope)
-@@ -119,40 +741,503 @@ impl ContextCache {
+@@ -119,40 +745,503 @@ impl ContextCache {
          context: v8::Global<v8::Context>,
          module_map: ModuleMap,
          read_set: ContextReadSet,
@@ -3603,7 +3674,7 @@ index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..2db51593ddd327d0f9745d8d53ec9daf
      }
  
      pub fn cached_contexts(&self) -> &Arc<CachedContexts> {
-@@ -161,21 +1246,932 @@ impl ContextCache {
+@@ -161,21 +1250,932 @@ impl ContextCache {
  }
  
  impl CachedContexts {
@@ -4546,7 +4617,7 @@ index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..2db51593ddd327d0f9745d8d53ec9daf
 +    }
 +}
 diff --git a/crates/isolate/src/environment/action/mod.rs b/crates/isolate/src/environment/action/mod.rs
-index eb9682ccd2ab6d269d4a24d735f86c6e84d5ecf2..714bce78df02769596a0c71586f1f86471eefc99 100644
+index eb9682ccd2ab6d269d4a24d735f86c6e84d5ecf2..b6f888a39ab8cf2b04e659afb3ced57a48236311 100644
 --- a/crates/isolate/src/environment/action/mod.rs
 +++ b/crates/isolate/src/environment/action/mod.rs
 @@ -22,6 +22,7 @@ use std::{
@@ -4691,7 +4762,7 @@ index eb9682ccd2ab6d269d4a24d735f86c6e84d5ecf2..714bce78df02769596a0c71586f1f864
 -        let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
 -
 -        let mut isolate_context = RequestScope::new(context_scope, handle.clone(), state, true)?;
-+        let reusable_module_path = context_cache_key(component_function_path);
++        let reusable_module_path = context_cache_key(component_function_path, None);
 +        let mut context_scope;
 +        let mut reused_http_action_context = false;
 +        let reused_context = if reuse_context
@@ -4972,7 +5043,7 @@ index eb9682ccd2ab6d269d4a24d735f86c6e84d5ecf2..714bce78df02769596a0c71586f1f864
 -        let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
 -
 -        let mut isolate_context = RequestScope::new(context_scope, handle.clone(), state, true)?;
-+        let reusable_module_path = context_cache_key(request_params.path_and_args.path());
++        let reusable_module_path = context_cache_key(request_params.path_and_args.path(), None);
 +        let mut context_scope;
 +        let mut context_read_set = None;
 +        let reused_context = if reuse_context
@@ -5566,10 +5637,16 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
  
      pub fn begin_execution(&mut self) -> anyhow::Result<()> {
 diff --git a/crates/isolate/src/environment/analyze.rs b/crates/isolate/src/environment/analyze.rs
-index e385000ac3932be8a109efcbbea1041819112d7b..fc465c27e37b34fcc6d94637553f0e58a632bad4 100644
+index e385000ac3932be8a109efcbbea1041819112d7b..9390a71739df44ae75a82d4cc460bb45cd4fcca6 100644
 --- a/crates/isolate/src/environment/analyze.rs
 +++ b/crates/isolate/src/environment/analyze.rs
-@@ -62,6 +62,7 @@ use model::{
+@@ -57,11 +57,13 @@ use model::{
+         },
+         module_versions::{
+             invalid_function_name_error,
++            parse_context_initialization_module,
+             AnalyzedFunction,
+             AnalyzedHttpRoute,
              AnalyzedHttpRoutes,
              AnalyzedModule,
              AnalyzedSourcePosition,
@@ -5577,7 +5654,7 @@ index e385000ac3932be8a109efcbbea1041819112d7b..fc465c27e37b34fcc6d94637553f0e58
              Visibility,
          },
          user_error::{
-@@ -449,22 +450,42 @@ impl AnalyzeEnvironment {
+@@ -449,22 +451,59 @@ impl AnalyzeEnvironment {
                  None
              });
  
@@ -5592,6 +5669,7 @@ index e385000ac3932be8a109efcbbea1041819112d7b..fc465c27e37b34fcc6d94637553f0e58
 -            )
 -            .is_some_and(|value| value.is_true());
 +            .context("Module namespace wasn't an object?")?;
++        let mut context_initialization_module = None;
 +        let context_reuse = match module_namespace.get(
 +            &scope,
 +            strings::experimental_reuseContext.create(&scope)?.into(),
@@ -5602,6 +5680,21 @@ index e385000ac3932be8a109efcbbea1041819112d7b..fc465c27e37b34fcc6d94637553f0e58
 +                let object = value
 +                    .to_object(&scope)
 +                    .context("Context reuse policy wasn't an object")?;
++                let initializer = object
++                    .get(&scope, strings::initializationModule.create(&scope)?.into())
++                    .context("Failed to read context initialization module")?;
++                if !initializer.is_undefined() {
++                    anyhow::ensure!(
++                        initializer.is_string(),
++                        ErrorMetadata::bad_request(
++                            "InvalidContextInitializationModule",
++                            "Context initialization module must be a string",
++                        )
++                    );
++                    context_initialization_module = Some(parse_context_initialization_module(
++                        &initializer.to_rust_string_lossy(&scope),
++                    )?);
++                }
 +                let property = |name: &'static strings::StaticString| -> anyhow::Result<bool> {
 +                    let name = name.create(&scope)?;
 +                    Ok(object
@@ -5625,11 +5718,466 @@ index e385000ac3932be8a109efcbbea1041819112d7b..fc465c27e37b34fcc6d94637553f0e58
              source_index,
 -            reuse_context,
 +            context_reuse,
++            context_initialization_module,
          }))
      }
  }
+@@ -1089,3 +1128,74 @@ fn cron_analyze<RT: Runtime>(
+ 
+     Ok(Ok(cron_specs))
+ }
++
++#[cfg(test)]
++mod context_reuse_tests {
++    use model::modules::module_versions::{
++        FullModuleSource,
++        ModuleSource,
++    };
++    use runtime::prod::ProdRuntime;
++
++    use super::*;
++    use crate::ConcurrencyLimiter;
++
++    #[test]
++    fn grouped_context_policy_is_analyzed_and_persisted() -> anyhow::Result<()> {
++        crate::client::initialize_v8();
++        let tokio = ProdRuntime::init_tokio()?;
++        let rt = ProdRuntime::new(&tokio);
++        tokio.block_on(async {
++            let modules = Arc::new(BTreeMap::from([(
++                "entry.js".parse()?,
++                Arc::new(V8ModuleSource::new(FullModuleSource {
++                    source: ModuleSource::from(
++                        r#"
++                        export const experimental_reuseContext = {
++                            queries: true, mutations: true,
++                            initializationModule: "_deps/context_init.js"
++                        };
++                    "#,
++                    ),
++                    source_map: None,
++                })),
++            )]));
++            let mut isolate = Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26);
++            let mut contexts = ContextCache::new();
++            let permit = ConcurrencyLimiter::unlimited()
++                .acquire(Arc::new("analysis_test".to_owned()), false)
++                .await;
++            let mut clean = false;
++            let analyzed = AnalyzeEnvironment::analyze(
++                &mut isolate,
++                &mut contexts,
++                permit,
++                &mut clean,
++                UdfConfig {
++                    server_version: semver::Version::new(1, 36, 0),
++                    import_phase_rng_seed: [7; 32],
++                    import_phase_unix_timestamp: UnixTimestamp::from_millis(123456),
++                },
++                modules,
++                "entry.js".parse()?,
++                BTreeMap::new(),
++            )
++            .await??;
++            let serialized =
++                model::modules::module_versions::SerializedAnalyzedModule::try_from(analyzed)?;
++            let persisted: model::modules::module_versions::SerializedAnalyzedModule =
++                serde_json::from_value(serde_json::to_value(serialized)?)?;
++            let decoded = AnalyzedModule::try_from(persisted)?;
++            assert_eq!(decoded.context_reuse, ContextReusePolicy::database());
++            assert_eq!(
++                decoded
++                    .context_initialization_module
++                    .as_ref()
++                    .map(|p| p.as_str()),
++                Some("_deps/context_init.js")
++            );
++            assert!(clean);
++            Ok(())
++        })
++    }
++}
+diff --git a/crates/isolate/src/environment/udf/context_reuse_tests.rs b/crates/isolate/src/environment/udf/context_reuse_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f1e21f785479a29d6995c8c1d2a694e4727841d
+--- /dev/null
++++ b/crates/isolate/src/environment/udf/context_reuse_tests.rs
+@@ -0,0 +1,373 @@
++use std::{
++    collections::BTreeMap,
++    sync::Arc,
++    time::Duration,
++};
++
++use anyhow::Context;
++use async_trait::async_trait;
++use common::{
++    components::{
++        CanonicalizedComponentModulePath,
++        ComponentId,
++        ComponentPath,
++    },
++    document::ParsedDocument,
++    execution_context::ExecutionContext,
++    persistence::Persistence,
++    query_journal::QueryJournal,
++    runtime::{
++        new_unlimited_rate_limiter,
++        Runtime,
++    },
++    shutdown::ShutdownSignal,
++    types::{
++        ConvexOrigin,
++        DeploymentClass,
++        DeploymentMetadata,
++        FunctionCaller,
++        ModuleEnvironment,
++        ObjectKey,
++        UdfType,
++    },
++    virtual_system_mapping::VirtualSystemMapping,
++    RequestContext,
++    RequestId,
++};
++use database::Database;
++use file_storage::TransactionalFileStorage;
++use indexing::index_cache::IndexCache;
++use keybroker::{
++    Identity,
++    KeyBroker,
++};
++use model::{
++    initialize_application_system_tables,
++    modules::{
++        module_versions::{
++            AnalyzedModule,
++            FullModuleSource,
++            ModuleSource,
++        },
++        types::ModuleMetadata,
++        ModuleModel,
++    },
++    source_packages::{
++        types::{
++            PackageSize,
++            SourcePackage,
++            SourcePackageId,
++        },
++        SourcePackageModel,
++    },
++    udf_config::{
++        types::UdfConfig,
++        UdfConfigModel,
++    },
++};
++use parking_lot::RwLock;
++use runtime::prod::ProdRuntime;
++use search::searcher::SearcherStub;
++use serde_json::{
++    json,
++    Value as JsonValue,
++};
++use sqlite::SqlitePersistence;
++use storage::LocalDirStorage;
++use sync_types::types::SerializedArgs;
++use udf::{
++    validation::ValidatedPathAndArgs,
++    FunctionOutcome,
++};
++use value::{
++    sha256::Sha256Digest,
++    TableNamespace,
++};
++
++use super::DatabaseUdfEnvironment;
++use crate::{
++    client::{
++        CancellationSignal,
++        EnvironmentData,
++        UdfRequest,
++    },
++    context_cache::ContextCache,
++    isolate::Isolate,
++    module_cache::{
++        ModuleCache,
++        V8ModuleSource,
++    },
++    ConcurrencyLimiter,
++};
++
++const INITIALIZER: &str = "_deps/context_init_000000000000000000000000000000000000000000000000.js";
++
++#[derive(Default)]
++struct TestModules(RwLock<BTreeMap<String, Arc<V8ModuleSource>>>);
++
++#[async_trait]
++impl ModuleCache<ProdRuntime> for TestModules {
++    async fn get_module_with_metadata(
++        &self,
++        metadata: &ParsedDocument<ModuleMetadata>,
++        _source_package: &ParsedDocument<SourcePackage>,
++    ) -> anyhow::Result<Arc<V8ModuleSource>> {
++        self.0
++            .read()
++            .get(metadata.path.as_str())
++            .cloned()
++            .context("Missing test source")
++    }
++
++    fn put_cached_code(&self, _metadata: &ModuleMetadata, _data: Arc<[u8]>) {}
++
++    fn get_cached_code(&self, _metadata: &ModuleMetadata) -> Option<Arc<[u8]>> {
++        None
++    }
++}
++
++struct Fixture {
++    // Drop V8 roots before the isolate they belong to.
++    contexts: ContextCache,
++    isolate: Isolate<ProdRuntime>,
++    rt: ProdRuntime,
++    database: Database<ProdRuntime>,
++    modules: Arc<TestModules>,
++    package: SourcePackageId,
++    file_storage: TransactionalFileStorage<ProdRuntime>,
++}
++
++impl Fixture {
++    async fn new(rt: ProdRuntime) -> anyhow::Result<Self> {
++        let persistence: Arc<dyn Persistence> = Arc::new(SqlitePersistence::new(":memory:")?);
++        let (deleted_tablet_sender, _receiver) = tokio::sync::mpsc::channel(16);
++        let database = Database::load(
++            persistence,
++            rt.clone(),
++            Arc::new(SearcherStub),
++            ShutdownSignal::panic(),
++            VirtualSystemMapping::default(),
++            IndexCache::new(1 << 20).new_handle(),
++            Arc::new(new_unlimited_rate_limiter(rt.clone())),
++            deleted_tablet_sender,
++            "context_reuse_test".to_owned(),
++        )
++        .await?;
++        initialize_application_system_tables(&database).await?;
++        let mut tx = database.begin_system().await?;
++        UdfConfigModel::new(&mut tx, TableNamespace::root_component())
++            .set(UdfConfig {
++                server_version: semver::Version::new(1, 36, 0),
++                import_phase_rng_seed: [7; 32],
++                import_phase_unix_timestamp: rt.unix_timestamp(),
++            })
++            .await?;
++        let package = SourcePackageModel::new(&mut tx, TableNamespace::root_component())
++            .put(SourcePackage {
++                storage_key: ObjectKey::try_from("context-reuse-test")?,
++                sha256: Sha256Digest::from([0; 32]),
++                external_deps_package_id: None,
++                package_size: PackageSize::default(),
++                node_version: None,
++            })
++            .await?;
++        database
++            .commit_with_write_source(tx, "context_reuse_test")
++            .await?;
++        Ok(Self {
++            contexts: ContextCache::new(),
++            isolate: Isolate::new(rt.clone(), Some(Duration::from_secs(10)), 1 << 26),
++            database,
++            modules: Arc::new(TestModules::default()),
++            package,
++            file_storage: TransactionalFileStorage::new(
++                rt.clone(),
++                Arc::new(LocalDirStorage::new(rt.clone())?),
++                ConvexOrigin::from("http://localhost".to_owned()),
++            ),
++            rt,
++        })
++    }
++
++    async fn put(&self, path: &str, source: &str) -> anyhow::Result<()> {
++        let mut tx = self.database.begin_system().await?;
++        let path = CanonicalizedComponentModulePath {
++            component: ComponentId::Root,
++            module_path: path.parse()?,
++        };
++        let existing = ModuleModel::new(&mut tx).get_metadata(path.clone()).await?;
++        ModuleModel::new(&mut tx)
++            .put(
++                existing.map(|m| m.id()),
++                path.clone(),
++                ModuleSource::from(source),
++                self.package,
++                None,
++                Some(AnalyzedModule::default()),
++                ModuleEnvironment::Isolate,
++            )
++            .await?;
++        self.database
++            .commit_with_write_source(tx, "context_reuse_test")
++            .await?;
++        self.modules.0.write().insert(
++            path.module_path.as_str().to_owned(),
++            Arc::new(V8ModuleSource::new(FullModuleSource {
++                source: ModuleSource::from(source),
++                source_map: None,
++            })),
++        );
++        Ok(())
++    }
++
++    async fn run(&mut self, entry: &str, arg: i64, reuse: bool) -> anyhow::Result<JsonValue> {
++        let path_and_args = ValidatedPathAndArgs::from_proto(pb::common::ValidatedPathAndArgs {
++            path: Some(format!("{entry}:run")),
++            args: Some(SerializedArgs::from_args(vec![json!(arg)])?.into_bytes()),
++            component_path: Some(ComponentPath::root().into()),
++            reuse_context: Some(reuse),
++            context_initialization_module: Some(INITIALIZER.to_owned()),
++            ..Default::default()
++        })?;
++        let (environment, args) = DatabaseUdfEnvironment::new(
++            self.rt.clone(),
++            UdfRequest {
++                path_and_args,
++                udf_type: UdfType::Query,
++                transaction: self.database.begin(Identity::system()).await?,
++                unix_timestamp: self.rt.unix_timestamp(),
++                journal: QueryJournal::new(),
++                context: ExecutionContext::new(
++                    RequestContext::new_for_system_request(RequestId::new()),
++                    &FunctionCaller::Cron,
++                ),
++                environment_data: EnvironmentData {
++                    key_broker: KeyBroker::dev().function_runner_keybroker(),
++                    default_system_env_vars: BTreeMap::new(),
++                    file_storage: self.file_storage.clone(),
++                    module_loader: self.modules.clone(),
++                    deployment: DeploymentMetadata {
++                        name: "context_reuse_test".to_owned(),
++                        region: None,
++                        class: DeploymentClass::S16,
++                    },
++                },
++            },
++            0,
++            "context_reuse_test".to_owned(),
++            [7; 32],
++        );
++        let permit = ConcurrencyLimiter::unlimited()
++            .acquire(Arc::new("context_reuse_test".to_owned()), false)
++            .await;
++        let mut clean = false;
++        let (_tx, outcome) = Box::pin(environment.run(
++            &mut self.isolate,
++            &mut self.contexts,
++            permit,
++            &mut clean,
++            CancellationSignal::new_for_test(),
++            args,
++            None,
++            None,
++        ))
++        .await?;
++        assert!(clean);
++        let FunctionOutcome::Query(outcome) = outcome else {
++            anyhow::bail!("Expected query outcome");
++        };
++        Ok(outcome.result?.json_value())
++    }
++}
++
++#[test]
++fn grouped_context_reuses_entries_and_invalidates_uncalled_members() -> anyhow::Result<()> {
++    // Unoptimized database futures exceed the default test-thread stack.
++    std::thread::Builder::new()
++        .stack_size(16 * 1024 * 1024)
++        .spawn(|| {
++            crate::client::initialize_v8();
++            let tokio = ProdRuntime::init_tokio()?;
++            let rt = ProdRuntime::new(&tokio);
++            tokio.block_on(Box::pin(async {
++                let mut fixture = Fixture::new(rt).await?;
++                fixture
++                    .put(
++                        "_deps/shared.js",
++                        r#"
++            let calls = 0;
++            const query = (name) => ({ isQuery: true, invokeQuery: async (args) =>
++                JSON.stringify([name, JSON.parse(args)[0], ++calls]) });
++            export const a = query("a");
++            export const b = query("b");
++        "#,
++                    )
++                    .await?;
++                for (entry, name) in [
++                    ("a.js", "a"),
++                    ("b.js", "b"),
++                    ("c.js", "a"),
++                    ("outside.js", "a"),
++                ] {
++                    fixture
++                        .put(
++                            entry,
++                            &format!("export {{ {name} as run }} from './_deps/shared.js';"),
++                        )
++                        .await?;
++                }
++                fixture
++                    .put(
++                        INITIALIZER,
++                        "import '../a.js'; import '../b.js'; import '../c.js';",
++                    )
++                    .await?;
++
++                assert_eq!(
++                    fixture.run("a.js", 10, true).await?,
++                    json!(["a", 10.0, 1.0])
++                );
++                assert_eq!(
++                    fixture.run("b.js", 20, true).await?,
++                    json!(["b", 20.0, 2.0])
++                );
++
++                // Neither the requested entry nor its shared chunk changed. The complete
++                // cold read set must still notice a change to the uncalled third member.
++                fixture
++                    .put(
++                        "c.js",
++                        "export { a as run } from './_deps/shared.js'; export const added = 1;",
++                    )
++                    .await?;
++                assert_eq!(
++                    fixture.run("a.js", 30, true).await?,
++                    json!(["a", 30.0, 1.0])
++                );
++                assert_eq!(
++                    fixture.run("b.js", 40, true).await?,
++                    json!(["b", 40.0, 2.0])
++                );
++
++                let error = fixture.run("outside.js", 50, true).await.unwrap_err();
++                assert!(format!("{error:#}").contains("did not load the requested entry"));
++                // A malformed group cannot be expanded by a warm request, nor retained
++                // after that request fails.
++                assert_eq!(
++                    fixture.run("a.js", 60, true).await?,
++                    json!(["a", 60.0, 1.0])
++                );
++                assert_eq!(
++                    fixture.run("a.js", 70, false).await?,
++                    json!(["a", 70.0, 1.0])
++                );
++                assert_eq!(
++                    fixture.run("a.js", 80, true).await?,
++                    json!(["a", 80.0, 2.0])
++                );
++                Ok(())
++            }))
++        })?
++        .join()
++        .expect("context reuse test panicked")
++}
 diff --git a/crates/isolate/src/environment/udf/mod.rs b/crates/isolate/src/environment/udf/mod.rs
-index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa5305749e 100644
+index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..2bbf6443950050e72595ee2f6ad9c6e8c93dfded 100644
 --- a/crates/isolate/src/environment/udf/mod.rs
 +++ b/crates/isolate/src/environment/udf/mod.rs
 @@ -1,4 +1,3 @@
@@ -5652,7 +6200,19 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
  use itertools::Either;
  use model::{
      environment_variables::types::{
-@@ -53,8 +44,11 @@ use udf::{
+@@ -35,7 +26,10 @@ use model::{
+     },
+     modules::user_error::FunctionNotFoundError,
+ };
+-use sync_types::types::SerializedArgs;
++use sync_types::{
++    types::SerializedArgs,
++    CanonicalizedModulePath,
++};
+ use tokio::{
+     select,
+     sync::oneshot,
+@@ -53,8 +47,11 @@ use udf::{
  
  use crate::{
      context_cache::{
@@ -5664,7 +6224,16 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
      },
      environment::udf::{
          astral_future::RecursiveExecutor,
-@@ -123,7 +117,6 @@ use database::{
+@@ -71,6 +68,8 @@ use crate::{
+     IsolateClient,
+ };
+ pub mod async_syscall;
++#[cfg(test)]
++mod context_reuse_tests;
+ 
+ mod astral_future;
+ mod phase;
+@@ -123,7 +122,6 @@ use database::{
      BiggestDocumentWrites,
      FunctionExecutionSize,
      Transaction,
@@ -5672,7 +6241,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
      OVER_LIMIT_HELP,
  };
  use deno_core::{
-@@ -171,6 +164,7 @@ use self::{
+@@ -171,6 +169,7 @@ use self::{
  use super::ModuleCodeCacheResult;
  use crate::{
      client::{
@@ -5680,7 +6249,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
          EnvironmentData,
          UdfCallback,
          UdfRequest,
-@@ -196,6 +190,7 @@ use crate::{
+@@ -196,6 +195,7 @@ use crate::{
      metrics::{
          self,
          log_isolate_request_cancelled,
@@ -5688,7 +6257,15 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
      },
      request_scope::{
          RequestScope,
-@@ -288,14 +283,18 @@ impl<RT: Runtime> OpProvider for DatabaseUdfSyscallProvider<RT> {
+@@ -215,6 +215,7 @@ pub struct DatabaseUdfSyscallProvider<RT: Runtime> {
+ 
+     udf_type: UdfType,
+     path: ResolvedComponentFunctionPath,
++    context_initialization_module: Option<CanonicalizedModulePath>,
+     deployment: DeploymentMetadata,
+     client_id: String,
+     udf_server_version: Option<semver::Version>,
+@@ -288,14 +289,18 @@ impl<RT: Runtime> OpProvider for DatabaseUdfSyscallProvider<RT> {
              // start of execution and doesn't observe elapsed time.
              UdfType::Query => self.phase.performance_now_fixed(),
              UdfType::Mutation => self.phase.performance_now_incrementing(),
@@ -5709,7 +6286,18 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
          }
      }
  
-@@ -492,7 +491,7 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
+@@ -402,6 +407,10 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
+         &self.path
+     }
+ 
++    fn context_initialization_module(&self) -> Option<&CanonicalizedModulePath> {
++        self.context_initialization_module.as_ref()
++    }
++
+     fn udf_type(&self) -> UdfType {
+         self.udf_type
+     }
+@@ -492,7 +501,7 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
      ) -> anyhow::Result<Option<ContextReadSet>> {
          let read_set = self.phase.finish_snoop()?;
          Ok(if should_capture {
@@ -5718,7 +6306,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
          } else {
              None
          })
-@@ -503,8 +502,47 @@ type UdfRecursiveExecutor<RT> = RecursiveExecutor<
+@@ -503,8 +512,47 @@ type UdfRecursiveExecutor<RT> = RecursiveExecutor<
      anyhow::Result<(
          DatabaseUdfEnvironment<RT>,
          anyhow::Result<Result<PendingValue, JsError>>,
@@ -5766,7 +6354,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
  struct RunUdf<'a, 'b, RT: Runtime> {
      rt: &'a RT,
      v8_scope: &'a mut v8::Isolate,
-@@ -512,6 +550,7 @@ struct RunUdf<'a, 'b, RT: Runtime> {
+@@ -512,6 +560,7 @@ struct RunUdf<'a, 'b, RT: Runtime> {
      context_cache: &'a mut ContextCache,
      execution_handle: &'a ExecutionHandle,
      executor: &'a UdfRecursiveExecutor<RT>,
@@ -5774,7 +6362,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
  }
  
  impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
-@@ -529,9 +568,10 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -529,9 +578,10 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
              client_id,
              rng_seed,
          );
@@ -5788,7 +6376,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
          // N.B.: `run_nested` calls the corresponding `pop_context`.
          // This may not happen in case of a system error, but in that case we
          // are going to throw away the entire context stack anyway.
-@@ -541,25 +581,28 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -541,25 +591,28 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
          let mut isolate_clean = false;
          // User code is going to run again; regain the concurrency permit.
          let mut unpause_guard = self.paused_timeout.regain().await?;
@@ -5835,7 +6423,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
          let outcome = NestedUdfOutcome {
              observed_identity: nested_provider.syscall_provider.phase.observed_identity(),
              observed_rng: nested_provider.syscall_provider.phase.observed_rng(),
-@@ -570,10 +613,15 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -570,10 +623,15 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
              result: result?,
              syscall_trace: nested_provider.syscall_provider.syscall_trace,
          };
@@ -5855,16 +6443,35 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
      }
  }
  
-@@ -654,7 +702,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -603,6 +661,7 @@ pub trait DatabaseUdfInnerProvider<RT: Runtime>:
+ 
+     fn rt(&self) -> &RT;
+     fn path(&self) -> &ResolvedComponentFunctionPath;
++    fn context_initialization_module(&self) -> Option<&CanonicalizedModulePath>;
+     fn udf_type(&self) -> UdfType;
+     fn reactor_depth(&self) -> usize;
+     async fn initialize(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()>;
+@@ -654,7 +713,10 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
              module_loader,
              deployment,
          } = environment_data;
 -        let reuse_context = path_and_args.reuse_context();
 +        let reuse_context = path_and_args.reuse_context(udf_type);
++        let context_initialization_module = path_and_args
++            .context_initialization_module(udf_type)
++            .cloned();
          let (path, arguments, udf_server_version) = path_and_args.consume();
          let component = path.component;
          let identity = transaction.inert_identity();
-@@ -718,7 +766,7 @@ where
+@@ -664,6 +726,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+                     rt: rt.clone(),
+                     udf_type,
+                     path,
++                    context_initialization_module,
+                     udf_server_version: udf_server_version.clone(),
+ 
+                     phase: UdfPhase::new(
+@@ -718,7 +781,7 @@ where
          context_cache: &mut ContextCache,
          permit: ConcurrencyPermit,
          isolate_clean: &mut bool,
@@ -5873,7 +6480,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
          args: DatabaseUdfArgs,
          function_started: Option<oneshot::Sender<()>>,
          udf_callback: Option<IsolateClient<RT>>,
-@@ -733,7 +781,7 @@ where
+@@ -733,7 +796,7 @@ where
              // reject the function for capacity reasons.
              _ = tx.send(());
          }
@@ -5882,7 +6489,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
              .run_until(Self::run_nested(
                  &executor,
                  &args,
-@@ -743,7 +791,7 @@ where
+@@ -743,7 +806,7 @@ where
                  state,
                  &mut timeout,
                  isolate_clean,
@@ -5891,7 +6498,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
                  udf_callback,
              ))
              .await?;
-@@ -759,10 +807,20 @@ where
+@@ -759,10 +822,20 @@ where
              Err(e) => result = Err(e),
          }
          let result = result?;
@@ -5914,7 +6521,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
      }
  
      /// Runs a query or mutation, possibly nested via `runQuery`/`runMutation`.
-@@ -775,17 +833,26 @@ where
+@@ -775,17 +848,26 @@ where
          mut request_state: RequestState<RT, Self>,
          timeout: &mut Timeout<RT>,
          isolate_clean: &mut bool,
@@ -5945,7 +6552,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
              let v8_context = v8::Local::new(handle_scope, context);
              context_scope = v8::ContextScope::new(handle_scope, v8_context);
              (
-@@ -811,6 +878,7 @@ where
+@@ -811,6 +893,7 @@ where
                  None,
              )
          };
@@ -5953,7 +6560,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
          let mut result = {
              let v8_scope = isolate_context.scope();
              let module = {
-@@ -831,11 +899,17 @@ where
+@@ -831,11 +914,17 @@ where
                  .await;
                  if snoop {
                      let mut scope = RequestScope::<RT, Self>::enter(v8_scope);
@@ -5976,7 +6583,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
                          .await?;
                  }
                  initialize_result
-@@ -848,7 +922,7 @@ where
+@@ -848,7 +937,7 @@ where
                          &mut *v8_scope,
                          context_cache,
                          timeout,
@@ -5985,7 +6592,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
                          args,
                          module,
                          udf_callback,
-@@ -864,9 +938,32 @@ where
+@@ -864,9 +953,32 @@ where
          // to ensure the microtask queue is empty. Otherwise, JS from this request may
          // leak to a subsequent one on isolate reuse.
          isolate_context.checkpoint();
@@ -6018,7 +6625,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
          let this = request_state.environment;
          // Override the returned result if we hit a termination error.
          match execution_handle.pop_context(request_state.context_id)? {
-@@ -874,29 +971,47 @@ where
+@@ -874,29 +986,50 @@ where
              Err(e) => result = Ok(Err(e)),
          }
  
@@ -6056,7 +6663,10 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
 -                },
 -                v8::Global::new(v8_scope, context),
 +            Some(PendingReusableContext {
-+                module_path: context_cache_key(this.syscall_provider.path()),
++                module_path: context_cache_key(
++                    this.syscall_provider.path(),
++                    this.syscall_provider.context_initialization_module(),
++                ),
 +                context: v8::Global::new(v8_scope, context),
                  module_map,
                  read_set,
@@ -6077,7 +6687,56 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
      }
  
      #[fastrace::trace(properties = {"reusable_context": "{reusable_context}", "is_reused": "{is_reused}"})]
-@@ -964,7 +1079,7 @@ where
+@@ -919,10 +1052,14 @@ where
+                 .await?;
+         }
+ 
+-        let (udf_type, udf_path) = {
++        let (udf_type, udf_path, initialization_module) = {
+             let state = scope.state()?;
+             let environment = &state.environment.syscall_provider;
+-            (environment.udf_type(), environment.path().udf_path.clone())
++            (
++                environment.udf_type(),
++                environment.path().udf_path.clone(),
++                environment.context_initialization_module().cloned(),
++            )
+         };
+ 
+         if reusable_context {
+@@ -945,6 +1082,31 @@ where
+             return Ok(Err(JsError::from_message(message)));
+         };
+ 
++        if let Some(initialization_module) = initialization_module {
++            if !is_reused {
++                // Capture the complete fixed group in the existing cold-init read
++                // set. Loading a new member on a warm hit would evade invalidation.
++                let initializer = module_specifier_from_path(&initialization_module)?;
++                if let Err(error) = scope
++                    .eval_user_module(udf_type, false, &initializer, timeout)
++                    .await?
++                {
++                    return Ok(Err(error));
++                }
++            }
++            let module_id = scope.module_map().get_by_name(&module_specifier).context(
++                ErrorMetadata::bad_request(
++                    "InvalidContextInitializationModule",
++                    "Context initialization module did not load the requested entry",
++                ),
++            )?;
++            let module = scope
++                .module_map()
++                .handle_by_id(module_id)
++                .context("Missing initialized entry module")?;
++            return Ok(Ok(v8::Local::new(&scope, module)));
++        }
++
+         let module = match scope
+             .eval_user_module(udf_type, false, &module_specifier, timeout)
+             .await?
+@@ -964,7 +1126,7 @@ where
          v8_scope: &mut v8::PinScope<'_, '_>,
          context_cache: &mut ContextCache,
          timeout: &mut Timeout<RT>,
@@ -6086,7 +6745,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
          args: &DatabaseUdfArgs,
          module: v8::Local<'_, v8::Module>,
          udf_callback: Option<IsolateClient<RT>>,
-@@ -1068,17 +1183,24 @@ where
+@@ -1068,17 +1230,24 @@ where
              .ok_or_else(|| anyhow!("Couldn't find invoke function in {udf_path:?}"))?
              .try_into()?;
  
@@ -6118,7 +6777,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
          // If we hit a system error within a syscall, return `Err`, even if JS thinks it
          // returned successfully. The syscall layer uses
          // `scope.terminate_execution()` when we hit a system error, which
-@@ -1091,11 +1213,14 @@ where
+@@ -1091,11 +1260,14 @@ where
              Ok(None) => anyhow::bail!("Successful invocation returned None"),
              Err(e) => return Ok(Err(e)),
          };
@@ -6135,7 +6794,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
              pump_message_loop(&scope);
              scope.record_heap_stats(handle)?;
              handle.check_terminated()?;
-@@ -1179,6 +1304,7 @@ where
+@@ -1179,6 +1351,7 @@ where
                                  context_cache,
                                  execution_handle: handle,
                                  executor,
@@ -6143,7 +6802,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
                              };
                              let udf_callback = if let Some(callback) = &udf_callback {
                                  Either::Left(callback)
-@@ -1187,7 +1313,7 @@ where
+@@ -1187,7 +1360,7 @@ where
                              };
                              select! {
                                  biased;
@@ -6152,7 +6811,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
                                      log_isolate_request_cancelled();
                                      anyhow::bail!("Cancelled");
                                  },
-@@ -1223,7 +1349,7 @@ where
+@@ -1223,7 +1396,7 @@ where
                                  .into(),
                              )?;
                          },
@@ -6161,7 +6820,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
                      },
                  };
                  resolve_promise(result_scope, resolver, result_v8)?;
-@@ -1231,6 +1357,7 @@ where
+@@ -1231,6 +1404,7 @@ where
              handle.check_terminated()?;
          }
  
@@ -6169,7 +6828,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
          // Check to see if the user's promise is blocked.
          let result = match promise.state() {
              v8::PromiseState::Pending => Err(JsError::from_message(
-@@ -1276,23 +1403,50 @@ where
+@@ -1276,23 +1450,53 @@ where
      async fn take_and_validate_reused_context(
          &mut self,
          context_cache: &mut ContextCache,
@@ -6182,7 +6841,10 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
 -        else {
 +        timeout: &mut Timeout<RT>,
 +    ) -> anyhow::Result<Option<TakenContext>> {
-+        let module_path = context_cache_key(self.syscall_provider.path());
++        let module_path = context_cache_key(
++            self.syscall_provider.path(),
++            self.syscall_provider.context_initialization_module(),
++        );
 +        let Some(taken_context) = context_cache.take_reused_context(&module_path) else {
 +            metrics::log_database_udf_context_reuse_lookup(
 +                self.syscall_provider.udf_type(),
@@ -6234,7 +6896,7 @@ index 4d8b5e9c59ea08b1100512651c1cae08904cb19d..aaa2c2912d482a4743bc59bded9204fa
      }
  }
  
-@@ -1539,71 +1693,6 @@ pub fn add_warnings_to_log_lines(
+@@ -1539,71 +1743,6 @@ pub fn add_warnings_to_log_lines(
  impl<RT: Runtime> ValidateContext for DatabaseUdfSyscallProvider<RT> {
      #[fastrace::trace]
      async fn validate_reused_context(&mut self, read_set: &ContextReadSet) -> anyhow::Result<bool> {
@@ -7851,13 +8513,14 @@ index 57572cd038baf51d4e5d16417d02b3c6c0dc06a1..a3486878df9c670cac4d9d9ef25bec67
      /// source of non-determinism, so should not be externalized to
      /// functions. An example of a safe use of this function is `console.time`
 diff --git a/crates/isolate/src/strings.rs b/crates/isolate/src/strings.rs
-index 5cf9dbd3e740dac1391d3fdcf5c821cbbf07917d..8eb86cae70f3807ad9b8fa479f6b92bd3dd57b81 100644
+index 5cf9dbd3e740dac1391d3fdcf5c821cbbf07917d..2ec4908d713a71cc3b7fbaa8d5a51c9f962c8b15 100644
 --- a/crates/isolate/src/strings.rs
 +++ b/crates/isolate/src/strings.rs
-@@ -67,6 +67,10 @@ declare_strings!(
+@@ -67,6 +67,11 @@ declare_strings!(
      dynamic_import_unsupported => "dynamic module import unsupported",
      empty => "",
      experimental_reuseContext,
++    initializationModule,
 +    httpActions,
 +    actions,
 +    mutations,
@@ -8060,10 +8723,18 @@ index 3206946100217b6ab5cffac258f1ec8925002145..88e2f3cf621336b2fa04bfe4609138df
  
      let application = Application::new(
 diff --git a/crates/model/src/modules/module_versions.rs b/crates/model/src/modules/module_versions.rs
-index a01731e2639896321dcc0dba57e925d8facf41ae..c5cf88a58efb961ff39bab9690a7a70d7ded566d 100644
+index a01731e2639896321dcc0dba57e925d8facf41ae..d5f12a5442ef7d02b9a411214d2032c16e6b3c67 100644
 --- a/crates/model/src/modules/module_versions.rs
 +++ b/crates/model/src/modules/module_versions.rs
-@@ -89,6 +89,58 @@ impl SizedValue for FullModuleSource {
+@@ -5,6 +5,7 @@ use std::{
+     sync::Arc,
+ };
+ 
++use anyhow::Context;
+ use async_lru::async_lru::SizedValue;
+ use common::{
+     http::RoutedHttpPath,
+@@ -89,6 +90,76 @@ impl SizedValue for FullModuleSource {
      }
  }
  
@@ -8119,10 +8790,28 @@ index a01731e2639896321dcc0dba57e925d8facf41ae..c5cf88a58efb961ff39bab9690a7a70d
 +    }
 +}
 +
++pub fn parse_context_initialization_module(path: &str) -> anyhow::Result<CanonicalizedModulePath> {
++    let invalid_path = ErrorMetadata::bad_request(
++        "InvalidContextInitializationModule",
++        "Context initialization module must be a canonical _deps module path",
++    );
++    let module: CanonicalizedModulePath = path.parse().context(invalid_path.clone())?;
++    // ModulePath preserves redundant separators and `.` segments, and its
++    // dependency predicate also accepts the legacy actions/_deps directory.
++    // This cache identity must name the canonical root-level dependency path.
++    anyhow::ensure!(
++        path.starts_with("_deps/")
++            && module.as_str() == path
++            && path.split('/').all(|part| !matches!(part, "" | ".")),
++        invalid_path
++    );
++    Ok(module)
++}
++
  #[derive(Debug, Clone, PartialEq, Eq, Default)]
  pub struct AnalyzedModule {
      pub functions: WithHeapSize<Vec<AnalyzedFunction>>,
-@@ -96,12 +148,11 @@ pub struct AnalyzedModule {
+@@ -96,12 +167,14 @@ pub struct AnalyzedModule {
      pub cron_specs: Option<WithHeapSize<BTreeMap<CronIdentifier, CronSpec>>>,
      /// Index of the module's original source in the source map.
      pub source_index: Option<u32>,
@@ -8137,10 +8826,24 @@ index a01731e2639896321dcc0dba57e925d8facf41ae..c5cf88a58efb961ff39bab9690a7a70d
 +    /// non-deterministically leak between executions (e.g. on the global
 +    /// object or module attributes).
 +    pub context_reuse: ContextReusePolicy,
++    /// A fixed import root for grouped database contexts. Omission keeps
++    /// per-entry reuse; the root does not grant any execution-kind permission.
++    pub context_initialization_module: Option<CanonicalizedModulePath>,
  }
  
  impl HeapSize for AnalyzedModule {
-@@ -120,6 +171,13 @@ pub struct SerializedAnalyzedModule {
+@@ -110,6 +183,10 @@ impl HeapSize for AnalyzedModule {
+             + self.http_routes.heap_size()
+             + self.cron_specs.heap_size()
+             + self.source_index.heap_size()
++            + self
++                .context_initialization_module
++                .as_ref()
++                .map_or(0, |path| path.as_str().len())
+     }
+ }
+ 
+@@ -120,6 +197,15 @@ pub struct SerializedAnalyzedModule {
      http_routes: Option<Vec<SerializedAnalyzedHttpRoute>>,
      cron_specs: Option<Vec<SerializedNamedCronSpec>>,
      source_mapped: Option<SerializedMappedModule>,
@@ -8148,23 +8851,28 @@ index a01731e2639896321dcc0dba57e925d8facf41ae..c5cf88a58efb961ff39bab9690a7a70d
 +    // confused with an omitted typed field during rolling compatibility.
 +    #[serde(default, skip_serializing_if = "Option::is_none")]
 +    context_reuse: Option<ContextReusePolicy>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    context_initialization_module: Option<String>,
 +    // Keep the old field for rolling protocol compatibility. Older backends
 +    // ignore `contextReuse`, while newer backends decode this field as the
 +    // legacy database policy when the typed field is absent.
      #[serde(default)]
      #[serde(skip_serializing_if = "std::ops::Not::not")]
      reuse_context: bool,
-@@ -149,7 +207,8 @@ impl TryFrom<AnalyzedModule> for SerializedAnalyzedModule {
+@@ -149,7 +235,11 @@ impl TryFrom<AnalyzedModule> for SerializedAnalyzedModule {
                  .map(|specs| specs.into_iter().map(TryFrom::try_from).try_collect())
                  .transpose()?,
              source_mapped,
 -            reuse_context: m.reuse_context,
 +            context_reuse: Some(m.context_reuse),
++            context_initialization_module: m
++                .context_initialization_module
++                .map(|path| path.as_str().to_owned()),
 +            reuse_context: m.context_reuse.allows_legacy_database_reuse(),
          })
      }
  }
-@@ -178,7 +237,13 @@ impl TryFrom<SerializedAnalyzedModule> for AnalyzedModule {
+@@ -178,7 +268,18 @@ impl TryFrom<SerializedAnalyzedModule> for AnalyzedModule {
              source_index: m
                  .source_mapped
                  .and_then(|mapped_module| mapped_module.source_index),
@@ -8176,10 +8884,15 @@ index a01731e2639896321dcc0dba57e925d8facf41ae..c5cf88a58efb961ff39bab9690a7a70d
 +                    ContextReusePolicy::default()
 +                }
 +            }),
++            context_initialization_module: m
++                .context_initialization_module
++                .as_deref()
++                .map(parse_context_initialization_module)
++                .transpose()?,
          })
      }
  }
-@@ -574,3 +639,108 @@ impl TryFrom<AnalyzedModule> for SerializedMappedModule {
+@@ -574,3 +675,108 @@ impl TryFrom<AnalyzedModule> for SerializedMappedModule {
          })
      }
  }
@@ -8289,23 +9002,24 @@ index a01731e2639896321dcc0dba57e925d8facf41ae..c5cf88a58efb961ff39bab9690a7a70d
 +    }
 +}
 diff --git a/crates/node_executor/src/executor.rs b/crates/node_executor/src/executor.rs
-index 8c1cd8e59217e8d43404cdb6511a7fd90c4308a6..c54d017c9c78ad4d0dac7faa3f410f57ebe14df4 100644
+index 8c1cd8e59217e8d43404cdb6511a7fd90c4308a6..85dfd6034dde7806a8bc35b7edf3144106ecf70b 100644
 --- a/crates/node_executor/src/executor.rs
 +++ b/crates/node_executor/src/executor.rs
-@@ -558,7 +558,7 @@ impl<RT: Runtime> NodeActions<RT> {
+@@ -558,7 +558,8 @@ impl<RT: Runtime> NodeActions<RT> {
                  source_index,
                  http_routes: None,
                  cron_specs: None,
 -                reuse_context: false,
 +                context_reuse: Default::default(),
++                context_initialization_module: None,
              };
              result.insert(path, module);
          }
 diff --git a/crates/pb/protos/common.proto b/crates/pb/protos/common.proto
-index 6e47db9a428a58826b188daa89d674297b32bac0..d1f8a19d590040f310d3780d63dd30e3116ee803 100644
+index 6e47db9a428a58826b188daa89d674297b32bac0..781aa03698ed8486b491bddc92c92c50b2e0573b 100644
 --- a/crates/pb/protos/common.proto
 +++ b/crates/pb/protos/common.proto
-@@ -4,13 +4,25 @@ package common;
+@@ -4,13 +4,27 @@ package common;
  
  import "google/protobuf/empty.proto";
  
@@ -8328,10 +9042,12 @@ index 6e47db9a428a58826b188daa89d674297b32bac0..d1f8a19d590040f310d3780d63dd30e3
    optional bool reuse_context = 6;
 +  // Authoritative when present.
 +  optional ContextReusePolicy context_reuse = 7;
++  // Fixed import root for database context reuse. Does not grant reuse permission.
++  optional string context_initialization_module = 8;
  }
  
  message ValidatedHttpPath {
-@@ -18,7 +30,10 @@ message ValidatedHttpPath {
+@@ -18,7 +32,10 @@ message ValidatedHttpPath {
    optional ComponentPath component_path = 22;
    optional string component_id = 3;
    optional string npm_version = 4;
@@ -8516,30 +9232,33 @@ index 8309e206817ade15d508f8df79fc0dc242c4431d..4bbcc9fd9305b84d6aef28883965ae3d
      match &outcome {
          FunctionOutcome::Query(UdfOutcome { result, .. }) => result.is_ok(),
 diff --git a/crates/udf/src/validation.rs b/crates/udf/src/validation.rs
-index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e5cffa87e 100644
+index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..dcfc745dadb7743f8fd8710dceeff8f49280af66 100644
 --- a/crates/udf/src/validation.rs
 +++ b/crates/udf/src/validation.rs
-@@ -56,6 +56,7 @@ use model::{
+@@ -55,7 +55,9 @@ use model::{
+     modules::{
          function_validators::ReturnsValidator,
          module_versions::{
++            parse_context_initialization_module,
              AnalyzedFunction,
 +            ContextReusePolicy,
              Visibility,
          },
          ModuleModel,
-@@ -66,7 +67,10 @@ use model::{
+@@ -66,7 +68,11 @@ use model::{
  use rand::Rng;
  use roles::RequireDeploymentOp;
  use serde_json::Value as JsonValue;
 -use sync_types::types::SerializedArgs;
 +use sync_types::{
 +    types::SerializedArgs,
++    CanonicalizedModulePath,
 +    CanonicalizedUdfPath,
 +};
  use value::{
      heap_size::HeapSize,
      serialized_args_ext::SerializedArgsExt,
-@@ -83,6 +87,7 @@ use crate::{
+@@ -83,6 +89,7 @@ use crate::{
          validate_pending_udf_args_size,
          validate_udf_args_size,
      },
@@ -8547,7 +9266,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
      ActionOutcome,
      SyscallTrace,
      UdfOutcome,
-@@ -447,15 +452,17 @@ impl VisibilityInfo {
+@@ -447,15 +454,18 @@ impl VisibilityInfo {
  /// - Checking the args size.
  /// - Checking that the args pass validation.
  ///
@@ -8565,37 +9284,41 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
      npm_version: Option<Version>,
 -    reuse_context: bool,
 +    context_reuse: ContextReusePolicy,
++    context_initialization_module: Option<CanonicalizedModulePath>,
  }
  
  impl ValidatedPathAndArgs {
-@@ -538,7 +545,7 @@ impl ValidatedPathAndArgs {
+@@ -538,7 +548,8 @@ impl ValidatedPathAndArgs {
                      path,
                      args,
                      npm_version: None,
 -                    reuse_context: false,
 +                    context_reuse: ContextReusePolicy::default(),
++                    context_initialization_module: None,
                  },
                  ReturnsValidator::Unvalidated,
                  visibility_info,
-@@ -626,7 +633,7 @@ impl ValidatedPathAndArgs {
+@@ -626,7 +637,8 @@ impl ValidatedPathAndArgs {
              pending_args_policy,
              analyzed_function,
              udf_version,
 -            analyzed_module.reuse_context,
 +            analyzed_module.context_reuse,
++            analyzed_module.context_initialization_module.clone(),
          )? {
              Ok((validated_udf_path_and_args, visibility_info)) => Ok(Ok((
                  validated_udf_path_and_args,
-@@ -646,7 +653,7 @@ impl ValidatedPathAndArgs {
+@@ -646,7 +658,8 @@ impl ValidatedPathAndArgs {
          pending_args_policy: PendingArgsPolicy,
          analyzed_function: AnalyzedFunction,
          version: Version,
 -        reuse_context: bool,
 +        context_reuse: ContextReusePolicy,
++        context_initialization_module: Option<CanonicalizedModulePath>,
      ) -> anyhow::Result<Result<(ValidatedPathAndArgs, VisibilityInfo), JsError>> {
          let visibility_info = VisibilityInfo {
              visibility: analyzed_function.visibility.clone(),
-@@ -718,12 +725,16 @@ impl ValidatedPathAndArgs {
+@@ -718,12 +731,17 @@ impl ValidatedPathAndArgs {
              ))));
          }
  
@@ -8610,18 +9333,20 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
                  npm_version: Some(version),
 -                reuse_context,
 +                context_reuse,
++                context_initialization_module,
              },
              visibility_info,
          )))
-@@ -759,6 +770,7 @@ impl ValidatedPathAndArgs {
+@@ -759,6 +777,8 @@ impl ValidatedPathAndArgs {
              component_path,
              component_id,
              reuse_context,
 +            context_reuse,
++            context_initialization_module,
          }: pb::common::ValidatedPathAndArgs,
      ) -> anyhow::Result<Self> {
          let args =
-@@ -768,20 +780,212 @@ impl ValidatedPathAndArgs {
+@@ -768,20 +788,279 @@ impl ValidatedPathAndArgs {
              .context("Missing component_path in proto")?
              .try_into()
              .context("Invalid component path in proto")?;
@@ -8653,6 +9378,14 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
 +            } else {
 +                context_reuse
 +            },
++            context_initialization_module: if is_system_module {
++                None
++            } else {
++                context_initialization_module
++                    .as_deref()
++                    .map(parse_context_initialization_module)
++                    .transpose()?
++            },
          })
      }
  
@@ -8662,6 +9395,18 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
 +        // Check the type again because `from_proto` reconstructs this value without
 +        // passing through `new_inner`.
 +        self.context_reuse.allows(udf_type)
++    }
++
++    pub fn context_initialization_module(
++        &self,
++        udf_type: UdfType,
++    ) -> Option<&CanonicalizedModulePath> {
++        // Grouping never enables reuse or changes ordinary/HTTP action keys.
++        if matches!(udf_type, UdfType::Query | UdfType::Mutation) && self.reuse_context(udf_type) {
++            self.context_initialization_module.as_ref()
++        } else {
++            None
++        }
 +    }
 +}
 +
@@ -8675,6 +9420,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
 +        },
 +        types::UdfType,
 +    };
++    use errors::ErrorMetadataAnyhowExt;
 +    use sync_types::types::SerializedArgs;
 +
 +    use super::{
@@ -8693,6 +9439,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
 +            args: SerializedArgs::from_args(vec![]).expect("invalid test arguments"),
 +            npm_version: None,
 +            context_reuse: ContextReusePolicy::database(),
++            context_initialization_module: None,
 +        }
 +    }
 +
@@ -8730,6 +9477,51 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
 +        assert!(!path_and_args.reuse_context(UdfType::Mutation));
 +        assert!(!path_and_args.reuse_context(UdfType::Action));
 +        assert!(!path_and_args.reuse_context(UdfType::HttpAction));
++    }
++
++    #[test]
++    fn grouped_context_protocol_keeps_type_and_system_boundaries() -> anyhow::Result<()> {
++        let mut value = marked_path_and_args();
++        value.context_initialization_module = Some("_deps/init.js".parse()?);
++        value.context_reuse.mutations = false;
++        value.context_reuse.actions = true;
++        value.context_reuse.http_actions = true;
++        let proto: pb::common::ValidatedPathAndArgs = value.try_into()?;
++        let decoded = ValidatedPathAndArgs::from_proto(proto.clone())?;
++        assert_eq!(
++            decoded
++                .context_initialization_module(UdfType::Query)
++                .map(|p| p.as_str()),
++            Some("_deps/init.js")
++        );
++        for udf_type in [UdfType::Mutation, UdfType::Action, UdfType::HttpAction] {
++            assert!(decoded.context_initialization_module(udf_type).is_none());
++        }
++        let mut system = proto.clone();
++        system.path = Some("_system/internal.js:run".to_owned());
++        assert!(ValidatedPathAndArgs::from_proto(system)?
++            .context_initialization_module(UdfType::Query)
++            .is_none());
++        for invalid in [
++            "entry.js",
++            "_system/internal.js",
++            "_deps/init",
++            "_deps/init.ts",
++            "_deps/../entry.js",
++            "_deps//init.js",
++            "_deps/./init.js",
++            "_deps/init.js/",
++            "actions/_deps/init.js",
++        ] {
++            let mut malformed = proto.clone();
++            malformed.context_initialization_module = Some(invalid.to_owned());
++            let error = ValidatedPathAndArgs::from_proto(malformed)
++                .err()
++                .expect("Malformed initializer path was accepted");
++            assert!(error.is_bad_request(), "{invalid}");
++            assert_eq!(error.short_msg(), "InvalidContextInitializationModule");
++        }
++        Ok(())
 +    }
 +
 +    #[test]
@@ -8838,22 +9630,25 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
      }
  }
  
-@@ -793,7 +997,7 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
+@@ -793,7 +1072,8 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
              path,
              args,
              npm_version,
 -            reuse_context,
 +            context_reuse,
++            context_initialization_module,
          }: ValidatedPathAndArgs,
      ) -> anyhow::Result<Self> {
          let args = args.get().as_bytes().to_vec();
-@@ -804,20 +1008,39 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
+@@ -804,20 +1084,41 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
              npm_version: npm_version.map(|v| v.to_string()),
              component_path,
              component_id: path.component.serialize_to_string(),
 -            reuse_context: Some(reuse_context),
 +            reuse_context: Some(context_reuse.allows_legacy_database_reuse()),
 +            context_reuse: Some(context_reuse_policy_to_proto(context_reuse)),
++            context_initialization_module: context_initialization_module
++                .map(|path| path.as_str().to_owned()),
          })
      }
  }
@@ -8891,7 +9686,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
  }
  
  impl ValidatedHttpPath {
-@@ -851,14 +1074,32 @@ impl ValidatedHttpPath {
+@@ -851,14 +1152,32 @@ impl ValidatedHttpPath {
              Ok(udf_version) => udf_version,
              Err(e) => return Ok(Err(e)),
          };
@@ -8929,7 +9724,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
          }))
      }
  
-@@ -870,13 +1111,20 @@ impl ValidatedHttpPath {
+@@ -870,13 +1189,20 @@ impl ValidatedHttpPath {
          &self.path
      }
  
@@ -8951,7 +9746,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
          }: pb::common::ValidatedHttpPath,
      ) -> anyhow::Result<Self> {
          let component = ComponentId::deserialize_from_string(component_id.as_deref())?;
-@@ -884,14 +1132,25 @@ impl ValidatedHttpPath {
+@@ -884,14 +1210,25 @@ impl ValidatedHttpPath {
              .context("Missing component_path in proto")?
              .try_into()
              .context("Invalid component path in proto")?;
@@ -8979,7 +9774,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
          })
      }
  }
-@@ -903,7 +1162,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+@@ -903,7 +1240,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
          ValidatedHttpPath {
              path,
              npm_version,
@@ -8988,7 +9783,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..5a43caefaf7be700990cf7807063757e
          }: ValidatedHttpPath,
      ) -> anyhow::Result<Self> {
          let component_path = Some(path.component_path.into());
-@@ -912,7 +1171,10 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+@@ -912,7 +1249,10 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
              npm_version: npm_version.map(|v| v.to_string()),
              component_path,
              component_id: path.component.serialize_to_string(),
@@ -9137,13 +9932,13 @@ index 775c63926d8cc54a03a65cb231b6b55f06183d4d..f0df0ad9d65e4af55a21c9f17b1684b2
  involved, but an older image does not understand the new environment variables or emit the new
 diff --git a/patches/context_reuse/README.md b/patches/context_reuse/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..7e910f09378ac0a61aac77270fb51e6769d40893
+index 0000000000000000000000000000000000000000..f6cb7d04b3f9fa9f7c5e8c8110b2d58952b111ad
 --- /dev/null
 +++ b/patches/context_reuse/README.md
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,222 @@
 +# Context Reuse
 +
-+This patch makes V8 context reuse one per-module feature covering queries, mutations, ordinary
++This patch makes V8 context reuse one policy-controlled feature covering queries, mutations, ordinary
 +Convex-runtime actions, and HTTP actions. It keeps one bounded isolate-local cache for all three
 +execution kinds and reinstalls request-owned Rust state on every invocation.
 +
@@ -9174,6 +9969,33 @@ index 0000000000000000000000000000000000000000..7e910f09378ac0a61aac77270fb51e67
 +for code that retains arguments, identities, transactions, documents, request or response objects,
 +callbacks, errors, promises, streams, or other request-derived state in module globals or imported
 +package state. The same review applies to third-party packages and import-time initialization.
++
++## Grouped database initialization
++
++The typed policy also accepts `initializationModule: "_deps/context_init_<hash>.js"` for queries
++and mutations. This optional module statically imports a fixed group of entry modules. The backend
++evaluates that complete graph during cold initialization and uses the initializer path as the
++database cache and scheduler-affinity key. Omission retains per-entry reuse. The field does not
++grant a reuse permission or change action and HTTP-action cache keys.
++
++A warm invocation must find its original entry already loaded; it cannot expand the group. All
++member metadata and dependencies participate in the cold initialization read set, including
++members never invoked, so changing any member invalidates the resident. Function lookup,
++authorization, arguments and logging continue to use the original function path. Components and
++execution kinds remain separate; concurrent calls can still initialize independent replicas.
++
++The companion CLI patch automatically groups forwarding-only outputs with identical ordered
++static chunk imports under its existing experimental reuse opt-in. The initializer imports those
++entries without rebundling them. This shares an already-common dependency graph while adding only
++the forwarding entries and policy exports. It does not combine arbitrary modules with different
++initialization behavior. Group membership and contents determine the generated path.
++
++Grouping trades additional entry-metadata reads and broader invalidation for fewer duplicate
++contexts. Every member must remain safe for reuse; count limits still do not imply equal RSS.
++
++Older typed-policy backends ignore the initializer and retain per-entry reuse. An upstream backend
++that accepts only the boolean marker treats the typed object as disabled. Deploy the backend
++support before adopting grouped output to obtain the optimization.
 +
 +## What is bounded and safe
 +
@@ -9338,10 +10160,10 @@ index 0000000000000000000000000000000000000000..7e910f09378ac0a61aac77270fb51e67
 +The log record contains no errors, arguments, results or environment values.
 diff --git a/patches/context_reuse/design_reference.md b/patches/context_reuse/design_reference.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..3a20f4a1d5fd4b765d436bc641d31bc42885e383
+index 0000000000000000000000000000000000000000..5cbff6b6c385f597895bf040fd7d9117f415bda7
 --- /dev/null
 +++ b/patches/context_reuse/design_reference.md
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,203 @@
 +# Context reuse design reference
 +
 +This note records the implementation contract behind the concise
@@ -9367,6 +10189,20 @@ index 0000000000000000000000000000000000000000..3a20f4a1d5fd4b765d436bc641d31bc4
 +stale or mixed-version producer from turning a database marker into action or HTTP reuse.
 +Trusted protocol reconstruction also clears all reuse permissions for system-module paths; system
 +code cannot opt itself into retaining a reusable request context.
++
++An optional canonical `_deps` path in the policy's `initializationModule` property is stored in
++analyzed metadata and carried in `ValidatedPathAndArgs.context_initialization_module`. Its absence
++means per-entry reuse. Consumers apply it only to a query or mutation whose corresponding reuse
++permission is enabled; system paths clear it and actions ignore it. Older consumers omit or ignore
++the field and keep their previous per-entry behavior.
++
++For a group, cold initialization evaluates the initializer inside the existing read-snooping
++boundary, including every entry's module metadata. Both cold and warm calls require the original
++entry in that module map. A missing entry fails the invocation and cannot publish a resident.
++Database UDFs already prohibit handler-time dynamic imports, so warm calls cannot add modules
++outside the saved initialization read set. No incremental group expansion or read-set merging is
++needed. The initializer path changes cache identity only; the validated function path still owns
++function selection, visibility, arguments, and request accounting.
 +
 +## Request lifecycle
 +
@@ -9412,7 +10248,9 @@ index 0000000000000000000000000000000000000000..3a20f4a1d5fd4b765d436bc641d31bc4
 +## Cache and scheduler
 +
 +The cache is isolate-affine. Its resident key includes the cache kind, component, and canonical
-+entry-module path; the exported function name is not included. A shared bounded budget accounts for
++entry-module path, or the fixed initializer path for grouped database contexts; the exported
++function name is not included. Scheduler affinity, cache lookup, and publication use the same key.
++A shared bounded budget accounts for
 +residents and taken/in-flight reusable roots. A thread-safe mirror contains complete resident
 +keys and whether a probationary slot exists, and is cleared before the owning V8 roots are destroyed.
 +
