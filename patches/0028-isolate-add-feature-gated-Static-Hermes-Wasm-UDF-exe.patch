@@ -125,6 +125,8 @@ pending and active schema replacement.
 Use deployment-aware source-package loading in both Wasm execution paths,
 retain the typed module-path errors in test fixtures, and reconcile the
 dependency graph with the current upstream storage and logging interfaces.
+
+Discard a generated Store after any failed guest call without invoking guest diagnostics or teardown. Native allocation failures and interrupted execution can leave guest VM state unsafe to reenter. Preserve host capability revocation, handle cleanup, resource accounting and bounded teardown for normally returned guest errors; only live runtimes may return to the pool. Regression coverage exercises initialization, both selectors, preparation, handler traps, fuel, cancellation and memory limits.
 ---
  .github/workflows/build_local_backend.yml     |     7 +-
  Cargo.lock                                    | 15437 ++++++-----
@@ -228,11 +230,12 @@ dependency graph with the current upstream storage and logging interfaces.
  .../query_operations_tests.rs                 |  1354 +
  .../randomness_tests.rs                       |   543 +
  .../routed_module_cache.rs                    |  2411 ++
- .../routing_runtime.rs                        |  6107 +++++
- .../runtime_acceptance_tests.rs               | 12275 +++++++++
+ .../routing_runtime.rs                        |  6111 +++++
+ .../runtime_acceptance_tests.rs               | 12291 +++++++++
  ...database_get_conformance_boundary_tests.rs |  1034 +
+ .../runtime_trap_disposal_tests.rs            |   213 +
  .../runtime_hotpath_benchmark.rs              |   255 +
- .../runtime_lifecycle.rs                      |  2760 ++
+ .../runtime_lifecycle.rs                      |  2792 ++
  .../source_keyed_deployment_catalog.rs        |   143 +
  .../test_support.rs                           |   570 +
  .../test_support/fixtures.rs                  |  2801 ++
@@ -348,7 +351,7 @@ dependency graph with the current upstream storage and logging interfaces.
  .../design_reference.md                       |    15 +-
  patches/static_hermes_wasm_udfs/README.md     |   393 +
  .../compiler_and_artifact_contract.md         |   322 +
- patches/static_hermes_wasm_udfs/operations.md |   765 +
+ patches/static_hermes_wasm_udfs/operations.md |   773 +
  patches/static_hermes_wasm_udfs/value_abi.md  |   444 +
  scripts/run_cargo.sh                          |    96 +-
  scripts/run_cargo.test.mjs                    |   194 +
@@ -357,7 +360,7 @@ dependency graph with the current upstream storage and logging interfaces.
  .../docker-build/Dockerfile.backend.test.mjs  |   250 +
  self-hosted/docker-build/README.md            |    84 +
  self-hosted/docker-build/run_backend.sh       |     3 +-
- 231 files changed, 153985 insertions(+), 7574 deletions(-)
+ 232 files changed, 154258 insertions(+), 7574 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/query_shadow.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
  create mode 100644 crates/application/src/bin/source_package_preactivation_authority.rs
@@ -392,6 +395,7 @@ dependency graph with the current upstream storage and logging interfaces.
  create mode 100644 crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs
  create mode 100644 crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests.rs
  create mode 100644 crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests/database_get_conformance_boundary_tests.rs
+ create mode 100644 crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests/runtime_trap_disposal_tests.rs
  create mode 100644 crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_hotpath_benchmark.rs
  create mode 100644 crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle.rs
  create mode 100644 crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/source_keyed_deployment_catalog.rs
@@ -97637,10 +97641,10 @@ index 0000000000000000000000000000000000000000..208bd77b0e714d6217dbfb9e70c94443
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..eb7445aea36d1f5ae8e9ec0d3ba6f5536fa4289e
+index 0000000000000000000000000000000000000000..bc92ddc153fcff01e2e56e1262c503f1fc76d87b
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs
-@@ -0,0 +1,6107 @@
+@@ -0,0 +1,6111 @@
 +use common::types::ActiveJavascriptClass;
 +use futures::{
 +    future::{
@@ -100345,6 +100349,10 @@ index 0000000000000000000000000000000000000000..eb7445aea36d1f5ae8e9ec0d3ba6f553
 +    memory_permit: InvocationMemoryPermit,
 +    terminal_memory_outcome: TerminalMemoryOutcome,
 +) -> anyhow::Result<()> {
++    anyhow::ensure!(
++        instance.runtime_state == GeneratedRuntimeState::Live,
++        "generated Wasm instance cannot be pooled after a failed guest call"
++    );
 +    #[cfg(any(test, feature = "testing"))]
 +    let metrics = Arc::clone(&instance.store.data().metrics);
 +    #[cfg(any(test, feature = "testing"))]
@@ -103750,10 +103758,10 @@ index 0000000000000000000000000000000000000000..eb7445aea36d1f5ae8e9ec0d3ba6f553
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b318992aa18
+index 0000000000000000000000000000000000000000..aafe3ea63212d3aa5ca6e1a1681ff22f68f8ff40
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests.rs
-@@ -0,0 +1,12275 @@
+@@ -0,0 +1,12291 @@
 +use futures::poll;
 +
 +use super::{
@@ -103774,6 +103782,9 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +
 +#[cfg(test)]
 +mod database_get_conformance_boundary_tests;
++
++#[cfg(test)]
++mod runtime_trap_disposal_tests;
 +
 +#[cfg(test)]
 +async fn run_generated_fuel_acceptance(rt: ProdRuntime) -> anyhow::Result<()> {
@@ -103798,6 +103809,7 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +            package_key: "generated-fuel-default".to_owned(),
 +        },
 +    )?;
++    let default_metrics = Arc::new(GateMetrics::default());
 +    let mut default_state = generated_test_state(
 +        rt.clone(),
 +        database.begin_system().await?,
@@ -103807,7 +103819,7 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +        timestamp,
 +        CancellationSignal::new_for_test(),
 +        None,
-+        Arc::new(GateMetrics::default()),
++        Arc::clone(&default_metrics),
 +        None,
 +    )
 +    .await?;
@@ -103828,6 +103840,8 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +    );
 +    assert!(default_output.reusable_instance.is_none());
 +    assert!(default_output.memory_permit.is_none());
++    assert_eq!(default_metrics.teardowns.load(Ordering::SeqCst), 0);
++    assert_eq!(default_metrics.store_drops.load(Ordering::SeqCst), 1);
 +    let (transaction, outcome) = default_output
 +        .invocation
 +        .into_routed_result(default_output.system_error, false)?;
@@ -103858,6 +103872,7 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +            package_key: "generated-fuel-override".to_owned(),
 +        },
 +    )?;
++    let overridden_metrics = Arc::new(GateMetrics::default());
 +    let mut overridden_state = generated_test_state(
 +        rt.clone(),
 +        database.begin_system().await?,
@@ -103867,7 +103882,7 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +        timestamp,
 +        CancellationSignal::new_for_test(),
 +        None,
-+        Arc::new(GateMetrics::default()),
++        Arc::clone(&overridden_metrics),
 +        None,
 +    )
 +    .await?;
@@ -103889,6 +103904,8 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +    );
 +    assert!(overridden_output.reusable_instance.is_none());
 +    assert!(overridden_output.memory_permit.is_none());
++    assert_eq!(overridden_metrics.teardowns.load(Ordering::SeqCst), 0);
++    assert_eq!(overridden_metrics.store_drops.load(Ordering::SeqCst), 1);
 +    let error = overridden_output
 +        .invocation
 +        .into_routed_result(overridden_output.system_error, true)
@@ -105723,6 +105740,8 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +    let timeout_output = tokio::time::timeout(Duration::from_secs(5), timeout_execution)
 +        .await
 +        .context("generated CPU-bound timeout did not complete")???;
++    assert_eq!(timeout_metrics.teardowns.load(Ordering::SeqCst), 0);
++    assert_eq!(timeout_metrics.store_drops.load(Ordering::SeqCst), 1);
 +    assert!(!timeout_output.cancelled);
 +    assert_eq!(
 +        timeout_output.invocation.outcome,
@@ -105770,6 +105789,8 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +    let cancelled_output = tokio::time::timeout(Duration::from_secs(5), cancelled_execution)
 +        .await
 +        .context("generated CPU-bound cancellation did not complete")???;
++    assert_eq!(cancelled_metrics.teardowns.load(Ordering::SeqCst), 0);
++    assert_eq!(cancelled_metrics.store_drops.load(Ordering::SeqCst), 1);
 +    assert!(cancelled_output.cancelled);
 +    assert!(!sibling_execution.is_finished());
 +    drop(cancelled_output.invocation.transaction);
@@ -105778,6 +105799,8 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +    let sibling_output = tokio::time::timeout(Duration::from_secs(5), sibling_execution)
 +        .await
 +        .context("generated CPU-bound sibling cleanup did not complete")???;
++    assert_eq!(sibling_metrics.teardowns.load(Ordering::SeqCst), 0);
++    assert_eq!(sibling_metrics.store_drops.load(Ordering::SeqCst), 1);
 +    assert!(sibling_output.cancelled);
 +    drop(sibling_output.invocation.transaction);
 +
@@ -105947,7 +105970,7 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +        assert!(error.contains("Static Hermes host ABI invariant failed"));
 +        assert!(output.reusable_instance.is_none());
 +        assert!(output.memory_permit.is_none());
-+        assert_eq!(metrics.teardowns.load(Ordering::SeqCst), 1);
++        assert_eq!(metrics.teardowns.load(Ordering::SeqCst), 0);
 +        assert_eq!(metrics.store_drops.load(Ordering::SeqCst), 1);
 +        let memory = controller.snapshot_for_test(&memory_identity);
 +        assert_eq!(memory.active_instances, 0);
@@ -106778,10 +106801,9 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +    assert_eq!(denied_snapshot.evicting_instances, 0);
 +    assert_eq!(denied_snapshot.function_samples, 4);
 +    assert_eq!(denied_snapshot.memory_limit_samples, 1);
-+    assert_eq!(
-+        metrics.teardowns.load(Ordering::SeqCst),
-+        denied_teardowns + 1
-+    );
++    // Denied memory growth traps inside the guest. Dropping the Store releases
++    // its memory without reentering the failed runtime for teardown.
++    assert_eq!(metrics.teardowns.load(Ordering::SeqCst), denied_teardowns);
 +    assert_eq!(
 +        metrics.store_drops.load(Ordering::SeqCst),
 +        denied_store_drops + 1
@@ -115358,13 +115380,15 @@ index 0000000000000000000000000000000000000000..fdf7ba064009e3fca1cb11820dfe4b31
 +
 +#[test]
 +fn generated_wasm_database_resource_limits_discard_reused_runtime() -> anyhow::Result<()> {
-+    let tokio = ProdRuntime::init_tokio()?;
-+    let rt = ProdRuntime::new(&tokio);
-+    let block_rt = rt.clone();
-+    block_rt.block_on(
-+        "generated_wasm_database_resource_limits",
-+        run_generated_database_resource_limit_tests(rt),
-+    )
++    run_generated_test_with_large_stack("generated-wasm-database-resource-limits", || {
++        let tokio = ProdRuntime::init_tokio()?;
++        let rt = ProdRuntime::new(&tokio);
++        let block_rt = rt.clone();
++        block_rt.block_on(
++            "generated_wasm_database_resource_limits",
++            run_generated_database_resource_limit_tests(rt),
++        )
++    })
 +}
 +
 +#[test]
@@ -117069,6 +117093,225 @@ index 0000000000000000000000000000000000000000..48594f8cc3b51ef879486a1f88a520ba
 +    )?;
 +    write_report(&output_path, report)
 +}
+diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests/runtime_trap_disposal_tests.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests/runtime_trap_disposal_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..43676fdeb8a6da0b3990da12806de540edec7cd0
+--- /dev/null
++++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests/runtime_trap_disposal_tests.rs
+@@ -0,0 +1,213 @@
++use super::*;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum GuestExit {
++    InitializationTrap,
++    SelectorTrap,
++    SecondSelectorTrap,
++    PreparationTrap,
++    HandlerTrap,
++    PreparationRejected,
++    Success,
++}
++
++fn module(exit: GuestExit) -> Vec<u8> {
++    let mut types = EncodedTypeSection::new();
++    types.ty().function([], [EncodedValType::I64]);
++    types.ty().function([EncodedValType::I64], []);
++    types.ty().function([EncodedValType::I32], []);
++    types.ty().function([], []);
++    types
++        .ty()
++        .function([EncodedValType::I64], [EncodedValType::I32]);
++    types.ty().function([], [EncodedValType::I32]);
++    let mut imports = EncodedImportSection::new();
++    for (name, signature) in [
++        ("convex_value_null_new", 0),
++        ("convex_function_result", 1),
++        ("convex_profile_mark", 2),
++    ] {
++        imports.import("convex", name, EncodedEntityType::Function(signature));
++    }
++    let mut functions = EncodedFunctionSection::new();
++    let mut exports = EncodedExportSection::new();
++    for (index, (name, signature)) in [
++        ("_initialize", 3),
++        ("convex_wasm_select_entry", 4),
++        ("convex_wasm_udf_prepare_selected_entry", 5),
++        ("convex_wasm_udf_run", 5),
++        ("convex_wasm_udf_destroy_runtime", 3),
++        (NATIVE_CAPABILITY_PARTIAL_INITIALIZATION_TRACE_EXPORT, 0),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        functions.function(signature);
++        exports.export(
++            name,
++            EncodedExportKind::Func,
++            3 + u32::try_from(index).unwrap(),
++        );
++    }
++    let mut memory = EncodedMemorySection::new();
++    memory.memory(EncodedMemoryType {
++        minimum: 1,
++        maximum: Some(1),
++        memory64: false,
++        shared: false,
++        page_size_log2: None,
++    });
++    exports.export("memory", EncodedExportKind::Memory, 0);
++    let mut globals = EncodedGlobalSection::new();
++    globals.global(
++        EncodedGlobalType {
++            val_type: EncodedValType::I32,
++            mutable: true,
++            shared: false,
++        },
++        &EncodedConstExpr::i32_const(0),
++    );
++    let mut code = EncodedCodeSection::new();
++    for phase in [
++        GuestExit::InitializationTrap,
++        GuestExit::SelectorTrap,
++        GuestExit::PreparationTrap,
++        GuestExit::HandlerTrap,
++    ] {
++        let mut body = EncodedFunction::new([]);
++        if exit == phase {
++            if phase == GuestExit::HandlerTrap {
++                // Abandon a real host-owned value for finalization to release.
++                body.instruction(&EncodedInstruction::Call(0));
++                body.instruction(&EncodedInstruction::Drop);
++            }
++            body.instruction(&EncodedInstruction::Unreachable);
++        } else if phase == GuestExit::SelectorTrap && exit == GuestExit::SecondSelectorTrap {
++            body.instruction(&EncodedInstruction::GlobalGet(0));
++            body.instruction(&EncodedInstruction::If(EncodedBlockType::Empty));
++            body.instruction(&EncodedInstruction::Unreachable);
++            body.instruction(&EncodedInstruction::End);
++            body.instruction(&EncodedInstruction::I32Const(1));
++            body.instruction(&EncodedInstruction::GlobalSet(0));
++        } else if phase == GuestExit::HandlerTrap {
++            body.instruction(&EncodedInstruction::Call(0));
++            body.instruction(&EncodedInstruction::Call(1));
++        }
++        if phase != GuestExit::InitializationTrap {
++            let status =
++                if phase == GuestExit::PreparationTrap && exit == GuestExit::PreparationRejected {
++                    62
++                } else {
++                    0
++                };
++            body.instruction(&EncodedInstruction::I32Const(status));
++        }
++        body.instruction(&EncodedInstruction::End);
++        code.function(&body);
++    }
++    // Count entry into both cleanup and diagnostic exports, even if either
++    // were to fail later. A teardown-completion counter alone misses reentry.
++    for is_trace in [false, true] {
++        let mut body = EncodedFunction::new([]);
++        body.instruction(&EncodedInstruction::I32Const(0));
++        body.instruction(&EncodedInstruction::Call(2));
++        if is_trace {
++            body.instruction(&EncodedInstruction::I64Const(1));
++        }
++        body.instruction(&EncodedInstruction::End);
++        code.function(&body);
++    }
++    let mut module = EncodedModule::new();
++    module
++        .section(&types)
++        .section(&imports)
++        .section(&functions)
++        .section(&memory)
++        .section(&globals)
++        .section(&exports)
++        .section(&code);
++    module.finish()
++}
++
++#[test]
++fn generated_wasm_traps_discard_without_guest_reentry() -> anyhow::Result<()> {
++    let tokio = ProdRuntime::init_tokio()?;
++    let rt = ProdRuntime::new(&tokio);
++    rt.clone()
++        .block_on("generated_wasm_trap_disposal", async move {
++            let database = new_test_database(rt.clone()).await?;
++            let manifest = generated_schema_five_test_manifest_with_runtime_limits(
++                ManifestUdfKind::Query,
++                Vec::new(),
++                1 << 20,
++                1_000_000,
++                128,
++            )?;
++            for exit in [
++                GuestExit::InitializationTrap,
++                GuestExit::SelectorTrap,
++                GuestExit::SecondSelectorTrap,
++                GuestExit::PreparationTrap,
++                GuestExit::HandlerTrap,
++                GuestExit::PreparationRejected,
++                GuestExit::Success,
++            ] {
++                let metrics = Arc::new(GateMetrics::default());
++                let routed =
++                    generated_test_routed_module_from_bytes(Arc::clone(&manifest), module(exit))?;
++                let mut state = generated_test_state(
++                    rt.clone(),
++                    database.begin_system().await?,
++                    Arc::clone(&manifest),
++                    JsonValue::Null,
++                    UdfType::Query,
++                    UnixTimestamp::from_nanos(1_700_000_000_000_000_000),
++                    CancellationSignal::new_for_test(),
++                    None,
++                    Arc::clone(&metrics),
++                    None,
++                )
++                .await?;
++                arm_generated_timeout(
++                    rt.clone(),
++                    &mut state,
++                    Duration::from_secs(5),
++                    *DATABASE_UDF_SYSTEM_TIMEOUT,
++                )?;
++                let output =
++                    execute_generated(routed, state, None, exit != GuestExit::Success).await?;
++                let healthy = matches!(exit, GuestExit::Success | GuestExit::PreparationRejected);
++                assert_eq!(
++                    metrics.profile_marks.load(Ordering::SeqCst),
++                    if healthy { 2 } else { 0 },
++                    "{exit:?}"
++                );
++                assert_eq!(
++                    metrics.teardowns.load(Ordering::SeqCst),
++                    usize::from(healthy),
++                    "{exit:?}"
++                );
++                assert_eq!(metrics.store_drops.load(Ordering::SeqCst), 1, "{exit:?}");
++                assert!(output.reusable_instance.is_none(), "{exit:?}");
++                assert!(output.memory_permit.is_none(), "{exit:?}");
++                assert_eq!(
++                    output.partial_initialization_trace,
++                    healthy.then_some(1),
++                    "{exit:?}"
++                );
++                assert_eq!(
++                    output.invocation.outcome,
++                    if exit == GuestExit::Success {
++                        InvocationOutcome::Success
++                    } else {
++                        InvocationOutcome::SystemError
++                    },
++                    "{exit:?}"
++                );
++                assert_eq!(output.invocation.opaque_live_handles, 0, "{exit:?}");
++                assert!(output.invocation.capability_revoked, "{exit:?}");
++                drop(output.invocation.transaction);
++            }
++            database.shutdown().await
++        })
++}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_hotpath_benchmark.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_hotpath_benchmark.rs
 new file mode 100644
 index 0000000000000000000000000000000000000000..b3367a090c93b1624dce3131f06233cd4435c664
@@ -117332,10 +117575,10 @@ index 0000000000000000000000000000000000000000..b3367a090c93b1624dce3131f06233cd
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57e0f89601
+index 0000000000000000000000000000000000000000..eb7c1d4889f96c624a484f57c330d4257db46206
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle.rs
-@@ -0,0 +1,2760 @@
+@@ -0,0 +1,2792 @@
 +use std::io::{
 +    self,
 +    Write,
@@ -117529,6 +117772,15 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +    ))
 +}
 +
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) enum GeneratedRuntimeState {
++    Inactive,
++    Live,
++    // A failed guest call may leave native allocator or VM invariants broken.
++    // Only host-side resource cleanup and Store destruction are safe afterward.
++    Poisoned,
++}
++
 +pub(super) struct GeneratedReusableInstance<RT: Runtime> {
 +    pub(super) routed: Arc<GeneratedRoutedModule>,
 +    pub(super) route_identity: GeneratedRouteIdentity,
@@ -117549,14 +117801,14 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +    pub(super) context_read_set: Option<ContextReadSet>,
 +    #[cfg(any(test, feature = "testing"))]
 +    pub(super) id: u64,
-+    pub(super) runtime_live: bool,
++    pub(super) runtime_state: GeneratedRuntimeState,
 +    pub(super) pool_checked_out: bool,
 +    pub(super) idle_since: Instant,
 +}
 +
 +impl<RT: Runtime> Drop for GeneratedReusableInstance<RT> {
 +    fn drop(&mut self) {
-+        if self.runtime_live {
++        if self.runtime_state == GeneratedRuntimeState::Live {
 +            log_instance_pool_event("generated_undestroyed");
 +        } else if self.pool_checked_out {
 +            log_instance_pool_event("generated_discarded");
@@ -117731,7 +117983,7 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +    routed: &GeneratedRoutedModule,
 +    instance: &mut GeneratedReusableInstance<RT>,
 +) -> anyhow::Result<()> {
-+    if !instance.runtime_live {
++    if instance.runtime_state != GeneratedRuntimeState::Live {
 +        return Ok(());
 +    }
 +    #[cfg(any(test, feature = "testing"))]
@@ -117792,7 +118044,7 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +        }
 +    };
 +    // A failed destroy still discards the Store. It must never enter the pool.
-+    instance.runtime_live = false;
++    instance.runtime_state = GeneratedRuntimeState::Inactive;
 +    record_runtime_destruction(if result.is_ok() {
 +        RuntimeDestructionOutcome::Completed
 +    } else {
@@ -117864,7 +118116,7 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +pub(super) async fn discard_generated_instance<RT: Runtime>(
 +    mut instance: GeneratedReusableInstance<RT>,
 +) -> anyhow::Result<()> {
-+    if !instance.runtime_live {
++    if instance.runtime_state != GeneratedRuntimeState::Live {
 +        instance.pool_checked_out = false;
 +        drop(instance);
 +        return Ok(());
@@ -117890,7 +118142,7 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +pub(super) async fn discard_generated_instance_after_cpu_admission_rejection<RT: Runtime>(
 +    mut instance: GeneratedReusableInstance<RT>,
 +) -> anyhow::Result<()> {
-+    if !instance.runtime_live {
++    if instance.runtime_state != GeneratedRuntimeState::Live {
 +        instance.pool_checked_out = false;
 +        drop(instance);
 +        return Ok(());
@@ -118408,7 +118660,7 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +                    context_read_set: None,
 +                    #[cfg(any(test, feature = "testing"))]
 +                    id: NEXT_GENERATED_REUSABLE_INSTANCE_ID.fetch_add(1, Ordering::SeqCst),
-+                    runtime_live: false,
++                    runtime_state: GeneratedRuntimeState::Inactive,
 +                    pool_checked_out: true,
 +                    idle_since: Instant::now(),
 +                },
@@ -118510,14 +118762,17 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +                            .fetch_add(1, Ordering::SeqCst);
 +                        // A fresh Store cancelled before initialization needs only a
 +                        // host-side drop: guest teardown may depend on relocations
-+                        // and constructors. Once initialization starts, even partial
-+                        // initialization retains the bounded guest teardown obligation.
-+                        reusable_instance.runtime_live = true;
++                        // and constructors. Failed initialization must also drop
++                        // the Store without entering potentially broken native state.
++                        reusable_instance.runtime_state = GeneratedRuntimeState::Live;
 +                        run_generated_fresh_initialization(
 +                            &mut reusable_instance.store,
 +                            initialization,
 +                        )
-+                        .await?;
++                        .await
++                        .inspect_err(|_| {
++                            reusable_instance.runtime_state = GeneratedRuntimeState::Poisoned;
++                        })?;
 +                        #[cfg(any(test, feature = "testing"))]
 +                        {
 +                            phase_trace.initialization_completed = Some(phase_trace.elapsed());
@@ -118542,7 +118797,14 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +                            .arm_formatter_initialization_failure
 +                            .clone()
 +                            .ok_or_else(|| host_invariant_error())?;
-+                        if arm.call_async(&mut reusable_instance.store, ()).await? != 0 {
++                        if arm
++                            .call_async(&mut reusable_instance.store, ())
++                            .await
++                            .inspect_err(|_| {
++                                reusable_instance.runtime_state = GeneratedRuntimeState::Poisoned;
++                            })?
++                            != 0
++                        {
 +                            return Err(host_invariant_error());
 +                        }
 +                    }
@@ -118560,6 +118822,7 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +                        )
 +                        .await
 +                        .map_err(|error| {
++                            reusable_instance.runtime_state = GeneratedRuntimeState::Poisoned;
 +                            error.context(StaticHermesGeneratedExportDiagnostic::FirstSelectorTrap)
 +                        })?;
 +                        #[cfg(any(test, feature = "testing"))]
@@ -118593,6 +118856,7 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +                            .call_async(&mut reusable_instance.store, ())
 +                            .await
 +                            .map_err(|error| {
++                                reusable_instance.runtime_state = GeneratedRuntimeState::Poisoned;
 +                                error.context(
 +                                    StaticHermesGeneratedExportDiagnostic::
 +                                        SelectedEntryPreparationTrap,
@@ -118713,6 +118977,7 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +                        )
 +                        .await
 +                        .map_err(|error| {
++                            reusable_instance.runtime_state = GeneratedRuntimeState::Poisoned;
 +                            error.context(StaticHermesGeneratedExportDiagnostic::SecondSelectorTrap)
 +                        })?;
 +                        #[cfg(any(test, feature = "testing"))]
@@ -118783,7 +119048,10 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +                    let result = reusable_instance
 +                        .run
 +                        .call_async(&mut reusable_instance.store, ())
-+                        .await;
++                        .await
++                        .inspect_err(|_| {
++                            reusable_instance.runtime_state = GeneratedRuntimeState::Poisoned;
++                        });
 +                    drop(handler_timer);
 +                    crate::execution_observation::set_phase(
 +                        crate::execution_observation::Phase::Finalization,
@@ -118861,14 +119129,20 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +        phase_trace.final_fuel = reusable_instance.store.get_fuel().ok();
 +    }
 +    #[cfg(test)]
-+    let (call_result, partial_initialization_trace) =
-+        match reusable_instance.partial_initialization_trace.clone() {
-+            Some(trace) => match trace.call_async(&mut reusable_instance.store, ()).await {
-+                Ok(trace) => (call_result, Some(trace)),
-+                Err(error) => (Err(error), None),
++    let (call_result, partial_initialization_trace) = match reusable_instance
++        .partial_initialization_trace
++        .clone()
++        .filter(|_| reusable_instance.runtime_state == GeneratedRuntimeState::Live)
++    {
++        Some(trace) => match trace.call_async(&mut reusable_instance.store, ()).await {
++            Ok(trace) => (call_result, Some(trace)),
++            Err(error) => {
++                reusable_instance.runtime_state = GeneratedRuntimeState::Poisoned;
++                (Err(error), None)
 +            },
-+            None => (call_result, None),
-+        };
++        },
++        None => (call_result, None),
++    };
 +    try_generated!(
 +        Some(reusable_instance),
 +        generated_state_mut(reusable_instance.store.data_mut())
@@ -119541,6 +119815,7 @@ index 0000000000000000000000000000000000000000..c9ad8997caa558e0de90a9e27df0df57
 +            state.developer_error.is_some(),
 +        );
 +        reuse_instances
++            && reusable_instance.runtime_state == GeneratedRuntimeState::Live
 +            && !cancelled
 +            && outcome_can_reuse
 +            && !runtime_reuse_contaminated
@@ -169722,10 +169997,10 @@ index 0000000000000000000000000000000000000000..b3f0a1e5b5812b21c9de870931c6f0f7
 +inputs.
 diff --git a/patches/static_hermes_wasm_udfs/operations.md b/patches/static_hermes_wasm_udfs/operations.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..382be359e36254f33ced84576d5bf07dbec65a1f
+index 0000000000000000000000000000000000000000..963b77d92c1c048c687faa2eda5dabdfb290e496
 --- /dev/null
 +++ b/patches/static_hermes_wasm_udfs/operations.md
-@@ -0,0 +1,765 @@
+@@ -0,0 +1,773 @@
 +# Static Hermes Wasm UDF Operations and Validation
 +
 +This is a generic self-hosted adoption guide for the
@@ -170327,6 +170602,14 @@ index 0000000000000000000000000000000000000000..382be359e36254f33ced84576d5bf07d
 +`wasmtime_trap`, while selector and preparation traps remain
 +`generated_export_dispatch`. These reason fields extend the broader legacy
 +shadow-failure reason fields; they do not replace them.
++
++A failed Wasmtime guest call poisons its instance, including initialization,
++selection, preparation, execution and host-import failures. Finalization revokes
++host capabilities and releases host resources, then drops the Store without
++calling guest teardown or other guest exports. A native allocation trap can leave
++VM or allocator invariants broken; resetting fuel does not make guest cleanup
++safe. Poisoned instances never return to the pool. A guest that returns an error
++status normally still receives bounded teardown when discarded.
 +
 +A retained `wasmtime_trap` terminal also carries `wasmtimeTrapDiagnostic`.
 +`code` is a fixed Wasmtime trap category. The capsule retains at most 64
