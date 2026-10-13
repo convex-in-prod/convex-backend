@@ -27,11 +27,16 @@ Keep invocation identity, request state, execution-kind permissions, component
 boundaries and action keys unchanged. Older consumers retain per-entry reuse.
 Validate canonical initializer paths and cover protocol permission boundaries,
 cross-entry execution and invalidation of members that were never called.
+
+Keep upstream mutation file-storage retries separate from OCC and write-limit
+retries in runtime diagnostics, including selected and elapsed backoff. Give
+each invocation a fresh download cache while retaining the upstream cache
+sharing within nested mutations; context reuse never retains file contents.
 ---
  Cargo.lock                                    |    1 +
- .../src/application_function_runner/mod.rs    |  179 +-
+ .../src/application_function_runner/mod.rs    |  187 +-
  crates/application/src/lib.rs                 |    1 +
- crates/application/src/runtime_diagnostics.rs |  204 ++
+ crates/application/src/runtime_diagnostics.rs |  205 ++
  crates/common/src/knobs.rs                    |  146 ++
  crates/common/src/memory_pressure.rs          |   58 +-
  .../src/in_process_function_runner.rs         |   46 +-
@@ -41,7 +46,7 @@ cross-entry execution and invalidation of members that were never called.
  crates/isolate/src/environment/action/mod.rs  |  457 +++-
  .../isolate/src/environment/action/phase.rs   |  193 +-
  crates/isolate/src/environment/analyze.rs     |  126 +-
- .../environment/udf/context_reuse_tests.rs    |  373 +++
+ .../environment/udf/context_reuse_tests.rs    |  374 +++
  crates/isolate/src/environment/udf/mod.rs     |  459 ++--
  crates/isolate/src/execution_observation.rs   |  678 ++++++
  crates/isolate/src/isolate.rs                 |   41 +-
@@ -62,12 +67,12 @@ cross-entry execution and invalidation of members that were never called.
  crates/udf/src/validation.rs                  |  394 ++-
  patches/README.md                             |   54 +-
  patches/backend_memory_resilience/README.md   |   23 +-
- patches/context_reuse/README.md               |  222 ++
+ patches/context_reuse/README.md               |  225 ++
  patches/context_reuse/design_reference.md     |  203 ++
  .../dependency_capacity/design_reference.md   |   17 +-
  self-hosted/advanced/knobs.md                 |   67 +-
  self-hosted/docker/docker-compose.yml         |    3 +-
- 39 files changed, 7631 insertions(+), 536 deletions(-)
+ 39 files changed, 7644 insertions(+), 536 deletions(-)
  create mode 100644 crates/application/src/runtime_diagnostics.rs
  create mode 100644 crates/isolate/src/environment/udf/context_reuse_tests.rs
  create mode 100644 crates/isolate/src/execution_observation.rs
@@ -76,10 +81,10 @@ cross-entry execution and invalidation of members that were never called.
  create mode 100644 patches/context_reuse/design_reference.md
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 5f0b78260ae8635ed04c58c53b5b888bbcd0e2e6..bc03af2f485baf0888664e28805607e6cdf30837 100644
+index 6551dd9286716262eea34b20bf40772e17d6c459..d53d37390e8b5e77775f060a98d66d3b6f79abc1 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -6107,6 +6107,7 @@ dependencies = [
+@@ -6108,6 +6108,7 @@ dependencies = [
   "serde_json",
   "sha2 0.10.8",
   "shape_inference",
@@ -88,10 +93,10 @@ index 5f0b78260ae8635ed04c58c53b5b888bbcd0e2e6..bc03af2f485baf0888664e28805607e6
   "sourcemap",
   "storage",
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c358e456e 100644
+index 731bdb9c1b0b2d8a4922f0ece2341ef4171f19d4..a788fa47f2e4ae2c44a50e18bd2310da69ce2e3a 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
-@@ -234,6 +234,10 @@ use crate::{
+@@ -241,6 +241,10 @@ use crate::{
          FunctionExecutionLog,
          OutstandingFunctionState,
      },
@@ -102,7 +107,7 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
      source_map_cache::SourceMapCache,
      ActionError,
      ActionReturn,
-@@ -451,15 +455,36 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -458,15 +462,36 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  .await?
          };
  
@@ -143,7 +148,7 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
                  },
                  log_line_sender,
                  function_metadata,
-@@ -468,8 +493,17 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -475,8 +500,17 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  in_memory_index_last_modified,
                  context,
                  scheduler_dependency,
@@ -163,7 +168,7 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
          timer.finish();
          drop(permit);
  
-@@ -499,6 +533,20 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -507,6 +541,20 @@ impl<RT: Runtime> FunctionRouter<RT> {
              None
          };
  
@@ -184,7 +189,7 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
          Ok((tx, outcome))
      }
  }
-@@ -998,12 +1046,22 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1011,12 +1059,22 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Note that we use different context for every mutation attempt.
              // This so every JS function run gets a different executionId.
              let context = ExecutionContext::new(request_context.clone(), &caller);
@@ -208,7 +213,7 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
              let pause_client = self.runtime.pause_client();
              pause_client.wait("retry_mutation_loop_start").await;
              let identity = tx.inert_identity();
-@@ -1011,20 +1069,31 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1024,20 +1082,31 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Return the previous execution's result if the mutation was committed already.
              if let Some(result) = self
                  .check_mutation_status(&mut tx, &mutation_identifier)
@@ -250,7 +255,7 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
                  )
                  .await;
              let (mut tx, mut outcome) = match result {
-@@ -1034,13 +1103,24 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1047,11 +1116,19 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          && (backoff.failures() as usize) < *UDF_EXECUTOR_OCC_MAX_RETRIES
                      {
                          let sleep = backoff.fail(&mut self.runtime.rng());
@@ -269,13 +274,33 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
 +                        }
                          continue;
                      }
+                     if matches!(
+@@ -1061,13 +1138,24 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                         < *UDF_FILE_STORAGE_MAX_RETRIES
+                     {
+                         let sleep = file_storage_backoff.fail(&mut self.runtime.rng());
++                        if let Some(diagnostic) = &mut diagnostic {
++                            diagnostic.outcome = AttemptOutcome::FileStorageRetry;
++                            diagnostic.selected_backoff = Some(sleep);
++                        }
+                         tracing::warn!(
+                             "File storage failed ({e:#}), retrying {write_source:?} after \
+                              {sleep:?}",
+                         );
++                        let backoff_started = Instant::now();
+                         self.runtime.wait(sleep).await;
++                        if let Some(diagnostic) = &mut diagnostic {
++                            diagnostic.elapsed_backoff = Some(backoff_started.elapsed());
++                        }
+                         continue;
+                     }
 +                    if let Some(diagnostic) = &mut diagnostic {
 +                        diagnostic.outcome = AttemptOutcome::SystemError;
 +                    }
                      self.function_log
                          .log_mutation_system_error(
                              &e,
-@@ -1061,7 +1141,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1088,7 +1176,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Save a CommittedMutation object so we won't rerun this mutation if
              // successful.
              self.write_mutation_status(&mut tx, &mutation_identifier, &outcome)
@@ -289,7 +314,7 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
  
              let stats = tx.take_stats();
              let execution_time = start.elapsed();
-@@ -1071,6 +1156,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1098,6 +1191,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  // If it's an error inside the UDF, log the failed execution and return the
                  // developer error.
                  Err(ref error) => {
@@ -299,7 +324,7 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
                      drop(tx);
                      self.function_log
                          .log_mutation(
-@@ -1094,21 +1182,37 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1121,21 +1217,37 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Attempt to commit the transaction and log an error if commit failed,
              // even if it was an OCC error. We may decide later to suppress OCC
              // errors from the log.
@@ -341,7 +366,7 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
                          let js_error = JsError::from_error(e);
                          outcome.result = Err(js_error.clone());
                          Err(MutationError {
-@@ -1120,15 +1224,27 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1147,15 +1259,27 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                              && (backoff.failures() as usize) < *UDF_EXECUTOR_OCC_MAX_RETRIES
                          {
                              let sleep = backoff.fail(&mut self.runtime.rng());
@@ -369,7 +394,7 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
                              }
                              self.function_log
                                  .log_mutation_occ_error(
-@@ -1421,8 +1537,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1450,8 +1574,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          wait_for_permit: bool,
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
@@ -382,7 +407,7 @@ index d19dece9ec3435491ba230c445ed073171a3a15c..d13367e254b4b4430b4952d973bbad3c
                  path,
                  arguments,
                  identity,
-@@ -1431,8 +1549,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1460,8 +1586,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  context,
                  wait_for_permit,
                  scheduler_dependency,
@@ -416,10 +441,10 @@ index 87464287b5b4d711929a5b89d45d381919a6a529..8659ee7308cac6a6094e5b78cbf5a21a
  mod schema_worker;
 diff --git a/crates/application/src/runtime_diagnostics.rs b/crates/application/src/runtime_diagnostics.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..cd7d49cda39a76f1bd4fa38cb4eaa00fdd748636
+index 0000000000000000000000000000000000000000..5ab0775d8623493c27f8c8a9cf350ea2252003ef
 --- /dev/null
 +++ b/crates/application/src/runtime_diagnostics.rs
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,205 @@
 +//! Bounded per-attempt observations. Identities and paths are log fields only;
 +//! arguments, request metadata, environment and error text are never retained.
 +
@@ -498,6 +523,7 @@ index 0000000000000000000000000000000000000000..cd7d49cda39a76f1bd4fa38cb4eaa00f
 +    SystemError,
 +    OccRetry,
 +    WriteLimitRetry,
++    FileStorageRetry,
 +    AlreadyCommitted,
 +}
 +
@@ -625,7 +651,7 @@ index 0000000000000000000000000000000000000000..cd7d49cda39a76f1bd4fa38cb4eaa00f
 +    }
 +}
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index f8470065ac50d5cafd46d516a8c034404bcedc89..70b54b5bfe03646215457f84dde55b8bad90e8e1 100644
+index 87ccc80e67db5ebcdca8d37d222a9fdf444591da..c02ce57d96393b16ee3bb65d0c8588df0d51bd45 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -1364,6 +1364,40 @@ pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS",
@@ -996,7 +1022,7 @@ index 7a83c30ae6eccc746b304b91dedfd465b080f4b1..63806ffb741e457cbf383d01ce6511d3
  udf = { workspace = true, features = ["testing"] }
  usage_tracking = { workspace = true, features = ["testing"] }
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a96741d4f57c 100644
+index 0d077980adb96b8b7f23fa6e52af4e510ade4b04..8d33027f0623441d06dd75f3534bb90ea27009e7 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -9,6 +9,7 @@ use std::{
@@ -1034,7 +1060,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      query_journal::QueryJournal,
      runtime::{
          shutdown_and_join,
-@@ -130,6 +139,7 @@ use futures::{
+@@ -133,6 +142,7 @@ use futures::{
          PollNext,
          StreamExt,
      },
@@ -1042,7 +1068,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      TryStreamExt as _,
  };
  use itertools::Either;
-@@ -178,8 +188,14 @@ use value::identifier::Identifier;
+@@ -181,8 +191,14 @@ use value::identifier::Identifier;
  use crate::{
      concurrency_limiter::ConcurrencyLimiter,
      context_cache::{
@@ -1057,7 +1083,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      },
      isolate::{
          Isolate,
-@@ -207,6 +223,7 @@ use crate::{
+@@ -210,6 +226,7 @@ use crate::{
          queue_timer,
          rejected_before_execution_error,
          RejectedBeforeExecutionReason,
@@ -1065,7 +1091,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      },
      module_cache::{
          ModuleCache,
-@@ -221,6 +238,74 @@ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
+@@ -224,6 +241,74 @@ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
  pub const PAUSE_REQUEST: &str = "pause_request";
  pub const NO_AVAILABLE_WORKERS: &str = "There is no capacity available to run this function";
  
@@ -1140,7 +1166,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
  struct RequestSchedulingProperties {
      unblocks_ancestor: bool,
-@@ -580,6 +665,30 @@ fn per_client_worker_capacity(max_workers: usize, max_percent_per_client: usize)
+@@ -583,6 +668,30 @@ fn per_client_worker_capacity(max_workers: usize, max_percent_per_client: usize)
      percentage_capacity.max(1).min(max_workers)
  }
  
@@ -1171,7 +1197,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
  impl ActiveRequestGuard {
      fn new(
          active_workers: Arc<AtomicUsize>,
-@@ -705,6 +814,9 @@ pub struct IsolateConfig {
+@@ -708,6 +817,9 @@ pub struct IsolateConfig {
      max_user_timeout: Option<Duration>,
  
      pub(crate) limiter: ConcurrencyLimiter,
@@ -1181,7 +1207,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
  }
  
  impl IsolateConfig {
-@@ -713,8 +825,22 @@ impl IsolateConfig {
+@@ -716,8 +828,22 @@ impl IsolateConfig {
              name,
              max_user_timeout: None,
              limiter,
@@ -1204,7 +1230,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
  }
  
  pub struct UdfRequest<RT: Runtime> {
-@@ -797,22 +923,60 @@ impl<RT: Runtime> Request<RT> {
+@@ -801,22 +927,60 @@ impl<RT: Runtime> Request<RT> {
      }
  
      pub fn module(&self) -> Option<CanonicalizedComponentModulePath> {
@@ -1274,7 +1300,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      }
  
      fn independent_action_key(&self) -> Option<IndependentActionKey> {
-@@ -889,6 +1053,8 @@ impl<RT: Runtime> Request<RT> {
+@@ -893,6 +1057,8 @@ impl<RT: Runtime> Request<RT> {
  pub enum RequestType<RT: Runtime> {
      Udf {
          request: UdfRequest<RT>,
@@ -1283,7 +1309,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          response: oneshot::Sender<anyhow::Result<(Transaction<RT>, FunctionOutcome)>>,
          queue_timer: Timer<VMHistogram>,
          rng_seed: [u8; 32],
-@@ -898,6 +1064,8 @@ pub enum RequestType<RT: Runtime> {
+@@ -902,6 +1068,8 @@ pub enum RequestType<RT: Runtime> {
      },
      Action {
          request: ActionRequest<RT>,
@@ -1292,7 +1318,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          response: oneshot::Sender<anyhow::Result<ActionOutcome>>,
          queue_timer: Timer<VMHistogram>,
          action_callbacks: Arc<dyn ActionCallbacks>,
-@@ -959,6 +1127,8 @@ pub enum RequestType<RT: Runtime> {
+@@ -963,6 +1131,8 @@ pub enum RequestType<RT: Runtime> {
          can_block_on_descendant: bool,
          is_isolate_action: bool,
          is_control_plane: bool,
@@ -1301,7 +1327,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          fail_worker: bool,
          started: mpsc::UnboundedSender<usize>,
          completion: oneshot::Receiver<()>,
-@@ -981,6 +1151,19 @@ impl<RT: Runtime> RequestType<RT> {
+@@ -985,6 +1155,19 @@ impl<RT: Runtime> RequestType<RT> {
              } => *is_control_plane,
          }
      }
@@ -1321,7 +1347,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
  }
  
  #[allow(async_fn_in_trait)]
-@@ -1205,16 +1388,29 @@ pub struct IsolateClient<RT: Runtime> {
+@@ -1209,16 +1392,29 @@ pub struct IsolateClient<RT: Runtime> {
  }
  
  impl<RT: Runtime> IsolateClient<RT> {
@@ -1355,7 +1381,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          anyhow::ensure!(
              *ISOLATE_QUEUE_SIZE > 0,
              "ISOLATE_QUEUE_SIZE must be greater than zero"
-@@ -1268,9 +1464,39 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1272,9 +1468,39 @@ impl<RT: Runtime> IsolateClient<RT> {
              *ANALYZE_CONCURRENCY,
          )?;
          let delay_control_config = (*ISOLATE_QUEUE_DELAY_CONTROL_ENABLED).then_some(queue_config);
@@ -1396,7 +1422,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
  
          initialize_v8();
          // NB: We don't call V8::Dispose or V8::ShutdownPlatform since we just assume a
-@@ -1357,7 +1583,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1361,7 +1587,11 @@ impl<RT: Runtime> IsolateClient<RT> {
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          let (tx, rx) = oneshot::channel();
@@ -1408,15 +1434,15 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
              request: UdfRequest {
                  path_and_args,
                  udf_type,
-@@ -1367,6 +1597,7 @@ impl<RT: Runtime> IsolateClient<RT> {
-                 context,
+@@ -1372,6 +1602,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                  environment_data,
+                 file_downloads: FileDownloads::default(),
              },
 +            cancellation,
              response: tx,
              queue_timer: queue_timer(),
              rng_seed,
-@@ -1384,7 +1615,13 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1389,7 +1620,13 @@ impl<RT: Runtime> IsolateClient<RT> {
              EncodedSpan::from_parent(),
              scheduler_dependency,
          ))?;
@@ -1431,7 +1457,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
  
          Ok((tx, outcome))
      }
-@@ -1404,7 +1641,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1409,7 +1646,11 @@ impl<RT: Runtime> IsolateClient<RT> {
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
@@ -1443,7 +1469,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
              request: ActionRequest {
                  params: ActionRequestParams { path_and_args },
                  identity: transaction.identity().clone(),
-@@ -1412,6 +1653,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1417,6 +1658,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                  context,
                  environment_data,
              },
@@ -1451,7 +1477,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
              response: tx,
              queue_timer: queue_timer(),
              action_callbacks,
-@@ -1425,7 +1667,14 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1430,7 +1672,14 @@ impl<RT: Runtime> IsolateClient<RT> {
              EncodedSpan::from_parent(),
              scheduler_dependency,
          ))?;
@@ -1467,7 +1493,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
              Ok(outcome) => Ok(outcome),
              Err(e) => Err(recapture_stacktrace(e).await),
          }
-@@ -1838,8 +2087,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1843,8 +2092,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
      ) -> anyhow::Result<(Transaction<RT>, NestedUdfOutcome)> {
          let subquery_path = udf_request.path_and_args.path().clone();
          let (tx, rx) = oneshot::channel();
@@ -1481,7 +1507,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
              response: tx,
              queue_timer: queue_timer(),
              rng_seed,
-@@ -1861,7 +2115,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1866,7 +2120,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
              .ok()
              .context("scheduler shut down")?;
          metrics::log_scheduler_request_enqueued(self.pool_name, scheduling_properties.as_label());
@@ -1496,7 +1522,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          let outcome = match outcome {
              FunctionOutcome::Query(outcome) | FunctionOutcome::Mutation(outcome) => {
                  NestedUdfOutcome {
-@@ -1898,6 +2158,15 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -1903,6 +2163,15 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      worker: W,
      /// Vec of channels for sending work to individual workers.
      worker_senders: Vec<mpsc::Sender<IsolateWorkerRequest<RT>>>,
@@ -1512,7 +1538,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      /// Map from client_id to stack of workers (implemented with a deque). The
      /// most recently used worker for a given client is at the front of the
      /// deque. These workers were previously used by this client, but may
-@@ -1954,6 +2223,14 @@ struct ActiveWorkerState {
+@@ -1959,6 +2228,14 @@ struct ActiveWorkerState {
      scheduling_properties: RequestSchedulingProperties,
  }
  
@@ -1527,7 +1553,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
  impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      pub fn new(
          rt: RT,
-@@ -1984,6 +2261,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1989,6 +2266,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              in_progress_counts_by_client: HashMap::new(),
              in_progress_counts: ActiveRequestCounts::default(),
              active_workers,
@@ -1536,7 +1562,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
              available_workers: HashMap::new(),
              max_workers,
              base_worker_capacity,
-@@ -2003,6 +2282,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2008,6 +2287,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          info: IdleWorkerInfo,
      ) {
          self.release_action_function(completed_worker.action_key.as_ref());
@@ -1545,7 +1571,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          let new_count = match self
              .in_progress_counts_by_client
              .remove_entry(&completed_worker.client_id)
-@@ -2289,8 +2570,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2294,8 +2575,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      let dispatch_state = self.state_snapshot();
                      let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
                          && dispatch_state.dependency_dispatch_uses_reserve();
@@ -1562,7 +1588,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
                          Err(reason) => {
                              metrics::log_scheduler_request_rejected(
                                  self.worker.config().name,
-@@ -2315,6 +2602,28 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2320,6 +2607,28 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          self.worker.config().name,
                          scheduling_properties,
                      );
@@ -1591,7 +1617,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
                      if self.worker_senders[worker_id]
                          .try_send(IsolateWorkerRequest {
                              request,
-@@ -2332,6 +2641,50 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2337,6 +2646,50 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          );
                          return;
                      }
@@ -1642,7 +1668,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
                      if let Some((lane, sojourn)) = dispatch_sojourn {
                          metrics::log_isolate_queue_sojourn(
                              self.worker.config().name,
-@@ -2402,16 +2755,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2407,16 +2760,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  _ = &mut report_stats => {
                      let heap_stats = self.aggregate_heap_stats();
                      log_aggregated_heap_stats(&heap_stats);
@@ -1665,7 +1691,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      /// `self.available_workers` state, so the caller is responsible for using
      /// the worker and returning it back to `self.available_workers` after it is
      /// done.
-@@ -2419,7 +2776,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2424,7 +2781,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          &mut self,
          request: &Request<RT>,
          state: &SchedulerStateSnapshot,
@@ -1674,7 +1700,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          let client_id = request.client_id.as_str();
          let eligibility = state.request_eligibility(
              request.scheduling_properties(self.control_plane_lane_enabled),
-@@ -2433,28 +2790,96 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2438,28 +2795,96 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              );
              return Err(reason);
          }
@@ -1787,7 +1813,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          }
          // If we've recently started up and haven't yet created `max_workers` threads,
          // create a new worker instead of "stealing" some other client's worker.
-@@ -2475,7 +2900,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2480,7 +2905,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  self.worker.config().name,
                  self.worker_senders.len() - 1
              );
@@ -1803,7 +1829,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          }
          // No existing worker for this client and we've already started the max number
          // of workers -- just grab the least recently used worker. This worker is least
-@@ -2499,13 +2931,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2504,13 +2936,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              .pop_back()
              .expect("Available worker map should never contain an empty list");
          log_worker_stolen(worker.last_used_ts.elapsed());
@@ -1827,7 +1853,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      }
  
      fn aggregate_heap_stats(&self) -> IsolateHeapStats {
-@@ -2550,6 +2991,7 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2555,6 +2996,7 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
              max_user_timeout, ..
          } = self.config();
          let mut reqs = std::pin::pin!(ReceiverStream::new(reqs).peekable());
@@ -1835,7 +1861,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          let mut ready: Option<(oneshot::Sender<_>, ActiveRequestGuard)> = None;
          'recreate_isolate: loop {
              let mut last_client_id: Option<String> = None;
-@@ -2560,9 +3002,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2565,9 +3007,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                  *ISOLATE_MAX_USER_HEAP_SIZE,
              );
              isolate.set_heap_stats_handle(heap_stats.clone());
@@ -1852,7 +1878,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
                  context_cache.prepare(isolate.isolate());
                  // Check again whether the isolate has enough free heap memory
                  // before starting the next request
-@@ -2582,6 +3030,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2587,6 +3035,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                      });
                  }
                  tokio::select! {
@@ -1868,7 +1894,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
                      // If the isolate isn't "tainted", no need to wait for the idle timeout.
                      _ = self.rt().wait(*ISOLATE_IDLE_TIMEOUT), if last_client_id.is_some() => {
                          tracing::debug!("Restarting isolate for {last_client_id:?} due to idle timeout");
-@@ -2719,6 +3176,7 @@ mod tests {
+@@ -2724,6 +3181,7 @@ mod tests {
          collections::{
              BTreeMap,
              HashMap,
@@ -1876,7 +1902,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          },
          future::Future,
          pin::Pin,
-@@ -2739,7 +3197,9 @@ mod tests {
+@@ -2744,7 +3202,9 @@ mod tests {
      use common::{
          components::{
              CanonicalizedComponentFunctionPath,
@@ -1886,7 +1912,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
              ComponentName,
          },
          fastrace_helpers::EncodedSpan,
-@@ -2754,6 +3214,7 @@ mod tests {
+@@ -2759,6 +3219,7 @@ mod tests {
          types::{
              ModuleEnvironment,
              SchedulerDependencyClass,
@@ -1894,7 +1920,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          },
      };
      use errors::ErrorMetadataAnyhowExt as _;
-@@ -2771,14 +3232,18 @@ mod tests {
+@@ -2776,14 +3237,18 @@ mod tests {
      };
  
      use super::{
@@ -1913,7 +1939,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          IsolateConfig,
          IsolateWorker,
          IsolateWorkerHandle,
-@@ -2793,14 +3258,22 @@ mod tests {
+@@ -2798,14 +3263,22 @@ mod tests {
          SharedIsolateScheduler,
      };
      use crate::{
@@ -1938,7 +1964,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
          ConcurrencyLimiter,
          ConcurrencyPermit,
      };
-@@ -2897,6 +3370,8 @@ mod tests {
+@@ -2902,6 +3375,8 @@ mod tests {
                          can_block_on_descendant: _,
                          is_isolate_action: _,
                          is_control_plane: _,
@@ -1947,7 +1973,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
                          fail_worker,
                          started,
                          completion,
-@@ -3012,6 +3487,8 @@ mod tests {
+@@ -3017,6 +3492,8 @@ mod tests {
              ),
              is_isolate_action: matches!(kind, TestRequestKind::Action),
              is_control_plane: matches!(kind, TestRequestKind::ControlPlane),
@@ -1956,7 +1982,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
              fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
              started,
              completion: completion_receiver,
-@@ -3133,6 +3610,7 @@ mod tests {
+@@ -3138,6 +3615,7 @@ mod tests {
          ) -> Self {
              Self::new_with_policy(
                  rt,
@@ -1964,7 +1990,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
                  max_workers,
                  base_worker_capacity,
                  max_independent_actions,
-@@ -3162,6 +3640,7 @@ mod tests {
+@@ -3167,6 +3645,7 @@ mod tests {
              .unwrap();
              Self::new_with_policy(
                  rt,
@@ -1972,7 +1998,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
                  max_workers,
                  base_worker_capacity,
                  max_independent_actions,
-@@ -3175,6 +3654,7 @@ mod tests {
+@@ -3180,6 +3659,7 @@ mod tests {
          #[allow(clippy::too_many_arguments)]
          fn new_with_policy(
              rt: SchedulerTestRuntime,
@@ -1980,7 +2006,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
              max_workers: usize,
              base_worker_capacity: usize,
              max_independent_actions: usize,
-@@ -3185,7 +3665,7 @@ mod tests {
+@@ -3190,7 +3670,7 @@ mod tests {
          ) -> Self {
              let (sender, receiver) = new_scheduler_queue::<_, Request<_>>(
                  rt.clone(),
@@ -1989,7 +2015,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
                  queue_capacity,
                  max_workers - base_worker_capacity,
                  queue_config,
-@@ -3199,6 +3679,7 @@ mod tests {
+@@ -3204,6 +3684,7 @@ mod tests {
                  TestIsolateWorker {
                      rt: rt.clone(),
                      config: IsolateConfig::new(pool_name, ConcurrencyLimiter::unlimited()),
@@ -1997,7 +2023,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
                  },
                  max_workers,
                  base_worker_capacity,
-@@ -3380,6 +3861,20 @@ mod tests {
+@@ -3385,6 +3866,20 @@ mod tests {
          }
      }
  
@@ -2018,7 +2044,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      #[test]
      fn dependency_and_descendant_capability_are_independent() {
          assert_eq!(properties(false, false, false).as_label(), "independent");
-@@ -3624,6 +4119,16 @@ mod tests {
+@@ -3629,6 +4124,16 @@ mod tests {
          );
      }
  
@@ -2035,7 +2061,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      #[test]
      fn per_client_capacity_uses_total_occupancy() {
          let global = ActiveRequestCounts {
-@@ -3652,6 +4157,291 @@ mod tests {
+@@ -3657,6 +4162,291 @@ mod tests {
          assert!(!state.can_start_request(properties(true, false, false), "deployment", None));
      }
  
@@ -2327,7 +2353,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      #[test]
      fn action_cap_does_not_cap_queries_or_dependency_actions() {
          let active = ActiveRequestCounts {
-@@ -3702,6 +4492,40 @@ mod tests {
+@@ -3707,6 +4497,40 @@ mod tests {
          assert!(error.to_string().contains("greater than zero"));
      }
  
@@ -2368,7 +2394,7 @@ index fb88a249a07489dad6d0d3827d4af3a2b6657825..016d27c629115dfcecf47c74c407a967
      #[test]
      fn congested_scheduler_preserves_worker_and_queue_dependency_reserves() {
          let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
-@@ -3934,6 +4758,7 @@ mod tests {
+@@ -3939,6 +4763,7 @@ mod tests {
                  // ineligible behind A's active request.
                  let mut harness = SchedulerHarness::new_with_policy(
                      scheduler_rt,
@@ -5802,10 +5828,10 @@ index 513f0f201c6784b7ad79b0a8637188feace34fca..1757f255a7b6bdfdec01c90765587248
 +}
 diff --git a/crates/isolate/src/environment/udf/context_reuse_tests.rs b/crates/isolate/src/environment/udf/context_reuse_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..8f1e21f785479a29d6995c8c1d2a694e4727841d
+index 0000000000000000000000000000000000000000..15c3634b27b1ea615bfdb1c44164605420f1e0bb
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/context_reuse_tests.rs
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,374 @@
 +use std::{
 +    collections::BTreeMap,
 +    sync::Arc,
@@ -6040,6 +6066,7 @@ index 0000000000000000000000000000000000000000..8f1e21f785479a29d6995c8c1d2a694e
 +        let (environment, args) = DatabaseUdfEnvironment::new(
 +            self.rt.clone(),
 +            UdfRequest {
++                file_downloads: file_storage::FileDownloads::default(),
 +                path_and_args,
 +                udf_type: UdfType::Query,
 +                transaction: self.database.begin(Identity::system()).await?,
@@ -6180,7 +6207,7 @@ index 0000000000000000000000000000000000000000..8f1e21f785479a29d6995c8c1d2a694e
 +        .expect("context reuse test panicked")
 +}
 diff --git a/crates/isolate/src/environment/udf/mod.rs b/crates/isolate/src/environment/udf/mod.rs
-index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8bd597997d 100644
+index f6e57c9e41ec3664ca54a19c356f2f370ad0a5d9..8c5e2545e6c5a413514b68b3b2adc38a740a0291 100644
 --- a/crates/isolate/src/environment/udf/mod.rs
 +++ b/crates/isolate/src/environment/udf/mod.rs
 @@ -1,4 +1,3 @@
@@ -6244,7 +6271,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
      OVER_LIMIT_HELP,
  };
  use deno_core::{
-@@ -173,6 +171,7 @@ use self::{
+@@ -176,6 +174,7 @@ use self::{
  use super::ModuleCodeCacheResult;
  use crate::{
      client::{
@@ -6252,7 +6279,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          EnvironmentData,
          UdfCallback,
          UdfRequest,
-@@ -198,6 +197,7 @@ use crate::{
+@@ -201,6 +200,7 @@ use crate::{
      metrics::{
          self,
          log_isolate_request_cancelled,
@@ -6260,7 +6287,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
      },
      request_scope::{
          RequestScope,
-@@ -217,6 +217,7 @@ pub struct DatabaseUdfSyscallProvider<RT: Runtime> {
+@@ -220,6 +220,7 @@ pub struct DatabaseUdfSyscallProvider<RT: Runtime> {
  
      udf_type: UdfType,
      path: ResolvedComponentFunctionPath,
@@ -6268,7 +6295,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
      deployment: DeploymentMetadata,
      client_id: String,
      udf_server_version: Option<semver::Version>,
-@@ -290,14 +291,18 @@ impl<RT: Runtime> OpProvider for DatabaseUdfSyscallProvider<RT> {
+@@ -294,14 +295,18 @@ impl<RT: Runtime> OpProvider for DatabaseUdfSyscallProvider<RT> {
              // start of execution and doesn't observe elapsed time.
              UdfType::Query => self.phase.performance_now_fixed(),
              UdfType::Mutation => self.phase.performance_now_incrementing(),
@@ -6289,7 +6316,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          }
      }
  
-@@ -404,6 +409,10 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
+@@ -408,6 +413,10 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
          &self.path
      }
  
@@ -6300,7 +6327,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
      fn udf_type(&self) -> UdfType {
          self.udf_type
      }
-@@ -500,7 +509,7 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
+@@ -504,7 +513,7 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
      ) -> anyhow::Result<Option<ContextReadSet>> {
          let read_set = self.phase.finish_snoop()?;
          Ok(if should_capture {
@@ -6309,7 +6336,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          } else {
              None
          })
-@@ -511,8 +520,47 @@ type UdfRecursiveExecutor<RT> = RecursiveExecutor<
+@@ -515,8 +524,47 @@ type UdfRecursiveExecutor<RT> = RecursiveExecutor<
      anyhow::Result<(
          DatabaseUdfEnvironment<RT>,
          anyhow::Result<Result<PendingValue, JsError>>,
@@ -6357,7 +6384,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
  struct RunUdf<'a, 'b, RT: Runtime> {
      rt: &'a RT,
      v8_scope: &'a mut v8::Isolate,
-@@ -520,6 +568,7 @@ struct RunUdf<'a, 'b, RT: Runtime> {
+@@ -524,6 +572,7 @@ struct RunUdf<'a, 'b, RT: Runtime> {
      context_cache: &'a mut ContextCache,
      execution_handle: &'a ExecutionHandle,
      executor: &'a UdfRecursiveExecutor<RT>,
@@ -6365,7 +6392,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
  }
  
  impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
-@@ -537,9 +586,10 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -541,9 +590,10 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
              client_id,
              rng_seed,
          );
@@ -6379,7 +6406,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          // N.B.: `run_nested` calls the corresponding `pop_context`.
          // This may not happen in case of a system error, but in that case we
          // are going to throw away the entire context stack anyway.
-@@ -549,25 +599,28 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -553,25 +603,28 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
          let mut isolate_clean = false;
          // User code is going to run again; regain the concurrency permit.
          let mut unpause_guard = self.paused_timeout.regain().await?;
@@ -6426,7 +6453,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          let outcome = NestedUdfOutcome {
              observed_identity: nested_provider.syscall_provider.phase.observed_identity(),
              observed_rng: nested_provider.syscall_provider.phase.observed_rng(),
-@@ -578,10 +631,15 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -582,10 +635,15 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
              result: result?,
              syscall_trace: nested_provider.syscall_provider.syscall_trace,
          };
@@ -6446,7 +6473,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
      }
  }
  
-@@ -611,6 +669,7 @@ pub trait DatabaseUdfInnerProvider<RT: Runtime>:
+@@ -615,6 +673,7 @@ pub trait DatabaseUdfInnerProvider<RT: Runtime>:
  
      fn rt(&self) -> &RT;
      fn path(&self) -> &ResolvedComponentFunctionPath;
@@ -6454,7 +6481,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
      fn udf_type(&self) -> UdfType;
      fn reactor_depth(&self) -> usize;
      async fn initialize(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()>;
-@@ -662,7 +721,10 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -667,7 +726,10 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
              module_loader,
              deployment,
          } = environment_data;
@@ -6466,7 +6493,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          let (path, arguments, udf_server_version) = path_and_args.consume();
          let component = path.component;
          let identity = transaction.inert_identity();
-@@ -672,6 +734,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -677,6 +739,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
                      rt: rt.clone(),
                      udf_type,
                      path,
@@ -6474,7 +6501,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
                      udf_server_version: udf_server_version.clone(),
  
                      phase: UdfPhase::new(
-@@ -726,7 +789,7 @@ where
+@@ -732,7 +795,7 @@ where
          context_cache: &mut ContextCache,
          permit: ConcurrencyPermit,
          isolate_clean: &mut bool,
@@ -6483,7 +6510,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          args: DatabaseUdfArgs,
          function_started: Option<oneshot::Sender<()>>,
          udf_callback: Option<IsolateClient<RT>>,
-@@ -741,7 +804,7 @@ where
+@@ -747,7 +810,7 @@ where
              // reject the function for capacity reasons.
              _ = tx.send(());
          }
@@ -6492,7 +6519,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
              .run_until(Self::run_nested(
                  &executor,
                  &args,
-@@ -751,7 +814,7 @@ where
+@@ -757,7 +820,7 @@ where
                  state,
                  &mut timeout,
                  isolate_clean,
@@ -6501,7 +6528,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
                  udf_callback,
              ))
              .await?;
-@@ -767,10 +830,20 @@ where
+@@ -773,10 +836,20 @@ where
              Err(e) => result = Err(e),
          }
          let result = result?;
@@ -6524,7 +6551,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
      }
  
      /// Runs a query or mutation, possibly nested via `runQuery`/`runMutation`.
-@@ -783,17 +856,26 @@ where
+@@ -789,17 +862,26 @@ where
          mut request_state: RequestState<RT, Self>,
          timeout: &mut Timeout<RT>,
          isolate_clean: &mut bool,
@@ -6555,7 +6582,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
              let v8_context = v8::Local::new(handle_scope, context);
              context_scope = v8::ContextScope::new(handle_scope, v8_context);
              (
-@@ -819,6 +901,7 @@ where
+@@ -825,6 +907,7 @@ where
                  None,
              )
          };
@@ -6563,7 +6590,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          let mut result = {
              let v8_scope = isolate_context.scope();
              let module = {
-@@ -839,11 +922,17 @@ where
+@@ -845,11 +928,17 @@ where
                  .await;
                  if snoop {
                      let mut scope = RequestScope::<RT, Self>::enter(v8_scope);
@@ -6586,7 +6613,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
                          .await?;
                  }
                  initialize_result
-@@ -856,7 +945,7 @@ where
+@@ -862,7 +951,7 @@ where
                          &mut *v8_scope,
                          context_cache,
                          timeout,
@@ -6595,7 +6622,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
                          args,
                          module,
                          udf_callback,
-@@ -872,9 +961,32 @@ where
+@@ -878,9 +967,32 @@ where
          // to ensure the microtask queue is empty. Otherwise, JS from this request may
          // leak to a subsequent one on isolate reuse.
          isolate_context.checkpoint();
@@ -6628,7 +6655,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          let this = request_state.environment;
          // Override the returned result if we hit a termination error.
          match execution_handle.pop_context(request_state.context_id)? {
-@@ -882,29 +994,50 @@ where
+@@ -888,29 +1000,50 @@ where
              Err(e) => result = Ok(Err(e)),
          }
  
@@ -6690,7 +6717,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
      }
  
      #[fastrace::trace(properties = {"reusable_context": "{reusable_context}", "is_reused": "{is_reused}"})]
-@@ -927,10 +1060,14 @@ where
+@@ -933,10 +1066,14 @@ where
                  .await?;
          }
  
@@ -6707,7 +6734,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          };
  
          if reusable_context {
-@@ -953,6 +1090,31 @@ where
+@@ -959,6 +1096,31 @@ where
              return Ok(Err(JsError::from_message(message)));
          };
  
@@ -6739,7 +6766,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          let module = match scope
              .eval_user_module(udf_type, false, &module_specifier, timeout)
              .await?
-@@ -972,7 +1134,7 @@ where
+@@ -978,7 +1140,7 @@ where
          v8_scope: &mut v8::PinScope<'_, '_>,
          context_cache: &mut ContextCache,
          timeout: &mut Timeout<RT>,
@@ -6748,7 +6775,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          args: &DatabaseUdfArgs,
          module: v8::Local<'_, v8::Module>,
          udf_callback: Option<IsolateClient<RT>>,
-@@ -1076,17 +1238,24 @@ where
+@@ -1082,17 +1244,24 @@ where
              .ok_or_else(|| anyhow!("Couldn't find invoke function in {udf_path:?}"))?
              .try_into()?;
  
@@ -6780,7 +6807,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          // If we hit a system error within a syscall, return `Err`, even if JS thinks it
          // returned successfully. The syscall layer uses
          // `scope.terminate_execution()` when we hit a system error, which
-@@ -1099,11 +1268,14 @@ where
+@@ -1105,11 +1274,14 @@ where
              Ok(None) => anyhow::bail!("Successful invocation returned None"),
              Err(e) => return Ok(Err(e)),
          };
@@ -6797,7 +6824,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
              pump_message_loop(&scope);
              scope.record_heap_stats(handle)?;
              handle.check_terminated()?;
-@@ -1187,6 +1359,7 @@ where
+@@ -1193,6 +1365,7 @@ where
                                  context_cache,
                                  execution_handle: handle,
                                  executor,
@@ -6805,7 +6832,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
                              };
                              let udf_callback = if let Some(callback) = &udf_callback {
                                  Either::Left(callback)
-@@ -1195,7 +1368,7 @@ where
+@@ -1201,7 +1374,7 @@ where
                              };
                              select! {
                                  biased;
@@ -6814,7 +6841,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
                                      log_isolate_request_cancelled();
                                      anyhow::bail!("Cancelled");
                                  },
-@@ -1231,7 +1404,7 @@ where
+@@ -1237,7 +1410,7 @@ where
                                  .into(),
                              )?;
                          },
@@ -6823,7 +6850,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
                      },
                  };
                  resolve_promise(result_scope, resolver, result_v8)?;
-@@ -1239,6 +1412,7 @@ where
+@@ -1245,6 +1418,7 @@ where
              handle.check_terminated()?;
          }
  
@@ -6831,7 +6858,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
          // Check to see if the user's promise is blocked.
          let result = match promise.state() {
              v8::PromiseState::Pending => Err(JsError::from_message(
-@@ -1284,23 +1458,53 @@ where
+@@ -1290,23 +1464,53 @@ where
      async fn take_and_validate_reused_context(
          &mut self,
          context_cache: &mut ContextCache,
@@ -6899,7 +6926,7 @@ index ca2086a06aaa9347fbf3716b904be8c52531b2f0..107cb4ed3c7205aa9df75437227c2a8b
      }
  }
  
-@@ -1569,71 +1773,6 @@ pub fn add_warnings_to_log_lines(
+@@ -1575,71 +1779,6 @@ pub fn add_warnings_to_log_lines(
  impl<RT: Runtime> ValidateContext for DatabaseUdfSyscallProvider<RT> {
      #[fastrace::trace]
      async fn validate_reused_context(&mut self, read_set: &ContextReadSet) -> anyhow::Result<bool> {
@@ -9930,10 +9957,10 @@ index 775c63926d8cc54a03a65cb231b6b55f06183d4d..f0df0ad9d65e4af55a21c9f17b1684b2
  involved, but an older image does not understand the new environment variables or emit the new
 diff --git a/patches/context_reuse/README.md b/patches/context_reuse/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..f6cb7d04b3f9fa9f7c5e8c8110b2d58952b111ad
+index 0000000000000000000000000000000000000000..0b96710ecf1d71e67539e16b16ad3f7b8ad51fdc
 --- /dev/null
 +++ b/patches/context_reuse/README.md
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,225 @@
 +# Context Reuse
 +
 +This patch makes V8 context reuse one policy-controlled feature covering queries, mutations, ordinary
@@ -10011,6 +10038,9 @@ index 0000000000000000000000000000000000000000..f6cb7d04b3f9fa9f7c5e8c8110b2d589
 +After taking a resident, the backend validates its initialization read set. Deploys, environment
 +changes, component resources, or other initialization changes therefore force a fresh context.
 +Every request gets fresh identity, transaction, callbacks, streams, task state, and timeout state.
++Mutation file-download caches also belong to the invocation and are shared with its nested
++mutations, never retained in a reusable context. Sampled runtime diagnostics distinguish file-storage
++retries from OCC and write-limit retries and record their backoff.
 +Database UDFs and actions also carry caller-drop cancellation to the save boundary. A context is
 +published only after successful execution, a final microtask checkpoint, clean termination, no
 +pending request-owned work, and a valid read set. HTTP actions additionally require a successfully

@@ -10,6 +10,11 @@ Vendor the pinned mysql_async revision and add a synchronous force-disconnect pa
 Default to client-side force-disconnect without numeric server cancellation. Add an explicit trusted-single-namespace topology assertion for an optional serial control lane that keeps the target transport alive through KILL CONNECTION, rejects stale physical generations, uses separately bounded control capacity, and fails closed after control replacement or failure.
 
 Export bounded cancellation request, terminal-outcome, and latency metrics. Document the ownership contract, topology hazard, vendored-driver delta, strict activation setting, build-context inclusion, and focused verification requirements.
+
+Keep the extracted V5 write implementation and V6 reader/backfill components
+on the guarded connection and lease paths. Run paced READ COMMITTED deployment
+deletion batches through the same transaction owner through commit, so caller
+cancellation cannot return an interrupted deletion connection to the pool.
 ---
  .dockerignore                                 |    4 +
  Cargo.lock                                    |    2 -
@@ -18,13 +23,13 @@ Export bounded cancellation request, terminal-outcome, and latency metrics. Docu
  crates/db_connection/src/lib.rs               |   13 +-
  crates/mysql/src/cancellation.rs              |  933 ++++++
  crates/mysql/src/connection.rs                |  751 ++++-
- crates/mysql/src/deployment_deletion.rs       |    6 +-
+ crates/mysql/src/deployment_deletion.rs       |   22 +-
  crates/mysql/src/lib.rs                       |    2 +
  crates/mysql/src/metrics.rs                   |   36 +
- crates/mysql/src/v5/persistence.rs            |   68 +-
+ crates/mysql/src/v5/persistence.rs            |   67 +-
  crates/mysql/src/v6/persistence.rs            |   42 +-
  patches/README.md                             |   16 +
- .../README.md                                 |  191 ++
+ .../README.md                                 |  192 ++
  self-hosted/docker-build/Dockerfile.backend   |    2 +
  third_party/mysql_async/.gitignore            |    5 +
  third_party/mysql_async/Cargo.toml            |  128 +
@@ -89,7 +94,7 @@ Export bounded cancellation request, terminal-outcome, and latency metrics. Docu
  third_party/mysql_async/test/key.pem          |   27 +
  third_party/mysql_async/tests/exports.rs      |   18 +
  third_party/mysql_async/tests/generic.rs      |   61 +
- 78 files changed, 17828 insertions(+), 191 deletions(-)
+ 78 files changed, 17836 insertions(+), 199 deletions(-)
  create mode 100644 crates/mysql/src/cancellation.rs
  create mode 100644 patches/cancellation_safe_mysql_connections/README.md
  create mode 100644 third_party/mysql_async/.gitignore
@@ -172,10 +177,10 @@ index b1bfb7cdc245b87b1b256933ec6f7eb3e538b219..cc51533ad3bb501a8e7e996e481f2e3c
  !/rust-toolchain
  !/self-hosted/*
 diff --git a/Cargo.lock b/Cargo.lock
-index 1f150657db326e716cf2e462e1c888e92457f521..c4e7699c374c1bc158849132ef8bacdd7bb29124 100644
+index cb86a927c7463a09e05ba515711b954f12e7b6a9..1a985f08a2856bfa93d8dfa9b13837e7fc8a4ac4 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -7412,8 +7412,6 @@ dependencies = [
+@@ -7414,8 +7414,6 @@ dependencies = [
  [[package]]
  name = "mysql_async"
  version = "0.37.1"
@@ -208,7 +213,7 @@ index d2e5fe7074f029014a3c2b906ae4deb2ad50df9d..bdd7c27e0b13c6e1aad86fe1e5215784
  oauth2 = { version = "5", default-features = false }
  once_cell = "1.19"
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 189e311d4328d8e3ae7d1fe11e4252f375974546..5ef8a1d232aaaf20e7d9e5b6f2b6083951b56316 100644
+index 23dcffabaad98e2444da68b911181abb198b3342..e832514dd5aed58209836303911e53c4c1859584 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -1852,6 +1852,18 @@ pub static MYSQL_TIMEOUT: LazyLock<u64> = LazyLock::new(|| env_config("MYSQL_TIM
@@ -2221,10 +2226,10 @@ index fda1dcaeb2511f9ac2a05bd720feb149de7e8bf7..052b86e6d21f197c0ae4d69757278880
 +    }
 +}
 diff --git a/crates/mysql/src/deployment_deletion.rs b/crates/mysql/src/deployment_deletion.rs
-index 82193f805a97c3a7427c51477421a5d158c57d4a..963a9720203b92171ad9c61859e3b8ba0c6bb5b3 100644
+index 19319ccc3148c0debfd963b99e591bdf56dc72a6..1b185aabe73ef0fb1d610ee1ee90c0d29931361c 100644
 --- a/crates/mysql/src/deployment_deletion.rs
 +++ b/crates/mysql/src/deployment_deletion.rs
-@@ -37,6 +37,7 @@ use crate::{
+@@ -40,6 +40,7 @@ use crate::{
          PersistenceDeploymentId,
      },
      ConvexMySqlPool,
@@ -2232,7 +2237,7 @@ index 82193f805a97c3a7427c51477421a5d158c57d4a..963a9720203b92171ad9c61859e3b8ba
      MySqlInstanceName,
  };
  
-@@ -159,7 +160,10 @@ impl<RT: Runtime> DeploymentDeletionPool<RT> {
+@@ -171,7 +172,10 @@ impl<RT: Runtime> DeploymentDeletionPool<RT> {
              &url,
              *DATABASE_USE_PREPARED_STATEMENTS,
              true, /* require_leader */
@@ -2244,8 +2249,36 @@ index 82193f805a97c3a7427c51477421a5d158c57d4a..963a9720203b92171ad9c61859e3b8ba
          )?);
          Ok(Self {
              pool,
+@@ -451,20 +455,18 @@ impl<RT: Runtime> DeploymentDeleter<RT> {
+         // The revoked lease excludes valid writers; READ COMMITTED additionally avoids
+         // next-key locks blocking unrelated activity around the bounded range.
+         let started = Instant::now();
+-        let mut tx = conn
++        let rows_deleted = conn
+             .transaction(
+                 self.pool.cluster_name(),
+                 Some(IsolationLevel::ReadCommitted),
++                async |tx| {
++                    tx.exec_iter(&delete_query, delete_params)
++                        .await
++                        .with_context(|| format!("delete {table} range"))
++                },
+             )
+             .await
+-            .with_context(|| format!("begin {table} range deletion"))?;
+-        let rows_deleted = tx
+-            .exec_iter(&delete_query, delete_params)
+-            .await
+-            .with_context(|| format!("delete {table} range"))?;
+-        tx.commit()
+-            .await
+-            .with_context(|| format!("commit {table} range deletion"))?;
++            .with_context(|| format!("transact {table} range deletion"))?;
+         Ok(TableBatch {
+             rows_deleted,
+             next_cursor: next_key.map(|key| TableCursor {
 diff --git a/crates/mysql/src/lib.rs b/crates/mysql/src/lib.rs
-index 63d9601ea650f4e4ca16ef2906abbc3291ddb0ac..f8d5ed319a20e10608c86d3249299ec213eb1d4d 100644
+index 16d63156b4ff16dc4d801e6fcd797cc75fbcec4d..2091d97aab503b399ed4f3b60f1eef3495dcdc73 100644
 --- a/crates/mysql/src/lib.rs
 +++ b/crates/mysql/src/lib.rs
 @@ -2,6 +2,7 @@
@@ -2312,7 +2345,7 @@ index de2d30a4cbb888d61417a816e42be791ce12243c..3ca083bb57aeaa2a1cf5cc4ccc15e1b2
      StaticMetricLabel::new("key", String::from(key))
  }
 diff --git a/crates/mysql/src/v5/persistence.rs b/crates/mysql/src/v5/persistence.rs
-index a0e06176f773275c0ffb5933e3c3e7b234804a8a..ee3fa405e9911fabc782aaed250fcbd0e39e39ef 100644
+index e2dc5cea4809f44e49f1e0c32da2cafd0bc82b6f..712fa86f262941b8a3fc3a662f48fa23504e3120 100644
 --- a/crates/mysql/src/v5/persistence.rs
 +++ b/crates/mysql/src/v5/persistence.rs
 @@ -76,7 +76,6 @@ use common::{
@@ -2331,15 +2364,7 @@ index a0e06176f773275c0ffb5933e3c3e7b234804a8a..ee3fa405e9911fabc782aaed250fcbd0
  
          let lease = Lease::acquire(
              pool.clone(),
-@@ -279,7 +279,6 @@ impl<RT: Runtime> Persistence<RT> {
-             .await?
-             .is_none())
-     }
--
- }
- 
- #[async_trait]
-@@ -1533,6 +1532,7 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1541,6 +1541,7 @@ impl<RT: Runtime> Lease<RT> {
          tracing::info!("lease acquired with ts {}", ts);
  
          timer.finish();
@@ -2347,7 +2372,7 @@ index a0e06176f773275c0ffb5933e3c3e7b234804a8a..ee3fa405e9911fabc782aaed250fcbd0
          Ok(Self {
              db_name,
              pool,
-@@ -1582,43 +1582,35 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1590,43 +1591,35 @@ impl<RT: Runtime> Lease<RT> {
          F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
      {
          let mut client = self.pool.acquire("transact", &self.db_name).await?;
@@ -2420,10 +2445,10 @@ index a0e06176f773275c0ffb5933e3c3e7b234804a8a..ee3fa405e9911fabc782aaed250fcbd0
  }
  
 diff --git a/crates/mysql/src/v6/persistence.rs b/crates/mysql/src/v6/persistence.rs
-index 751be29e75c25a1eb6023a173fd9ba35f9f7c6b3..6f96f6a9b3d43f6bd8aae579c9a99401a3855b7e 100644
+index f9de9d45ab06a78cf470493b765c9b6e4d7e6abc..c3370df4da03ef16b8e04e4b94654fb61dbc73f0 100644
 --- a/crates/mysql/src/v6/persistence.rs
 +++ b/crates/mysql/src/v6/persistence.rs
-@@ -1362,6 +1362,7 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1062,6 +1062,7 @@ impl<RT: Runtime> Lease<RT> {
              "failed to acquire V6 lease: a higher lease timestamp already exists"
          );
          timer.finish();
@@ -2431,7 +2456,7 @@ index 751be29e75c25a1eb6023a173fd9ba35f9f7c6b3..6f96f6a9b3d43f6bd8aae579c9a99401
          Ok(Self {
              pool,
              db_name,
-@@ -1399,30 +1400,23 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1099,30 +1100,23 @@ impl<RT: Runtime> Lease<RT> {
          F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
      {
          let mut client = self.pool.acquire("v6_transact", &self.db_name).await?;
@@ -2508,10 +2533,10 @@ index 2656b7b5a518a4b7b09d0aaf1515270f706819b9..39e64c00c567230a9f557fe5b0d8f01c
  ### [Materialize snapshot import ZIPs](snapshot_import_zip_materialization/README.md)
 diff --git a/patches/cancellation_safe_mysql_connections/README.md b/patches/cancellation_safe_mysql_connections/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..546033d54e8f0390c772c1c04d8c79a79b1553af
+index 0000000000000000000000000000000000000000..42d8acdfa4ee5374baf7ee37832a1b0df48d5dd8
 --- /dev/null
 +++ b/patches/cancellation_safe_mysql_connections/README.md
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,192 @@
 +# Cancellation-Safe MySQL Connections
 +
 +Status: the maintained backend patch owns each direct MySQL operation and transaction through a
@@ -2625,6 +2650,7 @@ index 0000000000000000000000000000000000000000..546033d54e8f0390c772c1c04d8c79a7
 +The patch applies at the generic MySQL connection wrapper, so it covers persistence reads and
 +lease-owned write transactions without depending on a particular query shape, function runtime,
 +or timeout source. The shared V5/V6 deployment-deletion pool also uses these guards and
++keeps each READ COMMITTED deletion batch inside the transaction owner through commit and
 +always selects untrusted topology: its administrative cluster URL alone does not prove a shared
 +connection-identifier namespace. The default mode does not establish a control connection or reserve
 +bounded worker capacity. Trusted-single-namespace mode has a cancellation queue with
