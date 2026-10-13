@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Tue, 29 Sep 2026 04:02:39 +0800
-Subject: [PATCH 25/28] mutations: preserve terminal OCC across transport
- layers
+Subject: [PATCH 25/28] operations: contain terminal OCC and action admission
+ failures
 
 The mutation runner already applies its bounded OCC retry policy before
 returning an exhausted OptimisticConcurrencyControlFailure. Retrying that
@@ -32,16 +32,26 @@ exhausted OCC, same-worker progress, redaction and non-OCC classification.
 Those worker tests do not induce database conflicts or establish
 committed-result retention. Document adoption and rollback without adding
 retry APIs, scheduler priority or process supervision policy.
+
+Return known action admission failures through the existing failed
+ActionResponse instead of terminating the sync worker and its unrelated
+subscriptions and pending mutations. Preserve request IDs and redact
+internal diagnostics. Enforce the per-connection action count at the
+exact bound before adding a future. Unrelated internal errors still
+propagate; no automatic action replay or new wire protocol is introduced.
+
+Cover public and admin actions, concurrent subscription/mutation progress,
+the exact connection limit, and narrow structured-error classification.
 ---
  Cargo.lock                                    |   4 +
  crates/sync/Cargo.toml                        |   4 +
- crates/sync/src/occ_tests.rs                  | 457 ++++++++++++++++++
- crates/sync/src/worker.rs                     |  67 ++-
- .../node-executor/src/syscalls.test.ts        | 404 +++++++++++++++-
- npm-packages/node-executor/src/syscalls.ts    |  88 +++-
- patches/README.md                             |  12 +
- patches/terminal_occ/README.md                |  48 ++
- 8 files changed, 1057 insertions(+), 27 deletions(-)
+ crates/sync/src/occ_tests.rs                  | 584 ++++++++++++++++++
+ crates/sync/src/worker.rs                     | 152 +++--
+ .../node-executor/src/syscalls.test.ts        | 404 +++++++++++-
+ npm-packages/node-executor/src/syscalls.ts    |  88 ++-
+ patches/README.md                             |  15 +
+ patches/terminal_occ/README.md                |  76 +++
+ 8 files changed, 1273 insertions(+), 54 deletions(-)
  create mode 100644 crates/sync/src/occ_tests.rs
  create mode 100644 patches/terminal_occ/README.md
 
@@ -103,11 +113,11 @@ index f92a39618496df54d6fc69ea3f407d89470064af..e95ee29a8d58e6017f6d38938f9d29c4
  workspace = true
 diff --git a/crates/sync/src/occ_tests.rs b/crates/sync/src/occ_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..4e450aac0c9ba489bbc1029eba7bb4ba005170e9
+index 0000000000000000000000000000000000000000..6cf48d635e6de941fb5f2e0cc33d43d1a1e5898e
 --- /dev/null
 +++ b/crates/sync/src/occ_tests.rs
-@@ -0,0 +1,457 @@
-+//! Exercise the real sync worker with exhausted errors injected at its
+@@ -0,0 +1,584 @@
++//! Exercise the real sync worker with operation failures injected at its
 +//! application boundary. Database conflict execution and result retention are
 +//! separate integration properties.
 +use std::{
@@ -185,9 +195,39 @@ index 0000000000000000000000000000000000000000..4e450aac0c9ba489bbc1029eba7bb4ba
 +#[derive(Default)]
 +struct MutationApi {
 +    calls: Mutex<BTreeMap<u32, bool>>,
++    action_calls: Mutex<Vec<bool>>,
 +}
 +
 +impl MutationApi {
++    fn execute_action(
++        &self,
++        admin: bool,
++    ) -> anyhow::Result<Result<RedactedActionReturn, RedactedActionError>> {
++        let mut calls = self.action_calls.lock().unwrap();
++        calls.push(admin);
++        let code = match calls.len() {
++            1 => "ExpiredInQueue",
++            2 => "ExecuteFullError",
++            3 => "InitialPermitTimeoutError",
++            4 => "IsolateNotClean",
++            5 => {
++                return Err(ErrorMetadata::rate_limited(
++                    "TooManyConcurrentRequests",
++                    "private diagnostic",
++                )
++                .into())
++            },
++            6 => {
++                return Ok(Ok(RedactedActionReturn {
++                    value: JsonPackedValue::pack(common::value::ConvexValue::Int64(8)),
++                    log_lines: RedactedLogLines::empty(),
++                }))
++            },
++            _ => panic!("worker resubmitted an action"),
++        };
++        Err(ErrorMetadata::rejected_before_execution(code, "private diagnostic").into())
++    }
++
 +    fn execute(
 +        &self,
 +        identifier: Option<SessionRequestIdentifier>,
@@ -302,7 +342,7 @@ index 0000000000000000000000000000000000000000..4e450aac0c9ba489bbc1029eba7bb4ba
 +        args: SerializedArgs,
 +        caller: FunctionCaller,
 +    ) -> anyhow::Result<Result<RedactedActionReturn, RedactedActionError>> {
-+        panic!("unexpected application call")
++        self.execute_action(false)
 +    }
 +
 +    async fn execute_admin_action(
@@ -314,7 +354,7 @@ index 0000000000000000000000000000000000000000..4e450aac0c9ba489bbc1029eba7bb4ba
 +        args: SerializedArgs,
 +        caller: FunctionCaller,
 +    ) -> anyhow::Result<Result<RedactedActionReturn, RedactedActionError>> {
-+        panic!("unexpected application call")
++        self.execute_action(true)
 +    }
 +
 +    async fn execute_http_action(
@@ -417,7 +457,7 @@ index 0000000000000000000000000000000000000000..4e450aac0c9ba489bbc1029eba7bb4ba
 +}
 +
 +#[test]
-+fn exhausted_occ_keeps_public_and_admin_mutations_on_one_worker() -> anyhow::Result<()> {
++fn operation_failures_keep_public_and_admin_requests_on_one_worker() -> anyhow::Result<()> {
 +    let tokio = ProdRuntime::init_tokio()?;
 +    let rt = ProdRuntime::new(&tokio);
 +    let worker_rt = rt.clone();
@@ -446,6 +486,32 @@ index 0000000000000000000000000000000000000000..4e450aac0c9ba489bbc1029eba7bb4ba
 +                    0,
 +                    RequestMetadata::system(),
 +                );
++                // At the exact per-connection limit, reject only the new action
++                // without growing the pending set or invoking the application.
++                for _ in 0..OPERATION_QUEUE_BUFFER_SIZE {
++                    worker
++                        .action_futures
++                        .push(futures::future::pending().boxed());
++                }
++                worker
++                    .handle_message(ClientMessage::Action {
++                        request_id: 99,
++                        udf_path: "fixture:action".parse()?,
++                        args: SerializedArgs::from_args(vec![])?,
++                        component_path: None,
++                    })
++                    .await?;
++                assert_eq!(worker.action_futures.len(), OPERATION_QUEUE_BUFFER_SIZE);
++                assert!(api.action_calls.lock().unwrap().is_empty());
++                assert!(matches!(
++                    server_rx.next().await.unwrap().0,
++                    ServerMessage::ActionResponse {
++                        request_id: 99,
++                        result: Err(_),
++                        ..
++                    }
++                ));
++                worker.action_futures.clear();
 +                let peer = async {
 +                    client_tx.send((
 +                        ClientMessage::Connect {
@@ -467,6 +533,51 @@ index 0000000000000000000000000000000000000000..4e450aac0c9ba489bbc1029eba7bb4ba
 +                            },
 +                            worker_rt.monotonic_now(),
 +                        ))?;
++                    }
++                    for request_id in 10..16 {
++                        client_tx.send((
++                            ClientMessage::Action {
++                                request_id,
++                                udf_path: "fixture:action".parse()?,
++                                args: SerializedArgs::from_args(vec![])?,
++                                component_path: admin.then(String::new),
++                            },
++                            worker_rt.monotonic_now(),
++                        ))?;
++                        loop {
++                            let (message, _) = server_rx
++                                .next()
++                                .await
++                                .context("worker closed on action admission failure")?;
++                            match message {
++                                ServerMessage::ActionResponse {
++                                    request_id: response_id,
++                                    result,
++                                    log_lines,
++                                } => {
++                                    assert_eq!(response_id, request_id);
++                                    assert!(log_lines.0.is_empty());
++                                    if request_id < 15 {
++                                        let Err(ErrorPayload::Message(message)) = result else {
++                                            panic!(
++                                                "admission failure did not become an action \
++                                                 response"
++                                            );
++                                        };
++                                        assert_eq!(
++                                            message,
++                                            "Action admission failed: insufficient execution \
++                                             capacity. Try again later."
++                                        );
++                                    } else {
++                                        assert!(result.is_ok(), "following action failed");
++                                    }
++                                    break;
++                                },
++                                ServerMessage::Transition { .. } | ServerMessage::Ping => {},
++                                other => panic!("unexpected worker response: {other:?}"),
++                            }
++                        }
 +                    }
 +                    for request_id in 0..3 {
 +                        client_tx.send((
@@ -539,6 +650,7 @@ index 0000000000000000000000000000000000000000..4e450aac0c9ba489bbc1029eba7bb4ba
 +                        api.calls.lock().unwrap().clone(),
 +                        BTreeMap::from([(0, admin), (1, admin), (2, admin)])
 +                    );
++                    assert_eq!(*api.action_calls.lock().unwrap(), vec![admin; 6]);
 +                    assert_eq!(connected.load(Ordering::SeqCst), 1);
 +                    drop(client_tx);
 +                    Ok::<_, anyhow::Error>(())
@@ -564,19 +676,46 @@ index 0000000000000000000000000000000000000000..4e450aac0c9ba489bbc1029eba7bb4ba
 +        assert!(mutation_response(9, Err(error)).is_err());
 +    }
 +}
++
++#[test]
++fn action_admission_classification_keeps_unrelated_errors_fatal() {
++    for error in [
++        anyhow::anyhow!("ExpiredInQueue"),
++        ErrorMetadata::overloaded("ExpiredInQueue", "unrelated overload").into(),
++        ErrorMetadata::rate_limited("OtherLimit", "unrelated limit").into(),
++        ErrorMetadata::unauthenticated("Unauthenticated", "authentication failure").into(),
++        ErrorMetadata::system_occ(None, None).into(),
++    ] {
++        assert!(action_response(9, Err(error)).is_err());
++    }
++    let error = ErrorMetadata::rate_limited(
++        "TooManyInflightActionsForSingleClient",
++        "private diagnostic",
++    );
++    assert!(matches!(
++        action_response(9, Err(error.into())).unwrap(),
++        ServerMessage::ActionResponse {
++            request_id: 9,
++            result: Err(_),
++            ..
++        }
++    ));
++}
 diff --git a/crates/sync/src/worker.rs b/crates/sync/src/worker.rs
-index 5dc384c753620423ca5a969ff4636cd87e58095d..01c49c85e8bbe01110f67b5851e3e96909ff7397 100644
+index 5dc384c753620423ca5a969ff4636cd87e58095d..9b3239a2cedc53464f71545200b3b6b636dc2787 100644
 --- a/crates/sync/src/worker.rs
 +++ b/crates/sync/src/worker.rs
-@@ -31,6 +31,7 @@ use application::{
+@@ -30,7 +30,9 @@ use application::{
+         RedactedLogLines,
      },
      RedactedActionError,
++    RedactedActionReturn,
      RedactedMutationError,
 +    RedactedMutationReturn,
  };
  use common::{
      backoff::Backoff,
-@@ -94,6 +95,7 @@ use futures::{
+@@ -94,6 +96,7 @@ use futures::{
  use keybroker::Identity;
  use model::session_requests::types::SessionRequestIdentifier;
  use sync_types::{
@@ -584,7 +723,7 @@ index 5dc384c753620423ca5a969ff4636cd87e58095d..01c49c85e8bbe01110f67b5851e3e969
      AuthenticationToken,
      ClientMessage,
      DegradableQueryPressureEpoch,
-@@ -106,6 +108,7 @@ use sync_types::{
+@@ -106,6 +109,7 @@ use sync_types::{
      SerializedQueryJournal,
      ServerPressure,
      SessionId,
@@ -592,7 +731,7 @@ index 5dc384c753620423ca5a969ff4636cd87e58095d..01c49c85e8bbe01110f67b5851e3e969
      StateModification,
      StateVersion,
      Timestamp,
-@@ -972,7 +975,7 @@ impl<RT: Runtime> SyncWorker<RT> {
+@@ -972,7 +976,7 @@ impl<RT: Runtime> SyncWorker<RT> {
                                      Some(mutation_queue_size),
                                  )
                                  .in_span(root)
@@ -601,7 +740,7 @@ index 5dc384c753620423ca5a969ff4636cd87e58095d..01c49c85e8bbe01110f67b5851e3e969
                              },
                              Some(ref p) => {
                                  let path =
-@@ -988,26 +991,10 @@ impl<RT: Runtime> SyncWorker<RT> {
+@@ -988,26 +992,10 @@ impl<RT: Runtime> SyncWorker<RT> {
                                      Some(mutation_queue_size),
                                  )
                                  .in_span(root)
@@ -630,10 +769,119 @@ index 5dc384c753620423ca5a969ff4636cd87e58095d..01c49c85e8bbe01110f67b5851e3e969
                      })
                      .await
                  }
-@@ -1693,6 +1680,44 @@ impl<RT: Runtime> SyncWorker<RT> {
+@@ -1036,6 +1024,21 @@ impl<RT: Runtime> SyncWorker<RT> {
+             } => {
+                 log_action_args_size(self.partition_id, args.get().len());
+                 let identity = self.revalidate_identity().await?;
++                if self.action_futures.len() >= OPERATION_QUEUE_BUFFER_SIZE {
++                    self.tx.send((
++                        action_response(
++                            request_id,
++                            Err(ErrorMetadata::rate_limited(
++                                "TooManyInflightActionsForSingleClient",
++                                "Too many pending actions on this connection",
++                            )
++                            .into()),
++                        )?,
++                        self.rt.monotonic_now(),
++                    ))?;
++                    timer.finish();
++                    return Ok(());
++                }
+ 
+                 let api = self.api.clone();
+                 let host = self.host.clone();
+@@ -1066,7 +1069,7 @@ impl<RT: Runtime> SyncWorker<RT> {
+                                 caller,
+                             )
+                             .in_span(root)
+-                            .await?
++                            .await
+                         },
+                         Some(ref p) => {
+                             let path = Self::parse_admin_component_path(p, &udf_path, &identity)?;
+@@ -1079,36 +1082,12 @@ impl<RT: Runtime> SyncWorker<RT> {
+                                 caller,
+                             )
+                             .in_span(root)
+-                            .await?
++                            .await
+                         },
+                     };
+-                    let response = match result {
+-                        Ok(udf_return) => ServerMessage::ActionResponse {
+-                            request_id,
+-                            result: Ok(udf_return.value),
+-                            log_lines: udf_return.log_lines.into(),
+-                        },
+-                        Err(RedactedActionError { error, log_lines }) => {
+-                            ServerMessage::ActionResponse {
+-                                request_id,
+-                                result: Err(error.into_error_payload()),
+-                                log_lines: log_lines.into(),
+-                            }
+-                        },
+-                    };
+-                    Ok(response)
++                    action_response(request_id, result)
+                 }
+                 .boxed();
+-                anyhow::ensure!(
+-                    self.action_futures.len() <= OPERATION_QUEUE_BUFFER_SIZE,
+-                    ErrorMetadata::rate_limited(
+-                        "TooManyInflightActionsForSingleClient",
+-                        format!(
+-                            "Inflight actions overloaded for a single client, max concurrency: \
+-                             {OPERATION_QUEUE_BUFFER_SIZE}"
+-                        )
+-                    )
+-                );
+                 self.action_futures.push(future);
+             },
+             ClientMessage::Authenticate {
+@@ -1693,6 +1672,83 @@ impl<RT: Runtime> SyncWorker<RT> {
      }
  }
  
++fn action_response(
++    request_id: SessionRequestSeqNumber,
++    result: anyhow::Result<Result<RedactedActionReturn, RedactedActionError>>,
++) -> anyhow::Result<ServerMessage> {
++    let (result, log_lines) = match result {
++        Ok(Ok(udf_return)) => (Ok(udf_return.value), udf_return.log_lines),
++        Ok(Err(RedactedActionError { error, log_lines })) => {
++            (Err(error.into_error_payload()), log_lines)
++        },
++        Err(error)
++            if error.is_rejected_before_execution()
++                || (error.is_rate_limited()
++                    && matches!(
++                        error.short_msg(),
++                        "TooManyConcurrentRequests" | "TooManyInflightActionsForSingleClient"
++                    )) =>
++        {
++            // Admission failure belongs to this request, not the sync session.
++            // Closing the socket would interrupt subscriptions and other actions
++            // and replay pending mutations. Do not expose internal diagnostics or
++            // promise retry safety: a nested call may have failed after side effects.
++            // See patches/terminal_occ/README.md, "Behavior".
++            (
++                Err(ErrorPayload::Message(
++                    "Action admission failed: insufficient execution capacity. Try again later."
++                        .to_owned(),
++                )),
++                RedactedLogLines::empty(),
++            )
++        },
++        Err(error) => return Err(error),
++    };
++    Ok(ServerMessage::ActionResponse {
++        request_id,
++        result,
++        log_lines: log_lines.into(),
++    })
++}
++
 +fn mutation_response(
 +    request_id: SessionRequestSeqNumber,
 +    result: anyhow::Result<Result<RedactedMutationReturn, RedactedMutationError>>,
@@ -675,7 +923,7 @@ index 5dc384c753620423ca5a969ff4636cd87e58095d..01c49c85e8bbe01110f67b5851e3e969
  fn is_retriable_sync_worker_error(err: &anyhow::Error) -> bool {
      err.is_misdirected_request()
          || err.is_operational_internal_server_error()
-@@ -1711,6 +1736,10 @@ pub(crate) fn authentication_update_error(error: anyhow::Error) -> anyhow::Error
+@@ -1711,6 +1767,10 @@ pub(crate) fn authentication_update_error(error: anyhow::Error) -> anyhow::Error
      ErrorMetadata::auth_update_failed(error.short_msg().to_string(), error.msg().to_string()).into()
  }
  
@@ -1227,42 +1475,47 @@ index 661b9a077fe625adee5e4c6185cb4f184724d02e..eae3cf5b78653bc1c48515560e873bb5
        // errorHandler is a no-op
        await errorHandler(response, args.operationName);
 diff --git a/patches/README.md b/patches/README.md
-index a9e3f535008478fb11d7ad30a713266eaafd1023..f6981f845bcaef1f2c550a2c59da1fec87d3744e 100644
+index 13f7dd07abf3c6f9b20235ecd92f2cc176651f83..4d7d7e804d7b690d4a893a416a6f34cdbc42be1a 100644
 --- a/patches/README.md
 +++ b/patches/README.md
-@@ -52,6 +52,18 @@ adoption contract documented in the backend essay.
+@@ -52,6 +52,21 @@ adoption contract documented in the backend essay.
  - Activation: only through the privileged repair endpoint; dry-run is the default.
  - Rollback: do not execute a stale plan. There is no generic undo after destructive finalization.
  
-+## Mutation error propagation
++## Operation error propagation
 +
-+### [Terminal OCC across transport layers](terminal_occ/README.md)
++### [Request-local operation failures](terminal_occ/README.md)
 +
 +- Purpose: return exhausted per-mutation optimistic concurrency control (OCC) to its caller without
-+  restarting the mutation retry budget in a Node callback loop or by closing its sync socket.
++  restarting the mutation retry budget in a Node callback loop or by closing its sync socket;
++  return known action admission failures to their request without disconnecting unrelated work.
 +- Prerequisites: the existing application mutation runner and Node callback retry loop; no scheduler,
 +  priority, or native-resident supervision changes.
-+- Activation: automatic for identified exhausted OCC errors; no new configuration or wire message.
-+- Rollback: restore the previous backend and Node executor together; exhausted sync mutations can
-+  close the socket again, and exhausted callback mutations can receive additional retry cycles.
++- Activation: automatic for identified exhausted OCC and action admission failures; no new
++  configuration, wire message, or action retry.
++- Rollback: restore the previous backend and Node executor together; exhausted sync mutations
++  and rejected sync actions can close the socket again, and exhausted callback mutations can
++  receive additional retry cycles.
 +
  ## Deployment and code generation
  
  ### [Non-committing codegen analysis](non_committing_codegen_analysis/README.md)
 diff --git a/patches/terminal_occ/README.md b/patches/terminal_occ/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..e053beb8f227d8d13b177b6c38c6b3b3b65e4455
+index 0000000000000000000000000000000000000000..facbd33a6674bdf2f54b1916f3a908ae1ca1da52
 --- /dev/null
 +++ b/patches/terminal_occ/README.md
-@@ -0,0 +1,48 @@
-+# Terminal OCC across transport layers
+@@ -0,0 +1,76 @@
++# Request-local operation failures
 +
 +## Purpose
 +
 +The application mutation runner owns the bounded optimistic concurrency control (OCC) retry
 +budget. Once it returns an exhausted OCC error, the transport must return that error to the caller.
 +A Node callback retry loop or sync socket reconnect would otherwise begin another mutation retry
-+cycle and delay unrelated pending work.
++cycle and delay unrelated pending work. Likewise, known action admission failures belong to the
++failed request: closing the sync socket would interrupt unrelated actions and subscriptions and
++replay pending mutations. This patch contains both failures using existing response messages.
 +
 +## Behavior
 +
@@ -1282,6 +1535,25 @@ index 0000000000000000000000000000000000000000..e053beb8f227d8d13b177b6c38c6b3b3
 +application failures keep their existing response or failure behavior. HTTP OCC errors remain 503
 +and do not become deterministic user errors.
 +
++Public and admin action calls return known application admission failures as a failed
++`ActionResponse` with the original request ID, a static capacity error, and empty log lines.
++Recognition uses the structured `RejectedBeforeExecution` category, or the `RateLimited` category
++with `TooManyConcurrentRequests` or `TooManyInflightActionsForSingleClient`. It does not match
++message text or downgrade arbitrary overload, authentication, or internal errors. The per-connection
++pending-action limit rejects the excess request immediately without extending the future set.
++Successful and redacted function results keep their existing response behavior.
++
++Nested V8 action syscalls keep their existing error conversion: they remove the
++`RejectedBeforeExecution` category, then reject the JavaScript promise. An uncaught rejection
++returns through the ordinary redacted action-error path. The sync classifier therefore does not
++need to recognize the resulting `Overloaded` category or infer retry safety for the root action.
++
++The action response makes no promise that the root action had no effects: an admission error can
++come from a nested call after the root started. No action is retried by this patch. Existing JS and
++Rust clients already consume the failed `ActionResponse`; no client upgrade is required. HTTP
++status handling and the Node callback retry policy described above are unchanged by action
++containment.
++
 +The patch adds no retry API, protocol message, configuration, scheduler priority, or process
 +supervision policy. A caller may choose to submit a separate mutation after receiving the error;
 +that choice remains with the caller.
@@ -1291,8 +1563,9 @@ index 0000000000000000000000000000000000000000..e053beb8f227d8d13b177b6c38c6b3b3
 +The Node half extends the existing callback retry loop; the sync half uses the ordinary application
 +and sync interfaces. Neither requires the scheduler or native-resident supervision patches.
 +Apply the backend and its Node executor source together. Activation is automatic for positively
-+identified exhausted OCC. Restore the previous backend and Node executor together to roll back;
-+that restores callback retry amplification and socket closure on these failures.
++identified exhausted OCC and action admission failures. Restore the previous backend and Node
++executor together to roll back; that restores callback retry amplification and socket closure on
++these failures.
 +
 +## Verification
 +
@@ -1303,3 +1576,9 @@ index 0000000000000000000000000000000000000000..e053beb8f227d8d13b177b6c38c6b3b3
 +following mutation and query-set progress on the same worker, and unchanged non-OCC/HTTP
 +classification. These worker tests do not induce database conflicts or prove committed-result
 +retention or deduplication.
++
++The same public/admin worker test injects action queue expiry, a full queue, initial-permit timeout,
++isolate admission rejection, and application concurrency rejection before a successful action,
++mutations, and a query-set transition. It also checks rejection at the exact per-connection pending
++limit without growing the future set. Classification tests keep unrelated system and auth failures
++on their existing path. The tests establish same-worker progress, not execution retry safety.

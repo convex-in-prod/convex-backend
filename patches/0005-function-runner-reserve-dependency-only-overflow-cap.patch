@@ -31,6 +31,12 @@ Expose bounded scheduler capacity, class, overflow, expiry, rejection, source
 occupancy, and effective per-executor parallelism metrics. Initialize closed
 failure label sets at zero, reject invalid completion ownership and scheduled
 parallelism, and document the composed upstream and self-hosted contract.
+
+Bound independent actions per resolved function within the global action
+allowance. Include client and component identity, share the HTTP router
+allowance, and exempt ancestor-unblocking descendants. Zero preserves the
+global-only policy; an explicit cap cannot exceed the global cap. Track
+worker ownership in one bounded scheduler map and remove empty entries.
 ---
  .../dependency_overflow.rs                    |  302 ++++
  .../application_function_runner/metrics.rs    |    9 +
@@ -42,14 +48,14 @@ parallelism, and document the composed upstream and self-hosted contract.
  crates/application/src/lib.rs                 |  111 +-
  .../application/src/scheduled_jobs/metrics.rs |   33 +
  crates/application/src/scheduled_jobs/mod.rs  |   59 +-
- crates/common/src/codel_queue.rs              |  487 +++++-
- crates/common/src/knobs.rs                    |  104 +-
+ crates/common/src/codel_queue.rs              |  487 ++++-
+ crates/common/src/knobs.rs                    |  112 +-
  crates/common/src/types/functions.rs          |   12 +
  crates/common/src/types/mod.rs                |    1 +
  .../src/in_process_function_runner.rs         |    3 +
  crates/function_runner/src/lib.rs             |    2 +
  crates/function_runner/src/server.rs          |    9 +
- crates/isolate/src/client.rs                  | 1405 +++++++++++++++--
+ crates/isolate/src/client.rs                  | 1563 +++++++++++++++--
  crates/isolate/src/concurrency_limiter.rs     |   99 ++
  crates/isolate/src/isolate_worker.rs          |    5 +
  crates/isolate/src/metrics.rs                 |  198 +++
@@ -58,11 +64,11 @@ parallelism, and document the composed upstream and self-hosted contract.
  npm-packages/node-executor/src/executor.ts    |    4 +
  .../node-executor/src/syscalls.test.ts        |   35 +
  npm-packages/node-executor/src/syscalls.ts    |    6 +
- patches/dependency_capacity/README.md         |  272 ++++
- .../dependency_capacity/design_reference.md   |  739 +++++++++
- self-hosted/advanced/knobs.md                 |   43 +
- self-hosted/docker/docker-compose.yml         |    5 +
- 30 files changed, 4102 insertions(+), 209 deletions(-)
+ patches/dependency_capacity/README.md         |  290 +++
+ .../dependency_capacity/design_reference.md   |  739 ++++++++
+ self-hosted/advanced/knobs.md                 |   50 +
+ self-hosted/docker/docker-compose.yml         |    6 +
+ 30 files changed, 4294 insertions(+), 209 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/dependency_overflow.rs
  create mode 100644 npm-packages/node-executor/src/syscalls.test.ts
  create mode 100644 patches/dependency_capacity/README.md
@@ -2370,7 +2376,7 @@ index 674591dc6030d30e65c83b35c9753bad75cfd1cc..8f57ee5c5bb91d2503aaf75a0c480991
      }
  }
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 3f1d2495c2f48482a3fd160d4d4587575651c1a1..f492c8b9b54aaa0852ef24fcd3f83551035909c3 100644
+index 3f1d2495c2f48482a3fd160d4d4587575651c1a1..aa551c3b21b597e06f77e319098d540c8df7ecfe 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -30,6 +30,45 @@ use cmd_util::env::env_config;
@@ -2466,7 +2472,7 @@ index 3f1d2495c2f48482a3fd160d4d4587575651c1a1..f492c8b9b54aaa0852ef24fcd3f83551
  
  /// The maximum length of time to wait to start running a function when the
  /// isolate scheduler is idle.
-@@ -1004,7 +1060,21 @@ pub static ISOLATE_QUEUE_CONGESTED_TIMEOUT: LazyLock<Duration> =
+@@ -1004,7 +1060,29 @@ pub static ISOLATE_QUEUE_CONGESTED_TIMEOUT: LazyLock<Duration> =
  
  /// Maximum number of isolate worker threads in a function runner process.
  pub static MAX_ISOLATE_WORKERS: LazyLock<usize> =
@@ -2486,10 +2492,18 @@ index 3f1d2495c2f48482a3fd160d4d4587575651c1a1..f492c8b9b54aaa0852ef24fcd3f83551
 +/// derives the limit from shared base worker capacity.
 +pub static MAX_ISOLATE_ACTION_WORKERS: LazyLock<usize> =
 +    LazyLock::new(|| env_config_isolate_scheduler_usize_strict("MAX_ISOLATE_ACTION_WORKERS", 0));
++
++/// Maximum independent actions of one function (per client and component),
++/// retaining workers. Zero uses the global action limit.
++/// HTTP routes share their component's router allowance. See the "Action cap"
++/// section of patches/dependency_capacity/README.md.
++pub static MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION: LazyLock<usize> = LazyLock::new(|| {
++    env_config_isolate_scheduler_usize_strict("MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION", 0)
++});
  
  /// The size of the pending commits in the committer queue. This is a FIFO
  /// queue, so if the queue is too large, we run into a risk of all requests
-@@ -1457,7 +1527,7 @@ pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
+@@ -1457,7 +1535,7 @@ pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
  /// The maximum number of CPU cores that can be used simultaneously by the
  /// isolates. Zero means no limit.
  pub static FUNRUN_ISOLATE_ACTIVE_THREADS: LazyLock<usize> =
@@ -2498,7 +2512,7 @@ index 3f1d2495c2f48482a3fd160d4d4587575651c1a1..f492c8b9b54aaa0852ef24fcd3f83551
  
  /// Isolate worker usage at which the funrun load reporter's
  /// `effective_load` saturates to 1.0.
-@@ -2133,3 +2203,27 @@ pub static HTTP2_CLIENT_KEEPALIVE_INTERVAL: LazyLock<Duration> = LazyLock::new(|
+@@ -2133,3 +2211,27 @@ pub static HTTP2_CLIENT_KEEPALIVE_INTERVAL: LazyLock<Duration> = LazyLock::new(|
  /// dropped.
  pub static HTTP2_CLIENT_KEEPALIVE_TIMEOUT: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("HTTP2_CLIENT_KEEPALIVE_TIMEOUT_SECONDS", 15)));
@@ -2665,10 +2679,10 @@ index 8e94fbb8888e8dedc3b2df17781f4078e4720832..52de938e3fb5120e664d126c053005ec
                      http_response_streamer,
                      http_module_path,
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e164e0f8e1b 100644
+index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513234c9f07 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
-@@ -29,7 +29,7 @@ use common::{
+@@ -29,12 +29,13 @@ use common::{
      backoff::Backoff,
      bootstrap_model::components::definition::ComponentDefinitionMetadata,
      codel_queue::{
@@ -2677,7 +2691,13 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          CoDelQueueReceiver,
          CoDelQueueSender,
          ExpiredInQueue,
-@@ -56,12 +56,12 @@ use common::{
+     },
+     components::{
++        CanonicalizedComponentFunctionPath,
+         CanonicalizedComponentModulePath,
+         ComponentDefinitionPath,
+         ComponentName,
+@@ -56,12 +57,13 @@ use common::{
      knobs::{
          ANALYZE_CONCURRENCY,
          HEAP_WORKER_REPORT_INTERVAL_SECONDS,
@@ -2689,10 +2709,11 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 -        ISOLATE_QUEUE_IDLE_TIMEOUT,
          ISOLATE_QUEUE_SIZE,
 +        MAX_ISOLATE_ACTION_WORKERS,
++        MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION,
          REUSE_ISOLATES,
          V8_THREADS,
      },
-@@ -78,6 +78,7 @@ use common::{
+@@ -78,6 +80,7 @@ use common::{
      types::{
          DeploymentMetadata,
          ModuleEnvironment,
@@ -2700,7 +2721,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          UdfType,
      },
      utils::ensure_utc,
-@@ -192,6 +193,130 @@ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
+@@ -192,6 +195,152 @@ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
  pub const PAUSE_REQUEST: &str = "pause_request";
  pub const NO_AVAILABLE_WORKERS: &str = "There is no capacity available to run this function";
  
@@ -2790,18 +2811,40 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +    }
 +}
 +
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++struct IndependentActionKey {
++    client_id: String,
++    function: CanonicalizedComponentFunctionPath,
++}
++
 +struct SchedulerStateSnapshot {
 +    in_progress_counts_by_client: HashMap<String, ActiveRequestCounts>,
 +    active_counts: ActiveRequestCounts,
 +    max_workers: usize,
 +    base_worker_capacity: usize,
 +    max_independent_actions: usize,
++    max_independent_actions_per_function: usize,
++    independent_actions_by_function: HashMap<IndependentActionKey, usize>,
 +    max_workers_per_client: usize,
 +    base_workers_per_client: usize,
 +}
 +
 +impl SchedulerStateSnapshot {
-+    fn can_start_request(&self, properties: RequestSchedulingProperties, client_id: &str) -> bool {
++    fn can_start_request(
++        &self,
++        properties: RequestSchedulingProperties,
++        client_id: &str,
++        action_key: Option<&IndependentActionKey>,
++    ) -> bool {
++        if action_key.is_some_and(|key| {
++            self.independent_actions_by_function
++                .get(key)
++                .copied()
++                .unwrap_or(0)
++                >= self.max_independent_actions_per_function
++        }) {
++            return false;
++        }
 +        let client_active_counts = self
 +            .in_progress_counts_by_client
 +            .get(client_id)
@@ -2831,7 +2874,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
  #[derive(Clone)]
  pub struct IsolateConfig {
      // Name of isolate pool, used in metrics.
-@@ -212,7 +337,6 @@ impl IsolateConfig {
+@@ -212,7 +361,6 @@ impl IsolateConfig {
              limiter,
          }
      }
@@ -2839,7 +2882,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
  }
  
  pub struct UdfRequest<RT: Runtime> {
-@@ -261,14 +385,30 @@ pub struct Request<RT: Runtime> {
+@@ -261,14 +409,30 @@ pub struct Request<RT: Runtime> {
      pub client_id: String,
      pub inner: RequestType<RT>,
      pub parent_trace: EncodedSpan,
@@ -2870,7 +2913,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          }
      }
  
-@@ -282,12 +422,37 @@ impl<RT: Runtime> Request<RT> {
+@@ -282,12 +446,77 @@ impl<RT: Runtime> Request<RT> {
              | RequestType::EvaluateAuthConfig { .. }
              | RequestType::EvaluateAppDefinitions { .. }
              | RequestType::EvaluateComponentInitializer { .. } => return None,
@@ -2882,6 +2925,46 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
              module_path: function_path.udf_path.module().clone(),
          })
      }
++
++    fn independent_action_key(&self) -> Option<IndependentActionKey> {
++        // Descendants must be able to unblock their holders even when a root
++        // has filled its function's allowance. Use the resolved component path,
++        // not the caller's export alias. HTTP routes share their router identity:
++        // the selected handler is not known until JavaScript runs, and arbitrary
++        // request URLs must not let callers bypass admission.
++        if self.scheduler_dependency.unblocks_ancestor() {
++            return None;
++        }
++        let function = match &self.inner {
++            RequestType::Action { request, .. } => {
++                request.params.path_and_args.path().clone().for_logging()
++            },
++            RequestType::HttpAction { request, .. } => {
++                request.http_module_path.path().clone().for_logging()
++            },
++            RequestType::Udf { .. }
++            | RequestType::Analyze { .. }
++            | RequestType::EvaluateSchema { .. }
++            | RequestType::EvaluateAuthConfig { .. }
++            | RequestType::EvaluateAppDefinitions { .. }
++            | RequestType::EvaluateComponentInitializer { .. } => return None,
++            #[cfg(test)]
++            RequestType::Test {
++                action_function,
++                is_isolate_action,
++                ..
++            } => {
++                if !is_isolate_action {
++                    return None;
++                }
++                action_function.clone()
++            },
++        };
++        Some(IndependentActionKey {
++            client_id: self.client_id.clone(),
++            function,
++        })
++    }
 +
 +    fn scheduling_properties(&self) -> RequestSchedulingProperties {
 +        let (can_block_on_descendant, is_isolate_action) = match &self.inner {
@@ -2908,13 +2991,14 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
  }
  
  pub enum RequestType<RT: Runtime> {
-@@ -355,6 +520,16 @@ pub enum RequestType<RT: Runtime> {
+@@ -355,6 +584,17 @@ pub enum RequestType<RT: Runtime> {
          name: ComponentName,
          response: oneshot::Sender<anyhow::Result<BTreeMap<Identifier, Resource>>>,
      },
 +    #[cfg(test)]
 +    Test {
 +        id: usize,
++        action_function: CanonicalizedComponentFunctionPath,
 +        can_block_on_descendant: bool,
 +        is_isolate_action: bool,
 +        fail_worker: bool,
@@ -2925,7 +3009,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
  }
  
  #[allow(async_fn_in_trait)]
-@@ -435,6 +610,10 @@ impl<RT: Runtime> Request<RT> {
+@@ -435,6 +675,10 @@ impl<RT: Runtime> Request<RT> {
              RequestType::EvaluateComponentInitializer { response, .. } => {
                  let _ = response.send(Err(error));
              },
@@ -2936,7 +3020,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          }
      }
  
-@@ -448,6 +627,8 @@ impl<RT: Runtime> Request<RT> {
+@@ -448,6 +692,8 @@ impl<RT: Runtime> Request<RT> {
              RequestType::EvaluateAuthConfig { response, .. } => response.is_closed(),
              RequestType::EvaluateAppDefinitions { response, .. } => response.is_closed(),
              RequestType::EvaluateComponentInitializer { response, .. } => response.is_closed(),
@@ -2945,7 +3029,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          }
      }
  }
-@@ -460,6 +641,7 @@ impl<RT: Runtime> Clone for IsolateClient<RT> {
+@@ -460,6 +706,7 @@ impl<RT: Runtime> Clone for IsolateClient<RT> {
              scheduler: self.scheduler.clone(),
              sender: self.sender.clone(),
              internal_sender: self.internal_sender.clone(),
@@ -2953,7 +3037,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
              active_workers: self.active_workers.clone(),
              max_workers: self.max_workers,
          }
-@@ -547,6 +729,7 @@ pub struct IsolateClient<RT: Runtime> {
+@@ -547,6 +794,7 @@ pub struct IsolateClient<RT: Runtime> {
      scheduler: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
      sender: CoDelQueueSender<RT, Request<RT>>,
      internal_sender: mpsc::UnboundedSender<Request<RT>>,
@@ -2961,7 +3045,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
      /// Shared with the scheduler. Tracks the total number of in-progress
      /// workers across all clients.
      active_workers: Arc<AtomicUsize>,
-@@ -560,17 +743,40 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -560,17 +808,50 @@ impl<RT: Runtime> IsolateClient<RT> {
          max_isolate_workers: usize,
          isolate_worker: W,
      ) -> anyhow::Result<Self> {
@@ -2987,6 +3071,16 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +            max_independent_actions <= base_worker_capacity,
 +            "MAX_ISOLATE_ACTION_WORKERS must not exceed shared base isolate worker capacity"
 +        );
++        let max_independent_actions_per_function = if *MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION == 0
++        {
++            max_independent_actions
++        } else {
++            *MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION
++        };
++        anyhow::ensure!(
++            max_independent_actions_per_function <= max_independent_actions,
++            "MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION must not exceed MAX_ISOLATE_ACTION_WORKERS"
++        );
 +        let pool_name = isolate_worker.config().name;
 +        metrics::initialize_capacity_counters(pool_name);
 +
@@ -3007,16 +3101,17 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          let (internal_sender, internal_receiver) = mpsc::unbounded_channel();
          let handles = Arc::new(Mutex::new(Vec::new()));
          let handles_clone = handles.clone();
-@@ -585,6 +791,8 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -585,6 +866,9 @@ impl<RT: Runtime> IsolateClient<RT> {
                  rt_clone,
                  isolate_worker,
                  max_isolate_workers,
 +                base_worker_capacity,
 +                max_independent_actions,
++                max_independent_actions_per_function,
                  handles_clone,
                  max_percent_per_client,
                  _active_workers,
-@@ -595,6 +803,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -595,6 +879,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              rt,
              sender,
              internal_sender,
@@ -3024,7 +3119,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
              scheduler: Arc::new(Mutex::new(Some(scheduler))),
              handles,
              active_workers,
-@@ -637,6 +846,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -637,6 +922,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          instance_name: String,
          function_started_sender: Option<oneshot::Sender<()>>,
          subfunctions_in_same_isolate: bool,
@@ -3032,7 +3127,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          let (tx, rx) = oneshot::channel();
          let request = RequestType::Udf {
-@@ -660,10 +870,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -660,10 +946,11 @@ impl<RT: Runtime> IsolateClient<RT> {
                  Some(self.clone())
              },
          };
@@ -3045,7 +3140,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          ))?;
          let (tx, outcome) = Self::receive_response(rx).await??;
  
-@@ -682,6 +893,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -682,6 +969,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          environment_data: EnvironmentData<RT>,
          instance_name: String,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -3053,7 +3148,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
          let request = RequestType::Action {
-@@ -699,10 +911,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -699,10 +987,11 @@ impl<RT: Runtime> IsolateClient<RT> {
              log_line_sender,
              function_started_sender,
          };
@@ -3066,7 +3161,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          ))?;
          match Self::receive_response(rx).await? {
              Ok(outcome) => Ok(outcome),
-@@ -1050,6 +1263,12 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1050,6 +1339,12 @@ impl<RT: Runtime> IsolateClient<RT> {
      }
  
      pub async fn shutdown(&self) -> anyhow::Result<()> {
@@ -3079,7 +3174,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          {
              let handles: Vec<_> = {
                  let mut handles = self.handles.lock();
-@@ -1062,17 +1281,36 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1062,17 +1357,36 @@ impl<RT: Runtime> IsolateClient<RT> {
                  shutdown_and_join(handle.handle).await?;
              }
          }
@@ -3123,7 +3218,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          Ok(())
      }
  
-@@ -1102,10 +1340,20 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1102,10 +1416,20 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
              function_started_sender: None,
              udf_callback: Some(self.clone()),
          };
@@ -3145,7 +3240,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          let (tx, outcome) = IsolateClient::<RT>::receive_response(rx).await??;
          let outcome = match outcome {
              FunctionOutcome::Query(outcome) | FunctionOutcome::Mutation(outcome) => {
-@@ -1142,13 +1390,7 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -1142,13 +1466,7 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      rt: RT,
      worker: W,
      /// Vec of channels for sending work to individual workers.
@@ -3160,7 +3255,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
      /// Map from client_id to stack of workers (implemented with a deque). The
      /// most recently used worker for a given client is at the front of the
      /// deque. These workers were previously used by this client, but may
-@@ -1160,22 +1402,35 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -1160,30 +1478,48 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      /// Set of futures awaiting a response from an active worker.
      in_progress_workers:
          FuturesUnordered<Join<oneshot::Receiver<IdleWorkerInfo>, Ready<ActiveWorkerState>>>,
@@ -3181,6 +3276,9 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +    base_worker_capacity: usize,
 +    /// Maximum independent V8 and HTTP actions retaining workers.
 +    max_independent_actions: usize,
++    max_independent_actions_per_function: usize,
++    // Entries disappear on release, so retained keys are bounded by worker capacity.
++    independent_actions_by_function: HashMap<IndependentActionKey, usize>,
      handles: Arc<Mutex<Vec<IsolateWorkerHandle>>>,
 -    /// The max number of active workers (per `in_progress_count`) allowed for a
 -    /// single client_id.
@@ -3203,20 +3301,23 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
  struct IdleWorkerState {
      worker_id: usize,
      last_used_ts: tokio::time::Instant,
-@@ -1184,6 +1439,7 @@ struct IdleWorkerState {
+     info: IdleWorkerInfo,
+ }
  struct ActiveWorkerState {
++    action_key: Option<IndependentActionKey>,
      worker_id: usize,
      client_id: String,
 +    scheduling_properties: RequestSchedulingProperties,
  }
  
  impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
-@@ -1191,23 +1447,39 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1191,23 +1527,42 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          rt: RT,
          worker: W,
          max_workers: usize,
 +        base_worker_capacity: usize,
 +        max_independent_actions: usize,
++        max_independent_actions_per_function: usize,
          handles: Arc<Mutex<Vec<IsolateWorkerHandle>>>,
          max_percent_per_client: usize,
          active_workers: Arc<AtomicUsize>,
@@ -3246,6 +3347,8 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
              max_workers,
 +            base_worker_capacity,
 +            max_independent_actions,
++            max_independent_actions_per_function,
++            independent_actions_by_function: HashMap::new(),
              handles,
 -            max_active_workers_per_client: (max_workers * max_percent_per_client)
 -                .div_ceil(100)
@@ -3255,9 +3358,11 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          }
      }
  
-@@ -1217,24 +1489,25 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1216,25 +1571,27 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+         completed_worker: ActiveWorkerState,
          info: IdleWorkerInfo,
      ) {
++        self.release_action_function(completed_worker.action_key.as_ref());
          let new_count = match self
 -            .in_progress_count
 +            .in_progress_counts_by_client
@@ -3292,7 +3397,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          log_pool_running_count(
              self.worker.config().name,
              new_count,
-@@ -1251,50 +1524,90 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1251,50 +1608,124 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              });
      }
  
@@ -3303,8 +3408,33 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +            max_workers: self.max_workers,
 +            base_worker_capacity: self.base_worker_capacity,
 +            max_independent_actions: self.max_independent_actions,
++            max_independent_actions_per_function: self.max_independent_actions_per_function,
++            independent_actions_by_function: self.independent_actions_by_function.clone(),
 +            max_workers_per_client: self.max_workers_per_client,
 +            base_workers_per_client: self.base_workers_per_client,
++        }
++    }
++
++    fn reserve_action_function(&mut self, key: Option<IndependentActionKey>) {
++        if let Some(key) = key {
++            let count = self.independent_actions_by_function.entry(key).or_default();
++            assert!(*count < self.max_independent_actions_per_function);
++            *count += 1;
++        }
++    }
++
++    fn release_action_function(&mut self, key: Option<&IndependentActionKey>) {
++        if let Some(key) = key {
++            let count = self
++                .independent_actions_by_function
++                .get_mut(key)
++                .expect("independent action missing its function reservation");
++            *count = count
++                .checked_sub(1)
++                .expect("independent action function count underflow");
++            if *count == 0 {
++                self.independent_actions_by_function.remove(key);
++            }
 +        }
 +    }
 +
@@ -3324,6 +3454,11 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +            self.worker.config().name,
 +            "independent_action",
 +            self.max_independent_actions,
++        );
++        metrics::log_scheduler_capacity(
++            self.worker.config().name,
++            "independent_action_per_function",
++            self.max_independent_actions_per_function,
 +        );
          let mut report_stats = self.rt.wait(*HEAP_WORKER_REPORT_INTERVAL_SECONDS);
          let mut expired_receiver = receiver.expired_receiver();
@@ -3371,7 +3506,11 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +            let state = selection_state.lock();
 +            receiver.poll_next_selecting_with_expiration(cx, &mut |request| {
 +                state
-+                    .can_start_request(request.scheduling_properties(), &request.client_id)
++                    .can_start_request(
++                        request.scheduling_properties(),
++                        &request.client_id,
++                        request.independent_action_key().as_ref(),
++                    )
 +                    .then_some(())
 +            })
 +        })
@@ -3417,7 +3556,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          let internal_request_stream =
              UnboundedReceiverStream::new(internal_receiver).then(async |request| {
                  // Internal requests (for nested UDFs) get priority because they
-@@ -1310,7 +1623,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1310,7 +1741,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              |&mut ()| PollNext::Left
          ));
          loop {
@@ -3427,7 +3566,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
              tokio::select! {
                  biased;
                  completed_worker = self.in_progress_workers.next(),
-@@ -1329,6 +1643,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1329,6 +1761,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      let Some((request, expired)) = request else {
                          break;
                      };
@@ -3438,7 +3577,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
                      request.expire(expired);
                  }
                  request = next_request_stream.next(),
-@@ -1339,29 +1657,41 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1339,29 +1775,43 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      if request.is_response_closed() {
                          continue;
                      }
@@ -3461,8 +3600,10 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
                      };
                      let (done_sender, done_receiver) = oneshot::channel();
 +                    let client_id = request.client_id.clone();
++                    let action_key = request.independent_action_key();
                      let st = ActiveWorkerState {
 -                        client_id: request.client_id.clone(),
++                        action_key: action_key.clone(),
 +                        client_id: client_id.clone(),
                          worker_id,
 +                        scheduling_properties,
@@ -3492,13 +3633,14 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
                          .is_err()
                      {
                          // Available worker should have an empty channel, so if we fail
-@@ -1372,6 +1702,32 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1372,6 +1822,33 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          );
                          return;
                      }
 +                    // Record scheduler-owned state only after the worker
 +                    // accepted the request. The worker message owns externally
 +                    // visible active accounting and clears it on every drop path.
++                    self.reserve_action_function(action_key);
 +                    self.in_progress_workers
 +                        .push(future::join(done_receiver, future::ready(st)));
 +                    let entry = self
@@ -3525,7 +3667,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
                  },
                  _ = &mut report_stats => {
                      let heap_stats = self.aggregate_heap_stats();
-@@ -1396,19 +1752,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1396,19 +1873,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      fn get_worker(
          &mut self,
          request: &Request<RT>,
@@ -3539,7 +3681,11 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 -            .copied()
 -            .unwrap_or_default();
 -        if active_worker_count >= self.max_active_workers_per_client {
-+        if !state.can_start_request(request.scheduling_properties(), client_id) {
++        if !state.can_start_request(
++            request.scheduling_properties(),
++            client_id,
++            request.independent_action_key().as_ref(),
++        ) {
              tracing::warn!(
 -                "Client {} is using >= {} of scheduler capacity; rejecting new request",
 -                client_id,
@@ -3549,7 +3695,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
              );
              return Err(RejectedBeforeExecutionReason::PerClientWorkerOverloaded);
          }
-@@ -1522,18 +1872,14 @@ impl SharedIsolateHeapStats {
+@@ -1522,18 +1997,14 @@ impl SharedIsolateHeapStats {
  pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
      async fn service_requests(
          self,
@@ -3570,7 +3716,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
          'recreate_isolate: loop {
              let mut last_client_id: Option<String> = None;
              let mut last_request: Option<String> = None;
-@@ -1555,8 +1901,11 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -1555,8 +2026,11 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                      continue 'recreate_isolate;
                  }
                  heap_stats.store(isolate.heap_stats());
@@ -3583,7 +3729,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
                      let _ = done.send(IdleWorkerInfo {
                          cached_contexts: context_cache.cached_contexts().clone(),
                      });
-@@ -1570,9 +1919,10 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -1570,9 +2044,10 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                      },
                      // First peek the request to decide if we need to make a new isolate.
                      req = reqs.as_mut().peek() => {
@@ -3595,7 +3741,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
                          let reused = last_client_id.is_some();
                          // If we receive a request from a different client (i.e. a different instance),
                          // recreate the isolate. We don't allow an isolate to be reused
-@@ -1589,12 +1939,17 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -1589,12 +2064,17 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                              tracing::debug!("Reusing isolate for client {}", req.client_id);
                          }
                          // Ok, we're ready to accept the request for real.
@@ -3615,7 +3761,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
                          let root = initialize_root_from_parent(
                              func_path!(),
                              req.parent_trace.clone(),
-@@ -1687,3 +2042,823 @@ pub fn should_recreate_isolate<RT: Runtime>(
+@@ -1687,3 +2167,856 @@ pub fn should_recreate_isolate<RT: Runtime>(
  
      false
  }
@@ -3645,6 +3791,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +            CoDelQueueReceiver,
 +            CoDelQueueSender,
 +        },
++        components::CanonicalizedComponentFunctionPath,
 +        fastrace_helpers::EncodedSpan,
 +        knobs::CODEL_QUEUE_IDLE_EXPIRATION_MILLIS,
 +        pause::PauseClient,
@@ -3772,6 +3919,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +                let (id, started, completion, response, fail_worker) = match request.inner {
 +                    RequestType::Test {
 +                        id,
++                        action_function: _,
 +                        can_block_on_descendant: _,
 +                        is_isolate_action: _,
 +                        fail_worker,
@@ -3876,6 +4024,10 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +        let (response_sender, response) = oneshot::channel();
 +        let inner = RequestType::Test {
 +            id,
++            action_function: CanonicalizedComponentFunctionPath {
++                component: common::components::ComponentPath::root(),
++                udf_path: "test:action".parse().unwrap(),
++            },
 +            can_block_on_descendant: matches!(
 +                kind,
 +                TestRequestKind::DependencyHolder | TestRequestKind::Action
@@ -3950,6 +4102,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +                },
 +                max_workers,
 +                base_worker_capacity,
++                max_independent_actions,
 +                max_independent_actions,
 +                worker_handles.clone(),
 +                max_percent_per_client,
@@ -4091,6 +4244,8 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +            max_workers: 6,
 +            base_worker_capacity: 5,
 +            max_independent_actions: 3,
++            max_independent_actions_per_function: 3,
++            independent_actions_by_function: HashMap::new(),
 +            max_workers_per_client: 6,
 +            base_workers_per_client: 5,
 +        }
@@ -4118,8 +4273,8 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +            independent_actions: 0,
 +        };
 +        let state = snapshot(active, active);
-+        assert!(!state.can_start_request(properties(false, false, false), "deployment"));
-+        assert!(state.can_start_request(properties(true, false, false), "deployment"));
++        assert!(!state.can_start_request(properties(false, false, false), "deployment", None));
++        assert!(state.can_start_request(properties(true, false, false), "deployment", None));
 +        assert!(state.dependency_dispatch_uses_reserve());
 +    }
 +
@@ -4130,8 +4285,8 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +            independent_actions: 0,
 +        };
 +        let state = snapshot(active, active);
-+        assert!(state.can_start_request(properties(false, false, false), "deployment"));
-+        assert!(state.can_start_request(properties(true, false, false), "deployment"));
++        assert!(state.can_start_request(properties(false, false, false), "deployment", None));
++        assert!(state.can_start_request(properties(true, false, false), "deployment", None));
 +        assert!(!state.dependency_dispatch_uses_reserve());
 +    }
 +
@@ -4142,8 +4297,8 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +            independent_actions: 0,
 +        };
 +        let state = snapshot(active, active);
-+        assert!(!state.can_start_request(properties(false, false, false), "deployment"));
-+        assert!(!state.can_start_request(properties(true, false, false), "deployment"));
++        assert!(!state.can_start_request(properties(false, false, false), "deployment", None));
++        assert!(!state.can_start_request(properties(true, false, false), "deployment", None));
 +    }
 +
 +    #[test]
@@ -4159,8 +4314,8 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +        let mut state = snapshot(global, client);
 +        state.base_workers_per_client = 2;
 +        state.max_workers_per_client = 3;
-+        assert!(!state.can_start_request(properties(false, false, false), "deployment"));
-+        assert!(state.can_start_request(properties(true, false, false), "deployment"));
++        assert!(!state.can_start_request(properties(false, false, false), "deployment", None));
++        assert!(state.can_start_request(properties(true, false, false), "deployment", None));
 +        assert!(!state.dependency_dispatch_uses_reserve());
 +
 +        let client_at_total = ActiveRequestCounts {
@@ -4170,8 +4325,8 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +        let mut state = snapshot(global, client_at_total);
 +        state.base_workers_per_client = 2;
 +        state.max_workers_per_client = 3;
-+        assert!(!state.can_start_request(properties(false, false, false), "deployment"));
-+        assert!(!state.can_start_request(properties(true, false, false), "deployment"));
++        assert!(!state.can_start_request(properties(false, false, false), "deployment", None));
++        assert!(!state.can_start_request(properties(true, false, false), "deployment", None));
 +    }
 +
 +    #[test]
@@ -4181,9 +4336,33 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..6538972283dc3eb052929dce96267e16
 +            independent_actions: 3,
 +        };
 +        let state = snapshot(active, active);
-+        assert!(!state.can_start_request(properties(false, true, true), "deployment"));
-+        assert!(state.can_start_request(properties(false, true, false), "deployment"));
-+        assert!(state.can_start_request(properties(true, true, true), "deployment"));
++        assert!(!state.can_start_request(properties(false, true, true), "deployment", None));
++        assert!(state.can_start_request(properties(false, true, false), "deployment", None));
++        assert!(state.can_start_request(properties(true, true, true), "deployment", None));
++    }
++
++    #[test]
++    fn action_function_cap_is_scoped_and_released() {
++        let tokio = ProdRuntime::init_tokio().unwrap();
++        let rt = SchedulerTestRuntime::new(ProdRuntime::new(&tokio));
++        let mut harness = SchedulerHarness::new(rt, 8, 7, 6, 100, 8);
++        let scheduler = &mut harness.pending_scheduler.as_mut().unwrap().1;
++        scheduler.max_independent_actions_per_function = 1;
++        let mut first = test_request(1, TestRequestKind::Action, harness.started_sender.clone());
++        let key = first.request.independent_action_key().unwrap();
++        scheduler.reserve_action_function(Some(key.clone()));
++        let state = scheduler.state_snapshot();
++        let properties = first.request.scheduling_properties();
++        assert!(!state.can_start_request(properties, "deployment", Some(&key)));
++        let other = super::IndependentActionKey {
++            client_id: "other".into(),
++            ..key.clone()
++        };
++        assert!(state.can_start_request(properties, &other.client_id, Some(&other)));
++        scheduler.release_action_function(Some(&key));
++        assert!(scheduler.independent_actions_by_function.is_empty());
++        first.request.scheduler_dependency = SchedulerDependencyClass::UnblocksAncestor;
++        assert!(first.request.independent_action_key().is_none());
 +    }
 +
 +    #[test]
@@ -5045,10 +5224,10 @@ index 086fd56fdc47373d4ded09615f0a820f87bcf6d7..661b9a077fe625adee5e4c6185cb4f18
      }
 diff --git a/patches/dependency_capacity/README.md b/patches/dependency_capacity/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..f35502c5ed47b6ac3bb60c68a702246cebdcf78e
+index 0000000000000000000000000000000000000000..83b48a9753ab9f57f916204238aade265235a981
 --- /dev/null
 +++ b/patches/dependency_capacity/README.md
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,290 @@
 +# Dependency Capacity and Isolate Scheduler Liveness
 +
 +## Summary
@@ -5119,10 +5298,27 @@ index 0000000000000000000000000000000000000000..f35502c5ed47b6ac3bb60c68a702246c
 +ancestor. Nested Node actions receive equivalent overflow at the Node-action application gate
 +because their parent retains a permit from that gate.
 +
++## Action cap
++
 +`MAX_ISOLATE_ACTION_WORKERS` separately caps assigned independent V8 and HTTP actions. `0` derives
 +the cap from `B`; an explicit value cannot exceed `B`. Queries, mutations, and dependency actions
 +do not consume this class cap. The cap protects mixed traffic without reducing total query or
 +mutation worker capacity.
++
++`MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION` limits one function inside that total. `0` (the default)
++uses the global action cap, preserving the global-only policy; an explicit positive value cannot
++exceed the resolved global cap. A global cap of `12` with a per-function cap of `6` is a reasonable
++starting point for mixed workloads. One hot function then leaves six action slots available to
++other functions; two hot functions can still consume all twelve. This is not a reserved auth pool.
++
++Identity includes the isolate client and the validated component/function path, not an export
++alias or invocation arguments. HTTP actions share their component's router allowance: handler
++selection occurs inside JavaScript, and raw URL paths are not trustworthy admission identities.
++The cap does not apply to Node execution, queries, mutations, or ancestor-unblocking descendants.
++
++Counts track assigned workers, including workers suspended on external I/O.
++Completion releases worker ownership and removes empty function entries.
++Queued selection skips capped functions without hiding eligible requests.
 +
 +## Propagation and request ownership
 +
@@ -5199,6 +5395,7 @@ index 0000000000000000000000000000000000000000..f35502c5ed47b6ac3bb60c68a702246c
 +- `MAX_ISOLATE_WORKERS` (default `300`);
 +- `ISOLATE_DEPENDENCY_WORKER_RESERVE` (default `1`);
 +- `MAX_ISOLATE_ACTION_WORKERS` (default `0`, meaning derive from shared base);
++- `MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION` (default `0`, meaning use the global action cap);
 +- `ISOLATE_QUEUE_SIZE` (default `2000`, for the external CoDel base);
 +- `FUNRUN_ISOLATE_ACTIVE_THREADS` (default `0`, meaning unlimited).
 +
@@ -6067,10 +6264,10 @@ index 0000000000000000000000000000000000000000..f67e97ccb187471f3c09666c58524c76
 +overflow. A queue-policy rollback cannot repair an incorrect dependency marker
 +or an undersized reserve, and increasing a reserve cannot create CPU capacity.
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 9613214a88d95fe51063929b1f0ba52fdd88e1b2..b9fe56bada4b465ab84dc5c4110a9ae37b8cc516 100644
+index 9613214a88d95fe51063929b1f0ba52fdd88e1b2..9b286683796867d1f177d0339c384da787c275d5 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
-@@ -14,3 +14,46 @@ You can increase the max concurrency on your self-hosted instance with these
+@@ -14,3 +14,53 @@ You can increase the max concurrency on your self-hosted instance with these
  environment variables. Note that increasing concurrency will increase load on
  your system and after a certain threshold, performance will degrade. You will
  have to tune parameters based on your own hardware and workload.
@@ -6099,6 +6296,13 @@ index 9613214a88d95fe51063929b1f0ba52fdd88e1b2..b9fe56bada4b465ab84dc5c4110a9ae3
 +capacity. An explicit value cannot exceed base capacity. Queries, mutations,
 +and child actions that unblock an ancestor are not subject to this cap.
 +
++`MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION` additionally caps one validated function per client and
++component, counting worker ownership. HTTP
++actions share their component router's allowance. `0` retains the global-only policy; a positive
++value cannot exceed the resolved global action cap. For example, `6` alongside a global cap of `12`
++leaves capacity for other functions when one function is busy. Ancestor-unblocking descendants
++remain exempt. See [Action cap](../../patches/dependency_capacity/README.md#action-cap).
++
 +`ISOLATE_QUEUE_SIZE` is the shared base capacity of the bounded CoDel queue and
 +must be nonzero. Dependencies can use
 +`ISOLATE_DEPENDENCY_WORKER_RESERVE` additional queue entries. Once both parts
@@ -6118,10 +6322,10 @@ index 9613214a88d95fe51063929b1f0ba52fdd88e1b2..b9fe56bada4b465ab84dc5c4110a9ae3
 +overflow. Use it to control CPU oversubscription, and raise it only after
 +checking backend CPU headroom and throttling.
 diff --git a/self-hosted/docker/docker-compose.yml b/self-hosted/docker/docker-compose.yml
-index b4abf72d339801453b6c744b09d7b9a77a8378dc..8d00bbbd922fcb5966af0708945d273429faeb12 100644
+index b4abf72d339801453b6c744b09d7b9a77a8378dc..3a230da7a42a112bd4c668491baaecc67eed5abb 100644
 --- a/self-hosted/docker/docker-compose.yml
 +++ b/self-hosted/docker/docker-compose.yml
-@@ -16,6 +16,11 @@ services:
+@@ -16,6 +16,12 @@ services:
        - APPLICATION_MAX_CONCURRENT_NODE_ACTIONS=${APPLICATION_MAX_CONCURRENT_NODE_ACTIONS:-16}
        - APPLICATION_MAX_CONCURRENT_QUERIES=${APPLICATION_MAX_CONCURRENT_QUERIES:-16}
        - APPLICATION_MAX_CONCURRENT_V8_ACTIONS=${APPLICATION_MAX_CONCURRENT_V8_ACTIONS:-16}
@@ -6129,6 +6333,7 @@ index b4abf72d339801453b6c744b09d7b9a77a8378dc..8d00bbbd922fcb5966af0708945d2734
 +      - ISOLATE_DEPENDENCY_WORKER_RESERVE
 +      - ISOLATE_QUEUE_SIZE
 +      - MAX_ISOLATE_ACTION_WORKERS
++      - MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION
 +      - MAX_ISOLATE_WORKERS
        - AWS_ACCESS_KEY_ID
        - AWS_REGION
