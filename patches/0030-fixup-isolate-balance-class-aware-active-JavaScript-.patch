@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 14 Oct 2026 03:24:51 +0800
+Subject: [PATCH 30/30] fixup! isolate: balance class-aware active-JavaScript
+ admission
+
+---
+ crates/isolate/src/client.rs          | 131 ++++++++++++++++++++++----
+ patches/dependency_capacity/README.md |  10 +-
+ 2 files changed, 117 insertions(+), 24 deletions(-)
+
+diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
+index ef4240c4e7b46f12cf3a7106fe95b220fb1d0888..309ac50fb7a814aa54f6120325043b7800cd9325 100644
+--- a/crates/isolate/src/client.rs
++++ b/crates/isolate/src/client.rs
+@@ -5521,9 +5521,86 @@ mod tests {
+         assert!(first.request.independent_action_key().is_none());
+     }
+ 
++    #[test]
++    fn action_function_cap_isolates_http_routes_within_the_global_cap() {
++        let tokio = ProdRuntime::init_tokio().unwrap();
++        let rt = SchedulerTestRuntime::new(ProdRuntime::new(&tokio));
++        let mut harness = SchedulerHarness::new(rt, 4, 3, 2, 100, 8);
++        let started = harness.started_sender.clone();
++        let http_request = |id, route| {
++            let mut pending = test_request(id, TestRequestKind::Action, started.clone());
++            let RequestType::Test {
++                action_function,
++                http_route,
++                ..
++            } = &mut pending.request.inner
++            else {
++                unreachable!()
++            };
++            action_function.udf_path = "http:default".parse().unwrap();
++            *http_route = route;
++            pending
++        };
++        let bulk_route = HttpActionRoute {
++            method: RoutableMethod::Get,
++            path: "/bulk/*".into(),
++            matched: true,
++        };
++        let bulk = http_request(1, Some(bulk_route.clone()));
++        let same_route = http_request(2, Some(bulk_route.clone()));
++        let auth = http_request(
++            3,
++            Some(HttpActionRoute {
++                path: "/session/*".into(),
++                ..bulk_route.clone()
++            }),
++        );
++        let other_method = http_request(
++            4,
++            Some(HttpActionRoute {
++                method: RoutableMethod::Post,
++                ..bulk_route
++            }),
++        );
++        let unmatched = http_request(5, None);
++        let another_unmatched = http_request(6, None);
++        let scheduler = &mut harness.pending_scheduler.as_mut().unwrap().1;
++        scheduler.max_independent_actions_per_function = 1;
++        let properties = bulk.request.scheduling_properties(false);
++        let eligible = |state: &SchedulerStateSnapshot, pending: &PendingTestRequest| {
++            state.can_start_request(
++                properties,
++                "deployment",
++                pending.request.independent_action_key().as_ref(),
++            )
++        };
++
++        scheduler.reserve_pending_permit(&bulk.request);
++        let state = scheduler.state_snapshot();
++        assert!(!eligible(&state, &same_route));
++        assert!(eligible(&state, &auth));
++        assert!(eligible(&state, &other_method));
++        assert!(eligible(&state, &unmatched));
++
++        scheduler.reserve_pending_permit(&auth.request);
++        assert!(!eligible(&scheduler.state_snapshot(), &other_method));
++        scheduler.release_pending_permit(&bulk.request);
++        assert!(eligible(&scheduler.state_snapshot(), &same_route));
++        scheduler.release_pending_permit(&auth.request);
++
++        scheduler.reserve_pending_permit(&unmatched.request);
++        let state = scheduler.state_snapshot();
++        assert!(!eligible(&state, &another_unmatched));
++        assert!(eligible(&state, &auth));
++        scheduler.release_pending_permit(&unmatched.request);
++        assert!(scheduler.independent_actions_by_function.is_empty());
++    }
++
+     #[test]
+     fn action_function_cap_skips_blocked_work_and_releases_completed_workers() {
+-        for lane_aware in [false, true] {
++        for (lane_aware, http_routes) in
++            [(false, false), (true, false), (false, true), (true, true)]
++        {
+             let tokio = ProdRuntime::init_tokio().unwrap();
+             let rt = ProdRuntime::new(&tokio);
+             let scheduler_rt = SchedulerTestRuntime::new(rt.clone());
+@@ -5557,26 +5634,40 @@ mod tests {
+                     .1
+                     .max_independent_actions_per_function = 1;
+                 harness.start();
+-                let first = harness.enqueue_test(1, TestRequestKind::Action);
+-                assert_eq!(harness.next_started().await, 1);
+-                let blocked = harness.enqueue_test(2, TestRequestKind::Action);
+-                let PendingTestRequest {
+-                    mut request,
+-                    completion,
+-                    response,
+-                } = test_request(3, TestRequestKind::Action, harness.started_sender.clone());
+-                let RequestType::Test {
+-                    action_function, ..
+-                } = &mut request.inner
+-                else {
+-                    unreachable!()
+-                };
+-                action_function.udf_path = "test:other".parse().unwrap();
+-                harness.enqueue(request);
+-                let other = InFlightTestRequest {
+-                    completion,
+-                    response,
++                let enqueue_action = |harness: &SchedulerHarness, id, name: &str| {
++                    let PendingTestRequest {
++                        mut request,
++                        completion,
++                        response,
++                    } = test_request(id, TestRequestKind::Action, harness.started_sender.clone());
++                    let RequestType::Test {
++                        action_function,
++                        http_route,
++                        ..
++                    } = &mut request.inner
++                    else {
++                        unreachable!()
++                    };
++                    if http_routes {
++                        action_function.udf_path = "http:default".parse().unwrap();
++                        *http_route = Some(HttpActionRoute {
++                            method: RoutableMethod::Get,
++                            path: format!("/{name}/*"),
++                            matched: true,
++                        });
++                    } else {
++                        action_function.udf_path = format!("test:{name}").parse().unwrap();
++                    }
++                    harness.enqueue(request);
++                    InFlightTestRequest {
++                        completion,
++                        response,
++                    }
+                 };
++                let first = enqueue_action(&harness, 1, "action");
++                assert_eq!(harness.next_started().await, 1);
++                let blocked = enqueue_action(&harness, 2, "action");
++                let other = enqueue_action(&harness, 3, "other");
+                 assert_eq!(harness.next_started().await, 3);
+                 let query = harness.enqueue_test(4, TestRequestKind::Independent);
+                 assert_eq!(harness.next_started().await, 4);
+diff --git a/patches/dependency_capacity/README.md b/patches/dependency_capacity/README.md
+index b8ca97c63808e135b2cdabdf41a7483e465dba7a..9b078e98765dd213998237faa23bc700a82fba57 100644
+--- a/patches/dependency_capacity/README.md
++++ b/patches/dependency_capacity/README.md
+@@ -341,7 +341,9 @@ overflow and dependency precedence are preserved. See
+ [deployment operations](../non_committing_codegen_analysis/deployment_operations.md).
+ 
+ The per-function cap tests cover pending reservations, deployment/component/function separation,
+-dependency exemption, eligible work passing a capped function in both queue policies, and release
+-after worker completion or a canceled/expired initial-permit wait. The later queue-control and
+-active-JavaScript patches preserve this capacity policy; their selection and initial-permit
+-reservations use the same function counts.
++registered HTTP route and method separation, the shared unmatched allowance, and the global cap.
++They also cover dependency exemption, eligible work passing a capped function in both queue policies,
++and release after worker completion or a canceled/expired initial-permit wait. Routing tests cover
++exact paths, prefix identities, longest-prefix selection, and HEAD normalization. The later
++queue-control and active-JavaScript patches preserve this capacity policy; their selection and
++initial-permit reservations use the same function counts.
