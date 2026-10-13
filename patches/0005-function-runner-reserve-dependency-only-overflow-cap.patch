@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Sun, 12 Jul 2026 14:32:36 +0800
-Subject: [PATCH 05/30] function-runner: reserve dependency-only overflow
+Subject: [PATCH 05/28] function-runner: reserve dependency-only overflow
  capacity
 
 Treat MAX_ISOLATE_WORKERS minus ISOLATE_DEPENDENCY_WORKER_RESERVE as shared
@@ -33,12 +33,26 @@ failure label sets at zero, reject invalid completion ownership and scheduled
 parallelism, and document the composed upstream and self-hosted contract.
 
 Bound independent actions per resolved function within the global action
-allowance. Include client and component identity, share the HTTP router
-allowance, and exempt ancestor-unblocking descendants. Zero preserves the
-global-only policy; an explicit cap cannot exceed the global cap. Track
-worker ownership in one bounded scheduler map and remove empty entries.
+allowance. Include client and component identity and exempt ancestor-unblocking
+descendants. For HTTP actions, carry the analyzed registered method and route
+into admission so unrelated handlers do not share one router allowance. Prefix
+requests share their registered prefix, HEAD shares GET, and unmatched requests
+share a component-router allowance. Never key admission by concrete URL suffixes
+or query strings. Retain the global cap across routes; this does not reserve
+capacity for any particular handler.
+
+Preserve the registered identity through exact and longest-prefix routing,
+including component mounts and application prefixes. Compare normalized suffix
+lengths so adjacent prefix lengths cannot select a shorter route. Cover route
+and method isolation, bounded prefix and unmatched identities, and the shared
+global action limit.
+
+Zero preserves the global-only policy; an explicit cap cannot exceed the global
+cap. Track worker ownership in one bounded scheduler map and remove empty
+entries.
 ---
  .../dependency_overflow.rs                    |  302 ++++
+ .../http_routing.rs                           |   76 +-
  .../application_function_runner/metrics.rs    |    9 +
  .../src/application_function_runner/mod.rs    |  229 ++-
  crates/application/src/cache/metrics.rs       |    4 +
@@ -50,25 +64,28 @@ worker ownership in one bounded scheduler map and remove empty entries.
  crates/application/src/scheduled_jobs/mod.rs  |   59 +-
  crates/common/src/codel_queue.rs              |  487 ++++-
  crates/common/src/knobs.rs                    |  112 +-
+ crates/common/src/types/actions.rs            |    7 +-
  crates/common/src/types/functions.rs          |   12 +
  crates/common/src/types/mod.rs                |    1 +
  .../src/in_process_function_runner.rs         |    3 +
  crates/function_runner/src/lib.rs             |    2 +
- crates/function_runner/src/server.rs          |    9 +
- crates/isolate/src/client.rs                  | 1563 +++++++++++++++--
+ crates/function_runner/src/server.rs          |   15 +
+ crates/isolate/src/client.rs                  | 1574 +++++++++++++++--
  crates/isolate/src/concurrency_limiter.rs     |   99 ++
+ crates/isolate/src/environment/analyze.rs     |    8 +-
  crates/isolate/src/isolate_worker.rs          |    5 +
  crates/isolate/src/metrics.rs                 |  198 +++
  .../src/node_action_callbacks.rs              |   38 +-
+ crates/model/src/modules/module_versions.rs   |  121 +-
  crates/node_executor/src/executor.rs          |    2 +
  npm-packages/node-executor/src/executor.ts    |    4 +
  .../node-executor/src/syscalls.test.ts        |   35 +
  npm-packages/node-executor/src/syscalls.ts    |    6 +
- patches/dependency_capacity/README.md         |  290 +++
- .../dependency_capacity/design_reference.md   |  739 ++++++++
- self-hosted/advanced/knobs.md                 |   50 +
+ patches/dependency_capacity/README.md         |  294 +++
+ .../dependency_capacity/design_reference.md   |  747 ++++++++
+ self-hosted/advanced/knobs.md                 |   52 +
  self-hosted/docker/docker-compose.yml         |    6 +
- 30 files changed, 4294 insertions(+), 209 deletions(-)
+ 34 files changed, 4490 insertions(+), 256 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/dependency_overflow.rs
  create mode 100644 npm-packages/node-executor/src/syscalls.test.ts
  create mode 100644 patches/dependency_capacity/README.md
@@ -382,6 +399,161 @@ index 0000000000000000000000000000000000000000..bbb07d1f496b7132d615a88053c90cf3
 +        drop(permit);
 +    }
 +}
+diff --git a/crates/application/src/application_function_runner/http_routing.rs b/crates/application/src/application_function_runner/http_routing.rs
+index 45d91e449bca9c0ccf18238f4bc165ac211435ef..627846980460e28bf2739b6c1cb2e257ca96987a 100644
+--- a/crates/application/src/application_function_runner/http_routing.rs
++++ b/crates/application/src/application_function_runner/http_routing.rs
+@@ -25,6 +25,7 @@ use common::{
+     },
+     types::{
+         FunctionCaller,
++        HttpActionRoute,
+         ModuleEnvironment,
+         RoutableMethod,
+     },
+@@ -66,6 +67,12 @@ use value::sha256::Sha256Digest;
+ use super::ApplicationFunctionRunner;
+ use crate::function_log::HttpActionStatusCode;
+ 
++struct RoutedHttpAction {
++    component_path: ComponentPath,
++    routed_path: RoutedHttpPath,
++    http_route: Option<HttpActionRoute>,
++}
++
+ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+     #[fastrace::trace]
+     pub async fn run_http_action(
+@@ -84,21 +91,24 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+             .begin_with_usage(identity.clone(), usage_tracker.clone())
+             .await?;
+ 
+-        let (component_path, routed_path) =
+-            match self.route_http_action(&mut tx, &http_request.head).await? {
+-                Some(r) => r,
+-                None => {
+-                    drop(tx);
+-                    let response_parts = udf::HttpActionResponsePart::from_text(
+-                        StatusCode::NOT_FOUND,
+-                        "This Convex deployment does not have HTTP actions enabled.".to_string(),
+-                    );
+-                    for part in response_parts {
+-                        response_streamer.send_part(part)??;
+-                    }
+-                    return Ok(udf::HttpActionResult::Streamed);
+-                },
+-            };
++        let RoutedHttpAction {
++            component_path,
++            routed_path,
++            http_route,
++        } = match self.route_http_action(&mut tx, &http_request.head).await? {
++            Some(r) => r,
++            None => {
++                drop(tx);
++                let response_parts = udf::HttpActionResponsePart::from_text(
++                    StatusCode::NOT_FOUND,
++                    "This Convex deployment does not have HTTP actions enabled.".to_string(),
++                );
++                for part in response_parts {
++                    response_streamer.send_part(part)??;
++                }
++                return Ok(udf::HttpActionResult::Streamed);
++            },
++        };
+         let path = CanonicalizedComponentFunctionPath {
+             component: component_path,
+             udf_path: CanonicalizedUdfPath::new(
+@@ -131,6 +141,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                     http_response_streamer,
+                     http_module_path: validated_path,
+                     routed_path,
++                    http_route,
+                     http_request,
+                 },
+                 context.clone(),
+@@ -333,7 +344,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+         &self,
+         tx: &mut Transaction<RT>,
+         head: &HttpActionRequestHead,
+-    ) -> anyhow::Result<Option<(ComponentPath, RoutedHttpPath)>> {
++    ) -> anyhow::Result<Option<RoutedHttpAction>> {
+         let mut model = BootstrapComponentsModel::new(tx);
+         let mut current_component_path = ComponentPath::root();
+         let mut routed_path = RoutedHttpPath(head.url.path().to_string());
+@@ -376,24 +387,28 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+             // be the most specific match.
+             if let Some(ref effective_path) = http_js_routed_path
+                 && let Some(http_routes) = http_routes
+-                && http_routes.route_exact(&effective_path[..], method)
++                && let Some(route) = http_routes.route_exact(&effective_path[..], method)
+             {
+-                return Ok(Some((current_component_path, effective_path.clone())));
++                return Ok(Some(RoutedHttpAction {
++                    component_path: current_component_path,
++                    routed_path: effective_path.clone(),
++                    http_route: Some(route.clone()),
++                }));
+             }
+ 
+             // Next, try finding the most specific prefix match from both `http.js`
+             // and the component-level mounts.
+             enum CurrentMatch<'a> {
+-                CurrentHttpJs,
++                CurrentHttpJs(&'a HttpActionRoute),
+                 MountedComponent(&'a Reference),
+             }
+             let mut longest_match = None;
+ 
+             if let Some(ref effective_path) = http_js_routed_path
+                 && let Some(http_routes) = http_routes
+-                && let Some(match_suffix) = http_routes.route_prefix(effective_path, method)
++                && let Some(matched) = http_routes.route_prefix(effective_path, method)
+             {
+-                longest_match = Some((match_suffix, CurrentMatch::CurrentHttpJs));
++                longest_match = Some((matched.suffix, CurrentMatch::CurrentHttpJs(matched.route)));
+             }
+             // http_mounts are not nested under a (possible) App http_prefix - they always
+             // use the original routed_path (absolute paths from root)
+@@ -405,7 +420,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                 if let Some((ref existing_suffix, _)) = longest_match {
+                     // If the existing longest match has a shorter suffix, then it
+                     // matches a longer prefix.
+-                    if existing_suffix.len() < match_suffix.len() {
++                    if existing_suffix.len() < new_match.len() {
+                         continue;
+                     }
+                 }
+@@ -419,18 +434,23 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                     if let Some(effective_path) = http_js_routed_path
+                         && http_routes.is_some()
+                     {
+-                        return Ok(Some((current_component_path, effective_path)));
++                        return Ok(Some(RoutedHttpAction {
++                            component_path: current_component_path,
++                            routed_path: effective_path,
++                            http_route: None,
++                        }));
+                     } else {
+                         return Ok(None);
+                     }
+                 },
+-                Some((_, CurrentMatch::CurrentHttpJs)) => {
+-                    return Ok(Some((
+-                        current_component_path,
++                Some((_, CurrentMatch::CurrentHttpJs(route))) => {
++                    return Ok(Some(RoutedHttpAction {
++                        component_path: current_component_path,
+                         // Use the effective (prefix-stripped) path for http.js
+-                        http_js_routed_path
++                        routed_path: http_js_routed_path
+                             .expect("CurrentHttpJs match requires http_js_routed_path"),
+-                    )));
++                        http_route: Some(route.clone()),
++                    }));
+                 },
+                 Some((match_suffix, CurrentMatch::MountedComponent(reference))) => {
+                     let Reference::ChildComponent {
 diff --git a/crates/application/src/application_function_runner/metrics.rs b/crates/application/src/application_function_runner/metrics.rs
 index de7378717f7421f98b76e73ac0b4add88adcdf11..b2334260ae062c0b8adff91e3da8714f4c8601b2 100644
 --- a/crates/application/src/application_function_runner/metrics.rs
@@ -2376,7 +2548,7 @@ index 674591dc6030d30e65c83b35c9753bad75cfd1cc..8f57ee5c5bb91d2503aaf75a0c480991
      }
  }
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 3f1d2495c2f48482a3fd160d4d4587575651c1a1..aa551c3b21b597e06f77e319098d540c8df7ecfe 100644
+index 3f1d2495c2f48482a3fd160d4d4587575651c1a1..225ca8fa6ca760a9e90d8643c4cdde8857d419b7 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -30,6 +30,45 @@ use cmd_util::env::env_config;
@@ -2495,8 +2667,8 @@ index 3f1d2495c2f48482a3fd160d4d4587575651c1a1..aa551c3b21b597e06f77e319098d540c
 +
 +/// Maximum independent actions of one function (per client and component),
 +/// retaining workers. Zero uses the global action limit.
-+/// HTTP routes share their component's router allowance. See the "Action cap"
-+/// section of patches/dependency_capacity/README.md.
++/// HTTP actions are grouped by registered method and route. See the "Action
++/// cap" section of patches/dependency_capacity/README.md.
 +pub static MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION: LazyLock<usize> = LazyLock::new(|| {
 +    env_config_isolate_scheduler_usize_strict("MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION", 0)
 +});
@@ -2540,6 +2712,24 @@ index 3f1d2495c2f48482a3fd160d4d4587575651c1a1..aa551c3b21b597e06f77e319098d540c
 +        );
 +    }
 +}
+diff --git a/crates/common/src/types/actions.rs b/crates/common/src/types/actions.rs
+index 62dcb61a4062ea0ca4d6d9677cb93bfdf54284d4..fb3795798b51c404657e9d415ed653dbbaaa68d0 100644
+--- a/crates/common/src/types/actions.rs
++++ b/crates/common/src/types/actions.rs
+@@ -134,9 +134,10 @@ impl TryFrom<http::Method> for RoutableMethod {
+ pub struct HttpActionRoute {
+     pub method: RoutableMethod,
+     pub path: String,
+-    /// Whether this route was resolved by the JS router's `lookup()`.
+-    /// When false, `path` is a fallback from the request URL and should not
+-    /// be used as the identifier for usage tracking (to avoid route explosion).
++    /// Whether this is a registered route from analysis or the JS router's
++    /// `lookup()`. When false, `path` is a fallback from the request URL
++    /// and should not be used as the identifier for usage tracking (to
++    /// avoid route explosion).
+     pub matched: bool,
+ }
+ 
 diff --git a/crates/common/src/types/functions.rs b/crates/common/src/types/functions.rs
 index 148ca68f24549129e9592307ebe19ee71ae74216..9b347c6caf3d8e0da0fe6b07bba9dedaae093fbd 100644
 --- a/crates/common/src/types/functions.rs
@@ -2624,18 +2814,21 @@ index 27ec38f32a423786d4d4b12b7e0071b62a1790b1..cd61703cf92ce25891499358abcee5d9
          Option<FunctionFinalTransaction>,
          FunctionOutcome,
 diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
-index 8e94fbb8888e8dedc3b2df17781f4078e4720832..52de938e3fb5120e664d126c053005ec3409af3e 100644
+index 8e94fbb8888e8dedc3b2df17781f4078e4720832..6b3bc15463c9431a4654c62875e295f3976ea327 100644
 --- a/crates/function_runner/src/server.rs
 +++ b/crates/function_runner/src/server.rs
-@@ -38,6 +38,7 @@ use common::{
+@@ -36,8 +36,10 @@ use common::{
+     types::{
+         ConvexOrigin,
          DeploymentMetadata,
++        HttpActionRoute,
          IndexId,
          ModuleEnvironment,
 +        SchedulerDependencyClass,
          UdfType,
      },
  };
-@@ -137,6 +138,7 @@ pub struct RunRequestArgs {
+@@ -137,6 +139,7 @@ pub struct RunRequestArgs {
      pub default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
      pub in_memory_index_last_modified: BTreeMap<IndexId, Timestamp>,
      pub context: ExecutionContext,
@@ -2643,7 +2836,17 @@ index 8e94fbb8888e8dedc3b2df17781f4078e4720832..52de938e3fb5120e664d126c053005ec
      pub subfunctions_in_same_isolate: bool,
      pub deployment: DeploymentMetadata,
  }
-@@ -322,6 +324,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -151,6 +154,9 @@ pub struct HttpActionMetadata {
+     pub http_response_streamer: HttpActionResponseStreamer,
+     pub http_module_path: ValidatedHttpPath,
+     pub routed_path: RoutedHttpPath,
++    // From analyzed routing metadata, not the concrete request URL. Unmatched
++    // requests share one admission allowance within their component router.
++    pub http_route: Option<HttpActionRoute>,
+     pub http_request: HttpActionRequestInner,
+ }
+ 
+@@ -322,6 +328,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
              default_system_env_vars,
              in_memory_index_last_modified,
              context,
@@ -2651,7 +2854,7 @@ index 8e94fbb8888e8dedc3b2df17781f4078e4720832..52de938e3fb5120e664d126c053005ec
              subfunctions_in_same_isolate,
              deployment,
          }: RunRequestArgs,
-@@ -398,6 +401,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -398,6 +405,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                          deployment_name,
                          function_started_sender,
                          subfunctions_in_same_isolate,
@@ -2659,7 +2862,7 @@ index 8e94fbb8888e8dedc3b2df17781f4078e4720832..52de938e3fb5120e664d126c053005ec
                      )
                      .await?;
                  Ok((
-@@ -423,6 +427,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -423,6 +431,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                          environment_data,
                          deployment_name,
                          function_started_sender,
@@ -2667,7 +2870,7 @@ index 8e94fbb8888e8dedc3b2df17781f4078e4720832..52de938e3fb5120e664d126c053005ec
                      )
                      .await?;
                  Ok((
-@@ -432,6 +437,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -432,10 +441,15 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                  ))
              },
              UdfType::HttpAction => {
@@ -2678,8 +2881,21 @@ index 8e94fbb8888e8dedc3b2df17781f4078e4720832..52de938e3fb5120e664d126c053005ec
                  let HttpActionMetadata {
                      http_response_streamer,
                      http_module_path,
+                     routed_path,
++                    http_route,
+                     http_request,
+                 } = http_action_metadata.context("Missing http action metadata")?;
+                 let log_line_sender =
+@@ -450,6 +464,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                     .execute_http_action(
+                         http_module_path,
+                         routed_path,
++                        http_route,
+                         http_request,
+                         identity,
+                         action_callbacks,
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513234c9f07 100644
+index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..0a488b0755ecb9c47f0567d1d93dd8a43857d9c4 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -29,12 +29,13 @@ use common::{
@@ -2713,15 +2929,17 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          REUSE_ISOLATES,
          V8_THREADS,
      },
-@@ -78,6 +80,7 @@ use common::{
+@@ -77,7 +79,9 @@ use common::{
+     static_span,
      types::{
          DeploymentMetadata,
++        HttpActionRoute,
          ModuleEnvironment,
 +        SchedulerDependencyClass,
          UdfType,
      },
      utils::ensure_utc,
-@@ -192,6 +195,152 @@ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
+@@ -192,6 +196,153 @@ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
  pub const PAUSE_REQUEST: &str = "pause_request";
  pub const NO_AVAILABLE_WORKERS: &str = "There is no capacity available to run this function";
  
@@ -2815,6 +3033,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
 +struct IndependentActionKey {
 +    client_id: String,
 +    function: CanonicalizedComponentFunctionPath,
++    http_route: Option<HttpActionRoute>,
 +}
 +
 +struct SchedulerStateSnapshot {
@@ -2874,7 +3093,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
  #[derive(Clone)]
  pub struct IsolateConfig {
      // Name of isolate pool, used in metrics.
-@@ -212,7 +361,6 @@ impl IsolateConfig {
+@@ -212,7 +363,6 @@ impl IsolateConfig {
              limiter,
          }
      }
@@ -2882,7 +3101,15 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
  }
  
  pub struct UdfRequest<RT: Runtime> {
-@@ -261,14 +409,30 @@ pub struct Request<RT: Runtime> {
+@@ -228,6 +378,7 @@ pub struct UdfRequest<RT: Runtime> {
+ pub struct HttpActionRequest<RT: Runtime> {
+     pub http_module_path: ValidatedHttpPath,
+     pub routed_path: RoutedHttpPath,
++    pub http_route: Option<HttpActionRoute>,
+     pub http_request: udf::HttpActionRequest,
+     pub transaction: Transaction<RT>,
+     pub identity: Identity,
+@@ -261,14 +412,30 @@ pub struct Request<RT: Runtime> {
      pub client_id: String,
      pub inner: RequestType<RT>,
      pub parent_trace: EncodedSpan,
@@ -2913,7 +3140,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          }
      }
  
-@@ -282,12 +446,77 @@ impl<RT: Runtime> Request<RT> {
+@@ -282,12 +449,80 @@ impl<RT: Runtime> Request<RT> {
              | RequestType::EvaluateAuthConfig { .. }
              | RequestType::EvaluateAppDefinitions { .. }
              | RequestType::EvaluateComponentInitializer { .. } => return None,
@@ -2929,19 +3156,20 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
 +    fn independent_action_key(&self) -> Option<IndependentActionKey> {
 +        // Descendants must be able to unblock their holders even when a root
 +        // has filled its function's allowance. Use the resolved component path,
-+        // not the caller's export alias. HTTP routes share their router identity:
-+        // the selected handler is not known until JavaScript runs, and arbitrary
-+        // request URLs must not let callers bypass admission.
++        // not the caller's export alias. HTTP identities use analyzed registered
++        // routes, so arbitrary URL suffixes cannot create new allowances.
 +        if self.scheduler_dependency.unblocks_ancestor() {
 +            return None;
 +        }
-+        let function = match &self.inner {
-+            RequestType::Action { request, .. } => {
-+                request.params.path_and_args.path().clone().for_logging()
-+            },
-+            RequestType::HttpAction { request, .. } => {
-+                request.http_module_path.path().clone().for_logging()
-+            },
++        let (function, http_route) = match &self.inner {
++            RequestType::Action { request, .. } => (
++                request.params.path_and_args.path().clone().for_logging(),
++                None,
++            ),
++            RequestType::HttpAction { request, .. } => (
++                request.http_module_path.path().clone().for_logging(),
++                request.http_route.clone(),
++            ),
 +            RequestType::Udf { .. }
 +            | RequestType::Analyze { .. }
 +            | RequestType::EvaluateSchema { .. }
@@ -2951,18 +3179,20 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
 +            #[cfg(test)]
 +            RequestType::Test {
 +                action_function,
++                http_route,
 +                is_isolate_action,
 +                ..
 +            } => {
 +                if !is_isolate_action {
 +                    return None;
 +                }
-+                action_function.clone()
++                (action_function.clone(), http_route.clone())
 +            },
 +        };
 +        Some(IndependentActionKey {
 +            client_id: self.client_id.clone(),
 +            function,
++            http_route,
 +        })
 +    }
 +
@@ -2991,7 +3221,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
  }
  
  pub enum RequestType<RT: Runtime> {
-@@ -355,6 +584,17 @@ pub enum RequestType<RT: Runtime> {
+@@ -355,6 +590,18 @@ pub enum RequestType<RT: Runtime> {
          name: ComponentName,
          response: oneshot::Sender<anyhow::Result<BTreeMap<Identifier, Resource>>>,
      },
@@ -2999,6 +3229,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
 +    Test {
 +        id: usize,
 +        action_function: CanonicalizedComponentFunctionPath,
++        http_route: Option<HttpActionRoute>,
 +        can_block_on_descendant: bool,
 +        is_isolate_action: bool,
 +        fail_worker: bool,
@@ -3009,7 +3240,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
  }
  
  #[allow(async_fn_in_trait)]
-@@ -435,6 +675,10 @@ impl<RT: Runtime> Request<RT> {
+@@ -435,6 +682,10 @@ impl<RT: Runtime> Request<RT> {
              RequestType::EvaluateComponentInitializer { response, .. } => {
                  let _ = response.send(Err(error));
              },
@@ -3020,7 +3251,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          }
      }
  
-@@ -448,6 +692,8 @@ impl<RT: Runtime> Request<RT> {
+@@ -448,6 +699,8 @@ impl<RT: Runtime> Request<RT> {
              RequestType::EvaluateAuthConfig { response, .. } => response.is_closed(),
              RequestType::EvaluateAppDefinitions { response, .. } => response.is_closed(),
              RequestType::EvaluateComponentInitializer { response, .. } => response.is_closed(),
@@ -3029,7 +3260,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          }
      }
  }
-@@ -460,6 +706,7 @@ impl<RT: Runtime> Clone for IsolateClient<RT> {
+@@ -460,6 +713,7 @@ impl<RT: Runtime> Clone for IsolateClient<RT> {
              scheduler: self.scheduler.clone(),
              sender: self.sender.clone(),
              internal_sender: self.internal_sender.clone(),
@@ -3037,7 +3268,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
              active_workers: self.active_workers.clone(),
              max_workers: self.max_workers,
          }
-@@ -547,6 +794,7 @@ pub struct IsolateClient<RT: Runtime> {
+@@ -547,6 +801,7 @@ pub struct IsolateClient<RT: Runtime> {
      scheduler: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
      sender: CoDelQueueSender<RT, Request<RT>>,
      internal_sender: mpsc::UnboundedSender<Request<RT>>,
@@ -3045,7 +3276,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
      /// Shared with the scheduler. Tracks the total number of in-progress
      /// workers across all clients.
      active_workers: Arc<AtomicUsize>,
-@@ -560,17 +808,50 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -560,17 +815,50 @@ impl<RT: Runtime> IsolateClient<RT> {
          max_isolate_workers: usize,
          isolate_worker: W,
      ) -> anyhow::Result<Self> {
@@ -3101,7 +3332,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          let (internal_sender, internal_receiver) = mpsc::unbounded_channel();
          let handles = Arc::new(Mutex::new(Vec::new()));
          let handles_clone = handles.clone();
-@@ -585,6 +866,9 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -585,6 +873,9 @@ impl<RT: Runtime> IsolateClient<RT> {
                  rt_clone,
                  isolate_worker,
                  max_isolate_workers,
@@ -3111,7 +3342,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
                  handles_clone,
                  max_percent_per_client,
                  _active_workers,
-@@ -595,6 +879,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -595,6 +886,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              rt,
              sender,
              internal_sender,
@@ -3119,7 +3350,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
              scheduler: Arc::new(Mutex::new(Some(scheduler))),
              handles,
              active_workers,
-@@ -637,6 +922,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -637,6 +929,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          instance_name: String,
          function_started_sender: Option<oneshot::Sender<()>>,
          subfunctions_in_same_isolate: bool,
@@ -3127,7 +3358,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          let (tx, rx) = oneshot::channel();
          let request = RequestType::Udf {
-@@ -660,10 +946,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -660,10 +953,11 @@ impl<RT: Runtime> IsolateClient<RT> {
                  Some(self.clone())
              },
          };
@@ -3140,7 +3371,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          ))?;
          let (tx, outcome) = Self::receive_response(rx).await??;
  
-@@ -682,6 +969,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -682,6 +976,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          environment_data: EnvironmentData<RT>,
          instance_name: String,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -3148,7 +3379,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
          let request = RequestType::Action {
-@@ -699,10 +987,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -699,10 +994,11 @@ impl<RT: Runtime> IsolateClient<RT> {
              log_line_sender,
              function_started_sender,
          };
@@ -3161,7 +3392,23 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          ))?;
          match Self::receive_response(rx).await? {
              Ok(outcome) => Ok(outcome),
-@@ -1050,6 +1339,12 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -718,6 +1014,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+         &self,
+         http_module_path: ValidatedHttpPath,
+         routed_path: RoutedHttpPath,
++        http_route: Option<HttpActionRoute>,
+         http_request: udf::HttpActionRequest,
+         identity: Identity,
+         action_callbacks: Arc<dyn ActionCallbacks>,
+@@ -735,6 +1032,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+             request: HttpActionRequest {
+                 http_module_path,
+                 routed_path,
++                http_route,
+                 http_request,
+                 identity,
+                 transaction,
+@@ -1050,6 +1348,12 @@ impl<RT: Runtime> IsolateClient<RT> {
      }
  
      pub async fn shutdown(&self) -> anyhow::Result<()> {
@@ -3174,7 +3421,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          {
              let handles: Vec<_> = {
                  let mut handles = self.handles.lock();
-@@ -1062,17 +1357,36 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1062,17 +1366,36 @@ impl<RT: Runtime> IsolateClient<RT> {
                  shutdown_and_join(handle.handle).await?;
              }
          }
@@ -3218,7 +3465,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          Ok(())
      }
  
-@@ -1102,10 +1416,20 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1102,10 +1425,20 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
              function_started_sender: None,
              udf_callback: Some(self.clone()),
          };
@@ -3240,7 +3487,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          let (tx, outcome) = IsolateClient::<RT>::receive_response(rx).await??;
          let outcome = match outcome {
              FunctionOutcome::Query(outcome) | FunctionOutcome::Mutation(outcome) => {
-@@ -1142,13 +1466,7 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -1142,13 +1475,7 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      rt: RT,
      worker: W,
      /// Vec of channels for sending work to individual workers.
@@ -3255,7 +3502,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
      /// Map from client_id to stack of workers (implemented with a deque). The
      /// most recently used worker for a given client is at the front of the
      /// deque. These workers were previously used by this client, but may
-@@ -1160,30 +1478,48 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -1160,30 +1487,48 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      /// Set of futures awaiting a response from an active worker.
      in_progress_workers:
          FuturesUnordered<Join<oneshot::Receiver<IdleWorkerInfo>, Ready<ActiveWorkerState>>>,
@@ -3311,7 +3558,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
  }
  
  impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
-@@ -1191,23 +1527,42 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1191,23 +1536,42 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          rt: RT,
          worker: W,
          max_workers: usize,
@@ -3358,7 +3605,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          }
      }
  
-@@ -1216,25 +1571,27 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1216,25 +1580,27 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          completed_worker: ActiveWorkerState,
          info: IdleWorkerInfo,
      ) {
@@ -3397,7 +3644,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          log_pool_running_count(
              self.worker.config().name,
              new_count,
-@@ -1251,50 +1608,124 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1251,50 +1617,124 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              });
      }
  
@@ -3556,7 +3803,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          let internal_request_stream =
              UnboundedReceiverStream::new(internal_receiver).then(async |request| {
                  // Internal requests (for nested UDFs) get priority because they
-@@ -1310,7 +1741,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1310,7 +1750,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              |&mut ()| PollNext::Left
          ));
          loop {
@@ -3566,7 +3813,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
              tokio::select! {
                  biased;
                  completed_worker = self.in_progress_workers.next(),
-@@ -1329,6 +1761,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1329,6 +1770,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      let Some((request, expired)) = request else {
                          break;
                      };
@@ -3577,7 +3824,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
                      request.expire(expired);
                  }
                  request = next_request_stream.next(),
-@@ -1339,29 +1775,43 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1339,29 +1784,43 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      if request.is_response_closed() {
                          continue;
                      }
@@ -3633,7 +3880,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
                          .is_err()
                      {
                          // Available worker should have an empty channel, so if we fail
-@@ -1372,6 +1822,33 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1372,6 +1831,33 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          );
                          return;
                      }
@@ -3667,7 +3914,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
                  },
                  _ = &mut report_stats => {
                      let heap_stats = self.aggregate_heap_stats();
-@@ -1396,19 +1873,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1396,19 +1882,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      fn get_worker(
          &mut self,
          request: &Request<RT>,
@@ -3695,7 +3942,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
              );
              return Err(RejectedBeforeExecutionReason::PerClientWorkerOverloaded);
          }
-@@ -1522,18 +1997,14 @@ impl SharedIsolateHeapStats {
+@@ -1522,18 +2006,14 @@ impl SharedIsolateHeapStats {
  pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
      async fn service_requests(
          self,
@@ -3716,7 +3963,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
          'recreate_isolate: loop {
              let mut last_client_id: Option<String> = None;
              let mut last_request: Option<String> = None;
-@@ -1555,8 +2026,11 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -1555,8 +2035,11 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                      continue 'recreate_isolate;
                  }
                  heap_stats.store(isolate.heap_stats());
@@ -3729,7 +3976,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
                      let _ = done.send(IdleWorkerInfo {
                          cached_contexts: context_cache.cached_contexts().clone(),
                      });
-@@ -1570,9 +2044,10 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -1570,9 +2053,10 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                      },
                      // First peek the request to decide if we need to make a new isolate.
                      req = reqs.as_mut().peek() => {
@@ -3741,7 +3988,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
                          let reused = last_client_id.is_some();
                          // If we receive a request from a different client (i.e. a different instance),
                          // recreate the isolate. We don't allow an isolate to be reused
-@@ -1589,12 +2064,17 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -1589,12 +2073,17 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                              tracing::debug!("Reusing isolate for client {}", req.client_id);
                          }
                          // Ok, we're ready to accept the request for real.
@@ -3761,7 +4008,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
                          let root = initialize_root_from_parent(
                              func_path!(),
                              req.parent_trace.clone(),
-@@ -1687,3 +2167,856 @@ pub fn should_recreate_isolate<RT: Runtime>(
+@@ -1687,3 +2176,858 @@ pub fn should_recreate_isolate<RT: Runtime>(
  
      false
  }
@@ -3920,6 +4167,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
 +                    RequestType::Test {
 +                        id,
 +                        action_function: _,
++                        http_route: _,
 +                        can_block_on_descendant: _,
 +                        is_isolate_action: _,
 +                        fail_worker,
@@ -4028,6 +4276,7 @@ index 66d4cda3441881a15fcdd5dae995cfcb29565f2d..1388e1c2a02bd1f24b399c198a659513
 +                component: common::components::ComponentPath::root(),
 +                udf_path: "test:action".parse().unwrap(),
 +            },
++            http_route: None,
 +            can_block_on_descendant: matches!(
 +                kind,
 +                TestRequestKind::DependencyHolder | TestRequestKind::Action
@@ -4725,6 +4974,25 @@ index 950bf14107e2d49409ee2194bce8c2c521f07f3e..01d1f108fc9b81d6ab03fcd7bf6204fc
 +        assert_eq!(tracker.waiting_high_priority, 0);
 +    }
 +}
+diff --git a/crates/isolate/src/environment/analyze.rs b/crates/isolate/src/environment/analyze.rs
+index 4399a12b42211bd233c92f95187718116cb407ed..513f0f201c6784b7ad79b0a8637188feace34fca 100644
+--- a/crates/isolate/src/environment/analyze.rs
++++ b/crates/isolate/src/environment/analyze.rs
+@@ -758,10 +758,10 @@ fn udf_analyze<RT: Runtime>(
+ }
+ 
+ /// The `convex/http.js` default export, must be an HTTP router. In addition to
+-/// normal module analysis, this module may contain a Vec of
+-/// `AnalyzedHttpRoute`s returned by `Router.getRoutes()` which is currently
+-/// used only by the dashboard for dispaying HTTP routes. These routes are
+-/// publicly accessible at domains like `https://happy-otter-123.convex.site`.
++/// normal module analysis, this module contains the `AnalyzedHttpRoute`s
++/// returned by `Router.getRoutes()`. They drive component routing and
++/// independent-action admission, and supply the dashboard's registered route
++/// list.
+ fn http_analyze<RT: Runtime>(
+     scope: &mut ExecutionScope<RT, AnalyzeEnvironment>,
+     module: &v8::Local<v8::Module>,
 diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
 index 69c8f856653b4c6cea63961f2a89e333d23ada4b..def74d47a808666c972a94cb3c7139a778b38c5b 100644
 --- a/crates/isolate/src/isolate_worker.rs
@@ -5101,6 +5369,167 @@ index 1b0b4d2a6ae1479fc32938a800cefddfb15523a4..1e464a48f91e0411a8345c08f1c8cde8
  impl<T: Sync> FromRequestParts<T> for ExtractExecutionContext {
      type Rejection = HttpResponseError;
  
+diff --git a/crates/model/src/modules/module_versions.rs b/crates/model/src/modules/module_versions.rs
+index a01731e2639896321dcc0dba57e925d8facf41ae..48a8325571a5dcb0913e3f054a11acfed2cdba89 100644
+--- a/crates/model/src/modules/module_versions.rs
++++ b/crates/model/src/modules/module_versions.rs
+@@ -463,6 +463,11 @@ pub struct AnalyzedHttpRoutes {
+     routes: WithHeapSize<Vec<AnalyzedHttpRoute>>,
+ }
+ 
++pub struct HttpPrefixMatch<'a> {
++    pub route: &'a HttpActionRoute,
++    pub suffix: RoutedHttpPath,
++}
++
+ impl AnalyzedHttpRoutes {
+     pub fn new(routes: Vec<AnalyzedHttpRoute>) -> Self {
+         Self {
+@@ -470,21 +475,21 @@ impl AnalyzedHttpRoutes {
+         }
+     }
+ 
+-    pub fn route_exact(&self, path: &str, method: RoutableMethod) -> bool {
+-        self.routes.iter().any(|AnalyzedHttpRoute { route, .. }| {
+-            if route.path.ends_with('*') {
+-                return false;
+-            }
+-            route.method == method && &route.path[..] == path
+-        })
++    pub fn route_exact(&self, path: &str, method: RoutableMethod) -> Option<&HttpActionRoute> {
++        self.routes
++            .iter()
++            .map(|analyzed| &analyzed.route)
++            .find(|route| {
++                !route.path.ends_with('*') && route.method == method && route.path == path
++            })
+     }
+ 
+     pub fn route_prefix(
+         &self,
+         path: &RoutedHttpPath,
+         method: RoutableMethod,
+-    ) -> Option<RoutedHttpPath> {
+-        let mut longest_match: Option<RoutedHttpPath> = None;
++    ) -> Option<HttpPrefixMatch<'_>> {
++        let mut longest_match: Option<HttpPrefixMatch<'_>> = None;
+         for AnalyzedHttpRoute { route, .. } in &self.routes {
+             if route.method != method {
+                 continue;
+@@ -499,14 +504,17 @@ impl AnalyzedHttpRoutes {
+                 continue;
+             };
+             let new_match = RoutedHttpPath(format!("/{match_suffix}"));
+-            if let Some(ref existing_suffix) = longest_match {
++            if let Some(ref existing_match) = longest_match {
+                 // If the existing longest match has a shorter suffix, then it
+                 // matches a longer prefix.
+-                if existing_suffix.len() < match_suffix.len() {
++                if existing_match.suffix.len() < new_match.len() {
+                     continue;
+                 }
+             }
+-            longest_match = Some(new_match);
++            longest_match = Some(HttpPrefixMatch {
++                route,
++                suffix: new_match,
++            });
+         }
+         longest_match
+     }
+@@ -574,3 +582,92 @@ impl TryFrom<AnalyzedModule> for SerializedMappedModule {
+         })
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn http_route_matches_retain_registered_identity() {
++        let routes = AnalyzedHttpRoutes::new(
++            [
++                (RoutableMethod::Get, "/items/latest"),
++                (RoutableMethod::Post, "/items/latest"),
++                (RoutableMethod::Get, "/items/*"),
++                (RoutableMethod::Get, "/session/*"),
++            ]
++            .into_iter()
++            .map(|(method, path)| AnalyzedHttpRoute {
++                route: HttpActionRoute {
++                    method,
++                    path: path.into(),
++                    matched: true,
++                },
++                pos: None,
++            })
++            .collect(),
++        );
++        let get = routes
++            .route_exact("/items/latest", RoutableMethod::Get)
++            .unwrap();
++        let post = routes
++            .route_exact("/items/latest", RoutableMethod::Post)
++            .unwrap();
++        assert_ne!(get, post);
++        assert_eq!(get.path, "/items/latest");
++        assert_eq!(
++            routes.route_exact("/items/latest", "HEAD".parse().unwrap()),
++            Some(get),
++        );
++        let first = routes
++            .route_prefix(&RoutedHttpPath("/items/first".into()), RoutableMethod::Get)
++            .unwrap();
++        let second = routes
++            .route_prefix(&RoutedHttpPath("/items/second".into()), RoutableMethod::Get)
++            .unwrap();
++        assert_eq!(first.route, second.route);
++        assert_eq!(first.route.path, "/items/*");
++        assert_eq!(&first.suffix[..], "/first");
++        assert_eq!(&second.suffix[..], "/second");
++        assert_ne!(get, first.route);
++        assert!(routes
++            .route_exact("/missing", RoutableMethod::Get)
++            .is_none());
++        assert!(routes
++            .route_prefix(&RoutedHttpPath("/missing".into()), RoutableMethod::Get)
++            .is_none());
++        assert!(routes
++            .route_prefix(&RoutedHttpPath("/items/first".into()), RoutableMethod::Post)
++            .is_none());
++    }
++
++    #[test]
++    fn http_route_prefix_uses_the_longest_registered_prefix_in_any_order() {
++        for paths in [["*", "/a/*", "/a//*"], ["/a//*", "/a/*", "*"]] {
++            let routes = AnalyzedHttpRoutes::new(
++                paths
++                    .into_iter()
++                    .map(|path| AnalyzedHttpRoute {
++                        route: HttpActionRoute {
++                            method: RoutableMethod::Get,
++                            path: path.into(),
++                            matched: true,
++                        },
++                        pos: None,
++                    })
++                    .collect(),
++            );
++            let matched = routes
++                .route_prefix(&RoutedHttpPath("/a//item".into()), RoutableMethod::Get)
++                .unwrap();
++            assert_eq!(matched.route.path, "/a//*");
++            assert_eq!(&matched.suffix[..], "/item");
++            let fallback = routes
++                .route_prefix(&RoutedHttpPath("/other".into()), RoutableMethod::Get)
++                .unwrap();
++            assert_eq!(fallback.route.path, "*");
++            assert_eq!(&fallback.suffix[..], "/other");
++        }
++    }
++
++}
 diff --git a/crates/node_executor/src/executor.rs b/crates/node_executor/src/executor.rs
 index fcc13f8e08f8c56374a379b4d03c184e1f37758b..9632afd9ed742827279ae7ca12b92034f6a8725c 100644
 --- a/crates/node_executor/src/executor.rs
@@ -5224,10 +5653,10 @@ index 086fd56fdc47373d4ded09615f0a820f87bcf6d7..661b9a077fe625adee5e4c6185cb4f18
      }
 diff --git a/patches/dependency_capacity/README.md b/patches/dependency_capacity/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..83b48a9753ab9f57f916204238aade265235a981
+index 0000000000000000000000000000000000000000..1d917044ced7472d95b4d3fb20e6cac7b2e9b797
 --- /dev/null
 +++ b/patches/dependency_capacity/README.md
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,294 @@
 +# Dependency Capacity and Isolate Scheduler Liveness
 +
 +## Summary
@@ -5312,8 +5741,12 @@ index 0000000000000000000000000000000000000000..83b48a9753ab9f57f916204238aade26
 +other functions; two hot functions can still consume all twelve. This is not a reserved auth pool.
 +
 +Identity includes the isolate client and the validated component/function path, not an export
-+alias or invocation arguments. HTTP actions share their component's router allowance: handler
-+selection occurs inside JavaScript, and raw URL paths are not trustworthy admission identities.
++alias or invocation arguments. HTTP actions additionally use the method and registered route
++resolved from deployment analysis before isolate admission. Exact routes have separate allowances;
++all requests matching one prefix share that prefix's allowance. HEAD shares GET's allowance.
++Unmatched requests share one allowance per component router. Raw URL suffixes and query strings
++cannot create admission identities. Different routes still consume the same global action cap;
++route isolation does not reserve capacity for authentication or any other handler.
 +The cap does not apply to Node execution, queries, mutations, or ancestor-unblocking descendants.
 +
 +Counts track assigned workers, including workers suspended on external I/O.
@@ -5520,10 +5953,10 @@ index 0000000000000000000000000000000000000000..83b48a9753ab9f57f916204238aade26
 +  CPU remain finite.
 diff --git a/patches/dependency_capacity/design_reference.md b/patches/dependency_capacity/design_reference.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..f67e97ccb187471f3c09666c58524c7682424914
+index 0000000000000000000000000000000000000000..cd8a57fd2dc0ac84e9f40bac9723982fa9765f0c
 --- /dev/null
 +++ b/patches/dependency_capacity/design_reference.md
-@@ -0,0 +1,739 @@
+@@ -0,0 +1,747 @@
 +# Self-hosted Runtime Admission and Scheduler Knobs
 +
 +> Detailed design and measurement reference. This is not a separate adoption unit. Use
@@ -5782,6 +6215,14 @@ index 0000000000000000000000000000000000000000..f67e97ccb187471f3c09666c58524c76
 +functions or recreate the action-to-action deadlock. The action cap is workload
 +shaping and mixed-traffic protection; the dependency overflow is the liveness
 +mechanism.
++
++The optional `MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION` bounds each validated function inside the
++global action allowance. It uses client and
++component identity. HTTP actions additionally use the analyzed registered method and route;
++prefix matches share their registered prefix, HEAD shares GET, and unmatched requests share a
++component-router allowance. Concrete URLs never define admission identities. Zero retains the
++global-only policy. Queries, mutations, and ancestor-unblocking descendants are exempt. Selection skips a
++capped function without hiding other eligible work; completion releases the function count. See [Action cap](README.md#action-cap) for configuration and limits.
 +
 +The application query, mutation, V8-action, and Node-action limiters use the
 +same total-occupancy rule before the isolate queue. Their effective dependency
@@ -6264,10 +6705,10 @@ index 0000000000000000000000000000000000000000..f67e97ccb187471f3c09666c58524c76
 +overflow. A queue-policy rollback cannot repair an incorrect dependency marker
 +or an undersized reserve, and increasing a reserve cannot create CPU capacity.
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 9613214a88d95fe51063929b1f0ba52fdd88e1b2..9b286683796867d1f177d0339c384da787c275d5 100644
+index 9613214a88d95fe51063929b1f0ba52fdd88e1b2..7b64443592ff4998092a28209022ddaeebfa689b 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
-@@ -14,3 +14,53 @@ You can increase the max concurrency on your self-hosted instance with these
+@@ -14,3 +14,55 @@ You can increase the max concurrency on your self-hosted instance with these
  environment variables. Note that increasing concurrency will increase load on
  your system and after a certain threshold, performance will degrade. You will
  have to tune parameters based on your own hardware and workload.
@@ -6298,8 +6739,10 @@ index 9613214a88d95fe51063929b1f0ba52fdd88e1b2..9b286683796867d1f177d0339c384da7
 +
 +`MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION` additionally caps one validated function per client and
 +component, counting worker ownership. HTTP
-+actions share their component router's allowance. `0` retains the global-only policy; a positive
-+value cannot exceed the resolved global action cap. For example, `6` alongside a global cap of `12`
++actions are grouped by registered method and route within the component: prefix matches share
++their registered prefix, HEAD shares GET, and unmatched requests share one router allowance.
++`0` retains the global-only policy; a positive value cannot exceed the resolved global action cap.
++For example, `6` alongside a global cap of `12`
 +leaves capacity for other functions when one function is busy. Ancestor-unblocking descendants
 +remain exempt. See [Action cap](../../patches/dependency_capacity/README.md#action-cap).
 +

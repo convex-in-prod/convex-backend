@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 15 Jul 2026 20:14:14 +0800
-Subject: [PATCH 12/30] sync: add degradable query backpressure
+Subject: [PATCH 12/28] sync: add degradable query backpressure
 
 Add a closed connection-level degradable root-query declaration and lifecycle capability. Preserve the legacy Connect and one-shot pressure shapes when omitted, reject malformed bounded fields and duplicate negotiation, and keep the feature inert when its optional leader cap is unset.
 
@@ -1624,7 +1624,7 @@ index 8659ee7308cac6a6094e5b78cbf5a21ad03bbc6c..b862af1046dc527da813d62ee27a78fb
                  .await?
          });
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index a72db60f542c956fdfd8197bc46c3e93c56fe6e0..ebf39652fe0fff4d9eb0094a2709aac443ed5cd8 100644
+index 70b54b5bfe03646215457f84dde55b8bad90e8e1..9b857efd42f55207e4b138aff390d4033bf46bc2 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -89,6 +89,145 @@ fn env_config_optional_usize_strict(name: &str) -> Option<usize> {
@@ -1779,8 +1779,8 @@ index a72db60f542c956fdfd8197bc46c3e93c56fe6e0..ebf39652fe0fff4d9eb0094a2709aac4
  /// Maximum independent actions of one function (per client and component),
 -/// retaining workers. Zero uses the global action limit.
 +/// including initial-permit reservations. Zero uses the global action limit.
- /// HTTP routes share their component's router allowance. See the "Action cap"
- /// section of patches/dependency_capacity/README.md.
+ /// HTTP actions are grouped by registered method and route. See the "Action
+ /// cap" section of patches/dependency_capacity/README.md.
  pub static MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION: LazyLock<usize> =
 @@ -1469,11 +1608,10 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
      )
@@ -3001,7 +3001,7 @@ index 7e979d12e851894fa4839c9913c0eed01993095e..74322431d0eec038615bdac847f7ad9d
              ConcurrencyLimiter::unlimited()
          };
 diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
-index 52de938e3fb5120e664d126c053005ec3409af3e..8ab3248854081d14a80ba992c2dc0586920bbcb3 100644
+index 6b3bc15463c9431a4654c62875e295f3976ea327..38a5bef3bede125c4e7c7ab21766026040692cda 100644
 --- a/crates/function_runner/src/server.rs
 +++ b/crates/function_runner/src/server.rs
 @@ -34,6 +34,7 @@ use common::{
@@ -3011,8 +3011,8 @@ index 52de938e3fb5120e664d126c053005ec3409af3e..8ab3248854081d14a80ba992c2dc0586
 +        ActiveJavascriptClass,
          ConvexOrigin,
          DeploymentMetadata,
-         IndexId,
-@@ -147,6 +148,7 @@ pub struct RunRequestArgs {
+         HttpActionRoute,
+@@ -148,6 +149,7 @@ pub struct RunRequestArgs {
  pub struct FunctionMetadata {
      pub path_and_args: ValidatedPathAndArgs,
      pub journal: QueryJournal,
@@ -3020,7 +3020,7 @@ index 52de938e3fb5120e664d126c053005ec3409af3e..8ab3248854081d14a80ba992c2dc0586
  }
  
  pub struct HttpActionMetadata {
-@@ -380,6 +382,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -384,6 +386,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                  let FunctionMetadata {
                      path_and_args,
                      journal,
@@ -3028,7 +3028,7 @@ index 52de938e3fb5120e664d126c053005ec3409af3e..8ab3248854081d14a80ba992c2dc0586
                  } = function_metadata.context("Missing function metadata for query or mutation")?;
                  // Initialize the UDF's RNG from some high-quality entropy. As with
                  // `unix_timestamp` below, the UDF is only deterministic modulo this
-@@ -402,6 +405,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -406,6 +409,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                          function_started_sender,
                          subfunctions_in_same_isolate,
                          scheduler_dependency,
@@ -3037,7 +3037,7 @@ index 52de938e3fb5120e664d126c053005ec3409af3e..8ab3248854081d14a80ba992c2dc0586
                      .await?;
                  Ok((
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc979711d3d 100644
+index 016d27c629115dfcecf47c74c407a96741d4f57c..1bd64d7d4631692f01c7febc1b1e4fca692213d6 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -6,6 +6,7 @@ use std::{
@@ -3054,9 +3054,9 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
      types::{
 +        ActiveJavascriptClass,
          DeploymentMetadata,
+         HttpActionRoute,
          ModuleEnvironment,
-         SchedulerDependencyClass,
-@@ -135,7 +137,6 @@ use futures::{
+@@ -136,7 +138,6 @@ use futures::{
      stream::{
          self,
          FuturesUnordered,
@@ -3064,7 +3064,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          StreamExt,
      },
      task::AtomicWaker,
-@@ -185,7 +186,11 @@ use udf::{
+@@ -186,7 +187,11 @@ use udf::{
  use value::identifier::Identifier;
  
  use crate::{
@@ -3077,7 +3077,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
      context_cache::{
          context_cache_key,
          CachedContexts,
-@@ -228,7 +233,6 @@ use crate::{
+@@ -229,7 +234,6 @@ use crate::{
          ModuleCache,
          V8ModuleSource,
      },
@@ -3085,7 +3085,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
  };
  
  const ISOLATE_QUEUE_METRICS_LOG_FREQUENCY: Duration = Duration::from_secs(1);
-@@ -311,6 +315,7 @@ struct RequestSchedulingProperties {
+@@ -312,6 +316,7 @@ struct RequestSchedulingProperties {
      can_block_on_descendant: bool,
      is_isolate_action: bool,
      is_control_plane: bool,
@@ -3093,7 +3093,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
  }
  
  impl RequestSchedulingProperties {
-@@ -525,6 +530,11 @@ enum ExternalPermitWaitOutcome {
+@@ -526,6 +531,11 @@ enum ExternalPermitWaitOutcome {
      DeadlineElapsed,
  }
  
@@ -3105,7 +3105,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
  fn reject_queued_request<RT: Runtime>(
      request: Request<RT>,
      rejection: IsolateQueueRejection,
-@@ -548,32 +558,39 @@ fn reject_queued_request<RT: Runtime>(
+@@ -549,32 +559,39 @@ fn reject_queued_request<RT: Runtime>(
  }
  
  async fn wait_for_external_permit<RT: Runtime>(
@@ -3165,7 +3165,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
      }
  }
  
-@@ -643,6 +660,70 @@ impl ActiveRequestCounts {
+@@ -644,6 +661,70 @@ impl ActiveRequestCounts {
                  .expect("active independent action count underflow");
          }
      }
@@ -3236,7 +3236,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
  }
  
  struct ActiveRequestGuard {
-@@ -780,6 +861,7 @@ impl SchedulerStateSnapshot {
+@@ -782,6 +863,7 @@ impl SchedulerStateSnapshot {
                      .unwrap_or(0)
                      >= self.max_independent_actions_per_function
              }),
@@ -3244,7 +3244,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          }
      }
  
-@@ -888,6 +970,7 @@ pub struct Request<RT: Runtime> {
+@@ -891,6 +973,7 @@ pub struct Request<RT: Runtime> {
      pub inner: RequestType<RT>,
      pub parent_trace: EncodedSpan,
      pub scheduler_dependency: SchedulerDependencyClass,
@@ -3252,7 +3252,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
  }
  
  impl<RT: Runtime> Request<RT> {
-@@ -906,16 +989,49 @@ impl<RT: Runtime> Request<RT> {
+@@ -909,16 +992,49 @@ impl<RT: Runtime> Request<RT> {
          parent_trace: EncodedSpan,
          scheduler_dependency: SchedulerDependencyClass,
      ) -> Self {
@@ -3302,7 +3302,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          request
      }
  
-@@ -1040,6 +1156,7 @@ impl<RT: Runtime> Request<RT> {
+@@ -1046,6 +1162,7 @@ impl<RT: Runtime> Request<RT> {
              can_block_on_descendant,
              is_isolate_action,
              is_control_plane: control_plane_lane_enabled && self.inner.is_control_plane(),
@@ -3310,7 +3310,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          }
      }
  }
-@@ -1574,6 +1691,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1581,6 +1698,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          function_started_sender: Option<oneshot::Sender<()>>,
          subfunctions_in_same_isolate: bool,
          scheduler_dependency: SchedulerDependencyClass,
@@ -3318,7 +3318,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          let (tx, rx) = oneshot::channel();
          let cancellation = CancellationSignal::new();
-@@ -1602,11 +1720,12 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1609,11 +1727,12 @@ impl<RT: Runtime> IsolateClient<RT> {
                  Some(self.clone())
              },
          };
@@ -3332,7 +3332,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          ))?;
          let response = pin!(Self::receive_response(rx));
          // Declare this guard after the pinned response future so cancellation is
-@@ -2173,6 +2292,10 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -2182,6 +2301,10 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      /// if at least one request is active for that client.
      in_progress_counts_by_client: HashMap<String, ActiveRequestCounts>,
      in_progress_counts: ActiveRequestCounts,
@@ -3343,7 +3343,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
      /// Externally visible active-worker accounting. The worker request owns the
      /// corresponding guard so failure paths cannot leave this count stale.
      active_workers: Arc<AtomicUsize>,
-@@ -2251,6 +2374,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2260,6 +2383,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              in_progress_workers: FuturesUnordered::new(),
              in_progress_counts_by_client: HashMap::new(),
              in_progress_counts: ActiveRequestCounts::default(),
@@ -3352,7 +3352,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
              active_workers,
              active_modules: HashMap::new(),
              active_contexts: HashMap::new(),
-@@ -2312,9 +2437,18 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2321,9 +2446,18 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      }
  
      fn state_snapshot(&self) -> SchedulerStateSnapshot {
@@ -3373,7 +3373,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
              max_workers: self.max_workers,
              base_worker_capacity: self.base_worker_capacity,
              max_independent_actions: self.max_independent_actions,
-@@ -2348,6 +2482,32 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2357,6 +2491,32 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          }
      }
  
@@ -3406,7 +3406,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
      pub(crate) async fn run(
          mut self,
          receiver: SchedulerQueueReceiver<RT, Request<RT>>,
-@@ -2372,85 +2532,42 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2381,85 +2541,42 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          );
          let mut report_stats = self.rt.wait(*HEAP_WORKER_REPORT_INTERVAL_SECONDS);
          let queue_metrics_reporter = receiver.metrics_reporter();
@@ -3513,7 +3513,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          });
          let internal_selection_state = scheduler_state.clone();
          let mut pending_internal: VecDeque<Request<RT>> = VecDeque::new();
-@@ -2487,28 +2604,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2496,28 +2613,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      Poll::Pending => return Poll::Pending,
                  }
              }
@@ -3547,7 +3547,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          let mut external_expiration_receiver_open = true;
          let mut report_queue_metrics = if queue_metrics_reporter.is_some() {
              Either::Left(self.rt.wait(ISOLATE_QUEUE_METRICS_LOG_FREQUENCY))
-@@ -2517,8 +2619,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2526,8 +2628,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              // path; the opt-in policy must not add default scheduler wakeups.
              Either::Right(future::pending())
          };
@@ -3568,7 +3568,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
              tokio::select! {
                  biased;
                  completed_worker = self.in_progress_workers.next(),
-@@ -2541,186 +2655,158 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2550,186 +2664,158 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      report_queue_metrics =
                          Either::Left(self.rt.wait(ISOLATE_QUEUE_METRICS_LOG_FREQUENCY));
                  },
@@ -3882,7 +3882,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
                  }), if external_expiration_receiver_open => {
                      match expired {
                          Some(IsolateQueueOutput {
-@@ -2756,6 +2842,167 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2765,6 +2851,167 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          }
      }
  
@@ -4050,7 +4050,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
      /// Find a worker for the request's client.
      /// Returns an error if no worker can be allocated for this client.
      ///
-@@ -3203,6 +3450,7 @@ mod tests {
+@@ -3212,6 +3459,7 @@ mod tests {
              UnixTimestamp,
          },
          types::{
@@ -4058,7 +4058,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
              ModuleEnvironment,
              SchedulerDependencyClass,
              UdfType,
-@@ -3232,6 +3480,7 @@ mod tests {
+@@ -3241,6 +3489,7 @@ mod tests {
          ActiveRequestCounts,
          CancelExecutionOnDrop,
          CancellationSignal,
@@ -4066,7 +4066,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          ExternalPermitWaitOutcome,
          IdleWorkerInfo,
          IdleWorkerState,
-@@ -3239,6 +3488,7 @@ mod tests {
+@@ -3248,6 +3497,7 @@ mod tests {
          IsolateWorker,
          IsolateWorkerHandle,
          IsolateWorkerRequest,
@@ -4074,7 +4074,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          Request,
          RequestSchedulingProperties,
          RequestType,
-@@ -3411,6 +3661,7 @@ mod tests {
+@@ -3421,6 +3671,7 @@ mod tests {
      enum TestRequestKind {
          Dependency,
          DependencyHolder,
@@ -4082,7 +4082,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          Independent,
          Action,
          ControlPlane,
-@@ -3493,10 +3744,21 @@ mod tests {
+@@ -3504,10 +3755,21 @@ mod tests {
                  )
              },
              TestRequestKind::Independent
@@ -4105,7 +4105,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
              },
          };
          PendingTestRequest {
-@@ -3827,6 +4089,11 @@ mod tests {
+@@ -3838,6 +4100,11 @@ mod tests {
              can_block_on_descendant,
              is_isolate_action,
              is_control_plane: false,
@@ -4117,7 +4117,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          }
      }
  
-@@ -3998,12 +4265,18 @@ mod tests {
+@@ -4009,12 +4276,18 @@ mod tests {
                  let limiter = ConcurrencyLimiter::new(1);
                  let held = limiter.acquire(Arc::new("active".to_owned()), false).await;
                  let deadline = clock.monotonic_now() + Duration::from_secs(60);
@@ -4140,7 +4140,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
                  ));
                  assert!(futures::poll!(wait.as_mut()).is_pending());
  
-@@ -4011,7 +4284,10 @@ mod tests {
+@@ -4022,7 +4295,10 @@ mod tests {
                  drop(held);
                  assert!(matches!(
                      futures::poll!(wait.as_mut()),
@@ -4152,7 +4152,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
                  ));
                  assert_eq!(limiter.active_permits(), 0);
              });
-@@ -4029,6 +4305,7 @@ mod tests {
+@@ -4040,6 +4316,7 @@ mod tests {
              can_block_on_descendant: false,
              is_isolate_action: false,
              is_control_plane: true,
@@ -4160,7 +4160,7 @@ index 568cbce0bc80c67d842c8b0fb8d51c1f88936ca3..4278513f942fdee3bad26c834fb06fc9
          };
          assert_eq!(control_plane.queue_lane(), IsolateQueueLane::ControlPlane);
          assert!(!state.can_start_request(control_plane, "deployment", None));
-@@ -4723,6 +5000,172 @@ mod tests {
+@@ -4734,6 +5011,172 @@ mod tests {
          });
      }
  
@@ -8658,7 +8658,7 @@ index 0000000000000000000000000000000000000000..d3d5fe3f24d4a19852ac9eed0ee46ce5
 +that these classes and bounded metrics cannot express a measured scheduling
 +problem.
 diff --git a/patches/dependency_capacity/README.md b/patches/dependency_capacity/README.md
-index f53f10a833e21742fea018f7c69c125005ba6e24..6c382bd2d983b0d57decbd4b75a180fbb71481cb 100644
+index bd400e6e2733c445251cf28d0f62ee0082a570a6..1952ab32d77a3a66bc59e95cc6d6b63e991d3abb 100644
 --- a/patches/dependency_capacity/README.md
 +++ b/patches/dependency_capacity/README.md
 @@ -7,13 +7,17 @@ query, mutation, or child action it awaits cannot obtain one. It propagates ance
@@ -8684,8 +8684,8 @@ index f53f10a833e21742fea018f7c69c125005ba6e24..6c382bd2d983b0d57decbd4b75a180fb
  necessary for dependencies that arrive through external boundaries, especially Node/action
  callback chains. Both paths dispatch into the same physical worker total and dependency reserve;
  neither path creates a second worker pool or extra active-JavaScript permits.
-@@ -86,7 +90,8 @@ alias or invocation arguments. HTTP actions share their component's router allow
- selection occurs inside JavaScript, and raw URL paths are not trustworthy admission identities.
+@@ -90,7 +94,8 @@ cannot create admission identities. Different routes still consume the same glob
+ route isolation does not reserve capacity for authentication or any other handler.
  The cap does not apply to Node execution, queries, mutations, or ancestor-unblocking descendants.
  
 -Counts track assigned workers, including workers suspended on external I/O.
@@ -8694,7 +8694,7 @@ index f53f10a833e21742fea018f7c69c125005ba6e24..6c382bd2d983b0d57decbd4b75a180fb
  Completion releases worker ownership and removes empty function entries.
  Queued selection skips capped functions without hiding eligible requests.
  
-@@ -119,8 +124,8 @@ but it preserves the ancestor-release contract and is counted separately.
+@@ -123,8 +128,8 @@ but it preserves the ancestor-release contract and is counted separately.
  The scheduler has two ingress paths with intentionally different waiting semantics:
  
  - Direct nested UDF callbacks use upstream's internal unbounded channel. The scheduler polls this
@@ -8705,7 +8705,7 @@ index f53f10a833e21742fea018f7c69c125005ba6e24..6c382bd2d983b0d57decbd4b75a180fb
    buffer discards closed callers and selects the oldest request eligible in the current worker
    snapshot, so an older callback at one client's total cannot hide an eligible callback for
    another client.
-@@ -137,20 +142,21 @@ per-client accounting before another dispatch decision. External dependencies do
+@@ -141,20 +146,21 @@ per-client accounting before another dispatch decision. External dependencies do
  eligible external work below shared base capacity; they become the only externally eligible class
  when the shared base is full.
  
@@ -8741,7 +8741,7 @@ index f53f10a833e21742fea018f7c69c125005ba6e24..6c382bd2d983b0d57decbd4b75a180fb
  
  Scheduler dependency ownership and active-permit priority intentionally differ at resource
  boundaries. A transactional descendant that retains an isolate-holding ancestor is eligible for
-@@ -171,6 +177,11 @@ The self-hosted Compose template passes through:
+@@ -175,6 +181,11 @@ The self-hosted Compose template passes through:
  - `ISOLATE_QUEUE_SIZE` (default `2000`, for the external CoDel base);
  - `FUNRUN_ISOLATE_ACTIVE_THREADS` (default `0`, meaning unlimited).
  
@@ -8753,7 +8753,7 @@ index f53f10a833e21742fea018f7c69c125005ba6e24..6c382bd2d983b0d57decbd4b75a180fb
  Isolate capacities use strict parsing. `T` and `Q` must be positive, `R` must be smaller than `T`,
  `Q + R` must fit in `usize`, and an explicit independent-action cap cannot exceed `B`. Invalid
  present values fail startup rather than silently falling back.
-@@ -293,6 +304,7 @@ deployment operations. A synthetic stress fixture is not required.
+@@ -297,6 +308,7 @@ deployment operations. A synthetic stress fixture is not required.
  - Increasing queue depth retains more stale work without increasing service rate.
  - Treating a client or module marker as dependency status lets untrusted or application-owned
    metadata consume a liveness reserve.
@@ -8763,7 +8763,7 @@ index f53f10a833e21742fea018f7c69c125005ba6e24..6c382bd2d983b0d57decbd4b75a180fb
  - Unlimited dependency admission cannot be made safe because recursive depth, fan-out, memory, and
    CPU remain finite.
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 80f1317254d37ecbac55016522593137c689dc97..c4f9479c065847f3d4068080b83b989a9f7f8747 100644
+index a0e4fee64fd010c7f19275dc70873d8ebc6732ff..d0c45f347f5a957ccaace896ba8b9d83e4ca5f27 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
 @@ -262,7 +262,7 @@ capacity. An explicit value cannot exceed base capacity. Queries, mutations,
@@ -8772,10 +8772,10 @@ index 80f1317254d37ecbac55016522593137c689dc97..c4f9479c065847f3d4068080b83b989a
  `MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION` additionally caps one validated function per client and
 -component, counting worker ownership. HTTP
 +component, counting both worker ownership and pending initial active-JavaScript admission. HTTP
- actions share their component router's allowance. `0` retains the global-only policy; a positive
- value cannot exceed the resolved global action cap. For example, `6` alongside a global cap of `12`
- leaves capacity for other functions when one function is busy. Ancestor-unblocking descendants
-@@ -406,10 +406,42 @@ passes the variable through without a default. Changing it requires a backend re
+ actions are grouped by registered method and route within the component: prefix matches share
+ their registered prefix, HEAD shares GET, and unmatched requests share one router allowance.
+ `0` retains the global-only policy; a positive value cannot exceed the resolved global action cap.
+@@ -408,10 +408,42 @@ passes the variable through without a default. Changing it requires a backend re
  
  This caps isolates actively executing JavaScript. `0` means unlimited. A
  request can release this permit while waiting for asynchronous work, so this is
