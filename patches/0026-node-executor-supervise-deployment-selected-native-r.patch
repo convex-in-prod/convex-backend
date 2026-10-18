@@ -17,6 +17,14 @@ Keep early optional-cache reclamation with its existing consumers, publish
 only emergency state transitions, and preserve critical termination while
 allocator trim is pending or HTTP shedding is disabled. Cover hysteresis and
 unchanged-sample notifications in the memory-controller tests.
+
+Add lifecycle protocol 2 with explicit warm preparation before incumbent
+retirement and a relinquishment receipt before successor activation. Probe
+preparation again at the activation boundary, cancel on selection changes,
+and keep process reaping and surge ownership bounded while optional teardown
+overlaps promotion. Preserve protocol-1 complete reaping before activation.
+Advertise warm-handover capability separately and cover blocked preparation,
+selection replacement, authority ordering, and confirmed child cleanup.
 ---
  Cargo.lock                                    |    1 +
  crates/application/src/deploy_config.rs       |  162 ++
@@ -27,7 +35,7 @@ unchanged-sample notifications in the memory-controller tests.
  .../environment/udf/context_reuse_tests.rs    |    1 +
  crates/local_backend/src/deploy_config.rs     |    4 +-
  crates/local_backend/src/deploy_config2.rs    |   23 +
- .../src/deployment_operations.rs              |    1 +
+ .../src/deployment_operations.rs              |    2 +
  crates/local_backend/src/lib.rs               |   37 +-
  crates/local_backend/src/main.rs              |   16 +-
  crates/local_backend/src/memory_metrics.rs    |  114 +-
@@ -37,21 +45,21 @@ unchanged-sample notifications in the memory-controller tests.
  crates/model/src/source_packages/native.rs    |  151 ++
  crates/model/src/source_packages/types.rs     |   17 +
  crates/node_executor/Cargo.toml               |    8 +
- crates/node_executor/NATIVE_RESIDENTS.md      |  178 ++
+ crates/node_executor/NATIVE_RESIDENTS.md      |  200 ++
  crates/node_executor/src/lib.rs               |    3 +
  crates/node_executor/src/local.rs             |   73 +-
- crates/node_executor/src/native.rs            | 1548 +++++++++++++++++
- crates/node_executor/src/native_logs.rs       |  200 +++
+ crates/node_executor/src/native.rs            | 1664 +++++++++++++++++
+ crates/node_executor/src/native_logs.rs       |  200 ++
  crates/node_executor/src/process.rs           |   15 +
  crates/node_executor/src/routed.rs            |   62 +-
- .../node_executor/testdata/native_resident.rs |  156 ++
- crates/node_executor/tests/native_resident.rs |  805 +++++++++
+ .../node_executor/testdata/native_resident.rs |  179 ++
+ crates/node_executor/tests/native_resident.rs |  890 +++++++++
  patches/README.md                             |   25 +-
  patches/backend_memory_resilience/README.md   |   13 +-
  .../README.md                                 |    5 +-
  patches/native_residents/README.md            |   41 +
  .../README.md                                 |   11 +-
- 33 files changed, 3914 insertions(+), 111 deletions(-)
+ 33 files changed, 4161 insertions(+), 111 deletions(-)
  create mode 100644 crates/local_backend/src/native_resident.rs
  create mode 100644 crates/model/src/source_packages/native.rs
  create mode 100644 crates/node_executor/NATIVE_RESIDENTS.md
@@ -760,14 +768,15 @@ index 22cbe8c8830ce5c7cd5c54e76e88638748ff5463..801e3baa30b043bb750dd4c1b6c76996
  }
  
 diff --git a/crates/local_backend/src/deployment_operations.rs b/crates/local_backend/src/deployment_operations.rs
-index 57cd74ea4d54da7a289f1ca90672416b16b1c263..96f90b459f93df709d20cb41dd4c0c1fa9dbaacb 100644
+index 57cd74ea4d54da7a289f1ca90672416b16b1c263..6ebc6247699549ce430bfbc625b3213f4ac751f5 100644
 --- a/crates/local_backend/src/deployment_operations.rs
 +++ b/crates/local_backend/src/deployment_operations.rs
-@@ -258,6 +258,7 @@ pub async fn capabilities(
+@@ -258,6 +258,8 @@ pub async fn capabilities(
      Ok(axum::Json(json!({
          "protocolVersion": 1,
          "mutationPriorityProtocol": if *common::knobs::ISOLATE_QUEUE_DELAY_CONTROL_ENABLED { 1 } else { 0 },
 +        "nativeResidentProtocol": 1,
++        "nativeResidentWarmHandoverProtocol": 1,
          "sessionId": st.deployment_operations.session_id,
          "lifetimeSeconds": LIFETIME.as_secs(),
          "maxOperations": MAX_OPERATIONS,
@@ -1280,7 +1289,7 @@ index 33b690151a50e7dba2dc9028c67b1a5bbe2526fe..0db1c451b53b918016f2e0e754cbbe48
          // transaction start times can tie or differ from commit order.
 diff --git a/crates/model/src/source_packages/native.rs b/crates/model/src/source_packages/native.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..7bf801adeafbe55767ccc26e50d25fab278e81e0
+index 0000000000000000000000000000000000000000..e0dc69d443b5b4701256527da0b7c2819261acac
 --- /dev/null
 +++ b/crates/model/src/source_packages/native.rs
 @@ -0,0 +1,151 @@
@@ -1314,7 +1323,7 @@ index 0000000000000000000000000000000000000000..7bf801adeafbe55767ccc26e50d25fab
 +            );
 +        }
 +        anyhow::ensure!(
-+            self.lifecycle_protocol == 1,
++            matches!(self.lifecycle_protocol, 1 | 2),
 +            "Unsupported native resident lifecycle protocol"
 +        );
 +        anyhow::ensure!(
@@ -1548,14 +1557,14 @@ index ec00d83f718d3dbed076129ea90450c31d65d5e2..598e13269ae0797760d578facc8da829
  value = { workspace = true }
 diff --git a/crates/node_executor/NATIVE_RESIDENTS.md b/crates/node_executor/NATIVE_RESIDENTS.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..21491c45c838c6870e1b25a0d7e9294b867cfb73
+index 0000000000000000000000000000000000000000..83b3f97d8bd5c5c9f4090fc715f39cee222c1bc1
 --- /dev/null
 +++ b/crates/node_executor/NATIVE_RESIDENTS.md
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,200 @@
 +# Local native residents
 +
 +A native resident is a directly supervised executable, independent of Node source
-+packages. It implements lifecycle protocol 1 and uses application APIs as an ordinary
++packages. It implements lifecycle protocol 1 or 2 and uses application APIs as an ordinary
 +client. It does not implement a query, mutation, or action runtime.
 +
 +## Configuration and publication
@@ -1635,7 +1644,7 @@ index 0000000000000000000000000000000000000000..21491c45c838c6870e1b25a0d7e9294b
 +fresh read transaction. `status.selected` reports the supervisor's last reconciled selection
 +and can lag that transaction. Publication CAS and uncertain-reply resolution use the
 +committed selection; process status reports convergence. Deployment capabilities expose
-+`nativeResidentProtocol: 1`; enabling the adapter is a separate configuration requirement.
++`nativeResidentProtocol: 1` and `nativeResidentWarmHandoverProtocol: 1`; enabling the adapter is a separate configuration requirement.
 +
 +Control uses newline-delimited JSON over child stdin/stdout. Each message is at most
 +64 KiB. `generation` is an opaque string; protocol and nonce are unsigned integers.
@@ -1671,14 +1680,36 @@ index 0000000000000000000000000000000000000000..21491c45c838c6870e1b25a0d7e9294b
 +| --- | --- |
 +| Backend → child | `{type:"initialize",generation,descriptor,configuration}` |
 +| Child → backend | `{type:"ready",generation,artifactSha256,configurationSha256,lifecycleProtocol,applicationContract}` |
++| Backend → child | `{type:"warm",generation}` (protocol 2) |
++| Child → backend | `{type:"warmed",generation}` (protocol 2) |
 +| Backend → child | `{type:"activate",generation}` |
 +| Backend → child | `{type:"probe",generation,nonce}` |
-+| Child → backend | `{type:"progress",generation,nonce}` |
++| Child → backend | `{type:"progress",generation,nonce,ready}` (`ready` required in protocol 2) |
 +| Backend → child | `{type:"retire",generation,deadlineMs:180000}` |
++| Child → backend | `{type:"relinquished",generation}` (protocol 2) |
 +| Child → backend | `{type:"drained",generation}` |
 +| Child → backend | `{type:"failed",generation,code}` |
 +
-+Readiness is inert: no application ownership or external work starts before activate.
++Initial `ready` is inert in both protocols. Administrative prepare verifies initialization and
++reaps the trial; it does not start application warm-up. For a committed protocol-2 candidate,
++`warm` starts application-defined read-only preparation while the incumbent remains active.
++The application answers `warmed` within sixty seconds and keeps its prepared resources live until
++activation. A protocol-2 progress reply includes its live `ready` boolean. Warm-up failure or
++selection replacement discards the candidate without requesting incumbent retirement.
++The application keeps all exclusive external write authority disabled until `activate` and retains
++its own durable ownership checks. Descriptor publication alone does not retire an incumbent.
++
++The backend requests retirement only after candidate warm-up. Protocol 2 can answer `relinquished`
++after closing exclusive authority and draining every required external effect and receipt. The
++backend then activates the prepared successor concurrently with terminating and reaping the
++predecessor's remaining optional resources. If preparation inputs change during drain, promotion retains the
++candidate and checks readiness for up to sixty seconds instead of restarting a healthy candidate.
++A relinquishment receipt is irrevocable: the predecessor cannot
++resume authority. A failed or timed-out retirement requires confirmed predecessor death before
++promotion. Surge accounting remains attached to the predecessor until confirmed reaping.
++Protocol 1 retains inert startup and complete retirement/reaping before activation. Application
++contract compatibility checks are unchanged; warm preparation does not authorize incompatible APIs.
++
 +Progress acknowledges the exact probe on the thread that owns application decisions;
 +a responsive I/O thread does not establish coordinator progress. Healthy idle residents
 +still service probes. Readiness has a ten-second deadline and probes a five-second
@@ -1688,12 +1719,12 @@ index 0000000000000000000000000000000000000000..21491c45c838c6870e1b25a0d7e9294b
 +The backend confirms direct-child reaping before returning capacity.
 +RSS sampling continues while readiness and progress replies are pending. Memory pressure
 +and shutdown interrupt stalled replies and retirement, including both the predecessor
-+and an inert replacement. An inert replacement continues to answer coordinator probes
++and a replacement. A prepared replacement continues to answer coordinator probes
 +while its predecessor drains. Promotion resumes any outstanding probe with its original
 +nonce and deadline before activation.
 +The incumbent remains supervised during replacement verification and readiness. Protocol
 +writes retain their offsets and deadlines across cancellation and receive RSS checks;
-+retirement interrupts cover blocked writes too. A failed inert candidate is terminated
++retirement interrupts cover blocked writes too. A failed candidate is terminated
 +even if it subsequently sends a valid reply.
 +
 +The local backend supplies the critical cgroup pressure signal to native supervision,
@@ -1860,13 +1891,13 @@ index 1303aa0496988a1f52e2fa6a68d3386a3f1d4cdf..1c67f43a99a37d313cec2f32205682d1
              state_before,
 diff --git a/crates/node_executor/src/native.rs b/crates/node_executor/src/native.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2fc4cccb57
+index 0000000000000000000000000000000000000000..94d280399690a64ac790cb59a583c010af5502ee
 --- /dev/null
 +++ b/crates/node_executor/src/native.rs
-@@ -0,0 +1,1548 @@
+@@ -0,0 +1,1664 @@
 +//! Backend-owned native residents. The executable implements lifecycle protocol
-+//! v1; it is not an action runtime and receives no request or module-loading
-+//! API.
++//! v1 or v2; it is not an action runtime and receives no request or
++//! module-loading API.
 +#[cfg(target_os = "linux")]
 +use std::os::fd::AsRawFd;
 +use std::{
@@ -1941,6 +1972,7 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +const MAX_CONTROL_BYTES: usize = 64 * 1024;
 +const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 +const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
++const WARM_TIMEOUT: Duration = Duration::from_secs(60);
 +const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 +const RETIRE_TIMEOUT: Duration = Duration::from_secs(180);
 +const REAP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2305,9 +2337,17 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +        lifecycle_protocol: u32,
 +        application_contract: String,
 +    },
++    Warmed {
++        generation: String,
++    },
++    Relinquished {
++        generation: String,
++    },
 +    Progress {
 +        generation: String,
 +        nonce: u64,
++        #[serde(default)]
++        ready: Option<bool>,
 +    },
 +    Drained {
 +        generation: String,
@@ -2327,6 +2367,8 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +    permit: Option<SurgePermit>,
 +    probe: u64,
 +    pending_probe: Option<Instant>,
++    prepared: bool,
++    relinquished: bool,
 +    pending_write: Option<ControlWrite>,
 +    pending: Vec<u8>,
 +    cleanup: TaskTracker,
@@ -2406,6 +2448,8 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +        self.pending.clear();
 +        let generation = match &reply {
 +            Reply::Ready { generation, .. }
++            | Reply::Warmed { generation }
++            | Reply::Relinquished { generation }
 +            | Reply::Progress { generation, .. }
 +            | Reply::Drained { generation }
 +            | Reply::Failed { generation, .. } => generation,
@@ -2465,10 +2509,58 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +                );
 +                Ok(())
 +            },
-+            Reply::Progress { .. } | Reply::Drained { .. } | Reply::Failed { .. } => {
++            Reply::Warmed { .. }
++            | Reply::Relinquished { .. }
++            | Reply::Progress { .. }
++            | Reply::Drained { .. }
++            | Reply::Failed { .. } => {
 +                anyhow::bail!("Unexpected native readiness reply")
 +            },
 +        }
++    }
++
++    async fn warm(&mut self, max_rss_bytes: usize) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            self.descriptor.lifecycle_protocol == 2,
++            "Native warm protocol unavailable"
++        );
++        self.send(
++            json!({"type":"warm", "generation":self.generation}),
++            max_rss_bytes,
++        )
++        .await?;
++        match self
++            .read_healthy_until(Instant::now() + WARM_TIMEOUT, max_rss_bytes)
++            .await?
++        {
++            Reply::Warmed { .. } => {
++                self.prepared = true;
++                Ok(())
++            },
++            Reply::Ready { .. }
++            | Reply::Relinquished { .. }
++            | Reply::Progress { .. }
++            | Reply::Drained { .. }
++            | Reply::Failed { .. } => anyhow::bail!("Unexpected native warm reply"),
++        }
++    }
++
++    async fn prepared_for_activation(&mut self, max_rss_bytes: usize) -> anyhow::Result<()> {
++        // Subscription changes during predecessor drain can require another preparation
++        // read. Keep that candidate and its warm resources; readiness loss
++        // alone is not a crash.
++        let deadline = Instant::now() + WARM_TIMEOUT;
++        tokio::time::timeout_at(deadline, async {
++            loop {
++                self.probe(max_rss_bytes).await?;
++                if self.descriptor.lifecycle_protocol == 1 || self.prepared {
++                    return Ok(());
++                }
++                tokio::time::sleep(Duration::from_millis(100)).await;
++            }
++        })
++        .await
++        .context("Native candidate preparation timed out before activation")?
 +    }
 +
 +    async fn activate(&mut self, max_rss_bytes: usize) -> anyhow::Result<()> {
@@ -2505,10 +2597,17 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +            .await?;
 +        }
 +        match self.read_healthy_until(deadline, max_rss_bytes).await? {
-+            Reply::Progress { nonce, .. } => {
-+                anyhow::ensure!(nonce == self.probe, "Native progress nonce mismatch")
++            Reply::Progress { nonce, ready, .. } => {
++                anyhow::ensure!(nonce == self.probe, "Native progress nonce mismatch");
++                if self.descriptor.lifecycle_protocol == 2 {
++                    self.prepared = ready.context("Native progress omitted preparation state")?;
++                }
 +            },
-+            Reply::Ready { .. } | Reply::Drained { .. } | Reply::Failed { .. } => {
++            Reply::Warmed { .. }
++            | Reply::Relinquished { .. }
++            | Reply::Ready { .. }
++            | Reply::Drained { .. }
++            | Reply::Failed { .. } => {
 +                anyhow::bail!("Unexpected native progress reply")
 +            },
 +        }
@@ -2597,12 +2696,19 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +                    }
 +                },
 +                reply = self.read() => match reply? {
++                    Reply::Relinquished { .. } => {
++                        anyhow::ensure!(self.descriptor.lifecycle_protocol == 2, "Unexpected native relinquishment");
++                        // This receipt closes application authority and drains required effects.
++                        // Optional teardown can overlap activation; process reaping still owns surge.
++                        self.relinquished = true;
++                        return Ok(());
++                    },
 +                    Reply::Drained { .. } => return Ok(()),
 +                    Reply::Progress { nonce, .. } => {
 +                        anyhow::ensure!(self.pending_probe.is_some() && self.probe == nonce, "Native retirement progress nonce mismatch");
 +                        self.pending_probe = None;
 +                    },
-+                    Reply::Ready { .. } | Reply::Failed { .. } => anyhow::bail!("Unexpected native retirement reply"),
++                    Reply::Warmed { .. } | Reply::Ready { .. } | Reply::Failed { .. } => anyhow::bail!("Unexpected native retirement reply"),
 +                },
 +            }
 +        }
@@ -2783,6 +2889,8 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +        permit,
 +        probe: 0,
 +        pending_probe: None,
++        prepared: false,
++        relinquished: false,
 +        pending_write: None,
 +        pending: Vec::new(),
 +        cleanup,
@@ -2950,9 +3058,15 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +            // Release the permit after promotion when there is no old native child.
 +            let incumbent_generation = active.as_ref().map(|child| child.generation.clone());
 +            let candidate = tokio::select! {
-+                candidate = start(
-+                    config, descriptor, new_generation(), Some(permit), cleanup.clone(),
-+                ) => candidate,
++                candidate = async {
++                    let mut child = start(
++                        config, descriptor, new_generation(), Some(permit), cleanup.clone(),
++                    ).await?;
++                    if descriptor.lifecycle_protocol == 2 {
++                        child.warm(config.max_rss_bytes).await?;
++                    }
++                    Ok::<_, anyhow::Error>(child)
++                } => candidate,
 +                _ = shutdown.changed() => break 'supervisor,
 +                _ = memory.changed() => continue 'supervisor,
 +                // Drop watch read guards inside these futures before any
@@ -3007,6 +3121,7 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +            }
 +            continue;
 +        }
++        let mut relinquished = None;
 +        if let Some(mut old) = active.take() {
 +            if let Some(candidate) = &mut candidate {
 +                old.permit = candidate.permit.take();
@@ -3039,7 +3154,18 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +            if retirement.is_err() {
 +                tracing::warn!("Native resident replacement interrupted application drain");
 +            }
-+            old.terminate().await?;
++            if retirement.is_ok()
++                && old.relinquished
++                && candidate
++                    .as_ref()
++                    .is_some_and(|child| child.descriptor.lifecycle_protocol == 2)
++            {
++                relinquished = Some(old);
++            } else {
++                // A timeout or failed receipt never proves exclusive authority was released.
++                // Protocol-1 successors also retain complete reaping before activation.
++                old.terminate().await?;
++            }
 +            if candidate_failed {
 +                // A later valid reply cannot restore a candidate that already
 +                // failed protocol, progress, or RSS supervision during drain.
@@ -3063,17 +3189,36 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +        if let Some(candidate) = &mut candidate {
 +            // A candidate can wait through the predecessor's whole drain. Recheck
 +            // its coordinator progress before granting activation authority.
-+            let promotion = tokio::select! {
-+                result = async {
-+                    candidate.probe(config.max_rss_bytes).await?;
-+                    // A publication may replace selection while the readiness
-+                    // probe yields. Check at the final activation boundary.
-+                    anyhow::ensure!(selection.borrow().descriptor == desired.descriptor, "Native candidate selection changed");
-+                    candidate.activate(config.max_rss_bytes).await
-+                } => result,
-+                _ = shutdown.changed() => Err(anyhow::anyhow!("Native candidate shutdown")),
-+                _ = memory.changed() => Err(anyhow::anyhow!("Native candidate memory pressure")),
-+            };
++            // Relinquishment permits activation and optional teardown to progress
++            // independently. Reaping remains bounded even if a changed input
++            // temporarily delays preparation.
++            let mut publication = selection.clone();
++            let (promotion, reaped) = tokio::join!(
++                async {
++                    tokio::select! {
++                        result = async {
++                            candidate.prepared_for_activation(config.max_rss_bytes).await?;
++                            // Publication can replace selection during preparation or a probe.
++                            anyhow::ensure!(selection.borrow().descriptor == desired.descriptor,
++                                "Native candidate selection changed");
++                            candidate.activate(config.max_rss_bytes).await
++                        } => result,
++                        _ = shutdown.changed() => Err(anyhow::anyhow!("Native candidate shutdown")),
++                        _ = memory.changed() => Err(anyhow::anyhow!("Native candidate memory pressure")),
++                        _ = async {
++                            publication.wait_for(|s| s.descriptor != desired.descriptor)
++                                .await.map(|_| ())
++                        } => Err(anyhow::anyhow!("Native candidate selection changed")),
++                    }
++                },
++                async {
++                    match &mut relinquished {
++                        Some(old) => old.terminate().await,
++                        None => Ok(()),
++                    }
++                }
++            );
++            reaped?;
 +            if promotion.is_err() {
 +                candidate.terminate().await?;
 +                continue;
@@ -3171,6 +3316,8 @@ index 0000000000000000000000000000000000000000..490e2ded0ed2901c64a24ccf31522a2f
 +            permit,
 +            probe: 0,
 +            pending_probe: None,
++            prepared: false,
++            relinquished: false,
 +            pending_write: None,
 +            pending: Vec::new(),
 +            cleanup: TaskTracker::new(),
@@ -3749,10 +3896,10 @@ index 46ab34d8ca767eeb1e29fa2d393d7eb355b08b16..3970deccbc45f1ab0042df16c5675381
              &self.shutdown_changed,
 diff --git a/crates/node_executor/testdata/native_resident.rs b/crates/node_executor/testdata/native_resident.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..a8c46f25b4f71d3d1549db3ea66bb02854466dcf
+index 0000000000000000000000000000000000000000..d642ec4879233b02a2b59a37ccb01e8692c50f66
 --- /dev/null
 +++ b/crates/node_executor/testdata/native_resident.rs
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,179 @@
 +//! Small native lifecycle peer used only by integration tests.
 +use std::io::{
 +    BufRead,
@@ -3816,11 +3963,16 @@ index 0000000000000000000000000000000000000000..a8c46f25b4f71d3d1549db3ea66bb028
 +    let mut events = None;
 +    let mut mode = String::new();
 +    let mut active = false;
++    let mut protocol = 1;
++    let mut prepared = false;
 +    let mut retained = Vec::new();
 +    for line in std::io::stdin().lock().lines() {
 +        let input: Value = serde_json::from_str(&line?)?;
 +        let kind = input["type"].as_str().context("type missing")?;
 +        if kind == "initialize" {
++            protocol = input["descriptor"]["lifecycleProtocol"]
++                .as_u64()
++                .context("protocol missing")?;
 +            mode = input["configuration"]["mode"]
 +                .as_str()
 +                .unwrap_or("healthy")
@@ -3849,7 +4001,16 @@ index 0000000000000000000000000000000000000000..a8c46f25b4f71d3d1549db3ea66bb028
 +                descriptor["generation"] = input["generation"].clone();
 +                Some(descriptor)
 +            },
++            "warm" if mode == "warm_hold" => None,
++            "warm" if mode == "warm_fail" => anyhow::bail!("fixture warm failure"),
++            "warm" => {
++                anyhow::ensure!(protocol == 2 && !active);
++                prepared = true;
++                write_event(events, "warmed", &input["generation"])?;
++                Some(json!({"type":"warmed", "generation":input["generation"]}))
++            },
 +            "activate" => {
++                anyhow::ensure!(protocol == 1 || prepared);
 +                eprintln!("{}", json!({"event":"fixture_activated"}));
 +                if mode == "log_backpressure" {
 +                    let diagnostic =
@@ -3870,10 +4031,19 @@ index 0000000000000000000000000000000000000000..a8c46f25b4f71d3d1549db3ea66bb028
 +                None
 +            },
 +            "probe" if active && mode == "stall_active" => None,
-+            "probe" => Some(
-+                json!({"type":"progress", "generation":input["generation"], "nonce":input["nonce"]}),
-+            ),
++            "probe" => {
++                let mut reply = json!({"type":"progress", "generation":input["generation"], "nonce":input["nonce"]});
++                if protocol == 2 {
++                    reply["ready"] = json!(prepared);
++                }
++                Some(reply)
++            },
 +            "retire" if mode == "drain_hold" => None,
++            "retire" if protocol == 2 => {
++                active = false;
++                write_event(events, "relinquished", &input["generation"])?;
++                Some(json!({"type":"relinquished", "generation":input["generation"]}))
++            },
 +            "retire" => Some(json!({"type":"drained", "generation":input["generation"]})),
 +            _ => anyhow::bail!("unknown control request"),
 +        };
@@ -3911,10 +4081,10 @@ index 0000000000000000000000000000000000000000..a8c46f25b4f71d3d1549db3ea66bb028
 +}
 diff --git a/crates/node_executor/tests/native_resident.rs b/crates/node_executor/tests/native_resident.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..a73252dd744dbe707046e31037457b54c5b5311f
+index 0000000000000000000000000000000000000000..d43ca4601e7f55679252e0a4e5f0c2ae40a1576a
 --- /dev/null
 +++ b/crates/node_executor/tests/native_resident.rs
-@@ -0,0 +1,805 @@
+@@ -0,0 +1,890 @@
 +#![cfg(all(feature = "testing", target_os = "linux"))]
 +
 +use std::{
@@ -4719,6 +4889,91 @@ index 0000000000000000000000000000000000000000..a73252dd744dbe707046e31037457b54
 +        .expect("blocked logging stalled supervision or guard shutdown")
 +        .unwrap();
 +    fixture.assert_reaped();
++}
++
++#[tokio::test]
++async fn warm_handover_keeps_incumbent_until_prepared_and_relinquished() {
++    let mut fixture = Fixture::new("healthy");
++    fixture.descriptor.lifecycle_protocol = 2;
++    let supervisor = fixture.supervisor(MemoryPressureSignal::default());
++    supervisor
++        .reconcile(
++            Some(fixture.descriptor.clone()),
++            Timestamp::try_from(1u64).unwrap(),
++        )
++        .unwrap();
++    wait_for_active(&supervisor).await;
++    let incumbent = supervisor.status().active_generation.unwrap();
++    let blocked = fixture.publish_configuration("warm_hold");
++    supervisor
++        .reconcile(Some(blocked), Timestamp::try_from(2u64).unwrap())
++        .unwrap();
++    tokio::time::timeout(Duration::from_secs(10), async {
++        loop {
++            let events = fixture.events();
++            if events
++                .iter()
++                .any(|e| e["type"] == "warm" && e["generation"] != incumbent)
++            {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .unwrap();
++    // Several watchdog turns while preparation is blocked cannot retire the
++    // incumbent.
++    tokio::time::sleep(Duration::from_millis(1200)).await;
++    assert_eq!(
++        supervisor.status().active_generation.as_deref(),
++        Some(incumbent.as_str())
++    );
++    assert!(!fixture.events().iter().any(|e| e["type"] == "retire"));
++    let replacement = fixture.publish_configuration("replacement");
++    supervisor
++        .reconcile(
++            Some(replacement.clone()),
++            Timestamp::try_from(3u64).unwrap(),
++        )
++        .unwrap();
++    tokio::time::timeout(Duration::from_secs(10), async {
++        while supervisor.status().active_descriptor.as_ref() != Some(&replacement)
++            || supervisor.status().phase != "active"
++        {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .unwrap();
++    let successor = supervisor.status().active_generation.unwrap();
++    // Await a probe so the child has consumed activation before reading the event
++    // file.
++    tokio::time::timeout(Duration::from_secs(3), async {
++        while !fixture
++            .events()
++            .iter()
++            .any(|e| e["type"] == "activate" && e["generation"] == successor)
++        {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .unwrap();
++    let events = fixture.events();
++    let position = |kind: &str, generation: &str| {
++        events
++            .iter()
++            .position(|e| e["type"] == kind && e["generation"] == generation)
++            .unwrap()
++    };
++    assert!(position("warmed", &successor) < position("retire", &incumbent));
++    assert!(position("relinquished", &incumbent) < position("activate", &successor));
++    assert_eq!(events.iter().filter(|e| e["type"] == "activate").count(), 2);
++    supervisor.shutdown().await.unwrap();
++    for event in events {
++        assert!(!Path::new(&format!("/proc/{}", event["pid"])).exists());
++    }
 +}
 diff --git a/patches/README.md b/patches/README.md
 index 4d7d7e804d7b690d4a893a416a6f34cdbc42be1a..45b227ffa591f1513d861a9bbd636aca9cc32db7 100644
