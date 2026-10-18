@@ -281,6 +281,18 @@ an immutable i32 relocation base, inspect the complete bounded instruction
 sequence, and retain full Core validation. Other starts remain ineligible.
 The writes precede image restoration and have no effects outside that memory,
 so existing authenticated artifacts can use initialized images unchanged.
+
+Permit Store-local exception heap capacity at the initialized-image boundary
+without treating allocated capacity as a live-root proof. Reject reference-valued
+interfaces and non-function element segments, require completed calls with no
+pending exception or opaque host handles, and keep engine heap capacity private
+and separately charged. Reconstruct each target Store's functions and tags.
+
+Accept maintenance format v2 preparation without nursery discard authority,
+retaining version 1 semantics for existing guests. The complete image preserves
+incremental collector state and live nursery pages. Document host-first rollout
+and cover source attachment, scalar restoration, source disposal and fresh
+target exception handling in the focused cross-Store regression.
 ---
  .github/workflows/build_local_backend.yml     |     7 +-
  Cargo.lock                                    | 15589 +++++++-----
@@ -380,12 +392,12 @@ so existing authenticated artifacts can use initialized images unchanged.
  .../crypto_subtle_digest_tests.rs             |   762 +
  .../generic_query_application_tests.rs        |   389 +
  .../graph_runtime.rs                          |   763 +
- .../guest_memory_maintenance.rs               |   431 +
+ .../guest_memory_maintenance.rs               |   471 +
  .../host_imports.rs                           |  1623 ++
  .../static_hermes_wasmtime_gate/host_state.rs |  1588 ++
  .../immutable_static.rs                       |   480 +
  .../initialized_memory.rs                     |  1182 +
- .../initialized_state.rs                      |  1008 +
+ .../initialized_state.rs                      |  1262 +
  .../invocation_timestamp_tests.rs             |   299 +
  .../module_contract.rs                        |  1443 ++
  .../module_graph_registry.rs                  |  5682 +++++
@@ -403,7 +415,7 @@ so existing authenticated artifacts can use initialized images unchanged.
  .../runtime_trap_disposal_tests.rs            |   213 +
  .../runtime_hotpath_benchmark.rs              |   255 +
  .../runtime_lifecycle.rs                      |  3671 +++
- .../runtime_lifecycle/prepared_image.rs       |   479 +
+ .../runtime_lifecycle/prepared_image.rs       |   488 +
  .../runtime_lifecycle/reclamation.rs          |   110 +
  .../source_keyed_deployment_catalog.rs        |   143 +
  .../test_support.rs                           |   570 +
@@ -530,7 +542,7 @@ so existing authenticated artifacts can use initialized images unchanged.
  .../deployment_operations.md                  |   113 +-
  patches/static_hermes_wasm_udfs/README.md     |   424 +
  .../compiler_and_artifact_contract.md         |   349 +
- patches/static_hermes_wasm_udfs/operations.md |  1174 +
+ patches/static_hermes_wasm_udfs/operations.md |  1189 +
  patches/static_hermes_wasm_udfs/value_abi.md  |   444 +
  scripts/run_cargo.sh                          |    96 +-
  scripts/run_cargo.test.mjs                    |   194 +
@@ -539,7 +551,7 @@ so existing authenticated artifacts can use initialized images unchanged.
  .../docker-build/Dockerfile.backend.test.mjs  |   250 +
  self-hosted/docker-build/README.md            |    84 +
  self-hosted/docker-build/run_backend.sh       |     3 +-
- 257 files changed, 170821 insertions(+), 8004 deletions(-)
+ 257 files changed, 171139 insertions(+), 8004 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/query_shadow.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
  create mode 100644 crates/application/src/bin/source_package_preactivation_authority.rs
@@ -88071,10 +88083,10 @@ index 0000000000000000000000000000000000000000..b70d1ff4de524229650a02c45cf65dfb
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/guest_memory_maintenance.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/guest_memory_maintenance.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..e8703bbefcca9c50d401aa04f7aa552f7d994ced
+index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e664409270
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/guest_memory_maintenance.rs
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,471 @@
 +use std::ops::Range;
 +
 +use anyhow::Context as _;
@@ -88277,8 +88289,9 @@ index 0000000000000000000000000000000000000000..e8703bbefcca9c50d401aa04f7aa552f
 +    memory_bytes: usize,
 +) -> anyhow::Result<ReclaimedPayload> {
 +    let word = |offset: usize| u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
++    let version = word(0);
 +    anyhow::ensure!(
-+        word(0) == 1 && word(4) as usize == RECORD_BYTES,
++        matches!(version, 1 | 2) && word(4) as usize == RECORD_BYTES,
 +        "unsupported guest memory maintenance result layout"
 +    );
 +    anyhow::ensure!(
@@ -88298,6 +88311,14 @@ index 0000000000000000000000000000000000000000..e8703bbefcca9c50d401aa04f7aa552f
 +            anyhow::ensure!(
 +                count <= visited as usize,
 +                "allocator ranges exceed visited blocks"
++            );
++        },
++        MaintenanceOperation::PrepareImage if version == 2 => {
++            // Image certification preserves the entire heap. It does not
++            // authorize discarding nursery pages, which may still be live.
++            anyhow::ensure!(
++                status == 0 && count == 0 && visited == 0,
++                "invalid image preparation result"
 +            );
 +        },
 +        MaintenanceOperation::PrepareImage | MaintenanceOperation::ReclaimYoung => {
@@ -88415,6 +88436,37 @@ index 0000000000000000000000000000000000000000..e8703bbefcca9c50d401aa04f7aa552f
 +                decode_result(&record(operation, 0, 1, &[(4096, 8192)]), operation, 65536).is_err()
 +            );
 +        }
++        Ok(())
++    }
++
++    #[test]
++    fn image_preparation_v2_does_not_grant_nursery_discard_authority() -> anyhow::Result<()> {
++        let operation = MaintenanceOperation::PrepareImage;
++        let mut prepared = record(operation, 0, 0, &[]);
++        prepared[..4].copy_from_slice(&2u32.to_le_bytes());
++        assert!(matches!(
++            decode_result(&prepared, operation, 65536)?,
++            ReclaimedPayload::Complete(ranges) if ranges.is_empty()
++        ));
++        // Version 1 certifies only with an empty-nursery range; keep accepting
++        // existing artifacts without interpreting Deferred as image authority.
++        assert!(matches!(
++            decode_result(&record(operation, 0, 0, &[(4096, 8192)]), operation, 65536)?,
++            ReclaimedPayload::Complete(ranges) if ranges == vec![4096..8192]
++        ));
++        for (status, visits, ranges) in [
++            (0, 0, &[(4096, 8192)][..]),
++            (0, 1, &[]),
++            (2, 0, &[]),
++            (3, 0, &[]),
++        ] {
++            let mut invalid = record(operation, status, visits, ranges);
++            invalid[..4].copy_from_slice(&2u32.to_le_bytes());
++            assert!(decode_result(&invalid, operation, 65536).is_err());
++        }
++        let mut nursery = record(MaintenanceOperation::ReclaimYoung, 0, 0, &[]);
++        nursery[..4].copy_from_slice(&2u32.to_le_bytes());
++        assert!(decode_result(&nursery, MaintenanceOperation::ReclaimYoung, 65536).is_err());
 +        Ok(())
 +    }
 +
@@ -93405,10 +93457,10 @@ index 0000000000000000000000000000000000000000..9611f4a1a1923aa410f45a44ae35bd06
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/initialized_state.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/initialized_state.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..1c90be230c98b4e1299e78ef9bdec4b46533c028
+index 0000000000000000000000000000000000000000..1d451ae2b86dcc3a1ec4e24eb1af9f0d030c822d
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/initialized_state.rs
-@@ -0,0 +1,1008 @@
+@@ -0,0 +1,1262 @@
 +//! State outside linear memory that an initialized Emscripten graph must
 +//! reconstruct. Inspect authenticated Core bytes once at module load; exported
 +//! globals alone cannot reveal hidden mutable globals or segment/table changes.
@@ -93485,6 +93537,7 @@ index 0000000000000000000000000000000000000000..1c90be230c98b4e1299e78ef9bdec4b4
 +        let mut globals = Vec::new();
 +        let mut function_types = Vec::new();
 +        let mut functions = Vec::new();
++        let mut interface_functions = Vec::new();
 +        let mut imported_globals = Vec::new();
 +        let mut imported_functions = 0u32;
 +        let mut function_index = 0u32;
@@ -93547,6 +93600,7 @@ index 0000000000000000000000000000000000000000..1c90be230c98b4e1299e78ef9bdec4b4
 +                                globals.push(ty);
 +                            },
 +                            TypeRef::Func(index) | TypeRef::FuncExact(index) => {
++                                interface_functions.push(functions.len() as u32);
 +                                imported_functions += 1;
 +                                functions.push(index);
 +                            },
@@ -93614,6 +93668,7 @@ index 0000000000000000000000000000000000000000..1c90be230c98b4e1299e78ef9bdec4b4
 +                                    .or_insert_with(|| export.name.to_owned());
 +                            },
 +                            ExternalKind::Func => {
++                                interface_functions.push(export.index);
 +                                if matches!(
 +                                    export.name,
 +                                    "emscripten_stack_get_base"
@@ -93626,6 +93681,15 @@ index 0000000000000000000000000000000000000000..1c90be230c98b4e1299e78ef9bdec4b4
 +                                }
 +                            },
 +                            _ => {},
++                        }
++                    }
++                },
++                Payload::ElementSection(elements) => {
++                    for element in elements {
++                        if let wasmparser::ElementItems::Expressions(ty, _) = element?.items
++                            && ty != RefType::FUNCREF
++                        {
++                            return unsupported("element segment retains non-function references");
 +                        }
 +                    }
 +                },
@@ -93774,6 +93838,29 @@ index 0000000000000000000000000000000000000000..1c90be230c98b4e1299e78ef9bdec4b4
 +                    function_index += 1;
 +                },
 +                _ => {},
++            }
++        }
++        // References may exist in locals and exception payloads during a call,
++        // but must not cross function interfaces into host roots. Scalar
++        // signatures alone do not exclude host-owned resources behind numeric
++        // handles: the lifecycle also requires the closed host import boundary,
++        // completed guest calls, empty handle/operation tables and no pending
++        // exception before granting image authority.
++        for index in interface_functions {
++            let ty = function_types
++                .get(
++                    *functions
++                        .get(index as usize)
++                        .context("missing interface function")? as usize,
++                )
++                .context("missing interface function type")?;
++            if ty
++                .params()
++                .iter()
++                .chain(ty.results())
++                .any(|ty| matches!(ty, ValType::Ref(_)))
++            {
++                return unsupported("reference-valued function interface");
 +            }
 +        }
 +        if start_function.is_some() && !proven_memory_start {
@@ -94284,6 +94371,225 @@ index 0000000000000000000000000000000000000000..1c90be230c98b4e1299e78ef9bdec4b4
 +            ));
 +        }
 +        Ok(())
++    }
++
++    #[test]
++    fn reference_interfaces_cannot_retain_roots_outside_the_image() -> anyhow::Result<()> {
++        for imported in [true, false] {
++            let mut types = TypeSection::new();
++            types.ty().function([ValType::EXTERNREF], []);
++            let mut module = Module::new();
++            module.section(&types);
++            if imported {
++                let mut imports = ImportSection::new();
++                imports.import("host", "retain", wasm_encoder::EntityType::Function(0));
++                module.section(&imports);
++            } else {
++                let mut functions = FunctionSection::new();
++                functions.function(0);
++                let mut exports = ExportSection::new();
++                exports.export("retain", ExportKind::Func, 0);
++                let mut code = CodeSection::new();
++                let mut body = Function::new([]);
++                body.instruction(&Instruction::End);
++                code.function(&body);
++                module.section(&functions).section(&exports).section(&code);
++            }
++            assert!(matches!(
++                ModuleSnapshotLayout::inspect(&module.finish())?,
++                ModuleSnapshotSupport::Unsupported("reference-valued function interface")
++            ));
++        }
++        let mut elements = wasm_encoder::ElementSection::new();
++        elements.passive(wasm_encoder::Elements::Expressions(
++            wasm_encoder::RefType::EXTERNREF,
++            std::borrow::Cow::Borrowed(&[ConstExpr::ref_null(wasm_encoder::HeapType::EXTERN)]),
++        ));
++        let mut module = Module::new();
++        module.section(&elements);
++        assert!(matches!(
++            ModuleSnapshotLayout::inspect(&module.finish())?,
++            ModuleSnapshotSupport::Unsupported("element segment retains non-function references")
++        ));
++        Ok(())
++    }
++
++    #[test]
++    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++    fn caught_exception_capacity_does_not_cross_the_initialized_image() -> anyhow::Result<()> {
++        use super::super::initialized_memory::InitializedMemoryImage;
++
++        let mut types = TypeSection::new();
++        types.ty().function([], []);
++        types.ty().function([ValType::I32], []);
++        types.ty().function([], [ValType::I32]);
++        let mut functions = FunctionSection::new();
++        functions.function(0).function(0).function(2);
++        let mut memories = wasm_encoder::MemorySection::new();
++        memories.memory(MemoryType {
++            minimum: 1,
++            maximum: Some(1),
++            memory64: false,
++            shared: false,
++            page_size_log2: None,
++        });
++        let mut tags = wasm_encoder::TagSection::new();
++        tags.tag(wasm_encoder::TagType {
++            kind: wasm_encoder::TagKind::Exception,
++            func_type_idx: 1,
++        });
++        let mut globals = GlobalSection::new();
++        globals.global(
++            GlobalType {
++                val_type: ValType::I32,
++                mutable: true,
++                shared: false,
++            },
++            &ConstExpr::i32_const(0),
++        );
++        let mut exports = ExportSection::new();
++        exports.export("memory", ExportKind::Memory, 0);
++        exports.export("prepared_scalar", ExportKind::Global, 0);
++        exports.export("prepare", ExportKind::Func, 0);
++        exports.export("throw", ExportKind::Func, 1);
++        exports.export("resume", ExportKind::Func, 2);
++        let mut prepare = Function::new([]);
++        prepare
++            .instruction(&Instruction::I32Const(0))
++            .instruction(&Instruction::I32Const(42))
++            .instruction(&Instruction::I32Store(wasm_encoder::MemArg {
++                offset: 0,
++                align: 2,
++                memory_index: 0,
++            }))
++            .instruction(&Instruction::I32Const(7))
++            .instruction(&Instruction::GlobalSet(0))
++            .instruction(&Instruction::Block(wasm_encoder::BlockType::Empty))
++            .instruction(&Instruction::TryTable(
++                wasm_encoder::BlockType::Empty,
++                std::borrow::Cow::Borrowed(&[wasm_encoder::Catch::All { label: 0 }]),
++            ))
++            .instruction(&Instruction::I32Const(0))
++            .instruction(&Instruction::Throw(0))
++            .instruction(&Instruction::End)
++            .instruction(&Instruction::End)
++            .instruction(&Instruction::End);
++        let mut throw = Function::new([]);
++        throw
++            .instruction(&Instruction::I32Const(0))
++            .instruction(&Instruction::Throw(0))
++            .instruction(&Instruction::End);
++        let mut resume = Function::new([]);
++        resume
++            .instruction(&Instruction::Block(wasm_encoder::BlockType::Result(
++                ValType::I32,
++            )))
++            .instruction(&Instruction::TryTable(
++                wasm_encoder::BlockType::Empty,
++                std::borrow::Cow::Borrowed(&[wasm_encoder::Catch::One { tag: 0, label: 0 }]),
++            ))
++            .instruction(&Instruction::GlobalGet(0))
++            .instruction(&Instruction::I32Const(0))
++            .instruction(&Instruction::I32Load(wasm_encoder::MemArg {
++                offset: 0,
++                align: 2,
++                memory_index: 0,
++            }))
++            .instruction(&Instruction::I32Add)
++            .instruction(&Instruction::Throw(0))
++            .instruction(&Instruction::End)
++            .instruction(&Instruction::Unreachable)
++            .instruction(&Instruction::End)
++            .instruction(&Instruction::End);
++        let mut code = CodeSection::new();
++        code.function(&prepare).function(&throw).function(&resume);
++        let mut module = Module::new();
++        module
++            .section(&types)
++            .section(&functions)
++            .section(&memories)
++            .section(&tags)
++            .section(&globals)
++            .section(&exports)
++            .section(&code);
++        let core = module.finish();
++        let ModuleSnapshotSupport::Supported(layout) = ModuleSnapshotLayout::inspect(&core)? else {
++            anyhow::bail!("caught exception fixture must support initialized state");
++        };
++        let mut config = wasmtime::Config::new();
++        config.wasm_exceptions(true).memory_reservation(1u64 << 32);
++        let engine = wasmtime::Engine::new(&config).map_err(wasmtime_anyhow)?;
++        let module = wasmtime::Module::new(&engine, &core).map_err(wasmtime_anyhow)?;
++        let operation = async {
++            let mut source_store = Store::new(&engine, ());
++            let source = Instance::new_async(&mut source_store, &module, &[])
++                .await
++                .map_err(wasmtime_anyhow)?;
++            source
++                .get_typed_func::<(), ()>(&mut source_store, "prepare")
++                .map_err(wasmtime_anyhow)?
++                .call_async(&mut source_store, ())
++                .await
++                .map_err(wasmtime_anyhow)?;
++            assert!(source_store.gc_heap_capacity() > 0);
++            assert!(!source_store.has_pending_exception());
++            let source_memory = source.get_memory(&mut source_store, "memory").unwrap();
++            let state = layout
++                .bind(&mut source_store, source, &module)?
++                .capture(&mut source_store)
++                .await?;
++            let image = InitializedMemoryImage::capture(source_memory.data(&source_store))?;
++            let source_gc_capacity = source_store.gc_heap_capacity();
++            let source_pages =
++                unsafe { image.attach(&mut source_store, source_memory, 65536, 65536, None)? };
++            assert_eq!(source_store.gc_heap_capacity(), source_gc_capacity);
++            let mut target_store = Store::new(&engine, ());
++            let target = Instance::new_async(&mut target_store, &module, &[])
++                .await
++                .map_err(wasmtime_anyhow)?;
++            let memory = target.get_memory(&mut target_store, "memory").unwrap();
++            layout
++                .bind(&mut target_store, target, &module)?
++                .restore(&mut target_store, &state)
++                .await?;
++            let _pages = unsafe { image.attach(&mut target_store, memory, 65536, 65536, None)? };
++            assert_eq!(&memory.data(&target_store)[..4], &42i32.to_le_bytes());
++            assert_eq!(target_store.gc_heap_capacity(), 0);
++            memory.write(&mut target_store, 0, &99i32.to_le_bytes())?;
++            assert_eq!(
++                &source_memory.data(&source_store)[..4],
++                &42i32.to_le_bytes()
++            );
++            drop(source_store);
++            drop(source_pages);
++            // The restored scalar and bytes remain usable after source disposal.
++            // A fresh exception uses the target's own tag and GC heap.
++            assert_eq!(
++                target
++                    .get_typed_func::<(), i32>(&mut target_store, "resume")
++                    .map_err(wasmtime_anyhow)?
++                    .call_async(&mut target_store, ())
++                    .await
++                    .map_err(wasmtime_anyhow)?,
++                106
++            );
++            assert!(target_store.gc_heap_capacity() > 0);
++            assert!(!target_store.has_pending_exception());
++            // A subsequently uncaught exception is real Store-owned state,
++            // unlike the capacity left by the caught initialization exception.
++            assert!(target
++                .get_typed_func::<(), ()>(&mut target_store, "throw")
++                .map_err(wasmtime_anyhow)?
++                .call_async(&mut target_store, ())
++                .await
++                .is_err());
++            assert!(target_store.has_pending_exception());
++            Ok(())
++        };
++        match std::pin::pin!(operation).poll(&mut Context::from_waker(Waker::noop())) {
++            Poll::Ready(result) => result,
++            Poll::Pending => anyhow::bail!("exception fixture unexpectedly suspended"),
++        }
 +    }
 +
 +    #[test]
@@ -134827,10 +135133,10 @@ index 0000000000000000000000000000000000000000..0c332575c09bcbb82f7b51db524688dd
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle/prepared_image.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle/prepared_image.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..737a086f954196d8ed76dc7a277fc91e16016990
+index 0000000000000000000000000000000000000000..10e7e319ebd8b9012e54c85d1b99d4b13d88779f
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle/prepared_image.rs
-@@ -0,0 +1,479 @@
+@@ -0,0 +1,488 @@
 +//! Request-independent images owned by the existing preparation group. The
 +//! cache never contains a request-warmed Store, and no Store-owned reference
 +//! crosses the image boundary.
@@ -134952,8 +135258,8 @@ index 0000000000000000000000000000000000000000..737a086f954196d8ed76dc7a277fc91e
 +        image: Arc<GeneratedPreparedImage>,
 +    ) -> anyhow::Result<bool> {
 +        anyhow::ensure!(
-+            self.initialized_memory.is_none() && self.store.gc_heap_capacity() == 0,
-+            "initialized image requires a fresh linear-memory runtime"
++            self.initialized_memory.is_none() && !self.store.has_pending_exception(),
++            "initialized image requires an unattached runtime without a pending exception"
 +        );
 +        let states = self
 +            .initialized_state
@@ -135149,10 +135455,11 @@ index 0000000000000000000000000000000000000000..737a086f954196d8ed76dc7a277fc91e
 +                && !generated.runtime_reuse_contaminated
 +                && !generated.discard_after_caught_initialization_failure
 +                && !self.store.data().guest_developer_error
-+                && self.store.data().developer_error.is_none(),
++                && self.store.data().developer_error.is_none()
++                && !self.store.has_pending_exception(),
 +            "initialized image capture requires completed request-independent preparation"
 +        );
-+        if generation.retired.load(Ordering::Acquire) || self.store.gc_heap_capacity() != 0 {
++        if generation.retired.load(Ordering::Acquire) {
 +            return Ok(None);
 +        }
 +        self.runtime_state = GeneratedRuntimeState::Poisoned;
@@ -135169,9 +135476,17 @@ index 0000000000000000000000000000000000000000..737a086f954196d8ed76dc7a277fc91e
 +            ReclaimedPayload::Deferred | ReclaimedPayload::Unsupported => return Ok(None),
 +            ReclaimedPayload::Partial(_) => anyhow::bail!("partial initialized image preparation"),
 +        }
++        // The authenticated layouts exclude reference globals, table mutation,
++        // GC aggregates and reference-valued function interfaces. The registered
++        // host imports create no Wasmtime GC roots, and no guest call remains
++        // suspended here. Numeric host handles are checked separately below.
++        // Caught exceptions can leave unreachable objects and allocated GC
++        // capacity; neither is image state. A pending exception is still a
++        // Store-owned root. The separate heap stays private and charged; it is
++        // neither copied into the image nor restored in another Store.
 +        anyhow::ensure!(
-+            self.store.gc_heap_capacity() == 0,
-+            "image preparation created external GC state"
++            !self.store.has_pending_exception(),
++            "image preparation left a pending Wasm exception"
 +        );
 +        let generated = generated_state(self.store.data()).map_err(wasmtime_anyhow)?;
 +        // A collection retry can catch a failed allocation and still return a
@@ -187437,10 +187752,10 @@ index 0000000000000000000000000000000000000000..99122dd95ecdf2fdefc8a1df7c9b0b8d
 +inputs.
 diff --git a/patches/static_hermes_wasm_udfs/operations.md b/patches/static_hermes_wasm_udfs/operations.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..75945039887e3c7c8c000fb91e2cbb6d4ba4edc0
+index 0000000000000000000000000000000000000000..9bb9bcedbf1f750f96963b846ae38d378c33a480
 --- /dev/null
 +++ b/patches/static_hermes_wasm_udfs/operations.md
-@@ -0,0 +1,1174 @@
+@@ -0,0 +1,1189 @@
 +# Static Hermes Wasm UDF Operations and Validation
 +
 +This is a generic self-hosted adoption guide for the
@@ -187994,6 +188309,21 @@ index 0000000000000000000000000000000000000000..75945039887e3c7c8c000fb91e2cbb6d
 +effects remain ineligible. This linker initialization runs in ordinary memory
 +before restoration replaces it with the prepared image. Core validation and
 +ordinary instantiation still enforce types and memory bounds.
++Reference-valued function interfaces and non-function element segments are also
++ineligible. This proof also depends on the registered host imports creating no
++Wasmtime GC roots; numeric host handles require the separate empty-value and
++empty-operation checks at preparation. All guest calls must have completed, and
++the capture and attachment boundaries must have no pending Wasm exception.
++Caught exceptions can leave unreachable objects and allocated Wasmtime GC heap
++capacity. Neither is image state, and collection success is not a liveness proof.
++That heap remains separately charged and Store-local, and is never copied into
++the image. Each view reconstructs its own exception tags as well as its functions.
++The guest maintenance decoder accepts versions 1 and 2. Version 2 preparation
++certifies the entire heap without requiring nursery reclamation or granting
++discard ranges. Version 1 deferred preparation still retains ordinary instances.
++Deploy host support for version 2 before using guests that return it. A host that
++uses the export must reject unknown result versions; hosts that ignore this
++optional optimization can continue ordinary execution.
 +A replacement validates and applies the
 +complete initialization read set before restoration; changed configuration removes
 +only the expected cache owner, while existing views retain their own owners.
