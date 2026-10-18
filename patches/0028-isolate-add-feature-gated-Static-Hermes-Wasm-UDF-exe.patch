@@ -274,6 +274,13 @@ Allow internal GC capacity before the authenticated initial linear memory
 allocation. Keep static credit bound to the newly added linear capacity,
 reject invalid surviving-memory reconciliation, and preserve peak charges.
 Independent follow-up review and nine focused native regressions pass.
+
+Recognize the linker-generated relocated zero-fill start when establishing
+initialized-image eligibility. Require the sole imported graph memory and
+an immutable i32 relocation base, inspect the complete bounded instruction
+sequence, and retain full Core validation. Other starts remain ineligible.
+The writes precede image restoration and have no effects outside that memory,
+so existing authenticated artifacts can use initialized images unchanged.
 ---
  .github/workflows/build_local_backend.yml     |     7 +-
  Cargo.lock                                    | 15589 +++++++-----
@@ -378,7 +385,7 @@ Independent follow-up review and nine focused native regressions pass.
  .../static_hermes_wasmtime_gate/host_state.rs |  1588 ++
  .../immutable_static.rs                       |   480 +
  .../initialized_memory.rs                     |  1182 +
- .../initialized_state.rs                      |   710 +
+ .../initialized_state.rs                      |  1008 +
  .../invocation_timestamp_tests.rs             |   299 +
  .../module_contract.rs                        |  1443 ++
  .../module_graph_registry.rs                  |  5682 +++++
@@ -523,7 +530,7 @@ Independent follow-up review and nine focused native regressions pass.
  .../deployment_operations.md                  |   113 +-
  patches/static_hermes_wasm_udfs/README.md     |   424 +
  .../compiler_and_artifact_contract.md         |   349 +
- patches/static_hermes_wasm_udfs/operations.md |  1167 +
+ patches/static_hermes_wasm_udfs/operations.md |  1174 +
  patches/static_hermes_wasm_udfs/value_abi.md  |   444 +
  scripts/run_cargo.sh                          |    96 +-
  scripts/run_cargo.test.mjs                    |   194 +
@@ -532,7 +539,7 @@ Independent follow-up review and nine focused native regressions pass.
  .../docker-build/Dockerfile.backend.test.mjs  |   250 +
  self-hosted/docker-build/README.md            |    84 +
  self-hosted/docker-build/run_backend.sh       |     3 +-
- 257 files changed, 170516 insertions(+), 8004 deletions(-)
+ 257 files changed, 170821 insertions(+), 8004 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/query_shadow.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
  create mode 100644 crates/application/src/bin/source_package_preactivation_authority.rs
@@ -93398,10 +93405,10 @@ index 0000000000000000000000000000000000000000..9611f4a1a1923aa410f45a44ae35bd06
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/initialized_state.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/initialized_state.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..aa06cd6e8a4c3724c61e76002ff2670146da50b7
+index 0000000000000000000000000000000000000000..1c90be230c98b4e1299e78ef9bdec4b46533c028
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/initialized_state.rs
-@@ -0,0 +1,710 @@
+@@ -0,0 +1,1008 @@
 +//! State outside linear memory that an initialized Emscripten graph must
 +//! reconstruct. Inspect authenticated Core bytes once at module load; exported
 +//! globals alone cannot reveal hidden mutable globals or segment/table changes.
@@ -93481,6 +93488,10 @@ index 0000000000000000000000000000000000000000..aa06cd6e8a4c3724c61e76002ff26701
 +        let mut imported_globals = Vec::new();
 +        let mut imported_functions = 0u32;
 +        let mut function_index = 0u32;
++        let mut memory_count = 0;
++        let mut imports_graph_memory = false;
++        let mut start_function = None;
++        let mut proven_memory_start = false;
 +        let mut global_exports = BTreeMap::<u32, String>::new();
 +        let mut accessors = BTreeMap::<u32, &str>::new();
 +        let mut stack_base = None;
@@ -93546,8 +93557,13 @@ index 0000000000000000000000000000000000000000..aa06cd6e8a4c3724c61e76002ff26701
 +                                    );
 +                                }
 +                            },
-+                            TypeRef::Memory(ty) if ty.shared || ty.memory64 => {
-+                                return unsupported("shared or memory64 image");
++                            TypeRef::Memory(ty) => {
++                                if ty.shared || ty.memory64 {
++                                    return unsupported("shared or memory64 image");
++                                }
++                                memory_count += 1;
++                                imports_graph_memory =
++                                    import.module == "env" && import.name == "memory";
 +                            },
 +                            _ => {},
 +                        }
@@ -93559,10 +93575,8 @@ index 0000000000000000000000000000000000000000..aa06cd6e8a4c3724c61e76002ff26701
 +                        functions.push(index?);
 +                    }
 +                },
-+                Payload::StartSection { .. } => {
-+                    // Instantiation precedes restoration in every view. A start
-+                    // function could repeat initialization host side effects.
-+                    return unsupported("start function runs before image restoration");
++                Payload::StartSection { func, .. } => {
++                    start_function = Some(func);
 +                },
 +                Payload::GlobalSection(entries) => {
 +                    for entry in entries {
@@ -93579,6 +93593,7 @@ index 0000000000000000000000000000000000000000..aa06cd6e8a4c3724c61e76002ff26701
 +                        if memory.shared || memory.memory64 {
 +                            return unsupported("shared or memory64 image");
 +                        }
++                        memory_count += 1;
 +                    }
 +                },
 +                Payload::TableSection(tables) => {
@@ -93615,6 +93630,59 @@ index 0000000000000000000000000000000000000000..aa06cd6e8a4c3724c61e76002ff26701
 +                    }
 +                },
 +                Payload::CodeSectionEntry(body) => {
++                    if start_function == Some(function_index) {
++                        // Instantiation runs starts before image restoration.
++                        // Permit only the linker's single relocated zero-fill:
++                        // it writes the ordinary graph memory that restoration
++                        // replaces, with no calls or effects outside that memory.
++                        // Function names confer no authority, and extra memories
++                        // could retain writes outside the restored image.
++                        if memory_count != 1
++                            || !imports_graph_memory
++                            || body.get_locals_reader()?.get_count() != 0
++                        {
++                            return unsupported(
++                                "start function is not a proven memory initializer",
++                            );
++                        }
++                        let ops = body
++                            .get_operators_reader()?
++                            .into_iter()
++                            .take(8)
++                            .collect::<wasmparser::Result<Vec<_>>>()?;
++                        let (offset, global_index, length) = match ops.as_slice() {
++                            [
++                                Operator::I32Const { value: offset },
++                                Operator::GlobalGet { global_index },
++                                Operator::I32Add,
++                                // memory.fill consumes destination, byte, length.
++                                Operator::I32Const { value: 0 },
++                                Operator::I32Const { value: length },
++                                Operator::MemoryFill { mem: 0 },
++                                Operator::End,
++                            ] => (*offset, *global_index, *length),
++                            _ => {
++                                return unsupported(
++                                    "start function is not a proven memory initializer",
++                                )
++                            },
++                        };
++                        if offset < 0
++                            || length <= 0
++                            || !matches!(
++                                imported_globals.get(global_index as usize),
++                                Some(("env", "__memory_base", false))
++                            )
++                            || !globals
++                                .get(global_index as usize)
++                                .is_some_and(|ty| ty.content_type == ValType::I32)
++                        {
++                            return unsupported(
++                                "start function is not a proven memory initializer",
++                            );
++                        }
++                        proven_memory_start = true;
++                    }
 +                    let accessor = accessors.get(&function_index).copied();
 +                    if let Some(name) = accessor {
 +                        let type_index = functions
@@ -93707,6 +93775,11 @@ index 0000000000000000000000000000000000000000..aa06cd6e8a4c3724c61e76002ff26701
 +                },
 +                _ => {},
 +            }
++        }
++        if start_function.is_some() && !proven_memory_start {
++            // Imported starts have no inspectable body. A missing definition
++            // must not acquire image authority either.
++            return unsupported("start function is not a proven memory initializer");
 +        }
 +        let hidden_stack = match (stack_base, stack_end, stack_set) {
 +            (None, None, None) if accessors.is_empty() => None,
@@ -93817,7 +93890,9 @@ index 0000000000000000000000000000000000000000..aa06cd6e8a4c3724c61e76002ff26701
 +        FunctionSection,
 +        GlobalSection,
 +        GlobalType,
++        ImportSection,
 +        Instruction,
++        MemoryType,
 +        Module,
 +        TypeSection,
 +        ValType,
@@ -93976,8 +94051,238 @@ index 0000000000000000000000000000000000000000..aa06cd6e8a4c3724c61e76002ff26701
 +        wasmtime::Module::new(&wasmtime::Engine::default(), &core).map_err(wasmtime_anyhow)?;
 +        assert!(matches!(
 +            ModuleSnapshotLayout::inspect(&core)?,
-+            ModuleSnapshotSupport::Unsupported("start function runs before image restoration")
++            ModuleSnapshotSupport::Unsupported("start function is not a proven memory initializer")
 +        ));
++        Ok(())
++    }
++
++    const ZERO_FILL_START: [Instruction<'static>; 7] = [
++        Instruction::I32Const(64),
++        Instruction::GlobalGet(1),
++        Instruction::I32Add,
++        Instruction::I32Const(0),
++        Instruction::I32Const(9),
++        Instruction::MemoryFill(0),
++        Instruction::End,
++    ];
++
++    fn memory_start_fixture(imports: &ImportSection, body: &Function, start_index: u32) -> Vec<u8> {
++        let mut types = TypeSection::new();
++        types.ty().function([], []);
++        let mut functions = FunctionSection::new();
++        functions.function(0);
++        let mut code = CodeSection::new();
++        code.function(body);
++        let mut module = Module::new();
++        module
++            .section(&types)
++            .section(imports)
++            .section(&functions)
++            .section(&wasm_encoder::StartSection {
++                function_index: start_index,
++            })
++            .section(&code);
++        module.finish()
++    }
++
++    fn memory_start_imports() -> ImportSection {
++        let mut imports = ImportSection::new();
++        imports.import("env", "host_effect", wasm_encoder::EntityType::Function(0));
++        imports.import(
++            "env",
++            "memory",
++            MemoryType {
++                minimum: 1,
++                maximum: None,
++                memory64: false,
++                shared: false,
++                page_size_log2: None,
++            },
++        );
++        for name in ["__table_base", "__memory_base"] {
++            imports.import(
++                "env",
++                name,
++                GlobalType {
++                    val_type: ValType::I32,
++                    mutable: false,
++                    shared: false,
++                },
++            );
++        }
++        imports
++    }
++
++    #[test]
++    fn relocated_zero_fill_start_needs_no_function_name() -> anyhow::Result<()> {
++        let mut body = Function::new([]);
++        for op in &ZERO_FILL_START {
++            body.instruction(op);
++        }
++        let core = memory_start_fixture(&memory_start_imports(), &body, 1);
++        assert!(matches!(
++            ModuleSnapshotLayout::inspect(&core)?,
++            ModuleSnapshotSupport::Supported(_)
++        ));
++        Ok(())
++    }
++
++    #[test]
++    fn starts_cannot_extend_zero_fill_authority() -> anyhow::Result<()> {
++        let imports = memory_start_imports();
++        let mut variants = Vec::new();
++        for call_index in [0, 1] {
++            // A host call and a recursive defined call must both be rejected.
++            for position in [0, ZERO_FILL_START.len() - 1] {
++                let mut ops = ZERO_FILL_START.to_vec();
++                ops.insert(position, Instruction::Call(call_index));
++                variants.push(ops);
++            }
++        }
++        for (position, replacement) in [
++            (1, Instruction::GlobalGet(0)),
++            (3, Instruction::I32Const(1)),
++            (4, Instruction::I32Const(-1)),
++        ] {
++            let mut ops = ZERO_FILL_START.to_vec();
++            ops[position] = replacement;
++            variants.push(ops);
++        }
++        // Stack-valid memory-only work is still outside the narrow proof.
++        let mut extra_effect = ZERO_FILL_START.to_vec();
++        extra_effect.splice(
++            6..6,
++            [
++                Instruction::I32Const(1),
++                Instruction::MemoryGrow(0),
++                Instruction::Drop,
++            ],
++        );
++        variants.push(extra_effect);
++        for ops in variants {
++            let mut body = Function::new([]);
++            for op in &ops {
++                body.instruction(op);
++            }
++            let core = memory_start_fixture(&imports, &body, 1);
++            wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
++                .validate_all(&core)?;
++            assert!(matches!(
++                ModuleSnapshotLayout::inspect(&core)?,
++                ModuleSnapshotSupport::Unsupported(_)
++            ));
++        }
++        for (locals, start_index) in [(vec![], 0), (vec![(1, ValType::I32)], 1)] {
++            let mut body = Function::new(locals);
++            for op in &ZERO_FILL_START {
++                body.instruction(op);
++            }
++            let core = memory_start_fixture(&imports, &body, start_index);
++            assert!(matches!(
++                ModuleSnapshotLayout::inspect(&core)?,
++                ModuleSnapshotSupport::Unsupported(_)
++            ));
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn zero_fill_requires_the_graph_memory_and_immutable_i32_base() -> anyhow::Result<()> {
++        let mut body = Function::new([]);
++        for op in &ZERO_FILL_START {
++            body.instruction(op);
++        }
++        // Same instruction bytes must not grant authority to a different
++        // memory or relocation binding, including an additional memory.
++        for (mem_module, mem_name, count, base_module, base_name, mutable, val_type) in [
++            (
++                "other",
++                "memory",
++                1,
++                "env",
++                "__memory_base",
++                false,
++                ValType::I32,
++            ),
++            (
++                "env",
++                "other",
++                1,
++                "env",
++                "__memory_base",
++                false,
++                ValType::I32,
++            ),
++            (
++                "env",
++                "memory",
++                2,
++                "env",
++                "__memory_base",
++                false,
++                ValType::I32,
++            ),
++            (
++                "env",
++                "memory",
++                1,
++                "other",
++                "__memory_base",
++                false,
++                ValType::I32,
++            ),
++            ("env", "memory", 1, "env", "other", false, ValType::I32),
++            (
++                "env",
++                "memory",
++                1,
++                "env",
++                "__memory_base",
++                true,
++                ValType::I32,
++            ),
++            (
++                "env",
++                "memory",
++                1,
++                "env",
++                "__memory_base",
++                false,
++                ValType::I64,
++            ),
++        ] {
++            let mut imports = ImportSection::new();
++            imports.import("env", "host_effect", wasm_encoder::EntityType::Function(0));
++            for _ in 0..count {
++                imports.import(
++                    mem_module,
++                    mem_name,
++                    MemoryType {
++                        minimum: 1,
++                        maximum: None,
++                        memory64: false,
++                        shared: false,
++                        page_size_log2: None,
++                    },
++                );
++            }
++            for _ in 0..2 {
++                imports.import(
++                    base_module,
++                    base_name,
++                    GlobalType {
++                        val_type,
++                        mutable,
++                        shared: false,
++                    },
++                );
++            }
++            let core = memory_start_fixture(&imports, &body, 1);
++            assert!(matches!(
++                ModuleSnapshotLayout::inspect(&core)?,
++                ModuleSnapshotSupport::Unsupported(_)
++            ));
++        }
 +        Ok(())
 +    }
 +
@@ -187132,10 +187437,10 @@ index 0000000000000000000000000000000000000000..99122dd95ecdf2fdefc8a1df7c9b0b8d
 +inputs.
 diff --git a/patches/static_hermes_wasm_udfs/operations.md b/patches/static_hermes_wasm_udfs/operations.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..53fb84a366b91891bdeb9aeabfc9de8c7d1d9629
+index 0000000000000000000000000000000000000000..75945039887e3c7c8c000fb91e2cbb6d4ba4edc0
 --- /dev/null
 +++ b/patches/static_hermes_wasm_udfs/operations.md
-@@ -0,0 +1,1167 @@
+@@ -0,0 +1,1174 @@
 +# Static Hermes Wasm UDF Operations and Validation
 +
 +This is a generic self-hosted adoption guide for the
@@ -187681,8 +187986,15 @@ index 0000000000000000000000000000000000000000..53fb84a366b91891bdeb9aeabfc9de8c
 +Core once and retains eligibility with its compiled Module. Each view rebuilds
 +its own tables, GOT bindings and function references in the authenticated graph
 +order, restores proven scalar globals and stack limits, and privately maps the
-+sealed bytes. Reference globals, hidden unrestorable state, table/segment mutation
-+and start functions are ineligible. A replacement validates and applies the
++sealed bytes. Reference globals, hidden unrestorable state and table/segment
++mutation are ineligible. Start functions are ineligible except for a proven
++single zero-fill of the sole imported `env.memory`, addressed by a nonnegative
++constant offset from the immutable i32 `env.__memory_base`. The loader checks the
++complete instruction sequence, not a function name; calls, local state and other
++effects remain ineligible. This linker initialization runs in ordinary memory
++before restoration replaces it with the prepared image. Core validation and
++ordinary instantiation still enforce types and memory bounds.
++A replacement validates and applies the
 +complete initialization read set before restoration; changed configuration removes
 +only the expected cache owner, while existing views retain their own owners.
 +
