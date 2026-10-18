@@ -269,6 +269,11 @@ predecessor native artifacts in both metering modes. Portable Core Wasm has no
 new native-engine requirement. Focused controller, Store lifecycle, loader,
 metering and actual engine-identity checks pass; full application footprint
 and service-time acceptance remains separate from these correctness checks.
+
+Allow internal GC capacity before the authenticated initial linear memory
+allocation. Keep static credit bound to the newly added linear capacity,
+reject invalid surviving-memory reconciliation, and preserve peak charges.
+Independent follow-up review and nine focused native regressions pass.
 ---
  .github/workflows/build_local_backend.yml     |     7 +-
  Cargo.lock                                    | 15589 +++++++-----
@@ -349,7 +354,7 @@ and service-time acceptance remains separate from these correctness checks.
  crates/isolate/src/environment/analyze.rs     |   131 +-
  .../src/environment/udf/async_syscall.rs      |  1630 +-
  .../environment/udf/context_reuse_tests.rs    |     8 +
- .../environment/udf/generated_wasm_memory.rs  |  6433 +++++
+ .../environment/udf/generated_wasm_memory.rs  |  6533 +++++
  .../udf/generated_wasm_memory/forecast.rs     |   213 +
  .../udf/generated_wasm_memory/initialized.rs  |   313 +
  .../udf/generated_wasm_memory/inspection.rs   |   440 +
@@ -527,7 +532,7 @@ and service-time acceptance remains separate from these correctness checks.
  .../docker-build/Dockerfile.backend.test.mjs  |   250 +
  self-hosted/docker-build/README.md            |    84 +
  self-hosted/docker-build/run_backend.sh       |     3 +-
- 257 files changed, 170416 insertions(+), 8004 deletions(-)
+ 257 files changed, 170516 insertions(+), 8004 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/query_shadow.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
  create mode 100644 crates/application/src/bin/source_package_preactivation_authority.rs
@@ -58023,10 +58028,10 @@ index ed0d8f3d60f6bc036af8fb22d7193ceeb77b7d92..db620d1d172f1515634650e9cde64dae
              "context_reuse_test".to_owned(),
 diff --git a/crates/isolate/src/environment/udf/generated_wasm_memory.rs b/crates/isolate/src/environment/udf/generated_wasm_memory.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..c3ff164b0f513b88c685b0693ac93bda9bf428c6
+index 0000000000000000000000000000000000000000..7c8104a5e93fbced40b712296fb1655850f52ce7
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/generated_wasm_memory.rs
-@@ -0,0 +1,6433 @@
+@@ -0,0 +1,6533 @@
 +use std::{
 +    collections::{
 +        BTreeMap,
@@ -59764,10 +59769,12 @@ index 0000000000000000000000000000000000000000..c3ff164b0f513b88c685b0693ac93bda
 +            Some(GuestMemoryAdjustment::InitialStaticCredit(credit)) => {
 +                assert!(
 +                    invocation.cold_start
-+                        && invocation.current_guest_bytes == 0
 +                        && invocation.shared_static_bytes == 0
++                        && invocation.initialized_memory.is_none()
 +                        && invocation.checkout_baseline_bytes == 0
-+                        && credit <= guest_bytes
++                        && guest_bytes
++                            .checked_sub(invocation.current_guest_bytes)
++                            .is_some_and(|growth| credit <= growth)
 +                        && denied_growth_bytes.is_none()
 +                        && !allocation_committed,
 +                    "initial static credit requires a fresh guest allocation"
@@ -61258,8 +61265,9 @@ index 0000000000000000000000000000000000000000..c3ff164b0f513b88c685b0693ac93bda
 +
 +    /// The caller has retained evidence from an actual mapping of the same
 +    /// Module and is about to instantiate its sole defined linear memory.
-+    /// Arming this does not reduce liability; the first allocation must pass
-+    /// both raw limits and aggregate admission before the credit takes effect.
++    /// Arming this does not reduce liability; the first linear allocation must
++    /// pass raw limits and aggregate admission before the credit takes effect.
++    /// Wasmtime may allocate its independently charged GC heap before it.
 +    pub(crate) fn prepare_initial_static_memory(&mut self, initial: usize, shared: usize) {
 +        assert!(
 +            self.initial_static_memory.is_none()
@@ -61289,6 +61297,12 @@ index 0000000000000000000000000000000000000000..c3ff164b0f513b88c685b0693ac93bda
 +            anyhow::ensure!(
 +                invocation.current_guest_bytes == accounted,
 +                "generated Wasm memory account differs from controller capacity"
++            );
++            // A failed initial linear allocation can leave only the GC heap.
++            // Its capacity cannot support credit for absent shared pages.
++            anyhow::ensure!(
++                invocation.shared_static_bytes <= linear_bytes,
++                "static memory credit exceeds actual linear capacity"
 +            );
 +            invocation.initialized_memory
 +        };
@@ -61395,10 +61409,10 @@ index 0000000000000000000000000000000000000000..c3ff164b0f513b88c685b0693ac93bda
 +        let adjustment = match kind {
 +            GuestMemoryKind::Linear => match self.initial_static_memory.take() {
 +                Some((initial, shared)) => {
-+                    // Wasmtime allocates defined linear memories before tables,
-+                    // globals or guest startup. Never let a different allocation
-+                    // consume evidence intended for that initial linear memory.
-+                    if current != 0 || total != 0 || desired != initial {
++                    // Allocation kind, not callback order, binds the credit to
++                    // linear memory. Wasmtime may already have allocated its GC
++                    // heap while instantiating this same module.
++                    if current != 0 || desired != initial {
 +                        self.growth_failed = true;
 +                        return Err(wasmtime::Error::msg(
 +                            "initial static credit reached an unexpected allocation",
@@ -61408,15 +61422,9 @@ index 0000000000000000000000000000000000000000..c3ff164b0f513b88c685b0693ac93bda
 +                },
 +                None => Some(GuestMemoryAdjustment::LinearCapacity { current, desired }),
 +            },
-+            GuestMemoryKind::InternalGc => {
-+                if self.initial_static_memory.is_some() {
-+                    self.growth_failed = true;
-+                    return Err(wasmtime::Error::msg(
-+                        "internal GC allocation preceded the expected initial linear memory",
-+                    ));
-+                }
-+                None
-+            },
++            // GC must neither consume the pending credit nor prevent the
++            // following linear allocation from using it.
++            GuestMemoryKind::InternalGc => None,
 +        };
 +        let accepted = self.account.controller.update_accounted_bytes(
 +            self.account.invocation_id,
@@ -63162,9 +63170,9 @@ index 0000000000000000000000000000000000000000..c3ff164b0f513b88c685b0693ac93bda
 +                    .memory_size(128 * MIB)
 +                    .build(),
 +            );
-+            // The same limiter callback accounts for a preceding dependency's
-+            // GC heap, then the memory owner's initial linear allocation.
-+            limiter.memory_growing(0, 8 * scale * MIB, None).unwrap();
++            // A preceding dependency's GC heap remains private when the
++            // memory owner's initial linear allocation receives its credit.
++            limiter.gc_heap_growing(0, 8 * scale * MIB, None).unwrap();
 +            let host = |bytes| HostOwnedByteAccounting {
 +                current_bytes: bytes * scale * MIB,
 +                peak_bytes: 10 * scale * MIB,
@@ -63196,19 +63204,116 @@ index 0000000000000000000000000000000000000000..c3ff164b0f513b88c685b0693ac93bda
 +    }
 +
 +    #[test]
-+    fn initial_static_credit_rejects_internal_gc_with_identical_size() {
++    fn initial_static_credit_preserves_preceding_internal_gc_with_identical_size() {
 +        let controller = test_controller(policy()).unwrap();
 +        let permit = controller
 +            .try_admit(identity("static-credit-kind", "a", "read"), None)
 +            .unwrap();
 +        let mut limiter = permit.limiter(wasmtime::StoreLimitsBuilder::new().build());
 +        limiter.prepare_initial_static_memory(48 * MIB, 32 * MIB);
-+        assert!(limiter.gc_heap_growing(0, 48 * MIB, None).is_err());
-+        assert_eq!(permit.current_bytes().0, 0);
++        permit.begin_static_memory_instantiation().unwrap();
++        assert!(limiter.gc_heap_growing(0, 48 * MIB, None).unwrap());
++        assert_eq!(permit.current_bytes().0, 48 * MIB);
 +        assert_eq!(
 +            controller.state.lock().active[&permit.account.invocation_id].shared_static_bytes,
 +            0
 +        );
++        assert_eq!(permit.preparation_memory_cost().retained_bytes, 48 * MIB);
++        assert!(limiter.memory_growing(0, 48 * MIB, None).unwrap());
++        assert_eq!(permit.current_bytes().0, 96 * MIB);
++        assert_eq!(permit.preparation_memory_cost().retained_bytes, 64 * MIB);
++        assert!(limiter.gc_heap_growing(48 * MIB, 49 * MIB, None).unwrap());
++        assert_eq!(permit.preparation_memory_cost().retained_bytes, 65 * MIB);
++        permit.credit_shared_static(32 * MIB).unwrap();
++        assert_eq!(permit.preparation_memory_cost().peak_bytes, 65 * MIB);
++        assert_eq!(permit.preparation_memory_cost().retained_bytes, 65 * MIB);
++        permit.finish(TerminalMemoryOutcome::Success, false);
++    }
++
++    #[test]
++    fn real_store_initial_static_credit_allows_gc_before_linear_memory() -> anyhow::Result<()> {
++        let mut config = wasmtime::Config::new();
++        // The default GC capacity is zero. Reserve a page so its charge also
++        // makes the aggregate raw-limit case reject the linear allocation.
++        config.gc_heap_initial_size(65_536);
++        let engine = wasmtime::Engine::new(&config)?;
++        // An externref table requires Wasmtime's GC heap during instantiation,
++        // before the same module's defined linear memory is allocated.
++        let module = wasmtime::Module::new(
++            &engine,
++            r#"(module (memory (export "memory") 768) (table 1 externref))"#,
++        )?;
++        for (raw_limit, succeeds) in [(64 * MIB, true), (48 * MIB, false)] {
++            let controller = test_controller(policy())?;
++            let permit = controller
++                .try_admit(identity("static-credit-order", "a", "read"), None)
++                .unwrap();
++            let mut limiter = permit.limiter(
++                wasmtime::StoreLimitsBuilder::new()
++                    .memory_size(raw_limit)
++                    .memories(1)
++                    .trap_on_grow_failure(true)
++                    .build(),
++            );
++            limiter.prepare_initial_static_memory(48 * MIB, 32 * MIB);
++            let mut store = wasmtime::Store::new(&engine, limiter);
++            store.limiter(|limiter| limiter);
++            let instance = wasmtime::Instance::new(&mut store, &module, &[]);
++            assert_eq!(instance.is_ok(), succeeds);
++            let gc_bytes = store.gc_heap_capacity();
++            assert!(gc_bytes > 0);
++            if succeeds {
++                let memory = instance?.get_memory(&mut store, "memory").unwrap();
++                let linear_bytes = memory.data_size(&store);
++                assert_eq!(permit.current_bytes().0, linear_bytes + gc_bytes);
++                assert_eq!(
++                    permit.preparation_memory_cost().retained_bytes,
++                    16 * MIB + gc_bytes
++                );
++                store.data_mut().reconcile(linear_bytes, gc_bytes)?;
++                permit.credit_shared_static(32 * MIB)?;
++            } else {
++                assert_eq!(permit.current_bytes().0, gc_bytes);
++                assert_eq!(permit.preparation_memory_cost().retained_bytes, gc_bytes);
++                assert!(store.data().ensure_memory_available().is_err());
++                assert_eq!(
++                    controller.state.lock().active[&permit.account.invocation_id]
++                        .shared_static_bytes,
++                    0
++                );
++            }
++            drop(store);
++            permit.finish(
++                if succeeds {
++                    TerminalMemoryOutcome::Success
++                } else {
++                    TerminalMemoryOutcome::MemoryLimit
++                },
++                false,
++            );
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn failed_initial_static_allocation_cannot_credit_surviving_gc_capacity() {
++        let controller = test_controller(policy()).unwrap();
++        let permit = controller
++            .try_admit(identity("static-credit-failure", "a", "read"), None)
++            .unwrap();
++        let mut limiter = permit.limiter(wasmtime::StoreLimitsBuilder::new().build());
++        limiter.prepare_initial_static_memory(48 * MIB, 32 * MIB);
++        assert!(limiter.gc_heap_growing(0, 48 * MIB, None).unwrap());
++        assert!(limiter.memory_growing(0, 48 * MIB, None).unwrap());
++        assert!(limiter
++            .memory_grow_failed(wasmtime::Error::msg("allocation failed"))
++            .is_err());
++        // The failed Store must retain its reservation until destruction,
++        // rather than moving the linear credit onto its surviving GC heap.
++        assert!(limiter.reconcile(0, 48 * MIB).is_err());
++        assert_eq!(permit.current_bytes().0, 96 * MIB);
++        assert_eq!(permit.preparation_memory_cost().retained_bytes, 64 * MIB);
++        assert!(limiter.gc_heap_growing(48 * MIB, 49 * MIB, None).is_err());
 +        assert!(limiter.memory_growing(0, 48 * MIB, None).is_err());
 +        permit.finish(TerminalMemoryOutcome::MemoryLimit, false);
 +    }
@@ -130740,7 +130845,7 @@ index 0000000000000000000000000000000000000000..b3367a090c93b1624dce3131f06233cd
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..78370631b2764833bc756fed8fe87e9d659e05bd
+index 0000000000000000000000000000000000000000..0c332575c09bcbb82f7b51db524688ddaab5b2a8
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle.rs
 @@ -0,0 +1,3671 @@
@@ -132140,9 +132245,9 @@ index 0000000000000000000000000000000000000000..78370631b2764833bc756fed8fe87e9d
 +                .ok_or_else(|| host_invariant_error())?
 +                .mark_execution_started(false);
 +            // The evidence belongs to this exact retained Module, not an
-+            // artifact name or generation. Only its first allocation can
-+            // consume the credit: a preceding dependency may allocate a GC
-+            // heap even if it defines no linear memory.
++            // artifact name or generation. Only its first linear allocation
++            // can consume the credit. Wasmtime may allocate its internal GC
++            // heap first; the limiter keeps that capacity fully charged.
 +            let memory_owner_is_first = routed.graph.as_ref().is_none_or(|graph| {
 +                graph.dependencies.first().is_some_and(|dependency| {
 +                    Module::same(&dependency.module.module, memory_module)
