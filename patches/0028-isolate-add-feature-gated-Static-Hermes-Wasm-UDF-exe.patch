@@ -326,6 +326,19 @@ as a recoverable memory error rather than panicking through a mutable slice.
 Document the exclusive-Store pointer lifetimes and bounded-write contract.
 Exercise real initialized-image mappings, invalid arguments, empty output,
 page-crossing transfers and all-or-nothing denial with a writable prefix.
+
+Use the collecting host-reference heap and maintenance protocol v3 to keep
+prepared storage separate from request allocation. Run nursery-first pressure
+collection within the original invocation budget, release collector-owned free
+payload and empty nursery tails, and trim settled weak-slot capacity.
+
+Keep maintenance outside pool and admission locks while retaining request
+resources for finalizers. Preserve partial-release accounting and the older
+maintenance protocols; unchanged writable exposure must not starve collection.
+
+Validation: focused maintenance, mapping and reserve checks; maintained
+collector lifetime fixture with actual page discard; complete backend image
+build. Production memory and sustained runtime acceptance remain separate.
 ---
  .github/workflows/build_local_backend.yml     |     7 +-
  Cargo.lock                                    | 15589 +++++++-----
@@ -425,12 +438,12 @@ page-crossing transfers and all-or-nothing denial with a writable prefix.
  .../crypto_subtle_digest_tests.rs             |   762 +
  .../generic_query_application_tests.rs        |   389 +
  .../graph_runtime.rs                          |   763 +
- .../guest_memory_maintenance.rs               |   471 +
+ .../guest_memory_maintenance.rs               |  1064 +
  .../host_imports.rs                           |  1625 ++
  .../host_memory_write_tests.rs                |   241 +
  .../static_hermes_wasmtime_gate/host_state.rs |  1591 ++
  .../immutable_static.rs                       |   480 +
- .../initialized_memory.rs                     |  1182 +
+ .../initialized_memory.rs                     |  1212 +
  .../initialized_state.rs                      |  1262 +
  .../invocation_timestamp_tests.rs             |   299 +
  .../module_contract.rs                        |  1443 ++
@@ -441,7 +454,7 @@ page-crossing transfers and all-or-nothing denial with a writable prefix.
  .../query_operations.rs                       |   281 +
  .../query_operations_tests.rs                 |  1354 +
  .../randomness_tests.rs                       |   543 +
- .../routed_module_cache.rs                    |  2614 ++
+ .../routed_module_cache.rs                    |  2618 ++
  .../routing_runtime.rs                        |  7233 ++++++
  .../routing_runtime/preparation.rs            |  2087 ++
  .../runtime_acceptance_tests.rs               | 12594 +++++++++
@@ -449,8 +462,8 @@ page-crossing transfers and all-or-nothing denial with a writable prefix.
  .../runtime_trap_disposal_tests.rs            |   213 +
  .../runtime_hotpath_benchmark.rs              |   255 +
  .../runtime_lifecycle.rs                      |  3671 +++
- .../runtime_lifecycle/prepared_image.rs       |   488 +
- .../runtime_lifecycle/reclamation.rs          |   110 +
+ .../runtime_lifecycle/prepared_image.rs       |   492 +
+ .../runtime_lifecycle/reclamation.rs          |   125 +
  .../source_keyed_deployment_catalog.rs        |   143 +
  .../test_support.rs                           |   570 +
  .../test_support/fixtures.rs                  |  2863 +++
@@ -558,8 +571,8 @@ page-crossing transfers and all-or-nothing denial with a writable prefix.
  crates/wasm_runtime/src/lib.rs                |     5 +
  crates/wasm_runtime/src/udf.rs                |   441 +
  .../Cargo.toml                                |    21 +
- .../wasmtime_deserialize_regression/build.rs  |    49 +
- .../src/lib.rs                                |    82 +
+ .../wasmtime_deserialize_regression/build.rs  |    55 +
+ .../src/lib.rs                                |    94 +
  .../convex/src/server/impl/syscall.test.ts    |    61 +
  .../convex/src/server/impl/syscall.ts         |    13 +-
  npm-packages/convex/src/server/index.ts       |     6 +
@@ -579,7 +592,7 @@ page-crossing transfers and all-or-nothing denial with a writable prefix.
  .../deployment_operations.md                  |   113 +-
  patches/static_hermes_wasm_udfs/README.md     |   424 +
  .../compiler_and_artifact_contract.md         |   349 +
- patches/static_hermes_wasm_udfs/operations.md |  1227 +
+ patches/static_hermes_wasm_udfs/operations.md |  1257 +
  patches/static_hermes_wasm_udfs/value_abi.md  |   444 +
  scripts/run_cargo.sh                          |    96 +-
  scripts/run_cargo.test.mjs                    |   194 +
@@ -588,7 +601,7 @@ page-crossing transfers and all-or-nothing denial with a writable prefix.
  .../docker-build/Dockerfile.backend.test.mjs  |   250 +
  self-hosted/docker-build/README.md            |    84 +
  self-hosted/docker-build/run_backend.sh       |     3 +-
- 261 files changed, 172591 insertions(+), 8005 deletions(-)
+ 261 files changed, 173285 insertions(+), 8005 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/query_shadow.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
  create mode 100644 crates/application/src/bin/source_package_preactivation_authority.rs
@@ -55342,7 +55355,7 @@ index a872cc4c754385517e5f777836d4a07a50a330a0..aa6dbfebd75f6dbc944f6cce572bc517
  
  impl Default for IntervalMap {
 diff --git a/crates/isolate/Cargo.toml b/crates/isolate/Cargo.toml
-index 63806ffb741e457cbf383d01ce6511d32b7a433c..1be07cc3e2bd1b96a8b09ddae7cfbbf7a79cbe40 100644
+index 63806ffb741e457cbf383d01ce6511d32b7a433c..7d22f6ae825f1806d150890204ea541aafcd7551 100644
 --- a/crates/isolate/Cargo.toml
 +++ b/crates/isolate/Cargo.toml
 @@ -29,6 +29,9 @@ ignored = [
@@ -55420,7 +55433,7 @@ index 63806ffb741e457cbf383d01ce6511d32b7a433c..1be07cc3e2bd1b96a8b09ddae7cfbbf7
 +wasm-encoder = { workspace = true, optional = true }
 +# Keep the generated-runtime gate on its pinned engine while wasm_runtime
 +# remains on the workspace Wasmtime/wasmtime-wasi pair.
-+wasmtime = { git = "https://github.com/convex-in-prod/wasmtime", rev = "e7f307dadc8e2a8de3b4d09837985e07382f7305", default-features = false, features = ["anyhow", "async", "runtime", "std", "gc-null", "call-hook"], optional = true }
++wasmtime = { git = "https://github.com/convex-in-prod/wasmtime", rev = "e7f307dadc8e2a8de3b4d09837985e07382f7305", default-features = false, features = ["anyhow", "async", "runtime", "std", "gc-drc", "call-hook"], optional = true }
 +wasmparser = { version = "=0.259.0", optional = true }
  webcrypto = { workspace = true }
  
@@ -55432,7 +55445,7 @@ index 63806ffb741e457cbf383d01ce6511d32b7a433c..1be07cc3e2bd1b96a8b09ddae7cfbbf7
 +wasm-encoder = { workspace = true }
 +# Runtime builds consume authenticated precompiled modules. Tests retain a
 +# compiler and text parser for constructing exact fixture artifacts.
-+wasmtime = { git = "https://github.com/convex-in-prod/wasmtime", rev = "e7f307dadc8e2a8de3b4d09837985e07382f7305", default-features = false, features = ["anyhow", "async", "runtime", "std", "gc-null", "cranelift", "wat"] }
++wasmtime = { git = "https://github.com/convex-in-prod/wasmtime", rev = "e7f307dadc8e2a8de3b4d09837985e07382f7305", default-features = false, features = ["anyhow", "async", "runtime", "std", "gc-drc", "cranelift", "wat"] }
  
  [[bench]]
  name = "new_context"
@@ -88422,10 +88435,10 @@ index 0000000000000000000000000000000000000000..b70d1ff4de524229650a02c45cf65dfb
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/guest_memory_maintenance.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/guest_memory_maintenance.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e664409270
+index 0000000000000000000000000000000000000000..0ff8c2a3adb861b3d0b05d5ef78d5a6b8d50b740
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/guest_memory_maintenance.rs
-@@ -0,0 +1,471 @@
+@@ -0,0 +1,1064 @@
 +use std::ops::Range;
 +
 +use anyhow::Context as _;
@@ -88436,6 +88449,8 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +    TypedFunc,
 +};
 +
++#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++use super::initialized_memory::ReclaimMode;
 +use super::wasmtime_anyhow;
 +
 +const EXPORT: &str = "convex_wasm_udf_memory_maintenance";
@@ -88449,6 +88464,10 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +    PrepareImage,
 +    FreeAllocatorPayload { page_size: u32 },
 +    ReclaimYoung,
++    FreeDynamicPayload { page_size: u32 },
++    EmptyYoungPayload,
++    CollectForPressure { occupied_bytes: u32 },
++    TrimWeakSlots,
 +}
 +
 +impl MaintenanceOperation {
@@ -88457,16 +88476,31 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +            Self::PrepareImage => (0, 0),
 +            Self::FreeAllocatorPayload { page_size } => (1, page_size as i32),
 +            Self::ReclaimYoung => (2, 0),
++            Self::FreeDynamicPayload { page_size } => (3, page_size as i32),
++            Self::EmptyYoungPayload => (4, 0),
++            Self::CollectForPressure { occupied_bytes } => (5, occupied_bytes as i32),
++            Self::TrimWeakSlots => (6, 0),
 +        }
 +    }
 +}
 +
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) enum PressureCollection {
++    Unnecessary,
++    Young,
++    Full,
++}
++
 +#[derive(Debug)]
-+pub(super) enum ReclaimedPayload {
++pub(super) enum MaintenanceResult {
 +    Complete(Vec<Range<usize>>),
 +    Partial(Vec<Range<usize>>),
 +    Deferred,
 +    Unsupported,
++    // Collection reports progress, never payload authority. The caller must
++    // export fresh ranges after any operation that can run finalizers.
++    Collection(PressureCollection),
++    WeakSlotsTrimmed,
 +}
 +
 +/// Optional guest support, discovered from the authenticated base instance.
@@ -88474,17 +88508,21 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +/// Store access and avoid allocation/collection until discard is complete.
 +pub(super) struct GuestMemoryMaintenance {
 +    call: TypedFunc<(i32, i32), i32>,
++    pub(super) version: Option<u32>,
 +}
 +
 +#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 +pub(super) enum ReclamationOutcome {
 +    Retained {
 +        reclaimed_bytes: usize,
-+        young_collected: bool,
++        collection: PressureCollection,
 +    },
 +    Deferred,
 +    Unsupported,
-+    InsufficientPayload,
++    InsufficientPayload {
++        reclaimed_bytes: usize,
++        collection: PressureCollection,
++    },
 +}
 +
 +impl GuestMemoryMaintenance {
@@ -88501,23 +88539,37 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +        let call = function
 +            .typed::<(i32, i32), i32>(&*store)
 +            .map_err(wasmtime_anyhow)?;
-+        Ok(Some(Self { call }))
++        Ok(Some(Self {
++            call,
++            version: None,
++        }))
 +    }
 +
 +    /// Uses the caller's existing fuel/deadline and memory admission. The
 +    /// caller must poison/dispose the Store on any error, including
 +    /// malformed output.
 +    pub(super) async fn run<T: Send>(
-+        &self,
++        &mut self,
 +        store: &mut Store<T>,
 +        memory: Memory,
 +        operation: MaintenanceOperation,
-+    ) -> anyhow::Result<ReclaimedPayload> {
-+        if let MaintenanceOperation::FreeAllocatorPayload { page_size } = operation {
++    ) -> anyhow::Result<MaintenanceResult> {
++        if let MaintenanceOperation::FreeAllocatorPayload { page_size }
++        | MaintenanceOperation::FreeDynamicPayload { page_size } = operation
++        {
 +            anyhow::ensure!(
 +                (4096..=65536).contains(&page_size) && page_size.is_power_of_two(),
 +                "unsupported guest reclamation page size"
 +            );
++        }
++        if operation.arguments().0 > 2 {
++            anyhow::ensure!(
++                self.version == Some(3),
++                "guest does not support lifetime maintenance"
++            );
++        }
++        if let MaintenanceOperation::CollectForPressure { occupied_bytes } = operation {
++            anyhow::ensure!(occupied_bytes > 0, "invalid collection pressure threshold");
 +        }
 +        let pointer = self
 +            .call
@@ -88530,7 +88582,218 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +        memory
 +            .read(&*store, pointer, &mut record)
 +            .context("guest memory maintenance result lies outside memory")?;
-+        decode_result(&record, operation, memory.data_size(&*store))
++        let result = decode_result(&record, operation, memory.data_size(&*store))?;
++        let version = u32::from_le_bytes(record[..4].try_into().unwrap());
++        anyhow::ensure!(
++            self.version.is_none_or(|known| known == version),
++            "guest memory maintenance version changed"
++        );
++        self.version = Some(version);
++        Ok(result)
++    }
++
++    /// Maintain allocation lifetimes at a successful, admitted reuse boundary.
++    /// `required_target` is aggregate pressure; the lower release target below
++    /// is an amortized reuse policy, not an active-memory cap or admission
++    /// credit. The caller owns this exact Store/recorder exclusively with
++    /// both write hooks installed, live finalizer resources and the
++    /// existing call budget.
++    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++    pub(super) async unsafe fn reclaim_for_reuse<T: Send>(
++        &mut self,
++        store: &mut Store<T>,
++        memory: Memory,
++        pages: &super::initialized_memory::PrivatePages,
++        required_target: Option<usize>,
++    ) -> anyhow::Result<ReclamationOutcome> {
++        // Restored Stores have not called preparation themselves. Discover the
++        // authenticated guest's protocol with an operation old guests support;
++        // never probe an unknown operation and recover from its trap.
++        if self.version.is_none() {
++            self.run(
++                store,
++                memory,
++                MaintenanceOperation::FreeAllocatorPayload { page_size: 4096 },
++            )
++            .await?;
++        }
++        if self.version != Some(3) {
++            return match required_target {
++                Some(target) => unsafe {
++                    self.reclaim_legacy_for_reuse(store, memory, pages, target)
++                        .await
++                },
++                None => Ok(ReclamationOutcome::Retained {
++                    reclaimed_bytes: 0,
++                    collection: PressureCollection::Unnecessary,
++                }),
++            };
++        }
++
++        const COLLECTION_BYTES: u32 = 2 * 1024 * 1024;
++        const RELEASE_HIGH: usize = 27 * 1024 * 1024 / 4;
++        const RELEASE_TARGET: usize = 25 * 1024 * 1024 / 4;
++        anyhow::ensure!(
++            !pages.observation().poisoned,
++            "cannot maintain a poisoned initialized instance"
++        );
++        // The common path is a constant-time occupied-byte check in the guest.
++        // Collection is driven by allocation pressure, not by request count.
++        let MaintenanceResult::Collection(mut collection) = self
++            .run(
++                store,
++                memory,
++                MaintenanceOperation::CollectForPressure {
++                    occupied_bytes: COLLECTION_BYTES,
++                },
++            )
++            .await?
++        else {
++            anyhow::bail!("pressure collection returned payload authority");
++        };
++        let exposure = pages.observation().exposed_bytes;
++        // Collection can free payload inside unchanged high-water backing.
++        // Require allocation-pressure progress, not increased exposure, before
++        // retrying release after changing request demand.
++        if required_target.is_none()
++            && (collection == PressureCollection::Unnecessary || exposure <= RELEASE_HIGH)
++        {
++            return Ok(ReclamationOutcome::Retained {
++                reclaimed_bytes: 0,
++                collection,
++            });
++        }
++        let target = required_target.map_or(RELEASE_TARGET, |target| target.min(RELEASE_TARGET));
++        let mut ranges = self
++            .free_lifetime_payload(store, memory, collection)
++            .await?;
++        if let Some(reclaimed_bytes) =
++            unsafe { pages.reclaim(&ranges, target, ReclaimMode::RequireTarget)? }
++        {
++            return Ok(ReclamationOutcome::Retained {
++                reclaimed_bytes,
++                collection,
++            });
++        }
++        if collection != PressureCollection::Full {
++            // A failed release can mean uncollected dynamic garbage. Make at
++            // most one lower-threshold attempt; no retry loop can postpone GC
++            // progress or replenish this invocation's fuel/deadline.
++            let MaintenanceResult::Collection(second) = self
++                .run(
++                    store,
++                    memory,
++                    MaintenanceOperation::CollectForPressure {
++                        occupied_bytes: 512 * 1024,
++                    },
++                )
++                .await?
++            else {
++                anyhow::bail!("pressure collection returned payload authority");
++            };
++            if second != PressureCollection::Unnecessary {
++                collection = second;
++                // All previous ranges expired during collection/finalization.
++                ranges = self
++                    .free_lifetime_payload(store, memory, collection)
++                    .await?;
++            }
++        }
++        let reclaimed_bytes =
++            unsafe { pages.reclaim(&ranges, target, ReclaimMode::AvailablePayload)? }
++                .context("partial reclamation did not report released bytes")?;
++        if required_target.is_some_and(|target| pages.observation().exposed_bytes > target) {
++            return Ok(ReclamationOutcome::InsufficientPayload {
++                reclaimed_bytes,
++                collection,
++            });
++        }
++        // A live floor need not cause disposal under the proactive policy.
++        // Ordinary ready-pool admission still charges all retained backing.
++        Ok(ReclamationOutcome::Retained {
++            reclaimed_bytes,
++            collection,
++        })
++    }
++
++    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++    async fn free_lifetime_payload<T: Send>(
++        &mut self,
++        store: &mut Store<T>,
++        memory: Memory,
++        collection: PressureCollection,
++    ) -> anyhow::Result<Vec<Range<usize>>> {
++        if collection == PressureCollection::Full {
++            match self
++                .run(store, memory, MaintenanceOperation::TrimWeakSlots)
++                .await?
++            {
++                MaintenanceResult::WeakSlotsTrimmed | MaintenanceResult::Deferred => {},
++                MaintenanceResult::Unsupported => {
++                    anyhow::bail!("prepared guest lacks weak-slot maintenance")
++                },
++                MaintenanceResult::Complete(_)
++                | MaintenanceResult::Partial(_)
++                | MaintenanceResult::Collection(_) => {
++                    anyhow::bail!("invalid weak-slot maintenance result")
++                },
++            }
++        }
++        let mut ranges = Vec::new();
++        // These exports do not allocate or advance collection. Their authorities
++        // can coexist; trimming weak slots or running any collection cannot be
++        // inserted between them and the host's discard.
++        for operation in [
++            MaintenanceOperation::FreeAllocatorPayload { page_size: 4096 },
++            MaintenanceOperation::FreeDynamicPayload { page_size: 4096 },
++        ] {
++            match self.run(store, memory, operation).await? {
++                MaintenanceResult::Complete(payload) | MaintenanceResult::Partial(payload) => {
++                    ranges.extend(payload)
++                },
++                MaintenanceResult::Deferred | MaintenanceResult::Unsupported => {},
++                MaintenanceResult::Collection(_) | MaintenanceResult::WeakSlotsTrimmed => {
++                    anyhow::bail!("free-payload export returned collection progress")
++                },
++            }
++        }
++        let nursery = match self
++            .run(store, memory, MaintenanceOperation::EmptyYoungPayload)
++            .await?
++        {
++            MaintenanceResult::Complete(mut payload) => Some(payload.remove(0)),
++            MaintenanceResult::Deferred | MaintenanceResult::Unsupported => None,
++            MaintenanceResult::Partial(_)
++            | MaintenanceResult::Collection(_)
++            | MaintenanceResult::WeakSlotsTrimmed => anyhow::bail!("invalid empty-nursery result"),
++        };
++        // Validate complete ownership before retaining a nursery prefix. An
++        // overlap inside that prefix is still contradictory guest evidence.
++        if let Some(young) = &nursery {
++            anyhow::ensure!(
++                ranges
++                    .iter()
++                    .all(|range| range.end <= young.start || young.end <= range.start),
++                "free payload overlaps the nursery"
++            );
++        }
++        if let Some(mut young) = nursery {
++            // Keep reusable nursery backing; only the tail of an already empty
++            // nursery is disposable. This grants no authority over live cells.
++            young.start = young
++                .start
++                .saturating_add(5 * 1024 * 1024 / 2)
++                .min(young.end);
++            if young.start < young.end {
++                ranges.push(young);
++            }
++        }
++        ranges.sort_unstable_by_key(|range| range.start);
++        anyhow::ensure!(
++            ranges.windows(2).all(|pair| pair[0].end <= pair[1].start),
++            "allocator and collector free payload overlap"
++        );
++        Ok(ranges)
 +    }
 +
 +    /// Reclaim only at a successful, admitted reuse boundary. The lifecycle
@@ -88541,8 +88804,8 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +    /// The caller must prove that `pages` records this `memory` in this Store,
 +    /// with both write hooks installed and no outstanding guest-memory borrows.
 +    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-+    pub(super) async unsafe fn reclaim_for_reuse<T: Send>(
-+        &self,
++    async unsafe fn reclaim_legacy_for_reuse<T: Send>(
++        &mut self,
 +        store: &mut Store<T>,
 +        memory: Memory,
 +        pages: &super::initialized_memory::PrivatePages,
@@ -88556,39 +88819,51 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +        if before.exposed_bytes <= retain_bytes {
 +            return Ok(ReclamationOutcome::Retained {
 +                reclaimed_bytes: 0,
-+                young_collected: false,
++                collection: PressureCollection::Unnecessary,
 +            });
 +        }
 +        let operation = MaintenanceOperation::FreeAllocatorPayload { page_size: 4096 };
 +        let native = self.run(store, memory, operation).await?;
 +        let ranges = match native {
-+            ReclaimedPayload::Complete(ranges) | ReclaimedPayload::Partial(ranges) => ranges,
-+            ReclaimedPayload::Deferred | ReclaimedPayload::Unsupported => {
++            MaintenanceResult::Complete(ranges) | MaintenanceResult::Partial(ranges) => ranges,
++            MaintenanceResult::Deferred
++            | MaintenanceResult::Unsupported
++            | MaintenanceResult::Collection(_)
++            | MaintenanceResult::WeakSlotsTrimmed => {
 +                anyhow::bail!("allocator enumeration returned a collection status");
 +            },
 +        };
 +        // No guest call occurs between enumeration and discard. Partial
 +        // enumeration grants authority for exactly the returned ranges.
-+        if let Some(reclaimed_bytes) = unsafe { pages.reclaim(&ranges, retain_bytes)? } {
++        if let Some(reclaimed_bytes) =
++            unsafe { pages.reclaim(&ranges, retain_bytes, ReclaimMode::RequireTarget)? }
++        {
 +            return Ok(ReclamationOutcome::Retained {
 +                reclaimed_bytes,
-+                young_collected: false,
++                collection: PressureCollection::Unnecessary,
 +            });
 +        }
 +        let nursery = match self
 +            .run(store, memory, MaintenanceOperation::ReclaimYoung)
 +            .await?
 +        {
-+            ReclaimedPayload::Complete(ranges) => ranges,
-+            ReclaimedPayload::Deferred => return Ok(ReclamationOutcome::Deferred),
-+            ReclaimedPayload::Unsupported => return Ok(ReclamationOutcome::Unsupported),
-+            ReclaimedPayload::Partial(_) => anyhow::bail!("partial nursery reclamation"),
++            MaintenanceResult::Complete(ranges) => ranges,
++            MaintenanceResult::Deferred => return Ok(ReclamationOutcome::Deferred),
++            MaintenanceResult::Unsupported => return Ok(ReclamationOutcome::Unsupported),
++            MaintenanceResult::Partial(_)
++            | MaintenanceResult::Collection(_)
++            | MaintenanceResult::WeakSlotsTrimmed => {
++                anyhow::bail!("invalid nursery reclamation result")
++            },
 +        };
 +        // Collection/finalizers invalidate the earlier native ranges. This
 +        // allocation-free probe does not invalidate the newly emptied nursery.
 +        let mut ranges = match self.run(store, memory, operation).await? {
-+            ReclaimedPayload::Complete(ranges) | ReclaimedPayload::Partial(ranges) => ranges,
-+            ReclaimedPayload::Deferred | ReclaimedPayload::Unsupported => {
++            MaintenanceResult::Complete(ranges) | MaintenanceResult::Partial(ranges) => ranges,
++            MaintenanceResult::Deferred
++            | MaintenanceResult::Unsupported
++            | MaintenanceResult::Collection(_)
++            | MaintenanceResult::WeakSlotsTrimmed => {
 +                anyhow::bail!("allocator enumeration returned a collection status");
 +            },
 +        };
@@ -88601,10 +88876,12 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +                .all(|young| { native.end <= young.start || young.end <= native.start })),
 +            "allocator reclamation overlaps the nursery"
 +        );
-+        if let Some(reclaimed_bytes) = unsafe { pages.reclaim(&ranges, retain_bytes)? } {
++        if let Some(reclaimed_bytes) =
++            unsafe { pages.reclaim(&ranges, retain_bytes, ReclaimMode::RequireTarget)? }
++        {
 +            return Ok(ReclamationOutcome::Retained {
 +                reclaimed_bytes,
-+                young_collected: true,
++                collection: PressureCollection::Young,
 +            });
 +        }
 +        // Native-free payload and the allocated nursery must be disjoint. Their
@@ -88612,12 +88889,15 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +        // The recorder excludes partial boundary pages and touches no heap data.
 +        ranges.extend(nursery);
 +        ranges.sort_unstable_by_key(|range| range.start);
-+        match unsafe { pages.reclaim(&ranges, retain_bytes)? } {
++        match unsafe { pages.reclaim(&ranges, retain_bytes, ReclaimMode::RequireTarget)? } {
 +            Some(reclaimed_bytes) => Ok(ReclamationOutcome::Retained {
 +                reclaimed_bytes,
-+                young_collected: true,
++                collection: PressureCollection::Young,
 +            }),
-+            None => Ok(ReclamationOutcome::InsufficientPayload),
++            None => Ok(ReclamationOutcome::InsufficientPayload {
++                reclaimed_bytes: 0,
++                collection: PressureCollection::Young,
++            }),
 +        }
 +    }
 +}
@@ -88626,16 +88906,20 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +    record: &[u8; RECORD_BYTES],
 +    operation: MaintenanceOperation,
 +    memory_bytes: usize,
-+) -> anyhow::Result<ReclaimedPayload> {
++) -> anyhow::Result<MaintenanceResult> {
 +    let word = |offset: usize| u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
 +    let version = word(0);
 +    anyhow::ensure!(
-+        matches!(version, 1 | 2) && word(4) as usize == RECORD_BYTES,
++        matches!(version, 1..=3) && word(4) as usize == RECORD_BYTES,
 +        "unsupported guest memory maintenance result layout"
 +    );
 +    anyhow::ensure!(
 +        word(8) == operation.arguments().0 as u32,
 +        "guest memory maintenance result has a different operation"
++    );
++    anyhow::ensure!(
++        operation.arguments().0 <= 2 || version == 3,
++        "lifetime maintenance requires version 3"
 +    );
 +    let status = word(12);
 +    let count = word(16) as usize;
@@ -88652,7 +88936,7 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +                "allocator ranges exceed visited blocks"
 +            );
 +        },
-+        MaintenanceOperation::PrepareImage if version == 2 => {
++        MaintenanceOperation::PrepareImage if version >= 2 => {
 +            // Image certification preserves the entire heap. It does not
 +            // authorize discarding nursery pages, which may still be live.
 +            anyhow::ensure!(
@@ -88660,7 +88944,45 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +                "invalid image preparation result"
 +            );
 +        },
-+        MaintenanceOperation::PrepareImage | MaintenanceOperation::ReclaimYoung => {
++        MaintenanceOperation::FreeDynamicPayload { .. } => {
++            anyhow::ensure!(
++                status <= 3 && count <= visited as usize,
++                "invalid dynamic free-payload result"
++            );
++            if status >= 2 {
++                anyhow::ensure!(
++                    count == 0 && visited == 0,
++                    "deferred dynamic payload grants authority"
++                );
++            }
++        },
++        MaintenanceOperation::CollectForPressure { .. } => {
++            anyhow::ensure!(
++                count == 0 && visited == 0,
++                "pressure collection grants payload authority"
++            );
++            return Ok(MaintenanceResult::Collection(match status {
++                0 => PressureCollection::Unnecessary,
++                4 => PressureCollection::Young,
++                5 => PressureCollection::Full,
++                _ => anyhow::bail!("invalid pressure collection status"),
++            }));
++        },
++        MaintenanceOperation::TrimWeakSlots => {
++            anyhow::ensure!(
++                count == 0 && visited == 0,
++                "weak-slot maintenance grants payload authority"
++            );
++            return match status {
++                0 => Ok(MaintenanceResult::WeakSlotsTrimmed),
++                2 => Ok(MaintenanceResult::Deferred),
++                3 => Ok(MaintenanceResult::Unsupported),
++                _ => anyhow::bail!("invalid weak-slot maintenance status"),
++            };
++        },
++        MaintenanceOperation::PrepareImage
++        | MaintenanceOperation::ReclaimYoung
++        | MaintenanceOperation::EmptyYoungPayload => {
 +            anyhow::ensure!(visited == 0, "nursery result contains allocator visits");
 +            match status {
 +                0 => anyhow::ensure!(count == 1, "empty successful nursery result"),
@@ -88677,7 +88999,9 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +            start < end && end <= memory_bytes,
 +            "guest memory reclamation range lies outside memory"
 +        );
-+        if let MaintenanceOperation::FreeAllocatorPayload { page_size } = operation {
++        if let MaintenanceOperation::FreeAllocatorPayload { page_size }
++        | MaintenanceOperation::FreeDynamicPayload { page_size } = operation
++        {
 +            anyhow::ensure!(
 +                start % page_size as usize == 0 && end % page_size as usize == 0,
 +                "allocator reclamation range is not page aligned"
@@ -88694,10 +89018,10 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +        "guest memory reclamation ranges overlap"
 +    );
 +    match status {
-+        0 => Ok(ReclaimedPayload::Complete(ranges)),
-+        1 => Ok(ReclaimedPayload::Partial(ranges)),
-+        2 => Ok(ReclaimedPayload::Deferred),
-+        3 => Ok(ReclaimedPayload::Unsupported),
++        0 => Ok(MaintenanceResult::Complete(ranges)),
++        1 => Ok(MaintenanceResult::Partial(ranges)),
++        2 => Ok(MaintenanceResult::Deferred),
++        3 => Ok(MaintenanceResult::Unsupported),
 +        _ => unreachable!("validated maintenance status changed"),
 +    }
 +}
@@ -88733,7 +89057,7 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +    {
 +        let operation = MaintenanceOperation::FreeAllocatorPayload { page_size: 4096 };
 +        let record = record(operation, 1, 4, &[(12288, 16384), (4096, 8192)]);
-+        let ReclaimedPayload::Partial(ranges) = decode_result(&record, operation, 65536)? else {
++        let MaintenanceResult::Partial(ranges) = decode_result(&record, operation, 65536)? else {
 +            anyhow::bail!("partial allocator output lost its status");
 +        };
 +        assert_eq!(ranges, vec![4096..8192, 12288..16384]);
@@ -88765,7 +89089,7 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +        ] {
 +            assert!(matches!(
 +                decode_result(&record(operation, 2, 0, &[]), operation, 65536)?,
-+                ReclaimedPayload::Deferred
++                MaintenanceResult::Deferred
 +            ));
 +            assert!(
 +                decode_result(&record(operation, 2, 0, &[(4096, 8192)]), operation, 65536).is_err()
@@ -88779,19 +89103,201 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +    }
 +
 +    #[test]
++    fn lifetime_protocol_separates_collection_from_discard_authority() -> anyhow::Result<()> {
++        let pressure = MaintenanceOperation::CollectForPressure {
++            occupied_bytes: 1024,
++        };
++        for (status, expected) in [
++            (0, PressureCollection::Unnecessary),
++            (4, PressureCollection::Young),
++            (5, PressureCollection::Full),
++        ] {
++            let mut output = record(pressure, status, 0, &[]);
++            assert!(decode_result(&output, pressure, 65536).is_err());
++            output[..4].copy_from_slice(&3u32.to_le_bytes());
++            assert!(matches!(decode_result(&output, pressure, 65536)?,
++                MaintenanceResult::Collection(actual) if actual == expected));
++            output[16..20].copy_from_slice(&1u32.to_le_bytes());
++            assert!(decode_result(&output, pressure, 65536).is_err());
++        }
++        for operation in [
++            MaintenanceOperation::FreeDynamicPayload { page_size: 4096 },
++            MaintenanceOperation::TrimWeakSlots,
++        ] {
++            let mut output = record(operation, 2, 0, &[]);
++            output[..4].copy_from_slice(&3u32.to_le_bytes());
++            assert!(matches!(
++                decode_result(&output, operation, 65536)?,
++                MaintenanceResult::Deferred
++            ));
++            output[20..24].copy_from_slice(&1u32.to_le_bytes());
++            assert!(decode_result(&output, operation, 65536).is_err());
++        }
++        let operation = MaintenanceOperation::FreeDynamicPayload { page_size: 4096 };
++        let mut output = record(operation, 1, 2, &[(8192, 12288), (4096, 8192)]);
++        output[..4].copy_from_slice(&3u32.to_le_bytes());
++        assert!(matches!(decode_result(&output, operation, 65536)?,
++            MaintenanceResult::Partial(ranges) if ranges == vec![4096..8192, 8192..12288]));
++        output[24..28].copy_from_slice(&4096u32.to_le_bytes());
++        assert!(decode_result(&output, operation, 65536).is_err());
++        Ok(())
++    }
++
++    #[test]
++    fn result_statuses_are_scoped_to_their_version_and_operation() {
++        for version in 1u32..=3 {
++            for operation in [
++                MaintenanceOperation::PrepareImage,
++                MaintenanceOperation::FreeAllocatorPayload { page_size: 4096 },
++                MaintenanceOperation::ReclaimYoung,
++                MaintenanceOperation::FreeDynamicPayload { page_size: 4096 },
++                MaintenanceOperation::EmptyYoungPayload,
++                MaintenanceOperation::CollectForPressure {
++                    occupied_bytes: u32::MAX,
++                },
++                MaintenanceOperation::TrimWeakSlots,
++            ] {
++                for status in 0..=6 {
++                    let (valid, ranges, visited) = match operation {
++                        MaintenanceOperation::PrepareImage if version >= 2 => {
++                            (status == 0, &[][..], 0)
++                        },
++                        MaintenanceOperation::PrepareImage
++                        | MaintenanceOperation::ReclaimYoung
++                        | MaintenanceOperation::EmptyYoungPayload => (
++                            matches!(status, 0 | 2 | 3),
++                            if status == 0 {
++                                &[(4096, 8192)][..]
++                            } else {
++                                &[][..]
++                            },
++                            0,
++                        ),
++                        MaintenanceOperation::FreeAllocatorPayload { .. } => {
++                            (status <= 1, &[][..], MAX_VISITED)
++                        },
++                        MaintenanceOperation::FreeDynamicPayload { .. } => {
++                            (status <= 3, &[][..], 0)
++                        },
++                        MaintenanceOperation::CollectForPressure { .. } => {
++                            (matches!(status, 0 | 4 | 5), &[][..], 0)
++                        },
++                        MaintenanceOperation::TrimWeakSlots => {
++                            (matches!(status, 0 | 2 | 3), &[][..], 0)
++                        },
++                    };
++                    let mut output = record(operation, status, visited, ranges);
++                    output[..4].copy_from_slice(&version.to_le_bytes());
++                    // Unused slots must neither add authority nor reject an
++                    // otherwise valid partial record left by an earlier call.
++                    output[HEADER_BYTES + ranges.len() * 8..].fill(0xff);
++                    assert_eq!(
++                        decode_result(&output, operation, 65536).is_ok(),
++                        valid && (version == 3 || operation.arguments().0 <= 2),
++                        "version {version}, operation {operation:?}, status {status}",
++                    );
++                }
++            }
++        }
++    }
++
++    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++    #[test]
++    fn pressure_collection_reexports_free_payload_before_discard() -> anyhow::Result<()> {
++        use std::{
++            future::Future as _,
++            task::{
++                Context,
++                Poll,
++                Waker,
++            },
++        };
++
++        use super::super::initialized_memory::InitializedMemoryImage;
++        let mut config = wasmtime::Config::new();
++        config.memory_reservation(1u64 << 32);
++        let engine = wasmtime::Engine::new(&config).map_err(wasmtime_anyhow)?;
++        let module = wasmtime::Module::new(
++            &engine,
++            r#"
++            (module
++                (memory (export "memory") 1 1)
++                (global $phase (mut i32) (i32.const 0))
++                (func (export "convex_wasm_udf_memory_maintenance")
++                    (param $operation i32) (param i32) (result i32)
++                    (i32.store (i32.const 0) (i32.const 3))
++                    (i32.store (i32.const 4) (i32.const 1048))
++                    (i32.store (i32.const 8) (local.get $operation))
++                    (i32.store (i32.const 12) (i32.const 0))
++                    (i32.store (i32.const 16) (i32.const 0))
++                    (i32.store (i32.const 20) (i32.const 0))
++                    (if (i32.eq (local.get $operation) (i32.const 5)) (then
++                        (global.set $phase (i32.add (global.get $phase) (i32.const 1)))
++                        (i32.store (i32.const 12) (i32.add (global.get $phase) (i32.const 3)))))
++                    (if (i32.eq (local.get $operation) (i32.const 4)) (then
++                        (i32.store (i32.const 12) (i32.const 2))))
++                    (if (i32.eq (local.get $operation) (i32.const 3)) (then
++                        (i32.store (i32.const 16) (i32.const 1))
++                        (i32.store (i32.const 20) (i32.const 1))
++                        (i32.store (i32.const 24) (i32.mul (global.get $phase) (i32.const 4096)))
++                        (i32.store (i32.const 28) (i32.mul (global.get $phase) (i32.const 8192)))))
++                    (i32.const 0)))"#,
++        )
++        .map_err(wasmtime_anyhow)?;
++        let operation = async {
++            let mut store = Store::new(&engine, ());
++            let instance = Instance::new_async(&mut store, &module, &[])
++                .await
++                .map_err(wasmtime_anyhow)?;
++            let memory = instance.get_memory(&mut store, "memory").unwrap();
++            let mut maintenance =
++                GuestMemoryMaintenance::from_instance(&mut store, instance)?.unwrap();
++            let image = InitializedMemoryImage::capture(memory.data(&store))?;
++            let pages = unsafe { image.attach(&mut store, memory, 65536, 65536, None)? };
++            memory.write(&mut store, 0, &[7; 16384])?;
++            let result = unsafe {
++                maintenance
++                    .reclaim_for_reuse(&mut store, memory, &pages, Some(8192))
++                    .await?
++            };
++            assert!(matches!(
++                result,
++                ReclamationOutcome::Retained {
++                    reclaimed_bytes: 8192,
++                    collection: PressureCollection::Full
++                }
++            ));
++            assert_eq!(pages.observation().exposed_bytes, 8192);
++            // The second collection revoked the first free range. Reusing it
++            // would silently reset live bytes in this page to the image.
++            assert!(memory.data(&store)[4096..8192]
++                .iter()
++                .all(|&byte| byte == 7));
++            assert!(memory.data(&store)[8192..16384]
++                .iter()
++                .all(|&byte| byte == 0));
++            Ok(())
++        };
++        match std::pin::pin!(operation).poll(&mut Context::from_waker(Waker::noop())) {
++            Poll::Ready(result) => result,
++            Poll::Pending => anyhow::bail!("reclamation fixture unexpectedly suspended"),
++        }
++    }
++
++    #[test]
 +    fn image_preparation_v2_does_not_grant_nursery_discard_authority() -> anyhow::Result<()> {
 +        let operation = MaintenanceOperation::PrepareImage;
 +        let mut prepared = record(operation, 0, 0, &[]);
 +        prepared[..4].copy_from_slice(&2u32.to_le_bytes());
 +        assert!(matches!(
 +            decode_result(&prepared, operation, 65536)?,
-+            ReclaimedPayload::Complete(ranges) if ranges.is_empty()
++            MaintenanceResult::Complete(ranges) if ranges.is_empty()
 +        ));
 +        // Version 1 certifies only with an empty-nursery range; keep accepting
 +        // existing artifacts without interpreting Deferred as image authority.
 +        assert!(matches!(
 +            decode_result(&record(operation, 0, 0, &[(4096, 8192)]), operation, 65536)?,
-+            ReclaimedPayload::Complete(ranges) if ranges == vec![4096..8192]
++            MaintenanceResult::Complete(ranges) if ranges == vec![4096..8192]
 +        ));
 +        for (status, visits, ranges) in [
 +            (0, 0, &[(4096, 8192)][..]),
@@ -88807,6 +89313,102 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +        nursery[..4].copy_from_slice(&2u32.to_le_bytes());
 +        assert!(decode_result(&nursery, MaintenanceOperation::ReclaimYoung, 65536).is_err());
 +        Ok(())
++    }
++
++    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++    #[test]
++    fn collection_retries_release_without_new_private_exposure() -> anyhow::Result<()> {
++        use std::{
++            future::Future as _,
++            task::{
++                Context,
++                Poll,
++                Waker,
++            },
++        };
++
++        use super::super::initialized_memory::InitializedMemoryImage;
++
++        let mut config = wasmtime::Config::new();
++        config.memory_reservation(1u64 << 32);
++        let engine = wasmtime::Engine::new(&config).map_err(wasmtime_anyhow)?;
++        let module = wasmtime::Module::new(
++            &engine,
++            r#"
++            (module
++                (memory (export "memory") 128 128)
++                (global $collections (mut i32) (i32.const 0))
++                (func (export "convex_wasm_udf_memory_maintenance")
++                    (param $operation i32) (param i32) (result i32)
++                    (i32.store (i32.const 0) (i32.const 3))
++                    (i32.store (i32.const 4) (i32.const 1048))
++                    (i32.store (i32.const 8) (local.get $operation))
++                    (i32.store (i32.const 12) (i32.const 0))
++                    (i32.store (i32.const 16) (i32.const 0))
++                    (i32.store (i32.const 20) (i32.const 0))
++                    (if (i32.eq (local.get $operation) (i32.const 5)) (then
++                        (global.set $collections (i32.add (global.get $collections) (i32.const 1)))
++                        ;; The first call's lower-threshold attempt finds no work.
++                        (if (i32.ne (global.get $collections) (i32.const 2)) (then
++                            (i32.store (i32.const 12) (i32.const 4))))))
++                    (if (i32.eq (local.get $operation) (i32.const 4)) (then
++                        (i32.store (i32.const 12) (i32.const 2))))
++                    ;; A later collection frees storage inside the same backing.
++                    (if (i32.and
++                        (i32.eq (local.get $operation) (i32.const 3))
++                        (i32.ge_u (global.get $collections) (i32.const 3))) (then
++                        (i32.store (i32.const 16) (i32.const 1))
++                        (i32.store (i32.const 20) (i32.const 1))
++                        (i32.store (i32.const 24) (i32.const 1048576))
++                        (i32.store (i32.const 28) (i32.const 2097152))))
++                    (i32.const 0)))"#,
++        )
++        .map_err(wasmtime_anyhow)?;
++        let operation = async {
++            let mut store = Store::new(&engine, ());
++            let instance = Instance::new_async(&mut store, &module, &[])
++                .await
++                .map_err(wasmtime_anyhow)?;
++            let memory = instance.get_memory(&mut store, "memory").unwrap();
++            let mut maintenance =
++                GuestMemoryMaintenance::from_instance(&mut store, instance)?.unwrap();
++            let image = InitializedMemoryImage::capture(memory.data(&store))?;
++            let pages = unsafe {
++                image.attach(&mut store, memory, 8 * 1024 * 1024, 8 * 1024 * 1024, None)?
++            };
++            memory.write(&mut store, 0, &vec![7; 7 * 1024 * 1024])?;
++            let first = unsafe {
++                maintenance
++                    .reclaim_for_reuse(&mut store, memory, &pages, None)
++                    .await?
++            };
++            assert!(matches!(
++                first,
++                ReclamationOutcome::Retained {
++                    reclaimed_bytes: 0,
++                    ..
++                }
++            ));
++            assert_eq!(pages.observation().exposed_bytes, 7 * 1024 * 1024);
++            let second = unsafe {
++                maintenance
++                    .reclaim_for_reuse(&mut store, memory, &pages, None)
++                    .await?
++            };
++            assert!(matches!(
++                second,
++                ReclamationOutcome::Retained {
++                    reclaimed_bytes: 786432,
++                    collection: PressureCollection::Young,
++                }
++            ));
++            assert_eq!(pages.observation().exposed_bytes, 25 * 1024 * 1024 / 4);
++            Ok(())
++        };
++        match std::pin::pin!(operation).poll(&mut Context::from_waker(Waker::noop())) {
++            Poll::Ready(result) => result,
++            Poll::Pending => anyhow::bail!("release retry fixture unexpectedly suspended"),
++        }
 +    }
 +
 +    #[test]
@@ -88857,7 +89459,11 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +                .await
 +                .map_err(wasmtime_anyhow)?;
 +            let memory = instance.get_memory(&mut store, "memory").unwrap();
-+            let maintenance = GuestMemoryMaintenance::from_instance(&mut store, instance)?.unwrap();
++            let mut maintenance =
++                GuestMemoryMaintenance::from_instance(&mut store, instance)?.unwrap();
++            // Preparation already established the protocol for this fixture;
++            // keep its probe sequence focused on conflicting range authority.
++            maintenance.version = Some(1);
 +            let image = InitializedMemoryImage::capture(memory.data(&store))?;
 +            let pages = unsafe { image.attach(&mut store, memory, 65536, 65536, None)? };
 +            memory.write(
@@ -88875,7 +89481,7 @@ index 0000000000000000000000000000000000000000..7f73a4a2748eaa83e66cb0700ae9a1e6
 +            assert_eq!(before, 12288);
 +            let result = unsafe {
 +                maintenance
-+                    .reclaim_for_reuse(&mut store, memory, &pages, 4096)
++                    .reclaim_for_reuse(&mut store, memory, &pages, Some(4096))
 +                    .await
 +            };
 +            assert_eq!(
@@ -92860,10 +93466,10 @@ index 0000000000000000000000000000000000000000..1632b2932239e37fe44752229376ff26
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/initialized_memory.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/initialized_memory.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..9611f4a1a1923aa410f45a44ae35bd065264547b
+index 0000000000000000000000000000000000000000..22d8d999b89537d744999d91a782c5f9342098af
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/initialized_memory.rs
-@@ -0,0 +1,1182 @@
+@@ -0,0 +1,1212 @@
 +//! Initialized application images on stable Wasmtime mappings. This module
 +//! owns private-page exposure, not JavaScript reuse authority or Store
 +//! snapshots. Callers must separately reconstruct tables/globals and validate
@@ -92903,6 +93509,12 @@ index 0000000000000000000000000000000000000000..9611f4a1a1923aa410f45a44ae35bd06
 +
 +const PAGE_BYTES: usize = 4096;
 +const RESERVATION_BYTES: usize = 1usize << 32;
++
++#[derive(Clone, Copy, Eq, PartialEq)]
++pub(super) enum ReclaimMode {
++    RequireTarget,
++    AvailablePayload,
++}
 +
 +pub(super) struct InitializedMemoryImage {
 +    file: File,
@@ -93456,12 +94068,15 @@ index 0000000000000000000000000000000000000000..9611f4a1a1923aa410f45a44ae35bd06
 +    /// Ranges must describe current dead payload, excluding metadata, roots and
 +    /// native resources. The guest must not allocate or collect between
 +    /// producing them and this call. No guest call or borrowed memory slice may
-+    /// overlap reclamation. An insufficient set leaves the mapping unchanged;
-+    /// any error requires disposal.
++    /// overlap reclamation. RequireTarget leaves an insufficient set unchanged;
++    /// AvailablePayload releases what is proven free even when the target
++    /// cannot be reached. Neither mode grants credit before actual discard,
++    /// and any error requires disposal.
 +    pub(super) unsafe fn reclaim(
 +        &self,
 +        ranges: &[Range<usize>],
 +        retain_bytes: usize,
++        mode: ReclaimMode,
 +    ) -> anyhow::Result<Option<usize>> {
 +        anyhow::ensure!(
 +            !self.poisoned.load(Ordering::Acquire)
@@ -93483,15 +94098,19 @@ index 0000000000000000000000000000000000000000..9611f4a1a1923aa410f45a44ae35bd06
 +                .get(interval)
 +                .is_some_and(|range| range.start <= offset && offset + PAGE_BYTES <= range.end)
 +        };
-+        // Establish sufficient authority before changing any page. Work and
-+        // storage stay bounded by the existing recorder, with no scratch Vec.
-+        if (0..count)
++        // Count authority before changing pages. Partial release is useful under
++        // lifetime pressure even when live state prevents reaching the target.
++        // Work stays bounded by the recorder; this runs outside admission locks.
++        let available = (0..count)
 +            .filter(|&index| reclaimable(self.pages[index].load(Ordering::Relaxed)))
 +            .take(excess)
-+            .count()
-+            < excess
-+        {
++            .count();
++        if available < excess && mode == ReclaimMode::RequireTarget {
 +            return Ok(None);
++        }
++        let excess = available;
++        if excess == 0 {
++            return Ok(Some(0));
 +        }
 +        self.poisoned.store(true, Ordering::Release);
 +        let mut discarded = 0;
@@ -93935,13 +94554,27 @@ index 0000000000000000000000000000000000000000..9611f4a1a1923aa410f45a44ae35bd06
 +        memory.write(&mut store, 0, &vec![0x52; 3 * PAGE_BYTES])?;
 +        unsafe {
 +            // Neither boundary page belongs wholly to the returned payload.
-+            assert_eq!(pages.reclaim(&[1..3 * PAGE_BYTES - 1], PAGE_BYTES)?, None);
++            assert_eq!(
++                pages.reclaim(
++                    &[1..3 * PAGE_BYTES - 1],
++                    PAGE_BYTES,
++                    ReclaimMode::RequireTarget
++                )?,
++                None
++            );
 +            assert_eq!(pages.observation().exposed_bytes, 3 * PAGE_BYTES);
 +            assert_eq!(
-+                pages.reclaim(&[1..3 * PAGE_BYTES - 1], 2 * PAGE_BYTES)?,
++                pages.reclaim(
++                    &[1..3 * PAGE_BYTES - 1],
++                    PAGE_BYTES,
++                    ReclaimMode::AvailablePayload
++                )?,
 +                Some(PAGE_BYTES)
 +            );
 +        }
++        // Partial release preserves both live boundary pages even though that
++        // leaves exposure above the requested one-page target.
++        assert_eq!(pages.observation().exposed_bytes, 2 * PAGE_BYTES);
 +        assert_eq!(memory.data(&store)[0], 0x52);
 +        assert_eq!(memory.data(&store)[PAGE_BYTES], 0x31);
 +        assert_eq!(memory.data(&store)[2 * PAGE_BYTES], 0x52);
@@ -94002,6 +94635,7 @@ index 0000000000000000000000000000000000000000..9611f4a1a1923aa410f45a44ae35bd06
 +                pages.reclaim(
 +                    &[0..2 * PAGE_BYTES, 3 * PAGE_BYTES..4 * PAGE_BYTES],
 +                    2 * PAGE_BYTES,
++                    ReclaimMode::RequireTarget,
 +                )?,
 +                Some(2 * PAGE_BYTES)
 +            );
@@ -94041,7 +94675,9 @@ index 0000000000000000000000000000000000000000..9611f4a1a1923aa410f45a44ae35bd06
 +        unsafe {
 +            assert!(!pages.permit(memory.data_ptr(&store) as usize, 1));
 +            assert!(pages.begin_invocation(PAGE_BYTES).is_err());
-+            assert!(pages.reclaim(&[0..PAGE_BYTES], 0).is_err());
++            assert!(pages
++                .reclaim(&[0..PAGE_BYTES], 0, ReclaimMode::RequireTarget)
++                .is_err());
 +        }
 +        Ok(())
 +    }
@@ -106107,10 +106743,10 @@ index 0000000000000000000000000000000000000000..48cdb07325514624213a497a565c76b7
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routed_module_cache.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routed_module_cache.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..1f5eb977c44ccad9fc086d0a2a3935db15c43b3c
+index 0000000000000000000000000000000000000000..79fe42de8f9e97cd14be6f6f6678757bd1b3fa9c
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routed_module_cache.rs
-@@ -0,0 +1,2614 @@
+@@ -0,0 +1,2618 @@
 +use value::Size;
 +
 +use super::*;
@@ -107230,6 +107866,10 @@ index 0000000000000000000000000000000000000000..1f5eb977c44ccad9fc086d0a2a3935db
 +        .target(GENERATED_TARGET_TRIPLE)
 +        .map_err(wasmtime_anyhow)?;
 +    config
++        // Caught Wasm exceptions allocate Store-owned references outside linear
++        // memory. Reused Stores need a collecting heap even when guest GC is
++        // infrequent. Native AOT compatibility authenticates this choice.
++        .collector(wasmtime::Collector::DeferredReferenceCounting)
 +        .consume_fuel(true)
 +        // Keep wasm32 memory at one address throughout its lifetime. Shared
 +        // immutable pages must not become private copies on memory growth.
@@ -135859,10 +136499,10 @@ index 0000000000000000000000000000000000000000..0c332575c09bcbb82f7b51db524688dd
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle/prepared_image.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle/prepared_image.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..10e7e319ebd8b9012e54c85d1b99d4b13d88779f
+index 0000000000000000000000000000000000000000..5e78a09b0c62d823e8d4fa8050639e3e4201054c
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle/prepared_image.rs
-@@ -0,0 +1,488 @@
+@@ -0,0 +1,492 @@
 +//! Request-independent images owned by the existing preparation group. The
 +//! cache never contains a request-warmed Store, and no Store-owned reference
 +//! crosses the image boundary.
@@ -135873,7 +136513,7 @@ index 0000000000000000000000000000000000000000..10e7e319ebd8b9012e54c85d1b99d4b1
 +use crate::environment::udf::static_hermes_wasmtime_gate::{
 +    guest_memory_maintenance::{
 +        MaintenanceOperation,
-+        ReclaimedPayload,
++        MaintenanceResult,
 +    },
 +    initialized_memory::{
 +        ImageCaptureError,
@@ -136161,7 +136801,7 @@ index 0000000000000000000000000000000000000000..10e7e319ebd8b9012e54c85d1b99d4b1
 +        &mut self,
 +    ) -> anyhow::Result<Option<Arc<GeneratedPreparedImage>>> {
 +        let (Some(maintenance), Some(states), Some(read_set), Some(generation)) = (
-+            self.memory_maintenance.as_ref(),
++            self.memory_maintenance.as_mut(),
 +            self.initialized_state.as_ref(),
 +            self.context_read_set.as_ref(),
 +            self.routed.generation.as_ref(),
@@ -136198,9 +136838,13 @@ index 0000000000000000000000000000000000000000..10e7e319ebd8b9012e54c85d1b99d4b1
 +            .await?;
 +        self.runtime_state = GeneratedRuntimeState::Live;
 +        match prepared {
-+            ReclaimedPayload::Complete(_) => {},
-+            ReclaimedPayload::Deferred | ReclaimedPayload::Unsupported => return Ok(None),
-+            ReclaimedPayload::Partial(_) => anyhow::bail!("partial initialized image preparation"),
++            MaintenanceResult::Complete(_) => {},
++            MaintenanceResult::Deferred | MaintenanceResult::Unsupported => return Ok(None),
++            MaintenanceResult::Partial(_)
++            | MaintenanceResult::Collection(_)
++            | MaintenanceResult::WeakSlotsTrimmed => {
++                anyhow::bail!("invalid initialized image preparation result")
++            },
 +        }
 +        // The authenticated layouts exclude reference globals, table mutation,
 +        // GC aggregates and reference-valued function interfaces. The registered
@@ -136353,12 +136997,15 @@ index 0000000000000000000000000000000000000000..10e7e319ebd8b9012e54c85d1b99d4b1
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle/reclamation.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle/reclamation.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..bec1542222217e42acde9238f38d23479f4f6eea
+index 0000000000000000000000000000000000000000..7266146115eaf711ab3afa44235b864d3fc69ca4
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_lifecycle/reclamation.rs
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,125 @@
 +use super::{
-+    super::guest_memory_maintenance::ReclamationOutcome,
++    super::guest_memory_maintenance::{
++        PressureCollection,
++        ReclamationOutcome,
++    },
 +    *,
 +};
 +use crate::environment::udf::generated_wasm_memory::InitializedRetention;
@@ -136396,9 +137043,16 @@ index 0000000000000000000000000000000000000000..bec1542222217e42acde9238f38d2347
 +            .map_err(WasmtimeError::from_anyhow)?
 +            .initialized_retention();
 +        let target = match decision {
-+            InitializedRetention::Retain => return Ok(true),
++            InitializedRetention::Retain => {
++                if self.memory_maintenance.as_ref().is_some_and(|maintenance| {
++                    maintenance.version.is_some_and(|version| version < 3)
++                }) {
++                    return Ok(true);
++                }
++                None
++            },
 +            InitializedRetention::Dispose => return Ok(false),
-+            InitializedRetention::Reclaim { target_bytes } => target_bytes,
++            InitializedRetention::Reclaim { target_bytes } => Some(target_bytes),
 +        };
 +        let initialized = self.initialized_memory.as_ref().unwrap();
 +        let pages = initialized
@@ -136408,7 +137062,7 @@ index 0000000000000000000000000000000000000000..bec1542222217e42acde9238f38d2347
 +            .map_err(WasmtimeError::from_anyhow)?;
 +        let maintenance = self
 +            .memory_maintenance
-+            .as_ref()
++            .as_mut()
 +            .context("initialized image lost guest memory maintenance")
 +            .map_err(WasmtimeError::from_anyhow)?;
 +        let _timer = GatePhaseTimer::new("initialized_memory_reclamation");
@@ -136425,46 +137079,51 @@ index 0000000000000000000000000000000000000000..bec1542222217e42acde9238f38d2347
 +        let reconciliation = self.reconcile_memory();
 +        // Reconciliation still samples exposure after a trap. Preserve the
 +        // original typed fuel/interrupt/memory failure if both operations fail.
-+        if result.is_ok() {
-+            reconciliation.map_err(WasmtimeError::from_anyhow)?;
-+        }
-+        match result {
++        let (reclaimed_bytes, collection, reusable) = match result {
 +            Ok(ReclamationOutcome::Retained {
 +                reclaimed_bytes,
-+                young_collected,
++                collection,
++            }) => (reclaimed_bytes, collection, true),
++            Ok(ReclamationOutcome::InsufficientPayload {
++                reclaimed_bytes,
++                collection,
 +            }) => {
-+                log_counter_with_labels(
-+                    &GENERATED_WASM_RECLAIMED_PRIVATE_BYTES_TOTAL,
-+                    reclaimed_bytes as u64,
-+                    vec![StaticMetricLabel::new(
-+                        "operation",
-+                        if young_collected {
-+                            "young"
-+                        } else {
-+                            "native_free"
-+                        },
-+                    )],
-+                );
-+                Ok(true)
++                log_instance_pool_event("generated_reclamation_insufficient");
++                (reclaimed_bytes, collection, false)
 +            },
 +            Ok(ReclamationOutcome::Deferred) => {
 +                log_instance_pool_event("generated_reclamation_deferred");
-+                Ok(false)
++                (0, PressureCollection::Unnecessary, false)
 +            },
 +            Ok(ReclamationOutcome::Unsupported) => {
 +                log_instance_pool_event("generated_reclamation_unsupported");
-+                Ok(false)
-+            },
-+            Ok(ReclamationOutcome::InsufficientPayload) => {
-+                log_instance_pool_event("generated_reclamation_insufficient");
-+                Ok(false)
++                (0, PressureCollection::Unnecessary, false)
 +            },
 +            Err(error) => {
 +                self.runtime_state = GeneratedRuntimeState::Poisoned;
-+                Err(WasmtimeError::from_anyhow(error)
-+                    .context(StaticHermesWasmExecutionFailure::RuntimeCleanup))
++                return Err(WasmtimeError::from_anyhow(error)
++                    .context(StaticHermesWasmExecutionFailure::RuntimeCleanup));
 +            },
++        };
++        // Partial release still discarded real pages even if aggregate pressure
++        // or subsequent reconciliation requires disposal. Count it before
++        // propagating that failure; the zero-release path allocates no labels.
++        if reclaimed_bytes != 0 {
++            log_counter_with_labels(
++                &GENERATED_WASM_RECLAIMED_PRIVATE_BYTES_TOTAL,
++                reclaimed_bytes as u64,
++                vec![StaticMetricLabel::new(
++                    "operation",
++                    match collection {
++                        PressureCollection::Unnecessary => "free_payload",
++                        PressureCollection::Young => "young",
++                        PressureCollection::Full => "full",
++                    },
++                )],
++            );
 +        }
++        reconciliation.map_err(WasmtimeError::from_anyhow)?;
++        Ok(reusable)
 +    }
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/source_keyed_deployment_catalog.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/source_keyed_deployment_catalog.rs
@@ -186834,7 +187493,7 @@ index 0000000000000000000000000000000000000000..a81d16d62c08687d4f11cb663ca0eb58
 +}
 diff --git a/crates/wasmtime_deserialize_regression/Cargo.toml b/crates/wasmtime_deserialize_regression/Cargo.toml
 new file mode 100644
-index 0000000000000000000000000000000000000000..efae44dfdc96860f3a467851c4e153bef462cbe3
+index 0000000000000000000000000000000000000000..de703711cafaccdbe6491a3d055abc0f88250bba
 --- /dev/null
 +++ b/crates/wasmtime_deserialize_regression/Cargo.toml
 @@ -0,0 +1,21 @@
@@ -186850,21 +187509,21 @@ index 0000000000000000000000000000000000000000..efae44dfdc96860f3a467851c4e153be
 +# Match the compiler-free dependency used by the generated runtime. Keeping
 +# this dependency local prevents the workspace Wasmtime release from silently
 +# changing the boundary covered by this regression.
-+wasmtime = { git = "https://github.com/convex-in-prod/wasmtime", rev = "e7f307dadc8e2a8de3b4d09837985e07382f7305", default-features = false, features = ["anyhow", "async", "runtime", "std", "gc-null"] }
++wasmtime = { git = "https://github.com/convex-in-prod/wasmtime", rev = "e7f307dadc8e2a8de3b4d09837985e07382f7305", default-features = false, features = ["anyhow", "async", "runtime", "std", "gc-drc"] }
 +
 +[build-dependencies]
 +sha2 = { workspace = true }
 +# Resolver v2 keeps the fixture producer's compiler out of the test target.
-+wasmtime = { git = "https://github.com/convex-in-prod/wasmtime", rev = "e7f307dadc8e2a8de3b4d09837985e07382f7305", default-features = false, features = ["anyhow", "async", "runtime", "std", "gc-null", "cranelift"] }
++wasmtime = { git = "https://github.com/convex-in-prod/wasmtime", rev = "e7f307dadc8e2a8de3b4d09837985e07382f7305", default-features = false, features = ["anyhow", "async", "runtime", "std", "gc-drc", "gc-null", "cranelift"] }
 +
 +[lints]
 +workspace = true
 diff --git a/crates/wasmtime_deserialize_regression/build.rs b/crates/wasmtime_deserialize_regression/build.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..02219627c09071ce4b81293572a702533700fdfd
+index 0000000000000000000000000000000000000000..1c82078ea4f25f0c2171dd6622f9bfe78cedef13
 --- /dev/null
 +++ b/crates/wasmtime_deserialize_regression/build.rs
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,55 @@
 +use std::{
 +    env,
 +    fs,
@@ -186876,6 +187535,7 @@ index 0000000000000000000000000000000000000000..02219627c09071ce4b81293572a70253
 +    Sha256,
 +};
 +use wasmtime::{
++    Collector,
 +    Config,
 +    Engine,
 +    ProfilingStrategy,
@@ -186890,12 +187550,17 @@ index 0000000000000000000000000000000000000000..02219627c09071ce4b81293572a70253
 +
 +fn main() {
 +    let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR"));
-+    for (name, interval) in [("ordinary", 0), ("polling", 100_000)] {
++    for (name, interval, collector) in [
++        ("ordinary", 0, Collector::DeferredReferenceCounting),
++        ("polling", 100_000, Collector::DeferredReferenceCounting),
++        ("null", 0, Collector::Null),
++    ] {
 +        let mut config = Config::new();
 +        config
 +            .target(TARGET_TRIPLE)
 +            .expect("compiler target configuration must be valid");
 +        config
++            .collector(collector)
 +            .consume_fuel(true)
 +            .epoch_interruption(true)
 +            .fuel_epoch_poll_interval(interval)
@@ -186916,10 +187581,10 @@ index 0000000000000000000000000000000000000000..02219627c09071ce4b81293572a70253
 +}
 diff --git a/crates/wasmtime_deserialize_regression/src/lib.rs b/crates/wasmtime_deserialize_regression/src/lib.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..2286acbedd0c4feccf452740ab1bdda5d15bde8f
+index 0000000000000000000000000000000000000000..16ad86b0ed10852b1110b1116a9d3211be74c523
 --- /dev/null
 +++ b/crates/wasmtime_deserialize_regression/src/lib.rs
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,94 @@
 +#![cfg(test)]
 +
 +use sha2::{
@@ -186969,6 +187634,7 @@ index 0000000000000000000000000000000000000000..2286acbedd0c4feccf452740ab1bdda5
 +        let mut config = Config::new();
 +        config.target(TARGET_TRIPLE)?;
 +        config
++            .collector(wasmtime::Collector::DeferredReferenceCounting)
 +            .consume_fuel(true)
 +            .epoch_interruption(true)
 +            .fuel_epoch_poll_interval(*interval)
@@ -186977,6 +187643,17 @@ index 0000000000000000000000000000000000000000..2286acbedd0c4feccf452740ab1bdda5
 +            .profiler(ProfilingStrategy::None)
 +            .wasm_exceptions(true);
 +        let engine = Engine::new(&config)?;
++        if *interval == 0 {
++            let historical = include_bytes!(concat!(env!("OUT_DIR"), "/null.cwasm")).to_vec();
++            assert_eq!(
++                format!("{:x}", Sha256::digest(&historical)),
++                env!("CWASM_NULL_SHA256"),
++            );
++            // This authenticated artifact differs only in collector choice.
++            // Accepting historical package metadata cannot authorize loading
++            // its native code into an incompatible collecting engine.
++            assert!(unsafe { Module::deserialize(&engine, &historical) }.is_err());
++        }
 +        for (other_interval, other_bytes, other_sha256) in &PRECOMPILED_MODULES {
 +            if other_interval == interval {
 +                continue;
@@ -189272,10 +189949,10 @@ index 0000000000000000000000000000000000000000..99122dd95ecdf2fdefc8a1df7c9b0b8d
 +inputs.
 diff --git a/patches/static_hermes_wasm_udfs/operations.md b/patches/static_hermes_wasm_udfs/operations.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..0d900c2623e5e0210c11d0350f8db3e2cc41358e
+index 0000000000000000000000000000000000000000..86011e86e9b77fbad0a7dab46194b3e06bd79db5
 --- /dev/null
 +++ b/patches/static_hermes_wasm_udfs/operations.md
-@@ -0,0 +1,1227 @@
+@@ -0,0 +1,1257 @@
 +# Static Hermes Wasm UDF Operations and Validation
 +
 +This is a generic self-hosted adoption guide for the
@@ -189854,10 +190531,14 @@ index 0000000000000000000000000000000000000000..0d900c2623e5e0210c11d0350f8db3e2
 +capacity. Neither is image state, and collection success is not a liveness proof.
 +That heap remains separately charged and Store-local, and is never copied into
 +the image. Each view reconstructs its own exception tags as well as its functions.
-+The guest maintenance decoder accepts versions 1 and 2. Version 2 preparation
++The guest maintenance decoder accepts versions 1, 2 and 3. Version 2 preparation
 +certifies the entire heap without requiring nursery reclamation or granting
 +discard ranges. Version 1 deferred preparation still retains ordinary instances.
-+Deploy host support for version 2 before using guests that return it. A host that
++Version 3 additionally separates prepared allocation storage and supports pressure
++collection, dynamic free payload, empty-nursery observation and weak-slot trimming.
++A restored Store discovers the version through the older allocator export before
++issuing version-3 operations; an unknown-operation trap is never negotiation.
++Deploy matching host support before using a new result version. A host that
 +uses the export must reject unknown result versions; hosts that ignore this
 +optional optimization can continue ordinary execution.
 +A replacement validates and applies the
@@ -189972,12 +190653,38 @@ index 0000000000000000000000000000000000000000..0d900c2623e5e0210c11d0350f8db3e2
 +release. Active cgroup pressure instead selects direct disposal because idle
 +return would be rejected regardless of collection.
 +
-+Selected maintenance reclaims allocator-free payload before conditional young
-+collection. It runs within the successful call's original CPU, fuel and deadline
-+limits, while finalizer resources remain valid. Only this path needs a second
-+reconciliation. Deferred or insufficient reclamation disposes the Store; an error
-+poisons it and preserves the original typed execution failure even if subsequent
-+reconciliation also fails. Image disposal runs no guest destructor. Claims remain
++For maintenance versions 1 and 2, selected reclamation frees native allocator
++payload before conditional young collection. Version 3 also separates prepared
++allocation storage from subsequent allocation. Prepared cells retain ordinary
++tracing, sweeping and finalization; their holes are not reused for request
++allocation. The host checks dynamic occupied bytes at each successful completion
++and requests collection above 2 MiB, trying young collection before ordinary full
++collection unless the nursery is already empty. A lower-threshold retry therefore
++does not repeat nursery root visitation when only old/native storage remains.
++The occupied-byte check is constant-time and does not walk the heap
++or acquire an admission lock.
++
++After collection, private exposure above 6.75 MiB selects release toward 6.25 MiB.
++These are release-policy thresholds, not active-memory limits or evidence about
++physical residency. Release uses allocator and collector free payload and the
++tail of an already empty nursery, preserving a 2.5 MiB nursery prefix for reuse.
++An unsuccessful attempt can be retried after the next pressure-triggered
++collection, even when physical exposure has not grown: changed demand can free
++payload inside existing backing. Aggregate pressure can select earlier
++maintenance. At most one
++additional collection attempt with a 512 KiB occupied threshold can follow an
++insufficient export. Ranges are reacquired after collection and weak-slot trimming,
++and their ownership must be disjoint before any page is discarded. Partial release
++is useful even when the proactive target cannot be met; ready admission still
++charges the retained backing. Failure to meet an aggregate-required target
++continues to select disposal.
++
++Maintenance runs within the successful call's original CPU, fuel and deadline
++limits, while finalizer resources remain valid, without controller/pool locks
++across guest calls or mapping operations. It requires a second reconciliation.
++An error poisons the Store and preserves the original typed execution failure
++even if subsequent reconciliation also fails. Image disposal runs no guest
++destructor. Claims remain
 +owned until readiness transfer publishes the physical savings; any savings
 +still covered by the checkout baseline remain claimed until completion or
 +Store disposal. There is no idle guest collection or per-call whole-image reset.
