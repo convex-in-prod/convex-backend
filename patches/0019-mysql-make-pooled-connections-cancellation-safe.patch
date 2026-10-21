@@ -22,14 +22,14 @@ cancellation cannot return an interrupted deletion connection to the pool.
  crates/common/src/knobs.rs                    |   12 +
  crates/db_connection/src/lib.rs               |   13 +-
  crates/mysql/src/cancellation.rs              |  933 ++++++
- crates/mysql/src/connection.rs                |  751 ++++-
+ crates/mysql/src/connection.rs                |  781 ++++-
  crates/mysql/src/deployment_deletion.rs       |   22 +-
  crates/mysql/src/lib.rs                       |    2 +
  crates/mysql/src/metrics.rs                   |   36 +
- crates/mysql/src/v5/persistence.rs            |   67 +-
+ crates/mysql/src/v5/persistence.rs            |   66 +-
  crates/mysql/src/v6/persistence.rs            |   42 +-
  patches/README.md                             |   16 +
- .../README.md                                 |  192 ++
+ .../README.md                                 |  194 ++
  self-hosted/docker-build/Dockerfile.backend   |    2 +
  third_party/mysql_async/.gitignore            |    5 +
  third_party/mysql_async/Cargo.toml            |  128 +
@@ -94,7 +94,7 @@ cancellation cannot return an interrupted deletion connection to the pool.
  third_party/mysql_async/test/key.pem          |   27 +
  third_party/mysql_async/tests/exports.rs      |   18 +
  third_party/mysql_async/tests/generic.rs      |   61 +
- 78 files changed, 17836 insertions(+), 199 deletions(-)
+ 78 files changed, 17867 insertions(+), 199 deletions(-)
  create mode 100644 crates/mysql/src/cancellation.rs
  create mode 100644 patches/cancellation_safe_mysql_connections/README.md
  create mode 100644 third_party/mysql_async/.gitignore
@@ -177,7 +177,7 @@ index b1bfb7cdc245b87b1b256933ec6f7eb3e538b219..cc51533ad3bb501a8e7e996e481f2e3c
  !/rust-toolchain
  !/self-hosted/*
 diff --git a/Cargo.lock b/Cargo.lock
-index 657f810aa482c88c4e4e7f0134ee1c9f915e3239..2d2a9a3f700f05f949e632f967e8982c20dd7b3b 100644
+index ef17a4e87f89370140f3c41ed6dea2a975070705..ebf0ac7baa90549564e506a73c89023a4a1b2b8c 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -7415,8 +7415,6 @@ dependencies = [
@@ -190,7 +190,7 @@ index 657f810aa482c88c4e4e7f0134ee1c9f915e3239..2d2a9a3f700f05f949e632f967e8982c
   "arc-swap",
   "bytes",
 diff --git a/Cargo.toml b/Cargo.toml
-index d2e5fe7074f029014a3c2b906ae4deb2ad50df9d..bdd7c27e0b13c6e1aad86fe1e52157848bd25da5 100644
+index 3fd225ee9f4613515591f072294db417c73cb2a0..f2518df263770d2919c9ddec5d1637dec3afd9b3 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -1,7 +1,7 @@
@@ -213,7 +213,7 @@ index d2e5fe7074f029014a3c2b906ae4deb2ad50df9d..bdd7c27e0b13c6e1aad86fe1e5215784
  oauth2 = { version = "5", default-features = false }
  once_cell = "1.19"
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 3f61926e459ddd718a768cd560e871dc9c0e3254..aa1a4d05a35c88af42f86f70825d1fa5b0efd147 100644
+index e72fa0d4c69caa98ee0d25582061dd85517b13af..8d132192db5e7fe5af27abf5f1315a29524b290f 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -1855,6 +1855,18 @@ pub static MYSQL_TIMEOUT: LazyLock<u64> = LazyLock::new(|| env_config("MYSQL_TIM
@@ -1213,17 +1213,18 @@ index 0000000000000000000000000000000000000000..611b11761b7686cde93533ce387a0dfa
 +    }
 +}
 diff --git a/crates/mysql/src/connection.rs b/crates/mysql/src/connection.rs
-index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c5be3c1a0 100644
+index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828f8704e23 100644
 --- a/crates/mysql/src/connection.rs
 +++ b/crates/mysql/src/connection.rs
-@@ -1,6 +1,5 @@
+@@ -1,7 +1,6 @@
  use std::{
      env,
+     io::ErrorKind,
 -    mem,
      path::PathBuf,
      str::FromStr,
      time::Duration,
-@@ -29,7 +28,6 @@ use common::{
+@@ -30,7 +29,6 @@ use common::{
      },
      runtime::{
          assert_send,
@@ -1231,7 +1232,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
          Runtime,
      },
  };
-@@ -72,18 +70,26 @@ use prometheus::VMHistogramVec;
+@@ -74,18 +72,26 @@ use prometheus::VMHistogramVec;
  use tokio::time::sleep;
  use url::Url;
  
@@ -1270,7 +1271,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
  };
  
  fn classify_mysql_error(e: mysql_async::Error) -> anyhow::Error {
-@@ -152,9 +158,9 @@ pub(crate) fn is_message_too_large_error(
+@@ -170,9 +176,9 @@ pub(crate) fn is_message_too_large_error(
  // instances can't start -- and during commit -- which means all future commits
  // fail with OCC errors.
  //
@@ -1283,7 +1284,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
  pub(crate) async fn with_timeout<R, Fut: Future<Output = Result<R, mysql_async::Error>>>(
      f: Fut,
  ) -> anyhow::Result<R> {
-@@ -284,7 +290,7 @@ fn format_mysql_binary_protocol(db_name: &str, statement: &str) -> anyhow::Resul
+@@ -302,7 +308,7 @@ fn format_mysql_binary_protocol(db_name: &str, statement: &str) -> anyhow::Resul
  }
  
  pub(crate) struct MySqlConnection<'a, RT: Runtime> {
@@ -1292,7 +1293,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      labels: Vec<StaticMetricLabel>,
      pool: &'a ConvexMySqlPool<RT>,
      db_name: &'a str,
-@@ -292,15 +298,189 @@ pub(crate) struct MySqlConnection<'a, RT: Runtime> {
+@@ -310,15 +316,195 @@ pub(crate) struct MySqlConnection<'a, RT: Runtime> {
      _timer: Timer<VMHistogramVec>,
  }
  
@@ -1425,10 +1426,16 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
 +}
 +
 +fn connection_error_requires_discard(error: &anyhow::Error) -> bool {
-+    // These errors may leave the protocol stream incomplete. Other server errors
-+    // are complete responses, so a caller may catch them and continue using the
-+    // same transaction.
-+    error.is::<DatabaseOperationalError>() || error.is::<DatabaseTimeoutError>()
++    // Retry classification does not establish protocol completion. Row decoding
++    // can return a non-operational I/O error without marking the driver
++    // disconnected. Server errors are complete responses and can leave the
++    // transaction reusable.
++    error.is::<DatabaseOperationalError>()
++        || error.is::<DatabaseTimeoutError>()
++        || matches!(
++            error.downcast_ref::<mysql_async::Error>(),
++            Some(mysql_async::Error::Io(_))
++        )
 +}
 +
 +fn connection_result_requires_discard<R>(conn: &Conn, result: &anyhow::Result<R>) -> bool {
@@ -1485,7 +1492,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
              Err(e) if e.is::<DatabaseOperationalError>() => (e, attempt < max_retries),
              Err(e) if e.is::<DatabaseTimeoutError>() => {
                  // Don't retry here as we want the caller to receive some
-@@ -311,41 +491,60 @@ async fn handle_errors_with_retries<R, RT: Runtime>(
+@@ -329,41 +515,62 @@ async fn handle_errors_with_retries<R, RT: Runtime>(
                  // So don't return the connection to the pool.
                  (e, false)
              },
@@ -1494,7 +1501,9 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
 +            // the fatal follow-up error that actually disconnected the connection.
 +            // Do not let recycler disposal replace authenticated server-side
 +            // cancellation for those paths.
-+            Err(e) if connection_disconnected => (e, false),
++            Err(e) if connection_disconnected || connection_error_requires_discard(&e) => {
++                (e, false)
++            },
 +            result => {
 +                return HandledMySqlOperation {
 +                    connection_reusable: true,
@@ -1563,7 +1572,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
          pool,
          async move |conn| f.take().expect("should never retry")(conn).await,
          0, /* max_retries */
-@@ -359,7 +558,9 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -377,7 +584,9 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
      pub async fn execute_many(&mut self, query: &str) -> anyhow::Result<()> {
          log_execute(self.labels.clone());
          let statement = format_mysql_text_protocol(self.db_name, query, vec![], &self.labels)?;
@@ -1574,7 +1583,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
              // Every statement after the first runs only as its result set is
              // consumed, and reports its error only there. Dropping the result
              // instead leaves them pending on the connection, so they run if it
-@@ -368,8 +569,11 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -386,8 +595,11 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
              with_timeout(result.drop_result()).await?;
              Ok(())
          })
@@ -1588,7 +1597,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      }
  
      /// Run a readonly query that returns one or zero results.
-@@ -380,30 +584,43 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -398,30 +610,43 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<Option<Row>> {
          log_query(self.labels.clone());
@@ -1642,7 +1651,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      }
  
      /// Run a readonly query and collect the results, mapping them with `f`
-@@ -417,17 +634,27 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -435,17 +660,27 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
      ) -> anyhow::Result<Vec<R>> {
          let labels = self.labels.clone();
          log_query(labels.clone());
@@ -1678,7 +1687,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
                      let progress_counter = query_progress_counter(size_hint, labels.clone());
                      Self::collect_query_stream(
                          with_timeout(
-@@ -444,10 +671,8 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -462,10 +697,8 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
              ))
              .await
          } else {
@@ -1690,7 +1699,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
                  self.pool,
                  async move |conn| {
                      let progress_counter = query_progress_counter(size_hint, labels.clone());
-@@ -462,7 +687,11 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -480,7 +713,11 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
                  *MYSQL_MAX_QUERY_RETRIES,
              ))
              .await
@@ -1702,7 +1711,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      }
  
      async fn collect_query_stream<R>(
-@@ -496,53 +725,105 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -514,53 +751,105 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<u64> {
          log_execute(self.labels.clone());
@@ -1839,7 +1848,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      }
  }
  
-@@ -551,6 +832,7 @@ pub(crate) struct MySqlTransaction<'a> {
+@@ -569,6 +858,7 @@ pub(crate) struct MySqlTransaction<'a> {
      use_prepared_statements: bool,
      db_name: &'a str,
      labels: &'a [StaticMetricLabel],
@@ -1847,7 +1856,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
  }
  
  impl MySqlTransaction<'_> {
-@@ -561,15 +843,28 @@ impl MySqlTransaction<'_> {
+@@ -579,15 +869,28 @@ impl MySqlTransaction<'_> {
          statement: &str,
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<Option<Row>> {
@@ -1881,7 +1890,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      }
  
      /// Executes the given statement and drops the result.
-@@ -578,11 +873,28 @@ impl MySqlTransaction<'_> {
+@@ -596,11 +899,28 @@ impl MySqlTransaction<'_> {
          statement: &str,
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<()> {
@@ -1914,7 +1923,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      }
  
      /// Execute a SQL statement, returning the number of rows affected.
-@@ -591,15 +903,42 @@ impl MySqlTransaction<'_> {
+@@ -609,15 +929,42 @@ impl MySqlTransaction<'_> {
          statement: &str,
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<u64> {
@@ -1965,7 +1974,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      }
  
      /// Executes a raw query using the text protocol, even when the connection
-@@ -610,7 +949,12 @@ impl MySqlTransaction<'_> {
+@@ -628,7 +975,12 @@ impl MySqlTransaction<'_> {
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<()> {
          let statement = format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
@@ -1979,7 +1988,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      }
  
      /// Like [`Self::query_drop`], returning the number of rows affected.
-@@ -620,19 +964,41 @@ impl MySqlTransaction<'_> {
+@@ -638,19 +990,41 @@ impl MySqlTransaction<'_> {
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<u64> {
          let statement = format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
@@ -2026,7 +2035,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      use_prepared_statements: bool,
      runtime: Option<RT>,
      stats: ConnectionPoolStats,
-@@ -662,7 +1028,8 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -680,7 +1054,8 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
          url: &Url,
          use_prepared_statements: bool,
          require_leader: bool,
@@ -2036,7 +2045,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      ) -> anyhow::Result<Self> {
          let cluster_name = derive_cluster_name(url).to_owned();
          // NOTE: the inactive_connection_ttl only applies to connections > min
-@@ -723,16 +1090,39 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -741,16 +1116,39 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
                  .with_root_certs(vec![ca_file_path.into()]);
              opts = opts.ssl_opts(ssl_opts);
          }
@@ -2077,7 +2086,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
          let pool_get_timer = get_connection_timer(&self.cluster_name);
          let conn = with_timeout(self.pool.get_conn())
              .trace_if_pending(func_path!()) // only trace if slow
-@@ -747,8 +1137,9 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -765,8 +1163,9 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
          db_name: &'a str,
      ) -> anyhow::Result<MySqlConnection<'a, RT>> {
          let conn = self.acquire_internal().await?;
@@ -2088,7 +2097,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
              labels: vec![
                  StaticMetricLabel::new("name", name),
                  StaticMetricLabel::new("cluster_name", self.cluster_name.clone()),
-@@ -773,7 +1164,10 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -791,7 +1190,10 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
  
      pub async fn shutdown(&self) -> anyhow::Result<()> {
          tracing::info!("Shutting down ConvexMySqlPool");
@@ -2100,7 +2109,7 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
      }
  }
  
-@@ -784,9 +1178,122 @@ impl<RT: Runtime> Drop for ConvexMySqlPool<RT> {
+@@ -802,9 +1204,144 @@ impl<RT: Runtime> Drop for ConvexMySqlPool<RT> {
              return;
          };
          let pool = self.pool.clone();
@@ -2124,10 +2133,32 @@ index 60377b6108201bc8568120d7c057ce185b823a75..58d61b450427caa80a5b3118c21a612c
 +    use std::sync::Mutex;
 +
 +    use super::{
++        classify_mysql_error,
++        connection_error_requires_discard,
++        DatabaseOperationalError,
 +        OperationControl,
 +        OperationOwnership,
 +        TransactionConnectionUse,
 +    };
++
++    #[test]
++    fn non_operational_io_error_requires_discard_without_becoming_retryable() {
++        for kind in [std::io::ErrorKind::InvalidData, std::io::ErrorKind::Other] {
++            let error =
++                classify_mysql_error(std::io::Error::new(kind, "invalid row packet").into())
++                    .context("reading a result row");
++            assert!(!error.is::<DatabaseOperationalError>());
++            assert!(connection_error_requires_discard(&error));
++        }
++
++        let server_error =
++            classify_mysql_error(mysql_async::Error::Server(mysql_async::ServerError {
++                code: 1062,
++                message: "duplicate key".to_owned(),
++                state: "23000".to_owned(),
++            }));
++        assert!(!connection_error_requires_discard(&server_error));
++    }
 +
 +    #[derive(Default)]
 +    struct RecordingOperationControl {
@@ -2278,7 +2309,7 @@ index 2415193ef1f3d37e024a939621e940cdc1be238f..e3a2ef12b7244c30b1d5d0c2b45f7b37
              rows_deleted,
              next_cursor: next_key.map(|key| TableCursor {
 diff --git a/crates/mysql/src/lib.rs b/crates/mysql/src/lib.rs
-index ae80d6073a9f7cb5c287b606b58c2052779a586a..2dfd02cf51541194a9d66d484a28c29579f1865f 100644
+index fd361255fd399988312a82204d1c46fc1b9e35e3..ded737c7755fc87ec1c356593ef7e1523c060c35 100644
 --- a/crates/mysql/src/lib.rs
 +++ b/crates/mysql/src/lib.rs
 @@ -2,6 +2,7 @@
@@ -2345,7 +2376,7 @@ index 1b03fbe3192c52b771c85dc2c882b315c7a8afb2..c1e692b55f3329fd80789c31a84bd35b
      StaticMetricLabel::new("key", String::from(key))
  }
 diff --git a/crates/mysql/src/v5/persistence.rs b/crates/mysql/src/v5/persistence.rs
-index 9d7155159231081a28b354931fd0653c6cb891a2..75e0a55d0ff4ad1c6902ed271f2afd81a3fff3ea 100644
+index d5164e15c9a3de8e77af8177f46674c9e3169802..4801e4ce65523303c310a8d53fee24e1066ef9f9 100644
 --- a/crates/mysql/src/v5/persistence.rs
 +++ b/crates/mysql/src/v5/persistence.rs
 @@ -76,7 +76,6 @@ use common::{
@@ -2356,15 +2387,7 @@ index 9d7155159231081a28b354931fd0653c6cb891a2..75e0a55d0ff4ad1c6902ed271f2afd81
      types::{
          IndexId,
          IndexRef,
-@@ -190,6 +189,7 @@ impl<RT: Runtime> Persistence<RT> {
-         {
-             return Err(ConnectError::ReadOnly);
-         }
-+        drop(client);
- 
-         let lease = Lease::acquire(
-             pool.clone(),
-@@ -1588,6 +1588,7 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1576,6 +1575,7 @@ impl<RT: Runtime> Lease<RT> {
          tracing::info!("lease acquired with ts {}", ts);
  
          timer.finish();
@@ -2372,7 +2395,7 @@ index 9d7155159231081a28b354931fd0653c6cb891a2..75e0a55d0ff4ad1c6902ed271f2afd81
          Ok(Self {
              db_name,
              pool,
-@@ -1637,43 +1638,35 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1625,43 +1625,35 @@ impl<RT: Runtime> Lease<RT> {
          F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
      {
          let mut client = self.pool.acquire("transact", &self.db_name).await?;
@@ -2445,18 +2468,18 @@ index 9d7155159231081a28b354931fd0653c6cb891a2..75e0a55d0ff4ad1c6902ed271f2afd81
  }
  
 diff --git a/crates/mysql/src/v6/persistence.rs b/crates/mysql/src/v6/persistence.rs
-index 95a8a0a138b82892e3a37348c84754827a77fac3..bd1a458d0e7ee1fab90814f98c27e118833b1e86 100644
+index bc11b28d0008ac5a791fcf92e7773e024e6b6c8b..bfc29b4da4d213409474c07aa8ebc3015ca45c6f 100644
 --- a/crates/mysql/src/v6/persistence.rs
 +++ b/crates/mysql/src/v6/persistence.rs
-@@ -1104,6 +1104,7 @@ impl<RT: Runtime> Lease<RT> {
-             "failed to acquire V6 lease: a higher lease timestamp already exists"
+@@ -1114,6 +1114,7 @@ impl<RT: Runtime> Lease<RT> {
+             "failed to acquire V6 lease: already acquired with higher timestamp, or read-only"
          );
          timer.finish();
 +        drop(client);
          Ok(Self {
              pool,
              db_name,
-@@ -1141,30 +1142,23 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1151,30 +1152,23 @@ impl<RT: Runtime> Lease<RT> {
          F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
      {
          let mut client = self.pool.acquire("v6_transact", &self.db_name).await?;
@@ -2533,10 +2556,10 @@ index 2656b7b5a518a4b7b09d0aaf1515270f706819b9..39e64c00c567230a9f557fe5b0d8f01c
  ### [Materialize snapshot import ZIPs](snapshot_import_zip_materialization/README.md)
 diff --git a/patches/cancellation_safe_mysql_connections/README.md b/patches/cancellation_safe_mysql_connections/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..42d8acdfa4ee5374baf7ee37832a1b0df48d5dd8
+index 0000000000000000000000000000000000000000..558ade33ccc828543f1c610565db2d856958d143
 --- /dev/null
 +++ b/patches/cancellation_safe_mysql_connections/README.md
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,194 @@
 +# Cancellation-Safe MySQL Connections
 +
 +Status: the maintained backend patch owns each direct MySQL operation and transaction through a
@@ -2626,17 +2649,19 @@ index 0000000000000000000000000000000000000000..42d8acdfa4ee5374baf7ee37832a1b0d
 +  SQL instead of creating an unbounded orphan population. A control connection whose kill fails or
 +  exceeds the hard deadline is force-disconnected rather than returned to the one-connection
 +  control pool with a possibly unread response.
-+- Dropping an individual transaction method future, receiving a database timeout or operational
-+  error from it, or observing that the driver left the connection disconnected marks that
-+  transaction connection unusable. A later method or commit rejects reuse, and the outer
++- Dropping an individual transaction method future, receiving a database timeout, operational
++  error, or I/O error from it, or observing that the driver left the connection disconnected marks
++  that transaction connection unusable. A later method or commit rejects reuse, and the outer
 +  transaction owner force-disconnects it.
-+- An operational error, database timeout, or disconnected driver state first removes and
++- An operational error, database timeout, I/O error, or disconnected driver state first removes and
 +  force-disconnects the failed connection. Replacement acquisition starts only after the reusable
 +  slot is empty and the old transport is closed. A replacement is registered and installed only
 +  after it also reserves cancellation capacity. If acquisition or reservation fails, or if its
 +  caller is canceled, the slot remains empty and cannot return or disconnect the failed connection
 +  a second time.
 +- A retry starts only after a replacement connection is installed in the reusable slot.
++  Non-operational I/O errors remain non-retryable: protocol decoding can fail without the driver
++  marking its transport disconnected, so retry classification cannot decide connection reuse.
 +- Pool shutdown first waits for checked-out data connections to return or be discarded, then stops
 +  the cancellation worker and disconnects its control pool. In trusted-single-namespace mode it
 +  drains queued cancellation requests before stopping. Explicit shutdown awaits that sequence.
@@ -2730,7 +2755,7 @@ index 0000000000000000000000000000000000000000..42d8acdfa4ee5374baf7ee37832a1b0d
 +is required. The restored behavior may again leave canceled statements in recycler cleanup until
 +the server responds.
 diff --git a/self-hosted/docker-build/Dockerfile.backend b/self-hosted/docker-build/Dockerfile.backend
-index ce7ab3c4f524c4f6db6c417efaa9b7ea988f5748..54f0058f9a02fbf8ee1a530553d4a11d38639fe7 100644
+index 1f94460c03076ed6f3ad8ccda070a8dd609ca26e..8a670b76117f1cef896a7c24110238f81f45f3b6 100644
 --- a/self-hosted/docker-build/Dockerfile.backend
 +++ b/self-hosted/docker-build/Dockerfile.backend
 @@ -18,6 +18,7 @@ RUN rustup self update && rustup toolchain install
