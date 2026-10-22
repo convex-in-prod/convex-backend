@@ -23,7 +23,9 @@ function callPerformanceTimeOrigin(): number {
 }
 
 // Capture the DOM interface types before the class declarations shadow them.
-type IPerformance = globalThis.Performance;
+// Event Timing counts browser input interactions, which this server runtime
+// does not expose. Keep checking the rest of the DOM Performance interface.
+type IPerformance = Omit<globalThis.Performance, "interactionCount">;
 type IPerformanceEntry = globalThis.PerformanceEntry;
 type IPerformanceMark = globalThis.PerformanceMark;
 type IPerformanceMeasure = globalThis.PerformanceMeasure;
