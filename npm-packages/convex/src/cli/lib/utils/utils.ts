@@ -1165,22 +1165,22 @@ export function spawnAsync(
     let stdout = "";
     let stderr = "";
 
+    // A UTF-8 filename or diagnostic can span pipe chunks. Decode the streams,
+    // rather than each Buffer, so watched paths retain their original spelling.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     const pipeOutput = options?.stdio === "inherit";
 
     if (pipeOutput) {
-      child.stdout.on("data", (text) =>
-        logMessage(text.toString("utf-8").trimEnd()),
-      );
-      child.stderr.on("data", (text) =>
-        logError(text.toString("utf-8").trimEnd()),
-      );
+      child.stdout.on("data", (text: string) => logMessage(text.trimEnd()));
+      child.stderr.on("data", (text: string) => logError(text.trimEnd()));
     } else {
-      child.stdout.on("data", (data) => {
-        stdout += data.toString("utf-8");
+      child.stdout.on("data", (data: string) => {
+        stdout += data;
       });
 
-      child.stderr.on("data", (data) => {
-        stderr += data.toString("utf-8");
+      child.stderr.on("data", (data: string) => {
+        stderr += data;
       });
     }
 
@@ -1206,7 +1206,6 @@ export function spawnAsync(
     };
 
     const errorListener = (error: Error) => {
-      child.removeListener("exit", completionListener);
       child.removeListener("close", completionListener);
       if (pipeOutput) {
         reject({ error, status: null });
@@ -1215,11 +1214,9 @@ export function spawnAsync(
       }
     };
 
-    if (pipeOutput) {
-      child.once("exit", completionListener);
-    } else {
-      child.once("close", completionListener);
-    }
+    // `exit` can precede the last diagnostics on the pipes, even when we forward
+    // output. Wait for them to close before the caller can exit the CLI.
+    child.once("close", completionListener);
     child.once("error", errorListener);
   });
 }

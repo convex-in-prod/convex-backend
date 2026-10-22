@@ -52,7 +52,10 @@ import { ensureAuthKitProvisionedBeforeBuild } from "./workos/workos.js";
 
 const brotli = promisify(zlib.brotliCompress);
 
-async function brotliCompress(ctx: Context, data: string): Promise<Buffer> {
+async function brotliCompress(
+  ctx: Context,
+  data: string,
+): Promise<Buffer & { buffer: ArrayBuffer }> {
   const start = performance.now();
   const result = await brotli(data, {
     params: {
@@ -65,7 +68,9 @@ async function brotliCompress(ctx: Context, data: string): Promise<Buffer> {
   logVerbose(
     `Compressed ${(data.length / 1024).toFixed(2)}KiB to ${(result.length / 1024).toFixed(2)}KiB (${((result.length / data.length) * 100).toFixed(2)}%) in ${duration.toFixed(2)}ms`,
   );
-  return result;
+  // zlib allocates ordinary ArrayBuffer storage; older Node typings also
+  // allow shared backing here. Narrow the result without copying uploads.
+  return result as Buffer & { buffer: ArrayBuffer };
 }
 
 /** Push configuration2 to the given remote origin. */

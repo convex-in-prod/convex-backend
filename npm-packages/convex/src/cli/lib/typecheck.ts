@@ -10,33 +10,17 @@ import {
   showSpinner,
 } from "../../bundler/log.js";
 import * as Sentry from "@sentry/node";
-import * as semver from "semver";
 import { formatDuration, spawnAsync } from "./utils/utils.js";
-import { readProjectConfig } from "./config.js";
 import { WatchContext } from "./watch.js";
-import { Filesystem } from "../../bundler/fs.js";
+import { createRequire } from "node:module";
 
 export type TypecheckResult = "cantTypeCheck" | "success" | "typecheckFailed";
 
 export type TypeCheckMode = "enable" | "try" | "disable";
 
-export type TypescriptCompiler = "tsc" | "tsgo";
-
 const SLOW_TYPECHECK_THRESHOLD_MS = 10_000;
 const SLOW_TYPECHECK_DOCS_URL =
   "https://docs.convex.dev/cli/troubleshooting/typecheck-performance";
-
-/**
- * Resolves the TypeScript compiler to use based on CLI flag, config file, and default.
- * Precedence: CLI flag → config file → default "tsc"
- */
-export async function resolveTypescriptCompiler(
-  ctx: Context,
-  cliOption?: TypescriptCompiler,
-): Promise<TypescriptCompiler> {
-  const { projectConfig } = await readProjectConfig(ctx);
-  return cliOption ?? projectConfig?.typescriptCompiler ?? "tsc";
-}
 
 type TypecheckResultHandler = (
   result: TypecheckResult,
@@ -52,9 +36,9 @@ type TypecheckResultHandler = (
  *
  * If typeCheckMode === "disable", never run the typecheck function.
  * If typeCheckMode === "enable", run the typecheck and crash if typechecking
- * fails or we can't find tsc.
+ * fails or the project has no tsconfig.
  * If typeCheckMode === "try", try and run the typecheck. crash if typechecking
- * fails but don't worry if tsc is missing and we can't run it.
+ * fails but skip projects without a tsconfig.
  */
 export async function typeCheckFunctionsInMode(
   ctx: Context,
@@ -64,7 +48,6 @@ export async function typeCheckFunctionsInMode(
   if (typeCheckMode === "disable") {
     return;
   }
-  const typescriptCompiler = await resolveTypescriptCompiler(ctx);
   const typecheckStart = performance.now();
   const slowTypecheckTimeout = setTimeout(() => {
     changeSpinner(
@@ -74,7 +57,6 @@ export async function typeCheckFunctionsInMode(
   try {
     await typeCheckFunctions(
       ctx,
-      typescriptCompiler,
       functionsDir,
       async (result, logSpecificError, runOnError) => {
         if (
@@ -113,120 +95,62 @@ export async function typeCheckFunctionsInMode(
 // Runs TypeScript compiler to typecheck Convex query and mutation functions.
 export async function typeCheckFunctions(
   ctx: Context,
-  typescriptCompiler: TypescriptCompiler,
   functionsDir: string,
   handleResult: TypecheckResultHandler,
 ): Promise<void> {
   const tsconfig = path.join(functionsDir, "tsconfig.json");
   if (!ctx.fs.exists(tsconfig)) {
     return handleResult("cantTypeCheck", () => {
-      logError(
-        "Found no convex/tsconfig.json to use to typecheck Convex functions, so skipping typecheck.",
-      );
+      logError(`No TypeScript configuration found at ${tsconfig}.`);
       logError("Run `npx convex codegen --init` to create one.");
     });
   }
-  await runTsc(
+  // Resolve the compiler shipped with this CLI, including pnpm's nested layout. The
+  // published CLI is CommonJS; source and ESM consumers use import.meta.url instead.
+  const require = createRequire(
+    typeof __filename === "string" ? __filename : import.meta.url,
+  );
+  const compilerPath = path.join(
+    path.dirname(require.resolve("tsrs/package.json")),
+    "bin",
+    "tsrs",
+  );
+  await runTypecheck(
     ctx,
-    typescriptCompiler,
-    ["--project", functionsDir],
+    compilerPath,
+    // Typechecking must not emit files even when a project enables TypeScript emit.
+    ["--project", functionsDir, "--noEmit"],
     handleResult,
   );
 }
 
-async function runTsc(
+async function runTypecheck(
   ctx: Context,
-  typescriptCompiler: TypescriptCompiler,
-  tscArgs: string[],
-  handleResult: TypecheckResultHandler,
-): Promise<void> {
-  const compilerPath = findTypeScriptCompilerPath(ctx.fs, typescriptCompiler);
-  if (!compilerPath) {
-    return handleResult("cantTypeCheck", () => {
-      logError(
-        chalkStderr.gray(
-          `No \`${typescriptCompiler}\` binary found, so skipping typecheck.`,
-        ),
-      );
-    });
-  }
-
-  // Check the TypeScript version matches the recommendation from Convex
-  const versionResult = await spawnAsync(ctx, process.execPath, [
-    compilerPath,
-    "--version",
-  ]);
-
-  const version = versionResult.stdout.match(/Version (.*)/)?.[1] ?? null;
-  const hasOlderTypeScriptVersion = version && semver.lt(version, "4.8.4");
-
-  await runTscInner(ctx, compilerPath, tscArgs, handleResult);
-
-  // Print this warning after any logs from running `tsc`
-  if (hasOlderTypeScriptVersion) {
-    logError(
-      chalkStderr.yellow(
-        "Convex works best with TypeScript version 4.8.4 or newer -- npm i --save-dev typescript@latest to update.",
-      ),
-    );
-  }
-}
-
-export function findTypeScriptCompilerPath(
-  fs: Pick<Filesystem, "exists">,
-  typescriptCompiler: TypescriptCompiler,
-): string | undefined {
-  switch (typescriptCompiler) {
-    case "tsgo": {
-      // @typescript/native-preview@7.0.0-dev.20260626.1 switched to using `bin/tsgo` instead of `bin/tsgo.js`.
-      const tsgoPaths = ["tsgo", "tsgo.js"].map((filename) =>
-        path.join(
-          "node_modules",
-          "@typescript",
-          "native-preview",
-          "bin",
-          filename,
-        ),
-      );
-      return tsgoPaths.find((path) => fs.exists(path));
-    }
-    case "tsc": {
-      const tscPaths = [
-        // TypeScript 7's recommended alias when the TypeScript 6 API is also installed.
-        path.join("node_modules", "@typescript", "native", "bin", "tsc"),
-        path.join("node_modules", "typescript", "bin", "tsc"),
-      ];
-      return tscPaths.find((path) => fs.exists(path));
-    }
-    default:
-      typescriptCompiler satisfies never;
-  }
-}
-
-async function runTscInner(
-  ctx: Context,
-  tscPath: string,
-  tscArgs: string[],
+  compilerPath: string,
+  compilerArgs: string[],
   handleResult: TypecheckResultHandler,
 ) {
-  // Run `tsc` once and have it print out the files it touched. This output won't
+  // Run `tsrs` once and have it print out the files it touched. This output won't
   // be very useful if there's an error, but we'll run it again to get a nice
   // user-facing error in this exceptional case.
   // The `--listFiles` command prints out files touched on success or error.
   const result = await spawnAsync(ctx, process.execPath, [
-    tscPath,
-    ...tscArgs,
+    compilerPath,
+    ...compilerArgs,
+    // Keep the diagnostic/file-list protocol independent of project formatting.
+    "--pretty",
+    "false",
     "--listFiles",
   ]);
   if (result.status === null) {
     return handleResult("typecheckFailed", () => {
-      logFailure(`TypeScript typecheck timed out.`);
+      logFailure(`TypeScript typecheck could not complete.`);
       if (result.error) {
         logError(chalkStderr.red(`${result.error.toString()}`));
       }
     });
   }
-  // Okay, we may have failed `tsc` but at least it returned. Try to parse its
+  // Okay, we may have failed `tsrs` but at least it returned. Try to parse its
   // output to discover which files it touched.
   const filesTouched = result.stdout
     .split("\n")
@@ -240,8 +164,8 @@ async function runTscInner(
       st = ctx.fs.stat(absPath);
       anyPathsFound = true;
     } catch {
-      // Just move on if we have a bogus path from `tsc`. We'll log below if
-      // we fail to stat *any* of the paths emitted by `tsc`.
+      // Just move on if we have a bogus path from `tsrs`. We'll log below if
+      // we fail to stat *any* of the paths emitted by `tsrs`.
       // TODO: Switch to using their JS API so we can get machine readable output.
       continue;
     }
@@ -249,7 +173,7 @@ async function runTscInner(
   }
   if (filesTouched.length > 0 && !anyPathsFound) {
     const err = new Error(
-      `Failed to stat any files emitted by tsc (received ${filesTouched.length})`,
+      `Failed to stat any files emitted by tsrs (received ${filesTouched.length})`,
     );
     Sentry.captureException(err);
   }
@@ -258,25 +182,29 @@ async function runTscInner(
     return handleResult("success");
   }
 
-  // This is the "No inputs were found", which is fine and we shouldn't
-  // report it to the user.
-  if (result.stdout.startsWith("error TS18003")) {
+  // An empty project is valid, but TS18003 must not hide later configuration
+  // diagnostics or a launcher failure on stderr.
+  if (
+    filesTouched.length === 1 &&
+    filesTouched[0].startsWith("error TS18003:") &&
+    result.stderr.trim() === ""
+  ) {
     return handleResult("success");
   }
 
-  // At this point we know that `tsc` failed. Rerun it without `--listFiles`
+  // At this point we know that `tsrs` failed. Rerun it without `--listFiles`
   // and with stderr redirected to have it print out a nice error.
   return handleResult(
     "typecheckFailed",
     () => {
-      logFailure("TypeScript typecheck via `tsc` failed.");
+      logFailure(`TypeScript typecheck via \`tsrs\` failed.`);
     },
     async () => {
       showSpinner("Collecting TypeScript errors");
       await spawnAsync(
         ctx,
         process.execPath,
-        [tscPath, ...tscArgs, "--pretty", "true"],
+        [compilerPath, ...compilerArgs, "--pretty", "true"],
         {
           stdio: "inherit",
         },

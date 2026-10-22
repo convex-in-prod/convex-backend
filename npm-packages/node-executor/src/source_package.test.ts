@@ -889,9 +889,8 @@ test("resident ownership protects source and external packages under pressure", 
     let residentReleased = false;
     try {
       const residentSourceDir = residentLease.package.dir;
-      const residentExternal = availableExternalPackages.get(
-        "external-package-0",
-      );
+      const residentExternal =
+        availableExternalPackages.get("external-package-0");
       if (residentExternal === undefined) {
         throw new Error("Expected resident external package to be cached");
       }
@@ -2005,7 +2004,7 @@ test("oversized package downloads fail before buffering the response", async () 
   const sourceZip = makeSourcePackageZip(null);
   const sourceUri = "https://packages.invalid/source.zip?token=signed-secret";
   vi.spyOn(globalThis, "fetch").mockResolvedValue(
-    new Response(sourceZip, {
+    new Response(new Uint8Array(sourceZip), {
       headers: { "Content-Length": "90000000" },
     }),
   );
@@ -2116,7 +2115,7 @@ test("stalled response body times out, cleans staging, and permits retry", async
   vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
     requestCount += 1;
     if (requestCount > 1) {
-      return new Response(sourceZip);
+      return new Response(new Uint8Array(sourceZip));
     }
 
     const signal = init?.signal;

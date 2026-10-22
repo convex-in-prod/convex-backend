@@ -2,7 +2,6 @@
 
 import url from "url";
 import path from "path";
-import { spawnSync } from "child_process";
 import fs from "fs";
 import * as tar from "tar";
 
@@ -144,16 +143,8 @@ function getStubDirectories(dirname) {
   );
 }
 
-function run(...args) {
-  console.log(args.join(" "));
-  spawnSync(args[0], args.slice(1), { stdio: "inherit" });
-}
-
-// `tsc --removeInternal` works on methods of classes but not properties of
-// objects or function parameters so until we move back to api-extractor we
-// manually remove a list of @internal properties.
-//
-// To maintain declaration maps it's helpful to avoid changing line numbers.
+// `--stripInternal` does not cover every nested property or parameter. Reject
+// remaining internal declarations instead of publishing them with the public API.
 function auditInternal(dirname) {
   auditForInternal(path.join(dirname, "dist", "cjs-types"));
   auditForInternal(path.join(dirname, "dist", "esm-types"));
@@ -177,7 +168,7 @@ function auditForInternal(dir) {
           `\n\`\`\`\n${match}\`\`\``,
         );
         throw new Error(
-          "Found @internal type in published types! Until we switch to api-extractor you need to add a pattern for this in scripts/postpack.mjs in rewriteDtsToRemoveInternal().",
+          "Found @internal type in published declarations. Remove it from the public declaration output before publishing.",
         );
       }
     }

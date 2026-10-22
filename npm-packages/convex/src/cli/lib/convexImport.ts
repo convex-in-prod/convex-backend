@@ -461,7 +461,9 @@ export async function uploadForImport(
         headers: {
           "Content-Type": "application/octet-stream",
         },
-        body: chunkWithoutBom,
+        // ReadStream allocates ordinary, non-shared buffers. Preserve the
+        // subarray offset without copying each upload chunk for DOM typings.
+        body: chunkWithoutBom as Buffer & { buffer: ArrayBuffer },
         method: "POST",
       });
       partTokens.push(await partResp.json());

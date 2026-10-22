@@ -207,7 +207,8 @@ export function useCurrentUsage(enabled: boolean = true): {
         throw new Error(normalized.message);
       }
       const currentUsage: CurrentUsage = {};
-      for (const [metric, { usage }] of Object.entries(body.metrics)) {
+      for (const metric of Object.keys(body.metrics)) {
+        const { usage } = body.metrics[metric];
         currentUsage[metric as UsageMetric] = {
           day: usage.current_day,
           month: usage.current_month,
