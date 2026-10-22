@@ -12,7 +12,7 @@ life of that process even after the corresponding disk-cache entry is deleted.
 
 ## Operator view
 
-This is one adoption unit. It includes the Node.js 24 runtime move, generation
+This is one adoption unit. It includes the Node.js 26 runtime move, generation
 retirement and hot replacement, proactive healthy-generation limits, and
 first-watchdog-miss evidence. Steady state still uses one process per logical
 executor slot. A healthy replacement temporarily adds one candidate process;
@@ -21,11 +21,11 @@ that surge allowance until it is reaped. The optional application-declared
 pinned-pool patch reuses this owner once per committed pool and coordinates one
 surge allowance across them.
 
-The repository and self-hosted images pin Node.js 24.18.1. The local executor
-accepts another `v24.*` binary from `PATH` when the exact NVM-managed binary is
-unavailable and rejects other major versions. Build the backend and dashboard
+The repository and self-hosted images pin Node.js 26.13.0. The local executor
+always selects `node` from `PATH`, accepts `v26.*`, and rejects other major
+versions. It does not search NVM installation directories. Build the backend and dashboard
 from the same source revision and verify that both release images report
-`v24.18.1`.
+`v26.13.0`.
 
 When a Node event loop stops responding:
 
@@ -811,17 +811,17 @@ traffic or change the steady-state one-process-per-logical-slot contract.
 Timeout and unhealthy-watchdog recovery are automatic after a backend image
 containing the lifecycle implementation starts. Build the backend and dashboard
 from the same source revision. Both self-hosted images read `.nvmrc` and install
-the exact Node.js 24.18.1 NodeSource package. Before replacement:
+the exact Node.js 26.13.0 NodeSource package. Before replacement:
 
 ```sh
 docker run --rm <backend-image> node --version
 docker run --rm <dashboard-image> node --version
 ```
 
-Both commands must print `v24.18.1`. The generated mise lock lists unofficial
-24.18.1 musl URLs without checksums because those archives were unavailable
-when the lock was generated. Do not use those musl entries until upstream
-publishes the archives and the lock is regenerated with checksums.
+Both commands must print `v26.13.0`. The generated mise lock includes download
+URLs and checksums for all seven configured platforms, including the unofficial
+musl builds. Updating `.nvmrc` also requires regenerating the Node entries with
+`mise lock node`; the other tool versions remain unchanged.
 
 On Unix, first-miss diagnostics are automatic. The optional
 `LOCAL_NODE_EXECUTOR_DIAGNOSTICS_DIR` selects an absolute persistent artifact

@@ -69,6 +69,14 @@ adoption contract documented in the backend essay.
 
 ## Deployment and code generation
 
+### [Node.js 26 source-package metadata](node26_source_metadata/README.md)
+
+- Purpose: accept and read Node.js 26 in existing source-package metadata.
+- Prerequisites: a compatible installed Node runtime for local actions; this patch
+  does not install or select an executable.
+- Activation: upgrade the backend before deploying source metadata declaring Node.js 26.
+- Rollback: older backends cannot read source records containing the new version value.
+
 ### [Non-committing codegen analysis](non_committing_codegen_analysis/README.md)
 
 - Purpose: let standalone codegen obtain authoritative evaluated component analysis without
@@ -191,7 +199,7 @@ requires explicit client negotiation, and its preparation is process-local.
   mechanism with retire-first cgroup-pressure handling. The composed pinned runtime uses the same
   lifecycle owner for a dedicated serialized system child and retains system-operation capacity
   through child completion when a caller disappears. This patch also moves the local runtime to
-  Node.js 24 and captures bounded
+  Node.js 26 and captures bounded
   active-request, process, diagnostic-report, and main-thread CPU-profile evidence on the first
   watchdog miss without delaying replacement. Published diagnostic artifacts are private,
   retained local files rather than logs. Detached descendant process groups, including
