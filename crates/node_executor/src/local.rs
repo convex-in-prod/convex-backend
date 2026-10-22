@@ -4126,12 +4126,13 @@ impl InnerLocalNodeExecutor {
             },
         };
 
-        if output_too_large
-            || !status.success()
-            || (!version.starts_with(b"v22.")
-                && !version.starts_with(b"v24.")
-                && !version.starts_with(b"v26."))
-        {
+        if output_too_large || !status.success() || !version.starts_with(b"v26.") {
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "DeploymentNotConfiguredForNodeActions",
+                "Deployment is not configured to deploy \"use node\" actions. \
+                 Node.js v26 is not installed. \
+                 Install Node.js v26 with nvm (https://github.com/nvm-sh/nvm) \
+                  to deploy Node.js actions."
             ))
         }
         Ok(())
@@ -9693,7 +9694,7 @@ mod tests {
         fs::write(
             &node_path,
             r#"#!/bin/sh
-printf 'v24.'
+printf 'v26.'
 while true; do
   printf x
 done
