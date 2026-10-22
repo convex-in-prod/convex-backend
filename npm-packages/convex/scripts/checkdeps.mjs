@@ -18,7 +18,8 @@ const options = {
     "src/bundler", // Bundler is only used by the CLI
   ],
   ignoreMatches: [
-    "esbuild", // the only unbundled dependency of the CLI
+    "esbuild", // native CLI dependency
+    "tsrs", // native compiler resolved by the bundled CLI at runtime
   ],
 };
 

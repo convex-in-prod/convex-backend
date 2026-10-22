@@ -12,7 +12,7 @@ import { noSchemaDataModelDTS } from "../dist/esm/cli/codegen_templates/dataMode
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import prettier from "prettier";
 
 const modulePaths = ["foo.ts", "bar/baz.ts"];
@@ -20,16 +20,16 @@ const modulePaths = ["foo.ts", "bar/baz.ts"];
 console.log("Generating codegen outputs for comparison...\n");
 
 // Generate all versions of our files
-const apiJsDts = apiCodegen(modulePaths, { generateJavaScriptApi: true });
+const apiJsDts = apiCodegen(modulePaths, { useTypeScript: false });
 const apiJs = apiJsDts.JS;
 const apiDts = apiJsDts.DTS;
-const apiTsResult = apiCodegen(modulePaths, { generateJavaScriptApi: false });
+const apiTsResult = apiCodegen(modulePaths, { useTypeScript: true });
 const apiTs = apiTsResult.TS;
 
-const serverJsDts = serverCodegen({ generateJavaScriptApi: true });
+const serverJsDts = serverCodegen({ useTypeScript: false });
 const serverJs = serverJsDts.JS;
 const serverDts = serverJsDts.DTS;
-const serverTsResult = serverCodegen({ generateJavaScriptApi: false });
+const serverTsResult = serverCodegen({ useTypeScript: true });
 const serverTs = serverTsResult.TS;
 
 const dataModelDts = noSchemaDataModelDTS();
@@ -169,9 +169,9 @@ try {
   }
 
   // Compile the TS files
-  const tscPath = path.join(projectRoot, "node_modules", ".bin", "tsc");
+  const tsrsPath = path.join(projectRoot, "node_modules", ".bin", "tsrs");
   try {
-    execSync(`${tscPath} --project ${path.join(tmpDir, "tsconfig.json")}`, {
+    execFileSync(tsrsPath, ["--project", path.join(tmpDir, "tsconfig.json")], {
       cwd: tmpDir,
       stdio: "pipe",
     });

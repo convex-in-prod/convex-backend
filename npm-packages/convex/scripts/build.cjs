@@ -147,6 +147,8 @@ if (process.argv.includes("standalone-cli")) {
       external: [
         // contains a binary
         "esbuild",
+        // contains a native compiler and its platform packages
+        "tsrs",
         // contains a binary
         "fsevents",
         // prettier 3 is more difficult to bundle into a CJS bundle.

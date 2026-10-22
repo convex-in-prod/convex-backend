@@ -67,6 +67,14 @@ adoption contract documented in the backend essay.
   and rejected sync actions can close the socket again, and exhausted callback mutations can
   receive additional retry cycles.
 
+## Build tooling
+
+### [Native TypeScript checking with tsrs](tsrs_typechecking/README.md)
+
+- Use pinned tsrs for application, SDK, runtime and self-hosted dashboard checks.
+- Emit SDK declarations once per visibility level; migrate supporting package builds
+  while preserving ESM/CommonJS loading and actual backend bundle inputs.
+
 ## Deployment and code generation
 
 ### [Node.js 26 source-package metadata](node26_source_metadata/README.md)

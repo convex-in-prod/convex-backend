@@ -129,7 +129,9 @@ fn main() -> anyhow::Result<()> {
     rerun_if_changed("../../npm-packages/convex/src/server")?;
     rerun_if_changed("../../npm-packages/convex/scripts/bundle-server.mjs")?;
     rerun_if_changed("../../npm-packages/convex/package.json")?;
+    rerun_if_changed("../../npm-packages/convex/tsconfig.json")?;
     rerun_if_changed("../../npm-packages/convex/scripts/build.py")?;
+    rerun_if_changed("../../npm-packages/convex/scripts/build.cjs")?;
 
     // Dependency resolution inputs: a dep bump or override change alters the
     // compiled-in bundles without touching any source watched above.
@@ -139,6 +141,9 @@ fn main() -> anyhow::Result<()> {
 
     rerun_if_changed("../../npm-packages/node-executor/src")?;
     rerun_if_changed("../../npm-packages/node-executor/package.json")?;
+    // Both the checker and esbuild read this configuration before producing the
+    // embedded bundles.
+    rerun_if_changed("../../npm-packages/node-executor/tsconfig.json")?;
 
     rerun_if_changed("../../npm-packages/system-udfs/convex/")?;
 
@@ -193,9 +198,19 @@ fn main() -> anyhow::Result<()> {
     // changes.
     rerun_if_changed("../../npm-packages/udf-runtime/src/")?;
     rerun_if_changed("../../npm-packages/udf-runtime/package.json")?;
+    rerun_if_changed("../../npm-packages/udf-runtime/tsconfig.json")?;
     rerun_if_changed("../../npm-packages/system-udfs/convex/_system")?;
     rerun_if_changed("../../npm-packages/system-udfs/package.json")?;
     rerun_if_changed("../../npm-packages/system-udfs/tsconfig.json")?;
+    rerun_if_changed("../../npm-packages/system-udfs/turbo.json")?;
+
+    // These workspace packages are embedded in the system bundles. Cargo must
+    // invalidate before Turbo can rebuild their output or rerun their checks.
+    for package in ["id-encoding", "udf-syscall-ffi"] {
+        for input in ["src", "package.json", "tsconfig.json"] {
+            rerun_if_changed(format!("../../npm-packages/{package}/{input}"))?;
+        }
+    }
 
     // Step 1: Ensure the `server`, `dashboard`, and `cli` deps are installed.
     // Keep the package list in sync with the `Build JS required by Rust` step in
