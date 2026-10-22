@@ -68,6 +68,9 @@ const optionsForBuild = {
 const nextConfig = {
   transpilePackages: [],
   reactStrictMode: true,
+  // The build script runs next typegen and tsrs first, including generated route
+  // types. Skip only Next's duplicate TypeScript-JavaScript checker.
+  typescript: { ignoreBuildErrors: true },
   // Next 16 writes an AGENTS.md and a CLAUDE.md into the package on every
   // dev/build run; this repo keeps those files under its own conventions.
   agentRules: false,

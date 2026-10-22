@@ -358,14 +358,14 @@ Command.prototype.addDeployOptions = function () {
     .addOption(
       new Option(
         "--typecheck <mode>",
-        `Whether to check TypeScript files with \`tsc --noEmit\` before deploying.`,
+        `Whether to check TypeScript files with \`tsrs --noEmit\` before deploying.`,
       )
         .choices(["enable", "try", "disable"] as const)
         .default("try" as const),
     )
     .option(
       "--typecheck-components",
-      "Check TypeScript files within component implementations with `tsc --noEmit`.",
+      "Check TypeScript files within component implementations with `tsrs --noEmit`.",
       false,
     )
     .addOption(
@@ -450,14 +450,14 @@ Command.prototype.addRunOptions = function () {
       .addOption(
         new Option(
           "--typecheck <mode>",
-          `Whether to check TypeScript files with \`tsc --noEmit\`.`,
+          `Whether to check TypeScript files with \`tsrs --noEmit\`.`,
         )
           .choices(["enable", "try", "disable"] as const)
           .default("try" as const),
       )
       .option(
         "--typecheck-components",
-        "Check TypeScript files within component implementations with `tsc --noEmit`.",
+        "Check TypeScript files within component implementations with `tsrs --noEmit`.",
         false,
       )
       .addOption(
