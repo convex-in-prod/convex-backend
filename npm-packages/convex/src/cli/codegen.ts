@@ -27,7 +27,7 @@ export const codegen = new Command("codegen")
   .addOption(
     new Option(
       "--typecheck <mode>",
-      `Whether to check TypeScript files with \`tsc --noEmit\`.`,
+      `Whether to check TypeScript files with \`tsrs --noEmit\`.`,
     )
       .choices(["enable", "try", "disable"] as const)
       .default("try" as const),
