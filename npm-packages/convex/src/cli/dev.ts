@@ -31,14 +31,14 @@ export const dev = new Command("dev")
   .addOption(
     new Option(
       "--typecheck <mode>",
-      `Check TypeScript files with \`tsc --noEmit\`.`,
+      `Check TypeScript files with \`tsrs --noEmit\`.`,
     )
       .choices(["enable", "try", "disable"] as const)
       .default("try" as const),
   )
   .option(
     "--typecheck-components",
-    "Check TypeScript files within component implementations with `tsc --noEmit`.",
+    "Check TypeScript files within component implementations with `tsrs --noEmit`.",
     false,
   )
   .addOption(

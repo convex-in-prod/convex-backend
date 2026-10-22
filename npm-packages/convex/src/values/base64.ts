@@ -53,7 +53,9 @@ function _byteLength(_b64: string, validLen: number, placeHoldersLen: number) {
 }
 
 /** @public */
-export function toByteArray(b64: string): Uint8Array {
+// This decoder allocates ordinary ArrayBuffer storage. Keep this spelling
+// compatible with consumers predating generic typed arrays.
+export function toByteArray(b64: string): Uint8Array & { buffer: ArrayBuffer } {
   var tmp;
   var lens = getLens(b64);
   var validLen = lens[0];

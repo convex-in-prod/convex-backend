@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = "~=3.13.0"
-# dependencies = [
-#     "toml",
-# ]
+# dependencies = []
 # ///
 
-import os
 import random
 import shutil
 import subprocess
@@ -16,8 +13,6 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from pathlib import Path
-
-NPM = "npm.CMD" if os.name == "nt" else "npm"
 
 times: dict[str, float] = {}
 
@@ -63,38 +58,22 @@ def provide_temp_dir(func: Callable[[Path], None]) -> Callable[[], None]:
 
 @log_duration
 @provide_temp_dir
-def build_esm_types(temp_dir: Path) -> None:
-    (temp_dir / Path("esm-types")).mkdir(parents=True, exist_ok=True)
-    (temp_dir / Path("esm-types/package.json")).write_text('{"type": "module"}')
-    run(f"tsc --outDir {temp_dir / 'esm-types'}")
+def build_public_types(temp_dir: Path) -> None:
+    run(f"tsrs --outDir {temp_dir / 'esm-types'}")
+    # Both declaration builds use the same module settings. Only the package
+    # markers differ; equal directory depths also preserve declaration-map paths.
+    shutil.copytree(temp_dir / "esm-types", temp_dir / "cjs-types")
+    (temp_dir / "esm-types/package.json").write_text('{"type": "module"}')
+    (temp_dir / "cjs-types/package.json").write_text('{"type": "commonjs"}')
 
 
 @log_duration
 @provide_temp_dir
-def build_internal_esm_types(temp_dir: Path) -> None:
-    (temp_dir / Path("internal-esm-types")).mkdir(parents=True, exist_ok=True)
-    (temp_dir / Path("internal-esm-types/package.json")).write_text(
-        '{"type": "module"}'
-    )
-    run(f"tsc --stripInternal false --outDir {temp_dir / 'internal-esm-types'}")
-
-
-@log_duration
-@provide_temp_dir
-def build_cjs_types(temp_dir: Path) -> None:
-    (temp_dir / Path("cjs-types")).mkdir(parents=True, exist_ok=True)
-    (temp_dir / Path("cjs-types/package.json")).write_text('{"type": "commonjs"}')
-    run(f"tsc --outDir {temp_dir / 'cjs-types'}")
-
-
-@log_duration
-@provide_temp_dir
-def build_internal_cjs_types(temp_dir: Path) -> None:
-    (temp_dir / Path("internal-cjs-types")).mkdir(parents=True, exist_ok=True)
-    (temp_dir / Path("internal-cjs-types/package.json")).write_text(
-        '{"type": "commonjs"}'
-    )
-    run(f"tsc --stripInternal false --outDir {temp_dir / 'internal-cjs-types'}")
+def build_internal_types(temp_dir: Path) -> None:
+    run(f"tsrs --stripInternal false --outDir {temp_dir / 'internal-esm-types'}")
+    shutil.copytree(temp_dir / "internal-esm-types", temp_dir / "internal-cjs-types")
+    (temp_dir / "internal-esm-types/package.json").write_text('{"type": "module"}')
+    (temp_dir / "internal-cjs-types/package.json").write_text('{"type": "commonjs"}')
 
 
 @log_duration
@@ -138,10 +117,8 @@ def main() -> None:
 
     children = []
     # Types are slower, run them first
-    children.append(pool.submit(build_esm_types))
-    children.append(pool.submit(build_internal_esm_types))
-    children.append(pool.submit(build_cjs_types))
-    children.append(pool.submit(build_internal_cjs_types))
+    children.append(pool.submit(build_public_types))
+    children.append(pool.submit(build_internal_types))
     children.append(pool.submit(build_cjs_and_esm))
     children.append(pool.submit(build_browser_script_tag))
     children.append(pool.submit(build_react_script_tag))

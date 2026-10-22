@@ -4,7 +4,7 @@ This patch makes the backend Docker build honor the Cargo profile the operator s
 expensive dependency work reusable across first-party source changes. The default path still builds
 a normal release image and applies the existing final GNU `strip` pass for image size. Profiling or
 debugging builds preserve their requested artifact shape, while ordinary builds use shallow Cargo
-Git dependencies, shared Cargo caches, and no redundant eager JavaScript workspace install.
+Git dependencies, shared Cargo caches, and a reusable JavaScript dependency layer.
 
 ## Local Cargo prerequisites
 
@@ -145,12 +145,12 @@ All Cargo cache mounts use `sharing=locked`. While holding those mounts exclusiv
 removes stale Git lockfiles that a cancelled BuildKit step may have left behind. The cleanup is not
 run concurrently with another build using the same repositories.
 
-The pinned pnpm and Turbo tools remain installed before Cargo dependency cooking. The full
-JavaScript workspace is copied later with the remaining first-party source. The final backend build
-retains the pnpm store cache; isolate's build script performs the frozen workspace install with
-lifecycle scripts disabled and builds the packages embedded in the backend binary. The Dockerfile
-does not run a separate eager `just install-js`, which would run unrelated workspace lifecycle
-downloads whenever package source changes.
+The pinned pnpm and Turbo tools and the JavaScript workspace are copied before Cargo dependency
+cooking. A separate `just install-js` layer installs the frozen workspace dependencies using the
+workspace's `allowBuilds` policy and a persistent pnpm store cache. The remaining first-party source
+is copied later. The final backend build retains the same pnpm store cache; isolate's build script
+rechecks the frozen workspace install with lifecycle scripts disabled and runs the filtered Turbo
+build for the packages embedded in the backend binary.
 
 ### Observed build evidence
 
@@ -159,11 +159,11 @@ while it repeatedly fetched complete Git dependency histories. With shallow fetc
 caches, the corrected cargo-chef prepare completed in 12 minutes 14 seconds, dependency cooking in
 46 seconds, and the final two backend binaries in about 4 minutes 36 seconds.
 
-In that corrected build, the still-eager JavaScript install took 13 minutes 20 seconds and included
-a Puppeteer browser download. That observation motivated removing the layer. The image was not
-rebuilt after the JavaScript-layer removal, so the patch does not claim a measured replacement time
-for that step. Source changes still cause the final backend layer to run the scripts-disabled pnpm
-install and required JavaScript builds; the persistent store avoids repeating package transfers.
+In that earlier build, the JavaScript install took 13 minutes 20 seconds and included a Puppeteer
+browser download. Those timings predate the current workspace lifecycle policy and dependency
+layering. They do not establish current install timings. Source changes still cause the final
+backend layer to run the scripts-disabled pnpm install and required JavaScript builds; the
+persistent store avoids repeating package transfers.
 
 ## How to use it
 
@@ -260,11 +260,10 @@ A local custom-profile cargo build probe was blocked before checking the backend
 host was missing `cmake` for `aws-lc-sys`.
 
 A later normal release image build with shallow Cargo fetches and shared caches produced both
-backend binaries and a runnable image with the timings recorded above. The subsequent
-JavaScript-layer removal is supported by the isolate build-script contract: cargo-chef uses dummy
+backend binaries and a runnable image with the timings recorded above. cargo-chef uses dummy
 workspace build scripts, while the real isolate build runs after the full source copy and performs
-the frozen, scripts-disabled install before its filtered Turbo build. No Docker image build was run
-after removing the eager install.
+the frozen, scripts-disabled install before its filtered Turbo build. This historical build evidence
+does not measure later changes to dependency layering.
 
 ## Development debug information
 

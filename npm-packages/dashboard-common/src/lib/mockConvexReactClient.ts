@@ -45,7 +45,7 @@ class MockConvexReactClient {
 
   watchQuery<Query extends FunctionReference<"query">>(
     query: FunctionReference<"query">,
-    ...args: Query["_args"]
+    ...args: [Query["_args"]]
   ): Watch<Query["_returnType"]> {
     return {
       localQueryResult: () => {
@@ -99,7 +99,7 @@ class MockConvexReactClient {
 
   mutation<Mutation extends FunctionReference<"mutation">>(
     mutation: Mutation,
-    ...args: Mutation["_args"]
+    ...args: [Mutation["_args"]]
   ): Promise<Mutation["_returnType"]> {
     const name = getFunctionName(mutation);
     const mutationImpl = this.mutations && this.mutations[name];

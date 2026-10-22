@@ -1,47 +1,31 @@
 import { chalkStderr } from "chalk";
 import { functionsDir, ensureHasConvexDependency } from "./lib/utils/utils.js";
-import { Command, Option } from "@commander-js/extra-typings";
-import { readConfig } from "./lib/config.js";
-import {
-  typeCheckFunctions,
-  resolveTypescriptCompiler,
-} from "./lib/typecheck.js";
+import { Command } from "@commander-js/extra-typings";
+import { readProjectConfig } from "./lib/config.js";
+import { typeCheckFunctions } from "./lib/typecheck.js";
 import { oneoffContext } from "../bundler/context.js";
 import { logFinishedStep, logMessage } from "../bundler/log.js";
 
 // Experimental (it's going to fail sometimes) TypeScript type checking.
 // Includes a separate command to help users debug their TypeScript configs.
 
-export type TypecheckResult = "cantTypeCheck" | "success" | "typecheckFailed";
-
-/** Run the TypeScript compiler, as configured during  */
 export const typecheck = new Command("typecheck")
   .description(
-    "Run TypeScript typechecking on your Convex functions with `tsc --noEmit`.",
+    "Run TypeScript typechecking on your Convex functions with tsrs.",
   )
   .allowExcessArguments(false)
-  .addOption(
-    new Option(
-      "--typescript-compiler <compiler>",
-      "TypeScript compiler to use for typechecking (`@typescript/native-preview` must be installed to use `tsgo`)",
-    ).choices(["tsc", "tsgo"] as const),
-  )
-  .action(async (cmdOptions) => {
+  .action(async () => {
     const ctx = await oneoffContext({
       url: undefined,
       adminKey: undefined,
       envFile: undefined,
     });
-    const typescriptCompiler = await resolveTypescriptCompiler(
-      ctx,
-      cmdOptions.typescriptCompiler,
-    );
-    const { configPath, config: localConfig } = await readConfig(ctx, false);
+    // Read configuration without bundling so compiler diagnostics remain reachable.
+    const { configPath, projectConfig } = await readProjectConfig(ctx);
     await ensureHasConvexDependency(ctx, "typecheck");
     await typeCheckFunctions(
       ctx,
-      typescriptCompiler,
-      functionsDir(configPath, localConfig.projectConfig),
+      functionsDir(configPath, projectConfig),
       async (typecheckResult, logSpecificError, runOnError) => {
         logSpecificError?.();
         if (typecheckResult === "typecheckFailed") {
@@ -60,7 +44,9 @@ export const typecheck = new Command("typecheck")
           });
         } else if (typecheckResult === "cantTypeCheck") {
           logMessage(
-            chalkStderr.gray("Unable to typecheck; is TypeScript installed?"),
+            chalkStderr.gray(
+              "Unable to typecheck; is convex/tsconfig.json present?",
+            ),
           );
           return await ctx.crash({
             exitCode: 1,
@@ -68,9 +54,7 @@ export const typecheck = new Command("typecheck")
             printedMessage: null,
           });
         } else {
-          logFinishedStep(
-            `Typecheck passed: \`${typescriptCompiler} --noEmit\` completed with exit code 0.`,
-          );
+          logFinishedStep("Typecheck passed.");
           return await ctx.flushAndExit(0);
         }
       },

@@ -283,7 +283,8 @@ async function checkEcho(ctx: Context, url: string, size: number) {
       },
     });
     const echoUrl = new URL(`/echo`, url);
-    const data = crypto.randomBytes(size);
+    // randomBytes allocates ordinary backing, despite older Node typings.
+    const data = crypto.randomBytes(size) as Buffer & { buffer: ArrayBuffer };
     const resp = await fetch(echoUrl.toString(), {
       body: data,
       method: "POST",

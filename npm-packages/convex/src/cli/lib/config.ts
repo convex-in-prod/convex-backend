@@ -4,7 +4,6 @@ import path from "path";
 import { promises as nodeFs } from "fs";
 import { z } from "zod";
 import { Context } from "../../bundler/context.js";
-import { TypescriptCompiler } from "./typecheck.js";
 import {
   changeSpinner,
   logError,
@@ -101,8 +100,6 @@ export interface ProjectConfig {
         includeSourcesContent?: boolean;
       }
     | undefined;
-
-  typescriptCompiler?: TypescriptCompiler | undefined;
 
   // WorkOS AuthKit integration configuration
   authKit?: AuthKitConfig | undefined;
@@ -350,13 +347,6 @@ const createProjectConfigSchema = (strict: boolean) => {
     }),
     bundler: bundlerSchema.optional(),
     generateCommonJSApi: z.boolean().default(false),
-    typescriptCompiler: z
-      .enum(["tsc", "tsgo"])
-      .optional()
-      .describe(
-        "TypeScript compiler to use for typechecking (`@typescript/native-preview` must be installed to use `tsgo`)",
-      ),
-
     // Optional $schema field for JSON schema validation in editors
     $schema: z.string().optional(),
     // WorkOS AuthKit integration configuration
