@@ -18,7 +18,7 @@ allowedAlternativeVersions in npm-packages/common-versions.json (checked by
 # node version
 
 Node.js 24 is the expected version for the whole repo. `.nvmrc` and the
-self-hosted images pin Node.js 24.18.1. The local backend accepts another
+self-hosted images pin Node.js 24.22.1. The local backend accepts another
 Node.js 24 binary from `PATH` but rejects other major versions.
 
 Lambda function Node.js versions are configured separately with `"use node"`.
