@@ -12,7 +12,7 @@ Make watchdog deadlines cover the first hanging probe and later failed intervals
 Document the liveness properties, accepted scheduler head-of-line limitation, rollback contract, and rejected larger runtime designs.
 ---
  .../application_function_runner/metrics.rs    |  73 ++++
- .../src/application_function_runner/mod.rs    | 369 +++++++++++++++++-
+ .../src/application_function_runner/mod.rs    | 362 +++++++++++++++++-
  crates/common/src/knobs.rs                    | 285 +++++++++++++-
  crates/node_executor/src/local.rs             | 288 ++++++++++++--
  crates/node_executor/src/metrics.rs           |  55 +++
@@ -23,12 +23,12 @@ Document the liveness properties, accepted scheduler head-of-line limitation, ro
  .../local_node_executor_resilience/README.md  |  22 +-
  .../README.md                                 |  22 +-
  self-hosted/advanced/knobs.md                 |  94 ++++-
- 12 files changed, 1594 insertions(+), 104 deletions(-)
+ 12 files changed, 1592 insertions(+), 99 deletions(-)
  create mode 100644 patches/local_node_executor_pool_admission/README.md
  create mode 100644 patches/local_node_executor_pool_admission/design_reference.md
 
 diff --git a/crates/application/src/application_function_runner/metrics.rs b/crates/application/src/application_function_runner/metrics.rs
-index 40c30df2e9b1d04fa8f7aceab1b1f0bd7fa14e4d..686ff607f9f1d37c7ff222689abf17b9439ca1e1 100644
+index a12751241e6e7a96ae01f37271d043c7f44a71bc..e1fdc36cf9aeba16e117c1cfa09e3f3db43fe7ce 100644
 --- a/crates/application/src/application_function_runner/metrics.rs
 +++ b/crates/application/src/application_function_runner/metrics.rs
 @@ -1,3 +1,5 @@
@@ -48,7 +48,7 @@ index 40c30df2e9b1d04fa8f7aceab1b1f0bd7fa14e4d..686ff607f9f1d37c7ff222689abf17b9
      register_convex_histogram,
      CancelableTimer,
      StaticMetricLabel,
-@@ -193,6 +198,74 @@ pub fn function_waiter_timer(udf_type: UdfType) -> StatusTimer {
+@@ -194,6 +199,74 @@ pub fn function_waiter_timer(udf_type: UdfType) -> StatusTimer {
      timer
  }
  
@@ -124,7 +124,7 @@ index 40c30df2e9b1d04fa8f7aceab1b1f0bd7fa14e4d..686ff607f9f1d37c7ff222689abf17b9
      APPLICATION_FUNCTION_RUNNER_RUN_SECONDS,
      "The time a function took to run. This excludes the semaphore wait time.",
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 03332e4f0da716b5df0c1bb866fcae5f37d82c41..afcd80f46c09739499126a621b6e69decb4ebaad 100644
+index b5ffc0709bc655c9d19c6ac824b224611693a1f0..9f6d2432bea53b92be456d5a2f9066fb49d6bebe 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
 @@ -133,7 +133,10 @@ use model::{
@@ -155,12 +155,15 @@ index 03332e4f0da716b5df0c1bb866fcae5f37d82c41..afcd80f46c09739499126a621b6e69de
      UdfExecutorResult,
  };
  use crate::{
-@@ -661,6 +669,16 @@ impl<RT: Runtime> Limiter<RT> {
-         &'a self,
+@@ -688,6 +696,19 @@ impl<RT: Runtime> Limiter<RT> {
          rt: &'a RT,
+         timeout: PermitTimeout,
          is_dependency: bool,
 +    ) -> anyhow::Result<RequestGuard<'a, RT>> {
-+        let deadline = rt.monotonic_now() + self.semaphore_timeout;
++        let deadline = match timeout {
++            PermitTimeout::Enforce => Some(rt.monotonic_now() + self.semaphore_timeout),
++            PermitTimeout::WaitIndefinitely => None,
++        };
 +        self.acquire_permit_until(rt, is_dependency, deadline).await
 +    }
 +
@@ -168,20 +171,24 @@ index 03332e4f0da716b5df0c1bb866fcae5f37d82c41..afcd80f46c09739499126a621b6e69de
 +        &'a self,
 +        rt: &'a RT,
 +        is_dependency: bool,
-+        deadline: tokio::time::Instant,
++        deadline: Option<tokio::time::Instant>,
      ) -> anyhow::Result<RequestGuard<'a, RT>> {
          let mut request_guard = self.start();
          select! {
-@@ -671,7 +689,7 @@ impl<RT: Runtime> Limiter<RT> {
-                 self.report_metrics();
+@@ -699,9 +720,9 @@ impl<RT: Runtime> Limiter<RT> {
                  future::pending::<!>().await
              } => match x {},
--            _ = rt.wait(self.semaphore_timeout) => {
-+            _ = rt.wait(deadline.saturating_duration_since(rt.monotonic_now())) => {
+             _ = async {
+-                match timeout {
+-                    PermitTimeout::Enforce => rt.wait(self.semaphore_timeout).await,
+-                    PermitTimeout::WaitIndefinitely => future::pending().await,
++                match deadline {
++                    Some(deadline) => rt.wait(deadline.saturating_duration_since(rt.monotonic_now())).await,
++                    None => future::pending().await,
+                 }
+             } => {
                  log_function_wait_timeout(self.env, self.udf_type);
-                 let functions = match self.udf_type {
-                     UdfType::Query => "queries",
-@@ -785,6 +803,152 @@ impl<RT: Runtime> Drop for RequestGuard<'_, RT> {
+@@ -810,6 +831,152 @@ impl<RT: Runtime> Drop for RequestGuard<'_, RT> {
      }
  }
  
@@ -334,7 +341,7 @@ index 03332e4f0da716b5df0c1bb866fcae5f37d82c41..afcd80f46c09739499126a621b6e69de
  /// Executes UDFs for backends.
  ///
  /// This struct directly executes http and node actions. Queries, Mutations and
-@@ -811,6 +975,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
+@@ -836,6 +1003,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
      query_analysis_admission: Option<QueryAnalysisAdmission>,
      default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
      node_action_limiter: Limiter<RT>,
@@ -342,7 +349,7 @@ index 03332e4f0da716b5df0c1bb866fcae5f37d82c41..afcd80f46c09739499126a621b6e69de
      ai_gateway_jwt_minter: Option<Arc<dyn AiGatewayJwtMinter>>,
      deployment: DeploymentMetadata,
  }
-@@ -862,6 +1027,28 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -887,6 +1055,28 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              function_log.clone(),
              *ISOLATE_DEPENDENCY_WORKER_RESERVE,
          );
@@ -371,7 +378,7 @@ index 03332e4f0da716b5df0c1bb866fcae5f37d82c41..afcd80f46c09739499126a621b6e69de
  
          Self {
              runtime,
-@@ -878,11 +1065,20 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -903,11 +1093,20 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              query_analysis_admission,
              default_system_env_vars,
              node_action_limiter,
@@ -392,22 +399,17 @@ index 03332e4f0da716b5df0c1bb866fcae5f37d82c41..afcd80f46c09739499126a621b6e69de
      /// Called with a typed caller via [`ActionCallbacks`], or with flat
      /// claims from Conductor's gRPC handler.
      pub async fn mint_ai_gateway_jwt(
-@@ -2007,14 +2203,44 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2063,9 +2262,39 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  // from isolate ancestry: do not propagate it to the isolate scheduler.
                  let is_node_action_dependency =
                      node_action_gate_dependency(&caller, scheduler_dependency);
--                let _permit = if wait_for_permit {
--                    self.node_action_limiter
--                        .acquire_permit(is_node_action_dependency)
--                        .await?
--                } else {
--                    self.node_action_limiter
--                        .acquire_permit_with_timeout(&self.runtime, is_node_action_dependency)
--                        .await?
-+                let admission_deadline = (!wait_for_permit).then(|| {
-+                    self.runtime.monotonic_now()
-+                        + *APPLICATION_FUNCTION_RUNNER_ACTION_SEMAPHORE_TIMEOUT
-+                });
++                let admission_deadline = match permit_timeout {
++                    PermitTimeout::Enforce => Some(
++                        self.runtime.monotonic_now()
++                            + *APPLICATION_FUNCTION_RUNNER_ACTION_SEMAPHORE_TIMEOUT,
++                    ),
++                    PermitTimeout::WaitIndefinitely => None,
++                };
 +                // Pool capacity precedes the backend-wide permit. A saturated
 +                // dedicated pool therefore cannot consume every global Node slot
 +                // while its requests wait. Every Node path uses this order, so
@@ -425,27 +427,20 @@ index 03332e4f0da716b5df0c1bb866fcae5f37d82c41..afcd80f46c09739499126a621b6e69de
 +                // generation reservation. Scheduled callers therefore hold both
 +                // application permits across their durable claim, and dropping a
 +                // pre-claim attempt releases them without invoking user code.
-+                let _permit = match admission_deadline {
-+                    None => {
-+                        self.node_action_limiter
-+                            .acquire_permit(is_node_action_dependency)
-+                            .await?
-+                    },
-+                    Some(deadline) => {
-+                        // Pool and global queueing share one absolute deadline;
-+                        // composing the limits must not double the caller's wait.
-+                        self.node_action_limiter
-+                            .acquire_permit_until(
-+                                &self.runtime,
-+                                is_node_action_dependency,
-+                                deadline,
-+                            )
-+                            .await?
-+                    },
-                 };
++                // Pool and global queueing share one absolute deadline;
++                // composing the limits must not double the caller's wait.
+                 let _permit = self
+                     .node_action_limiter
+-                    .acquire_permit(&self.runtime, permit_timeout, is_node_action_dependency)
++                    .acquire_permit_until(
++                        &self.runtime,
++                        is_node_action_dependency,
++                        admission_deadline,
++                    )
+                     .await?;
  
                  // Fetch source and external_deps presigned URI first
-@@ -3170,12 +3396,27 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
+@@ -3221,12 +3450,27 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
  
  #[cfg(test)]
  mod tests {
@@ -477,7 +472,7 @@ index 03332e4f0da716b5df0c1bb866fcae5f37d82c41..afcd80f46c09739499126a621b6e69de
  
      #[test]
      fn nested_node_actions_use_application_overflow_without_false_isolate_ancestry() {
-@@ -3195,4 +3436,104 @@ mod tests {
+@@ -3246,4 +3490,104 @@ mod tests {
              SchedulerDependencyClass::UnblocksAncestor,
          ));
      }
@@ -583,7 +578,7 @@ index 03332e4f0da716b5df0c1bb866fcae5f37d82c41..afcd80f46c09739499126a621b6e69de
 +    }
  }
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index a79147ad03f23bbd27ed93a3c96c79053df75b15..30b75d58a4b8cf72b1009337b4628715885d64e0 100644
+index abdea530c0214d83f03dd70b41424986270a7883..133bbe71b80d1fb0c388fb20ce8ad75bd186bb28 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -17,6 +17,7 @@ use std::{
@@ -799,7 +794,7 @@ index a79147ad03f23bbd27ed93a3c96c79053df75b15..30b75d58a4b8cf72b1009337b4628715
              .expect("Default local Node executor RSS budget overflow"),
      );
      assert!(
-@@ -2948,4 +3074,147 @@ mod strict_capacity_tests {
+@@ -2967,4 +3093,147 @@ mod strict_capacity_tests {
          assert!(validate_active_javascript_class_minimums(28, 4, 14, None).is_err());
          assert!(validate_active_javascript_class_minimums(28, 4, 14, Some(8)).is_err());
      }

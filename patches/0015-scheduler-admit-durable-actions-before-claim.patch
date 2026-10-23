@@ -10,9 +10,9 @@ Keep polling the prepared execution while the claim is in flight so a known-lost
 Add bounded admission and claim metrics, focused barrier coverage, patch-train integration notes, rollout guidance, and rejected-alternative analysis.
 ---
  .../application_function_runner/metrics.rs    |  42 ++
- .../src/application_function_runner/mod.rs    | 158 ++++++
- crates/application/src/cron_jobs/mod.rs       |  67 ++-
- crates/application/src/scheduled_jobs/mod.rs  |  83 ++--
+ .../src/application_function_runner/mod.rs    | 161 ++++++-
+ crates/application/src/cron_jobs/mod.rs       |  63 ++-
+ crates/application/src/scheduled_jobs/mod.rs  |  79 +--
  .../src/in_process_function_runner.rs         |   3 +
  crates/function_runner/src/lib.rs             |   2 +
  crates/function_runner/src/server.rs          | 123 +++++
@@ -22,11 +22,11 @@ Add bounded admission and claim metrics, focused barrier coverage, patch-train i
  patches/dependency_capacity/README.md         |   5 +
  patches/isolate_queue_control/README.md       |  21 +-
  patches/scheduled_action_admission/README.md  | 455 ++++++++++++++++++
- 13 files changed, 1045 insertions(+), 121 deletions(-)
+ 13 files changed, 1039 insertions(+), 122 deletions(-)
  create mode 100644 patches/scheduled_action_admission/README.md
 
 diff --git a/crates/application/src/application_function_runner/metrics.rs b/crates/application/src/application_function_runner/metrics.rs
-index b2334260ae062c0b8adff91e3da8714f4c8601b2..40c30df2e9b1d04fa8f7aceab1b1f0bd7fa14e4d 100644
+index 50807602a929157d507cfa672cb1f9392ca4ff83..a12751241e6e7a96ae01f37271d043c7f44a71bc 100644
 --- a/crates/application/src/application_function_runner/metrics.rs
 +++ b/crates/application/src/application_function_runner/metrics.rs
 @@ -8,6 +8,7 @@ use metrics::{
@@ -86,7 +86,7 @@ index b2334260ae062c0b8adff91e3da8714f4c8601b2..40c30df2e9b1d04fa8f7aceab1b1f0bd
      UDF_EXECUTOR_RESULT_TOTAL,
      "Number of queries against the module cache",
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index c7307e631c036030385d6836780cd1faae944c78..d05d203580e96f5b1834d8ff741f88c2cfa667b6 100644
+index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73adcfcb86e7 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
 @@ -106,6 +106,8 @@ use file_storage::{
@@ -109,47 +109,48 @@ index c7307e631c036030385d6836780cd1faae944c78..d05d203580e96f5b1834d8ff741f88c2
      function_waiter_timer,
      log_occ_retries,
      log_outstanding_functions,
-@@ -354,6 +359,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -385,6 +390,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                      active_javascript_class,
                  }),
                  None,
 +                None,
                  scheduler_dependency,
-                 false,
              )
-@@ -371,6 +377,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+             .await?;
+@@ -401,7 +407,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          log_line_sender: mpsc::UnboundedSender<LogLine>,
          context: ExecutionContext,
-         wait_for_permit: bool,
+         permit_timeout: PermitTimeout,
+-        wait_for_permit: bool,
 +        function_execution_start: Option<FunctionExecutionStartGate>,
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
-         let (_, outcome) = self
-@@ -385,6 +392,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+         let permit = self
+@@ -425,6 +431,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                      active_javascript_class: ActiveJavascriptClass::Protected,
                  }),
                  None,
 +                function_execution_start,
                  scheduler_dependency,
-                 wait_for_permit,
              )
-@@ -414,6 +422,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+             .await?;
+@@ -457,6 +464,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  Some(log_line_sender),
                  None,
                  Some(http_action_metadata),
 +                None,
                  SchedulerDependencyClass::Independent,
-                 false,
              )
-@@ -442,6 +451,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+             .await?;
+@@ -480,6 +488,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
          function_metadata: Option<FunctionMetadata>,
          http_action_metadata: Option<HttpActionMetadata>,
 +        function_execution_start: Option<FunctionExecutionStartGate>,
          scheduler_dependency: SchedulerDependencyClass,
-         wait_for_permit: bool,
      ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
-@@ -510,6 +520,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+         // Read in this transaction so preference changes invalidate cached queries.
+@@ -531,6 +540,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  self.default_system_env_vars.clone(),
                  in_memory_index_last_modified,
                  context,
@@ -157,10 +158,12 @@ index c7307e631c036030385d6836780cd1faae944c78..d05d203580e96f5b1834d8ff741f88c2
                  scheduler_dependency,
              ),
              diagnostic.as_ref().map(RuntimeDiagnostic::task),
-@@ -1594,6 +1605,140 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1650,7 +1660,140 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+         usage_tracking: FunctionUsageTracker,
          context: ExecutionContext,
-         wait_for_permit: bool,
-         scheduler_dependency: SchedulerDependencyClass,
+         permit_timeout: PermitTimeout,
+-        wait_for_permit: bool,
++        scheduler_dependency: SchedulerDependencyClass,
 +    ) -> anyhow::Result<ActionCompletion> {
 +        self.run_action_no_udf_log_with_execution_start(
 +            path,
@@ -169,7 +172,7 @@ index c7307e631c036030385d6836780cd1faae944c78..d05d203580e96f5b1834d8ff741f88c2
 +            caller,
 +            usage_tracking,
 +            context,
-+            wait_for_permit,
++            permit_timeout,
 +            None,
 +            scheduler_dependency,
 +        )
@@ -188,7 +191,7 @@ index c7307e631c036030385d6836780cd1faae944c78..d05d203580e96f5b1834d8ff741f88c2
 +        caller: FunctionCaller,
 +        usage_tracking: FunctionUsageTracker,
 +        context: ExecutionContext,
-+        wait_for_permit: bool,
++        permit_timeout: PermitTimeout,
 +        scheduler_dependency: SchedulerDependencyClass,
 +        source: DurableActionSource,
 +        claim: impl std::future::Future<Output = anyhow::Result<Option<T>>>,
@@ -202,7 +205,7 @@ index c7307e631c036030385d6836780cd1faae944c78..d05d203580e96f5b1834d8ff741f88c2
 +            caller,
 +            usage_tracking,
 +            context,
-+            wait_for_permit,
++            permit_timeout,
 +            Some(start_gate),
 +            scheduler_dependency,
 +        ));
@@ -292,29 +295,29 @@ index c7307e631c036030385d6836780cd1faae944c78..d05d203580e96f5b1834d8ff741f88c2
 +        caller: FunctionCaller,
 +        usage_tracking: FunctionUsageTracker,
 +        context: ExecutionContext,
-+        wait_for_permit: bool,
++        permit_timeout: PermitTimeout,
 +        function_execution_start: Option<FunctionExecutionStartGate>,
-+        scheduler_dependency: SchedulerDependencyClass,
+         scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
          let mut diagnostic =
-             RuntimeDiagnostic::start(&context, UdfType::Action, 0, || format!("{path:?}"));
-@@ -1606,6 +1751,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1664,6 +1807,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  usage_tracking,
                  context,
-                 wait_for_permit,
+                 permit_timeout,
 +                function_execution_start,
                  scheduler_dependency,
              ),
              diagnostic.as_ref().map(RuntimeDiagnostic::task),
-@@ -1648,6 +1794,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1706,7 +1850,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          usage_tracking: FunctionUsageTracker,
          context: ExecutionContext,
-         wait_for_permit: bool,
+         permit_timeout: PermitTimeout,
+-        wait_for_permit: bool,
 +        mut function_execution_start: Option<FunctionExecutionStartGate>,
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
          if path.is_system() && !(identity.is_admin() || identity.is_system()) {
-@@ -1676,6 +1823,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1735,6 +1879,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  (path_and_args, returns_validator)
              },
              Err(js_error) => {
@@ -324,15 +327,15 @@ index c7307e631c036030385d6836780cd1faae944c78..d05d203580e96f5b1834d8ff741f88c2
                  return Ok(ActionCompletion {
                      outcome: ValidatedActionOutcome::from_error(
                          js_error,
-@@ -1724,6 +1874,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1783,6 +1930,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          log_line_sender,
                          context.clone(),
-                         wait_for_permit,
+                         permit_timeout,
 +                        function_execution_start,
                          scheduler_dependency,
                      )
                      .boxed();
-@@ -1854,6 +2005,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1908,6 +2056,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                      encoded_parent_trace: EncodedSpan::from_parent().0,
                  };
  
@@ -343,7 +346,7 @@ index c7307e631c036030385d6836780cd1faae944c78..d05d203580e96f5b1834d8ff741f88c2
                  let node_outcome_future = self
                      .node_actions
                      .execute(request, log_line_sender, source_maps_callback)
-@@ -1918,6 +2073,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1972,6 +2124,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  })
              },
              ModuleEnvironment::Invalid => {
@@ -354,22 +357,18 @@ index c7307e631c036030385d6836780cd1faae944c78..d05d203580e96f5b1834d8ff741f88c2
              },
          };
 diff --git a/crates/application/src/cron_jobs/mod.rs b/crates/application/src/cron_jobs/mod.rs
-index 134b198a0265932ef2c731c1ec7a1b42a9b3678e..1db0f44104c1210a4ee100b2553d6544cd2ee143 100644
+index a0ae7fe9f9b8ff8b3933adaf6b91bea921b9027b..16941209a19176c527948a2c62a8908e988da440 100644
 --- a/crates/application/src/cron_jobs/mod.rs
 +++ b/crates/application/src/cron_jobs/mod.rs
-@@ -89,7 +89,10 @@ use value::{
- };
- 
+@@ -91,6 +91,7 @@ use value::{
  use crate::{
--    application_function_runner::ApplicationFunctionRunner,
-+    application_function_runner::{
-+        ApplicationFunctionRunner,
+     application_function_runner::{
+         ApplicationFunctionRunner,
 +        DurableActionSource,
-+    },
+         PermitTimeout,
+     },
      function_log::FunctionExecutionLog,
- };
- 
-@@ -676,7 +679,8 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -683,7 +684,8 @@ impl<RT: Runtime> CronJobContext<RT> {
          let identity = tx.identity().clone();
          let (_, component_path) = self.get_job_component(&mut tx, job.id).await?;
          let caller = FunctionCaller::Cron;
@@ -379,7 +378,7 @@ index 134b198a0265932ef2c731c1ec7a1b42a9b3678e..1db0f44104c1210a4ee100b2553d6544
              CronJobState::Pending => {
                  // Create a new request & execution ID
                  let request_id = RequestId::new();
-@@ -686,27 +690,37 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -693,27 +695,37 @@ impl<RT: Runtime> CronJobContext<RT> {
                  );
                  sentry::configure_scope(|scope| context.add_sentry_tags(scope));
  
@@ -431,9 +430,9 @@ index 134b198a0265932ef2c731c1ec7a1b42a9b3678e..1db0f44104c1210a4ee100b2553d6544
                          PublicFunctionPath::Component(path),
                          job.cron_spec.udf_args.clone(),
                          identity.clone(),
-@@ -715,8 +729,14 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -722,8 +734,14 @@ impl<RT: Runtime> CronJobContext<RT> {
                          context.clone(),
-                         true,
+                         PermitTimeout::WaitIndefinitely,
                          SchedulerDependencyClass::Independent,
 +                        DurableActionSource::Cron,
 +                        claim,
@@ -447,7 +446,7 @@ index 134b198a0265932ef2c731c1ec7a1b42a9b3678e..1db0f44104c1210a4ee100b2553d6544
                  let execution_time_f64 = completion.execution_time.as_secs_f64();
                  let truncated_log_lines = self.truncate_log_lines(completion.log_lines.clone());
  
-@@ -756,9 +776,16 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -763,9 +781,16 @@ impl<RT: Runtime> CronJobContext<RT> {
                      .await;
              },
              CronJobState::InProgress {
@@ -466,7 +465,7 @@ index 134b198a0265932ef2c731c1ec7a1b42a9b3678e..1db0f44104c1210a4ee100b2553d6544
                  // This case can happen if there is a system error while executing
                  // the action or if backend exits after executing the action but
                  // before updating the state. Since we execute actions at most once,
-@@ -799,7 +826,7 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -806,7 +831,7 @@ impl<RT: Runtime> CronJobContext<RT> {
  
                  let path = CanonicalizedComponentFunctionPath {
                      component: component_path,
@@ -476,22 +475,18 @@ index 134b198a0265932ef2c731c1ec7a1b42a9b3678e..1db0f44104c1210a4ee100b2553d6544
                  let mut err = err.into();
                  self.function_log
 diff --git a/crates/application/src/scheduled_jobs/mod.rs b/crates/application/src/scheduled_jobs/mod.rs
-index 8184cdbdcabe8bda64ccb60a7e3e88ba6e2a763e..2c7ffc99c9643a0f286ed072f7fdfe27aa3f23e0 100644
+index ae5686dfd27cfe95b7123ab667273ce8709f1c04..3bbb7fdbffc6a9af5aff28956af1fbc26e985068 100644
 --- a/crates/application/src/scheduled_jobs/mod.rs
 +++ b/crates/application/src/scheduled_jobs/mod.rs
-@@ -119,7 +119,10 @@ use value::{
- };
- 
+@@ -121,6 +121,7 @@ use value::{
  use crate::{
--    application_function_runner::ApplicationFunctionRunner,
-+    application_function_runner::{
-+        ApplicationFunctionRunner,
+     application_function_runner::{
+         ApplicationFunctionRunner,
 +        DurableActionSource,
-+    },
+         PermitTimeout,
+     },
      function_log::FunctionExecutionLog,
- };
- 
-@@ -1013,15 +1016,8 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+@@ -1021,15 +1022,8 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
          usage_tracker: FunctionUsageTracker,
      ) -> anyhow::Result<()> {
          let identity = tx.identity().clone();
@@ -509,7 +504,7 @@ index 8184cdbdcabe8bda64ccb60a7e3e88ba6e2a763e..2c7ffc99c9643a0f286ed072f7fdfe27
              ScheduledJobState::Pending => {
                  // Create a new request & execution ID
                  let request_id = RequestId::new();
-@@ -1031,24 +1027,38 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+@@ -1039,24 +1033,38 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                  );
                  sentry::configure_scope(|scope| context.add_sentry_tags(scope));
  
@@ -562,9 +557,9 @@ index 8184cdbdcabe8bda64ccb60a7e3e88ba6e2a763e..2c7ffc99c9643a0f286ed072f7fdfe27
                          PublicFunctionPath::Component(path),
                          job.udf_args()?,
                          identity,
-@@ -1057,8 +1067,15 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+@@ -1065,8 +1073,15 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                          context.clone(),
-                         true,
+                         PermitTimeout::WaitIndefinitely,
                          SchedulerDependencyClass::Independent,
 +                        DurableActionSource::Scheduled,
 +                        claim,
@@ -579,7 +574,7 @@ index 8184cdbdcabe8bda64ccb60a7e3e88ba6e2a763e..2c7ffc99c9643a0f286ed072f7fdfe27
                  let state = match &completion.outcome.result {
                      Ok(_) => ScheduledJobState::Success,
                      Err(e) => ScheduledJobState::Failed(e.to_string()),
-@@ -1083,9 +1100,17 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+@@ -1091,9 +1106,17 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                      .await;
              },
              ScheduledJobState::InProgress {
@@ -599,7 +594,7 @@ index 8184cdbdcabe8bda64ccb60a7e3e88ba6e2a763e..2c7ffc99c9643a0f286ed072f7fdfe27
                  // This case can happen if there is a system error while executing
                  // the action or if backend exits after executing the action but
                  // before updating the state. Since we execute actions at most once,
-@@ -1160,8 +1185,8 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+@@ -1168,8 +1191,8 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
              .then_some((tx, metadata)))
      }
  
@@ -839,10 +834,10 @@ index fe53f65c94a7f59f796eb271ee5fb65fd5ce47af..b86d342e0fab9b23f260360b9646ac63
 +    }
 +}
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 167bc0c9f91a4c10d5440da803e27121affc3000..8daa42f4fb0f806233313cad97770d20255c3304 100644
+index 51e8d744d32d8ae7b4e408333a0a4750d3a9a5ad..260b53073867f00beca6f5dc9eccebf26ad65d40 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
-@@ -1332,6 +1332,7 @@ pub enum RequestType<RT: Runtime> {
+@@ -1336,6 +1336,7 @@ pub enum RequestType<RT: Runtime> {
          fetch_client: Arc<dyn FetchClient>,
          log_line_sender: mpsc::UnboundedSender<LogLine>,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -850,7 +845,7 @@ index 167bc0c9f91a4c10d5440da803e27121affc3000..8daa42f4fb0f806233313cad97770d20
      },
      HttpAction {
          request: HttpActionRequest<RT>,
-@@ -1907,6 +1908,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1911,6 +1912,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          environment_data: EnvironmentData<RT>,
          instance_name: String,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -858,7 +853,7 @@ index 167bc0c9f91a4c10d5440da803e27121affc3000..8daa42f4fb0f806233313cad97770d20
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
-@@ -1929,6 +1931,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1933,6 +1935,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              fetch_client,
              log_line_sender,
              function_started_sender,

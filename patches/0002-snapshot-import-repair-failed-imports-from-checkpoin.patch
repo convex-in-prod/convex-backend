@@ -6,16 +6,18 @@ Subject: [PATCH 02/30] snapshot-import: repair failed imports from checkpoints
 Add dry-run and execute paths that finalize a failed replace-all ZIP import from complete hidden-table checkpoints. Validate import state, component namespaces, physical mappings, hidden tablet identity and row counts, active-table drift, duplicate mappings, and the complete active-table set before activation.
 
 Commit activation, audit logging, and the Failed-to-Completed transition atomically while preserving normal row-count semantics. Document the destructive recovery contract and verification limits in patches/snapshot_import_checkpoint_repair/README.md.
+
+Check staged validators against the selected checkpoint rows as well. Mark violated staged attempts failed in the activation transaction so a proof about the replaced table cannot authorize promotion of nonconforming imported rows. Staged violations do not reject repair, and dry runs do not change validation state.
 ---
  .../src/snapshot_import/confirmation.rs       |   41 +-
  .../snapshot_import/import_file_storage.rs    |   94 +-
- crates/application/src/snapshot_import/mod.rs | 1311 ++++++++++++++++-
+ crates/application/src/snapshot_import/mod.rs | 1344 ++++++++++++++++-
  crates/local_backend/src/router.rs            |    5 +
  crates/local_backend/src/snapshot_import.rs   |   32 +
  crates/model/src/snapshot_imports/mod.rs      |   45 +-
  crates/model/src/snapshot_imports/types.rs    |    3 +
- .../README.md                                 |  278 ++++
- 8 files changed, 1732 insertions(+), 77 deletions(-)
+ .../README.md                                 |  285 ++++
+ 8 files changed, 1772 insertions(+), 77 deletions(-)
  create mode 100644 patches/snapshot_import_checkpoint_repair/README.md
 
 diff --git a/crates/application/src/snapshot_import/confirmation.rs b/crates/application/src/snapshot_import/confirmation.rs
@@ -240,7 +242,7 @@ index 471868cd71cb57dab9d4458445c488a17372b135..ab844e92977d70d5587546201f523c70
          add_checkpoint_message(
              database,
 diff --git a/crates/application/src/snapshot_import/mod.rs b/crates/application/src/snapshot_import/mod.rs
-index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d9a803e0d 100644
+index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..adbd686f8175803bf88d2139c4c647c76c9ba67e 100644
 --- a/crates/application/src/snapshot_import/mod.rs
 +++ b/crates/application/src/snapshot_import/mod.rs
 @@ -41,7 +41,10 @@ use bytes::Bytes;
@@ -276,7 +278,15 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
      RequestId,
  };
  use database::{
-@@ -90,6 +97,7 @@ use errors::{
+@@ -81,6 +88,7 @@ use database::{
+     ImportFacingModel,
+     IndexModel,
+     SchemaModel,
++    SchemaValidationModel,
+     TableModel,
+     Transaction,
+ };
+@@ -90,6 +98,7 @@ use errors::{
  };
  use file_storage::FileStorage;
  use futures::{
@@ -284,7 +294,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
      stream::{
          self,
          BoxStream,
-@@ -124,6 +132,7 @@ use model::{
+@@ -124,6 +133,7 @@ use model::{
      },
  };
  use roles::RequireDeploymentOp;
@@ -292,7 +302,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
  use serde_json::Value as JsonValue;
  use shape_inference::{
      export_context::GeneratedSchema,
-@@ -288,25 +297,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+@@ -288,25 +298,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
          ));
          let import_id = snapshot_import.developer_id();
          match self.attempt_perform_import(snapshot_import).await {
@@ -319,7 +329,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
              Err(e) => {
                  let mut e = wrap_import_err(e);
                  if e.is_bad_request()
-@@ -363,7 +354,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+@@ -363,7 +355,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
      async fn attempt_perform_import(
          &mut self,
          snapshot_import: ParsedDocument<SnapshotImport>,
@@ -328,7 +338,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
          self.fail_if_too_old(&snapshot_import)?;
          let (initial_schemas, import) = self.parse_import(snapshot_import.developer_id()).await?;
          let source_size = import.source_size;
-@@ -395,7 +386,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+@@ -395,7 +387,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
          let pause_client = self.runtime.pause_client();
          pause_client.wait("before_finalize_import").await;
          let (id, snapshot_import) = snapshot_import.into_id_and_value();
@@ -337,7 +347,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
              &self.database,
              Identity::system(),
              snapshot_import.member_id,
-@@ -406,7 +397,10 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+@@ -406,7 +398,10 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
              AuditLogInfo::SnapshotImport {
                  import_format: snapshot_import.format,
              },
@@ -349,7 +359,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
              snapshot_import.requestor.clone(),
              usage.clone(),
          )
-@@ -429,7 +423,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
+@@ -429,7 +424,7 @@ impl<RT: Runtime> SnapshotImportExecutor<RT> {
              )
              .await;
  
@@ -358,7 +368,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
      }
  
      async fn parse_import(
-@@ -730,7 +724,7 @@ pub async fn clear_tables<RT: Runtime>(
+@@ -730,7 +725,7 @@ pub async fn clear_tables<RT: Runtime>(
          ImportMode::Replace,
          table_mapping,
          AuditLogInfo::ClearTables,
@@ -367,7 +377,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
          requestor,
          usage.clone(),
      )
-@@ -738,6 +732,1035 @@ pub async fn clear_tables<RT: Runtime>(
+@@ -738,6 +733,1062 @@ pub async fn clear_tables<RT: Runtime>(
      Ok(documents_deleted)
  }
  
@@ -466,6 +476,13 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
 +    tablet_id: TabletId,
 +    table_number: TableNumber,
 +    expected_row_count: u64,
++}
++
++struct RepairStagedValidationFailure {
++    namespace: TableNamespace,
++    schema_id: ResolvedDocumentId,
++    table_name: TableName,
++    error: String,
 +}
 +
 +fn repair_table_mapping_for_schema(
@@ -1280,15 +1297,16 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
 +    table_mapping_for_schema: &TableMapping,
 +    virtual_system_mapping: &VirtualSystemMapping,
 +    checkpoint_by_id_indexes: &BTreeMap<TabletId, IndexRef>,
-+) -> anyhow::Result<()> {
++) -> anyhow::Result<Vec<RepairStagedValidationFailure>> {
 +    let user_tablet_ids = checkpoint_tablet_guards
 +        .iter()
 +        .filter(|guard| !guard.physical_table_name.is_system())
 +        .map(|guard| guard.tablet_id)
 +        .collect::<Vec<_>>();
 +    if user_tablet_ids.is_empty() {
-+        return Ok(());
++        return Ok(vec![]);
 +    }
++    let mut staged_failures = Vec::new();
 +    let mut table_iterator = database
 +        .table_iterator(validation_ts, 1000)
 +        .multi(user_tablet_ids);
@@ -1297,6 +1315,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
 +        .iter()
 +        .filter(|guard| !guard.physical_table_name.is_system())
 +    {
++        let mut failed_staged_schemas = BTreeSet::new();
 +        let by_id_index = *checkpoint_by_id_indexes
 +            .get(&guard.tablet_id)
 +            .context("validated checkpoint tablet has no by-id index")?;
@@ -1308,7 +1327,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
 +                value: document, ..
 +            }) = stream.try_next().await?
 +            {
-+                for (namespace, _schema_state, (_, schema)) in initial_schemas {
++                for (namespace, _schema_state, (schema_id, schema)) in initial_schemas {
 +                    if *namespace != guard.namespace {
 +                        continue;
 +                    }
@@ -1327,12 +1346,30 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
 +                            ),
 +                        ));
 +                    }
++                    // Checkpoints can predate a staged validator. Their activation must
++                    // invalidate its proof just as an ordinary imported write would.
++                    if !failed_staged_schemas.contains(schema_id)
++                        && let Err(error) = schema.check_existing_document_against_staged(
++                            &document,
++                            guard.physical_table_name.clone(),
++                            &table_mapping_for_schema.namespace(guard.namespace),
++                            virtual_system_mapping,
++                        )
++                    {
++                        failed_staged_schemas.insert(*schema_id);
++                        staged_failures.push(RepairStagedValidationFailure {
++                            namespace: *namespace,
++                            schema_id: *schema_id,
++                            table_name: guard.physical_table_name.clone(),
++                            error: error.to_string(),
++                        });
++                    }
 +                }
 +            }
 +        }
 +        table_iterator.unregister_table(guard.tablet_id)?;
 +    }
-+    Ok(())
++    Ok(staged_failures)
 +}
 +
 +pub async fn repair_failed_import_from_checkpoints<RT: Runtime>(
@@ -1403,7 +1440,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
  /// Reads all objects from a [`ParsedImport`] and writes them into the database.
  /// Returns a table mapping containing just the imported tables. If `mode` is
  /// ReplaceAll this includes empty tables for tables that should be cleared.
-@@ -893,6 +1916,17 @@ async fn import_objects<RT: Runtime>(
+@@ -893,6 +1944,17 @@ async fn import_objects<RT: Runtime>(
          )
          .await?;
      }
@@ -1421,7 +1458,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
  
      Ok((table_mapping_in_import, total_num_documents))
  }
-@@ -1009,6 +2043,40 @@ enum AuditLogInfo {
+@@ -1009,6 +2071,40 @@ enum AuditLogInfo {
      SnapshotImport { import_format: ImportFormat },
  }
  
@@ -1462,7 +1499,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
  async fn finalize_import<RT: Runtime>(
      database: &Database<RT>,
      identity: Identity,
-@@ -1018,14 +2086,13 @@ async fn finalize_import<RT: Runtime>(
+@@ -1018,14 +2114,13 @@ async fn finalize_import<RT: Runtime>(
      mode: ImportMode,
      imported_tables: TableMapping,
      audit_log_info: AuditLogInfo,
@@ -1480,7 +1517,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
  
      // If we inserted into an existing table, we're done because the table is
      // now populated and active.
-@@ -1033,31 +2100,131 @@ async fn finalize_import<RT: Runtime>(
+@@ -1033,31 +2128,136 @@ async fn finalize_import<RT: Runtime>(
      let (ts, documents_deleted, _occ_stats) = database
          .execute_with_overloaded_retries(identity, usage, "snapshot_import_finalize", |tx| {
              async {
@@ -1620,7 +1657,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
 +                        );
 +                        let checkpoint_by_id_indexes = IndexModel::new(tx).by_id_indexes().await?;
 +                        let virtual_system_mapping = tx.virtual_system_mapping().clone();
-+                        validate_repair_checkpoint_documents(
++                        let staged_failures = validate_repair_checkpoint_documents(
 +                            database,
 +                            tx.begin_timestamp(),
 +                            checkpoint_tablet_guards,
@@ -1630,13 +1667,18 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
 +                            &checkpoint_by_id_indexes,
 +                        )
 +                        .await?;
++                        for failure in staged_failures {
++                            SchemaValidationModel::new(tx, failure.namespace)
++                                .mark_failed(failure.schema_id, &failure.table_name, failure.error)
++                                .await?;
++                        }
 +                    },
                  }
 +                let import_id = import_guard.import_id();
  
                  let to_delete = match mode {
                      ImportMode::Append | ImportMode::Replace | ImportMode::RequireEmpty => {
-@@ -1134,11 +2301,36 @@ async fn finalize_import<RT: Runtime>(
+@@ -1134,11 +2334,36 @@ async fn finalize_import<RT: Runtime>(
                  .await?;
                  DeploymentAuditLogModel::new(tx)
                      .insert_with_member_override(
@@ -1674,7 +1716,7 @@ index a6cd82f76bf6deb6c5cddbfe5e20f4827b853b93..fb86498f31aeefc0f3aaa75877055b1d
  
                  Ok(documents_deleted)
              }
-@@ -1451,6 +2643,17 @@ async fn import_single_table<RT: Runtime>(
+@@ -1451,6 +2676,17 @@ async fn import_single_table<RT: Runtime>(
          }
          num_objects += 1;
      }
@@ -1716,18 +1758,18 @@ index ae8bad2b7df870b4c584683d8d60782318efce68..7c90daaae904a7d2bc651ebfef9a75eb
  }
  
 diff --git a/crates/local_backend/src/snapshot_import.rs b/crates/local_backend/src/snapshot_import.rs
-index f8306a36996cec2f02bcba24c9c67a0597b6a111..b47f4fc8fdfb8a79db875229f658068bf08feae2 100644
+index 11c0859245ef1ad431085b3d07bbc9ac91cfda31..12b9dd4c67a201d877f95e848d69f782462cdbeb 100644
 --- a/crates/local_backend/src/snapshot_import.rs
 +++ b/crates/local_backend/src/snapshot_import.rs
-@@ -17,6 +17,7 @@ use common::{
+@@ -20,6 +20,7 @@ use common::{
              MtState,
              Query,
          },
 +        ExtractRequestMetadata,
          HttpResponseError,
      },
- };
-@@ -265,6 +266,37 @@ pub async fn perform_import(
+     knobs::MAX_IMPORT_UPLOAD_PART_BYTES,
+@@ -278,6 +279,37 @@ pub async fn perform_import(
      Ok(())
  }
  
@@ -1843,10 +1885,10 @@ index 575c8027921fb2adc3ae69ecb3bd1e4b8d07e52e..5d75dd5977d797ac19b9a8ad68d1ca15
      Uploaded,
 diff --git a/patches/snapshot_import_checkpoint_repair/README.md b/patches/snapshot_import_checkpoint_repair/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..7ac5c20135e3a2307199780470a3912d69dc482c
+index 0000000000000000000000000000000000000000..20f373d97cd1ea412e783dbf63de1285ae8d519c
 --- /dev/null
 +++ b/patches/snapshot_import_checkpoint_repair/README.md
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,285 @@
 +# Repair Snapshot Import Checkpoints
 +
 +This patch adds a privileged repair path for a failed replace-all ZIP snapshot
@@ -1998,6 +2040,13 @@ index 0000000000000000000000000000000000000000..7ac5c20135e3a2307199780470a3912d
 +tablets. Without this scan, a schema change that made normal finalization fail
 +could be accepted as the repair's new baseline and invalid checkpoint rows could
 +then be activated.
++
++The scan also checks staged validators. A checkpoint can predate a staged
++validator whose current active table has already been proven valid. Execute
++marks any violated staged attempts failed in the activation transaction, just
++as ordinary import writes do; staged violations do not reject the repair. Dry
++run does not change those attempts. This prevents a proof about the outgoing
++active table from authorizing promotion over nonconforming checkpoint rows.
 +
 +Dry run scans at the repair plan's repeatable timestamp. Execute scans inside
 +the activation transaction at that transaction's repeatable timestamp. The

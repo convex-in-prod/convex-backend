@@ -54,14 +54,14 @@ entries.
  .../dependency_overflow.rs                    |  302 ++++
  .../http_routing.rs                           |   76 +-
  .../application_function_runner/metrics.rs    |    9 +
- .../src/application_function_runner/mod.rs    |  229 ++-
+ .../src/application_function_runner/mod.rs    |  244 ++-
  crates/application/src/cache/metrics.rs       |    4 +
- crates/application/src/cache/mod.rs           |   25 +-
+ crates/application/src/cache/mod.rs           |   30 +-
  crates/application/src/cron_jobs/metrics.rs   |   22 +
- crates/application/src/cron_jobs/mod.rs       |   48 +-
+ crates/application/src/cron_jobs/mod.rs       |   53 +-
  crates/application/src/lib.rs                 |  111 +-
  .../application/src/scheduled_jobs/metrics.rs |   33 +
- crates/application/src/scheduled_jobs/mod.rs  |   59 +-
+ crates/application/src/scheduled_jobs/mod.rs  |   64 +-
  crates/common/src/codel_queue.rs              |  487 ++++-
  crates/common/src/knobs.rs                    |  111 +-
  crates/common/src/types/actions.rs            |    7 +-
@@ -85,7 +85,7 @@ entries.
  .../dependency_capacity/design_reference.md   |  747 ++++++++
  self-hosted/advanced/knobs.md                 |   52 +
  self-hosted/docker/docker-compose.yml         |    6 +
- 34 files changed, 4489 insertions(+), 256 deletions(-)
+ 34 files changed, 4515 insertions(+), 260 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/dependency_overflow.rs
  create mode 100644 npm-packages/node-executor/src/syscalls.test.ts
  create mode 100644 patches/dependency_capacity/README.md
@@ -555,10 +555,10 @@ index 45d91e449bca9c0ccf18238f4bc165ac211435ef..627846980460e28bf2739b6c1cb2e257
                  Some((match_suffix, CurrentMatch::MountedComponent(reference))) => {
                      let Reference::ChildComponent {
 diff --git a/crates/application/src/application_function_runner/metrics.rs b/crates/application/src/application_function_runner/metrics.rs
-index de7378717f7421f98b76e73ac0b4add88adcdf11..b2334260ae062c0b8adff91e3da8714f4c8601b2 100644
+index b44059fd3c9c01fa9f0d2340a82f995581b22510..50807602a929157d507cfa672cb1f9392ca4ff83 100644
 --- a/crates/application/src/application_function_runner/metrics.rs
 +++ b/crates/application/src/application_function_runner/metrics.rs
-@@ -122,7 +122,16 @@ register_convex_counter!(
+@@ -123,7 +123,16 @@ register_convex_counter!(
      APPLICATION_FUNCTION_RUNNER_WAIT_TIMEOUT_TOTAL,
      "Total number with running a function has timed out due to instance concurrency limits.",
      &["udf_type", "env_type"],
@@ -576,7 +576,7 @@ index de7378717f7421f98b76e73ac0b4add88adcdf11..b2334260ae062c0b8adff91e3da8714f
      log_counter_with_labels(
          &APPLICATION_FUNCTION_RUNNER_WAIT_TIMEOUT_TOTAL,
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c8998505916b9d9 100644
+index 23987705733077ce281b139232925842927e9ea8..768075f1138871c282d83e102af930ea14e7c01f 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
 @@ -47,6 +47,7 @@ use common::{
@@ -654,7 +654,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
          ));
          Self {
              function_runner,
-@@ -306,6 +314,13 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -306,13 +314,27 @@ impl<RT: Runtime> FunctionRouter<RT> {
      }
  }
  
@@ -666,82 +666,93 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
 +}
 +
  impl<RT: Runtime> FunctionRouter<RT> {
-     #[fastrace::trace]
-     pub(crate) async fn execute_query_or_mutation(
-@@ -315,6 +330,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+     pub(crate) async fn acquire_permit(
+         &self,
+         udf_type: UdfType,
++        scheduler_dependency: SchedulerDependencyClass,
+     ) -> anyhow::Result<RequestGuard<'_, RT>> {
++        // Admission precedes transaction creation for mutations. Carry ancestry
++        // here so waiting children can still use the dependency-only reserve.
+         self.limiter(udf_type)
+-            .acquire_permit(&self.rt, PermitTimeout::Enforce)
++            .acquire_permit(
++                &self.rt,
++                PermitTimeout::Enforce,
++                scheduler_dependency.unblocks_ancestor(),
++            )
+             .await
+     }
+ 
+@@ -333,6 +355,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          udf_type: UdfType,
          journal: QueryJournal,
          context: ExecutionContext,
 +        scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          anyhow::ensure!(udf_type == UdfType::Query || udf_type == UdfType::Mutation);
-         // All queries and mutations are run in the isolate environment.
-@@ -330,6 +346,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+         anyhow::ensure!(
+@@ -354,6 +377,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                      path_and_args,
                  }),
                  None,
 +                scheduler_dependency,
-                 false,
              )
              .await?;
-@@ -346,6 +363,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+         let tx = tx.with_context(|| format!("Missing transaction in response for {udf_type}"))?;
+@@ -369,10 +393,16 @@ impl<RT: Runtime> FunctionRouter<RT> {
          log_line_sender: mpsc::UnboundedSender<LogLine>,
          context: ExecutionContext,
-         wait_for_permit: bool,
+         permit_timeout: PermitTimeout,
++        wait_for_permit: bool,
 +        scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
+         let permit = self
+             .action_limiter
+-            .acquire_permit(&self.rt, permit_timeout)
++            .acquire_permit(
++                &self.rt,
++                permit_timeout,
++                scheduler_dependency.unblocks_ancestor(),
++            )
+             .await?;
          let (_, outcome) = self
              .function_runner_execute(
-@@ -358,6 +376,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -386,6 +416,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                      path_and_args,
                  }),
                  None,
 +                scheduler_dependency,
-                 wait_for_permit,
              )
              .await?;
-@@ -386,6 +405,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+ 
+@@ -405,7 +436,9 @@ impl<RT: Runtime> FunctionRouter<RT> {
+     ) -> anyhow::Result<HttpActionOutcome> {
+         // All http actions are run in the isolate environment.
+         let timer = function_total_timer(ModuleEnvironment::Isolate, UdfType::HttpAction);
+-        let permit = self.acquire_permit(UdfType::HttpAction).await?;
++        let permit = self
++            .acquire_permit(UdfType::HttpAction, SchedulerDependencyClass::Independent)
++            .await?;
+         let (_, outcome) = self
+             .function_runner_execute(
+                 tx,
+@@ -415,6 +448,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  Some(log_line_sender),
                  None,
                  Some(http_action_metadata),
 +                SchedulerDependencyClass::Independent,
-                 false,
              )
              .await?;
-@@ -399,7 +419,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
  
-     /// Waits to acquire action permit
-     pub async fn acquire_action_permit(&self) -> anyhow::Result<RequestGuard<'_, RT>> {
--        self.action_limiter.acquire_permit().await
-+        self.action_limiter.acquire_permit(false).await
-     }
- 
-     // Drain the v8 action concurrency permits to deterministically
-@@ -413,6 +433,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -437,6 +471,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
          function_metadata: Option<FunctionMetadata>,
          http_action_metadata: Option<HttpActionMetadata>,
 +        scheduler_dependency: SchedulerDependencyClass,
-         wait_for_permit: bool,
      ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
          // Read in this transaction so preference changes invalidate cached queries.
-@@ -433,9 +454,13 @@ impl<RT: Runtime> FunctionRouter<RT> {
-         };
- 
-         let permit = if wait_for_permit {
--            limiter.acquire_permit().await?
-+            limiter
-+                .acquire_permit(scheduler_dependency.unblocks_ancestor())
-+                .await?
-         } else {
--            limiter.acquire_permit_with_timeout(&self.rt).await?
-+            limiter
-+                .acquire_permit_with_timeout(&self.rt, scheduler_dependency.unblocks_ancestor())
-+                .await?
-         };
- 
-         let timer = function_run_timer(udf_type);
-@@ -455,6 +480,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+         let udf_runtime = BackendInfoModel::new(&mut tx)
+@@ -466,6 +501,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  self.default_system_env_vars.clone(),
                  in_memory_index_last_modified,
                  context,
@@ -749,7 +760,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
              )
              .await?;
          timer.finish();
-@@ -497,14 +523,15 @@ struct Limiter<RT: Runtime> {
+@@ -514,14 +550,15 @@ struct Limiter<RT: Runtime> {
      udf_type: UdfType,
      env: ModuleEnvironment,
  
@@ -768,7 +779,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
      total_outstanding: AtomicUsize,
  
      // Function execution log for recording outstanding function gauges.
-@@ -518,11 +545,15 @@ impl<RT: Runtime> Limiter<RT> {
+@@ -535,11 +572,15 @@ impl<RT: Runtime> Limiter<RT> {
          total_permits: usize,
          semaphore_timeout: Duration,
          function_log: FunctionExecutionLog<RT>,
@@ -785,17 +796,17 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
              total_permits,
              semaphore_timeout,
              total_outstanding: AtomicUsize::new(0),
-@@ -537,14 +568,14 @@ impl<RT: Runtime> Limiter<RT> {
-     async fn acquire_permit_with_timeout<'a>(
+@@ -555,14 +596,14 @@ impl<RT: Runtime> Limiter<RT> {
          &'a self,
          rt: &'a RT,
+         timeout: PermitTimeout,
 +        is_dependency: bool,
      ) -> anyhow::Result<RequestGuard<'a, RT>> {
          let mut request_guard = self.start();
          select! {
              biased;
--            _ = request_guard.acquire_permit() => {},
-+            _ = request_guard.acquire_permit(is_dependency) => {},
+-            result = request_guard.acquire_permit() => result?,
++            result = request_guard.acquire_permit(is_dependency) => result?,
              x = async {
 -                // Report metrics while waiting for a permit. This captures the
 -                // queued state only when the semaphore is actually full.
@@ -803,19 +814,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
                  self.report_metrics();
                  future::pending::<!>().await
              } => match x {},
-@@ -574,9 +605,9 @@ impl<RT: Runtime> Limiter<RT> {
-     }
- 
-     /// Waits to acquire a permit
--    async fn acquire_permit(&self) -> anyhow::Result<RequestGuard<'_, RT>> {
-+    async fn acquire_permit(&self, is_dependency: bool) -> anyhow::Result<RequestGuard<'_, RT>> {
-         let mut request_guard = self.start();
--        request_guard.acquire_permit().await?;
-+        request_guard.acquire_permit(is_dependency).await?;
-         Ok(request_guard)
-     }
- 
-@@ -588,19 +619,13 @@ impl<RT: Runtime> Limiter<RT> {
+@@ -604,19 +645,13 @@ impl<RT: Runtime> Limiter<RT> {
          }
      }
  
@@ -840,7 +839,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
  
          // Log to prometheus
          log_outstanding_functions(
-@@ -637,17 +662,17 @@ impl<RT: Runtime> Limiter<RT> {
+@@ -653,17 +688,17 @@ impl<RT: Runtime> Limiter<RT> {
  // gauges even if dropped.
  pub struct RequestGuard<'a, RT: Runtime> {
      limiter: &'a Limiter<RT>,
@@ -861,7 +860,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
          timer.finish();
          // Report metrics to account for the newly running function.
          self.limiter.report_metrics();
-@@ -657,7 +682,7 @@ impl<RT: Runtime> RequestGuard<'_, RT> {
+@@ -673,7 +708,7 @@ impl<RT: Runtime> RequestGuard<'_, RT> {
  
  impl<RT: Runtime> Drop for RequestGuard<'_, RT> {
      fn drop(&mut self) {
@@ -870,7 +869,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
          drop(self.permit.take());
          // Remove the request from the running ones.
          self.limiter
-@@ -736,6 +761,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -752,6 +787,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              *APPLICATION_MAX_CONCURRENT_NODE_ACTIONS,
              *APPLICATION_FUNCTION_RUNNER_ACTION_SEMAPHORE_TIMEOUT,
              function_log.clone(),
@@ -878,7 +877,16 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
          );
  
          Self {
-@@ -842,6 +868,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -854,7 +890,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                 // Preserve the caller's uncommitted module writes in this transaction.
+                 let permit = self
+                     .isolate_functions
+-                    .acquire_permit(UdfType::Query)
++                    .acquire_permit(UdfType::Query, SchedulerDependencyClass::Independent)
+                     .await?;
+                 self.isolate_functions
+                     .execute_query_or_mutation(
+@@ -864,6 +900,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          UdfType::Query,
                          QueryJournal::new(),
                          context.clone(),
@@ -886,7 +894,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
                      )
                      .await?
              },
-@@ -909,6 +936,31 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -931,6 +968,31 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          mutation_identifier: Option<SessionRequestIdentifier>,
          caller: FunctionCaller,
          mutation_queue_length: Option<usize>,
@@ -918,7 +926,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
      ) -> anyhow::Result<Result<MutationReturn, MutationError>> {
          let timer = mutation_timer();
          let result = self
-@@ -920,6 +972,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -942,6 +1004,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  mutation_identifier,
                  caller,
                  mutation_queue_length,
@@ -926,7 +934,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
              )
              .await;
          match &result {
-@@ -940,6 +993,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -962,6 +1025,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          mutation_identifier: Option<SessionRequestIdentifier>,
          caller: FunctionCaller,
          mutation_queue_length: Option<usize>,
@@ -934,7 +942,16 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
      ) -> anyhow::Result<Result<MutationReturn, MutationError>> {
          if path.is_system() && !(identity.is_admin() || identity.is_system()) {
              anyhow::bail!(unauthorized_error("mutation"));
-@@ -989,6 +1043,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -987,7 +1051,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+             let context = ExecutionContext::new(request_context.clone(), &caller);
+ 
+             let start = self.runtime.monotonic_now();
+-            let permit = self.acquire_mutation_permit().await;
++            let permit = self.acquire_mutation_permit(scheduler_dependency).await;
+             let mut tx = self
+                 .database
+                 .begin_with_usage(identity.clone(), usage_tracker.clone())
+@@ -1013,6 +1077,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                      caller.allowed_visibility(),
                      context.clone(),
                      mutation_queue_length,
@@ -942,15 +959,31 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
                  )
                  .await;
              let (mut tx, mut outcome) = match result {
-@@ -1192,6 +1247,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1211,10 +1276,13 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+     ///
+     /// Fails with `TooManyWrites` instead of waiting while the write throughput
+     /// limit is exceeded. The mutation checks the limit again after the wait.
+-    pub async fn acquire_mutation_permit(&self) -> anyhow::Result<RequestGuard<'_, RT>> {
++    pub async fn acquire_mutation_permit(
++        &self,
++        scheduler_dependency: SchedulerDependencyClass,
++    ) -> anyhow::Result<RequestGuard<'_, RT>> {
+         self.database.check_write_throughput_limit()?;
+         self.isolate_functions
+-            .acquire_permit(UdfType::Mutation)
++            .acquire_permit(UdfType::Mutation, scheduler_dependency)
+             .await
+     }
+ 
+@@ -1232,6 +1300,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          allowed_visibility: AllowedVisibility,
          context: ExecutionContext,
          mutation_queue_length: Option<usize>,
 +        scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Transaction<RT>, ValidatedUdfOutcome)> {
-         self.database.check_write_throughput_limit()?;
          let result = self
-@@ -1202,6 +1258,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+             .run_mutation_inner(
+@@ -1242,6 +1311,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  allowed_visibility,
                  context,
                  mutation_queue_length,
@@ -958,15 +991,15 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
              )
              .await;
          match result.as_ref() {
-@@ -1233,6 +1290,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1274,6 +1344,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          allowed_visibility: AllowedVisibility,
          context: ExecutionContext,
          mutation_queue_length: Option<usize>,
 +        scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Transaction<RT>, ValidatedUdfOutcome)> {
-         if path.is_system() && !(tx.identity().is_admin() || tx.identity().is_system()) {
-             anyhow::bail!(unauthorized_error("mutation"));
-@@ -1272,6 +1330,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+         let permit = permit?;
+         self.database.check_write_throughput_limit()?;
+@@ -1316,6 +1387,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  UdfType::Mutation,
                  QueryJournal::new(),
                  context.clone(),
@@ -974,7 +1007,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
              )
              .await?;
          let mutation_outcome = match outcome {
-@@ -1310,6 +1369,26 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1354,6 +1426,26 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          arguments: SerializedArgs,
          identity: Identity,
          caller: FunctionCaller,
@@ -1001,47 +1034,49 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
      ) -> anyhow::Result<Result<ActionReturn, ActionError>> {
          if path.is_system() && !(identity.is_admin() || identity.is_system()) {
              anyhow::bail!(unauthorized_error("action"));
-@@ -1326,6 +1405,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1370,6 +1462,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  usage_tracking.clone(),
                  context.clone(),
-                 false,
+                 PermitTimeout::Enforce,
 +                scheduler_dependency,
              )
              .await;
          let completion = match completion_result {
-@@ -1374,6 +1454,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1418,6 +1511,8 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          usage_tracking: FunctionUsageTracker,
          context: ExecutionContext,
-         wait_for_permit: bool,
+         permit_timeout: PermitTimeout,
++        wait_for_permit: bool,
 +        scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
          let result = self
              .run_action_inner(
-@@ -1384,6 +1465,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1428,6 +1523,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  usage_tracking,
                  context,
-                 wait_for_permit,
+                 permit_timeout,
 +                scheduler_dependency,
              )
              .await;
          match result.as_ref() {
-@@ -1416,6 +1498,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1460,6 +1556,8 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          usage_tracking: FunctionUsageTracker,
          context: ExecutionContext,
-         wait_for_permit: bool,
+         permit_timeout: PermitTimeout,
++        wait_for_permit: bool,
 +        scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
          if path.is_system() && !(identity.is_admin() || identity.is_system()) {
              anyhow::bail!(unauthorized_error("action"));
-@@ -1491,6 +1574,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1535,6 +1633,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          log_line_sender,
                          context.clone(),
-                         wait_for_permit,
+                         permit_timeout,
 +                        scheduler_dependency,
                      )
                      .boxed();
                  let (outcome_result, log_lines) = run_function_and_collect_log_lines(
-@@ -1549,11 +1633,18 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1593,9 +1692,14 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                      }
                      Ok(source_maps)
                  };
@@ -1050,19 +1085,14 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
 +                // from isolate ancestry: do not propagate it to the isolate scheduler.
 +                let is_node_action_dependency =
 +                    node_action_gate_dependency(&caller, scheduler_dependency);
-                 let _permit = if wait_for_permit {
--                    self.node_action_limiter.acquire_permit().await?
-+                    self.node_action_limiter
-+                        .acquire_permit(is_node_action_dependency)
-+                        .await?
-                 } else {
-                     self.node_action_limiter
--                        .acquire_permit_with_timeout(&self.runtime)
-+                        .acquire_permit_with_timeout(&self.runtime, is_node_action_dependency)
-                         .await?
-                 };
+                 let _permit = self
+                     .node_action_limiter
+-                    .acquire_permit(&self.runtime, permit_timeout)
++                    .acquire_permit(&self.runtime, permit_timeout, is_node_action_dependency)
+                     .await?;
  
-@@ -1609,6 +1700,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                 let mut environment_variables =
+@@ -1650,6 +1754,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                      environment_variables,
                      callback_token: self.key_broker.issue_action_token(path.component),
                      context: context.clone(),
@@ -1070,7 +1100,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
                      encoded_parent_trace: EncodedSpan::from_parent().0,
                  };
  
-@@ -1988,6 +2080,32 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2029,6 +2134,32 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          journal: Option<QueryJournal>,
          caller: FunctionCaller,
          invocation: QueryInvocation,
@@ -1103,7 +1133,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
      ) -> anyhow::Result<QueryReturn> {
          let result = self
              .run_query_at_ts_inner(
-@@ -1999,6 +2117,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2040,6 +2171,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  journal,
                  caller,
                  invocation,
@@ -1111,7 +1141,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
              )
              .await;
          match result.as_ref() {
-@@ -2031,6 +2150,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2072,6 +2204,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          journal: Option<QueryJournal>,
          caller: FunctionCaller,
          invocation: QueryInvocation,
@@ -1119,7 +1149,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
      ) -> anyhow::Result<QueryReturn> {
          if path.is_system() && !(identity.is_admin() || identity.is_system()) {
              anyhow::bail!(unauthorized_error("query"));
-@@ -2050,6 +2170,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2091,6 +2224,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  caller.clone(),
                  usage_tracker.clone(),
                  invocation,
@@ -1127,7 +1157,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
              )
              .await;
  
-@@ -2148,6 +2269,8 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2189,6 +2323,8 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
      }
  }
  
@@ -1136,7 +1166,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
  #[async_trait]
  impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
      #[fastrace::trace]
-@@ -2170,8 +2293,9 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
+@@ -2211,8 +2347,9 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
          context: ExecutionContext,
      ) -> anyhow::Result<FunctionResult> {
          let ts = self.database.now_ts_for_reads();
@@ -1147,7 +1177,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
                  RequestContext::new(context.request_id, context.request_metadata),
                  PublicFunctionPath::Component(path),
                  args,
-@@ -2183,6 +2307,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
+@@ -2224,6 +2361,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
                      parent_execution_id: Some(context.execution_id),
                  },
                  QueryInvocation::Fresh,
@@ -1155,7 +1185,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
              )
              .await?
              .result;
-@@ -2197,8 +2322,9 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
+@@ -2238,8 +2376,9 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
          args: SerializedArgs,
          context: ExecutionContext,
      ) -> anyhow::Result<FunctionResult> {
@@ -1166,7 +1196,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
                  RequestContext::new(context.request_id, context.request_metadata),
                  PublicFunctionPath::Component(path),
                  args,
-@@ -2209,6 +2335,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
+@@ -2250,6 +2389,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
                      parent_execution_id: Some(context.execution_id),
                  },
                  None,
@@ -1174,7 +1204,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
              )
              .await
              .map(|r| match r {
-@@ -2228,7 +2355,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
+@@ -2269,7 +2409,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
      ) -> anyhow::Result<FunctionResult> {
          let _tx = self.database.begin(identity.clone()).await?;
          let result = self
@@ -1183,7 +1213,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
                  RequestContext::new(context.request_id, context.request_metadata),
                  PublicFunctionPath::Component(path),
                  args,
-@@ -2237,6 +2364,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
+@@ -2278,6 +2418,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
                      parent_scheduled_job: context.parent_scheduled_job,
                      parent_execution_id: Some(context.execution_id),
                  },
@@ -1191,7 +1221,7 @@ index 7e8a9c5c400e22e2f1c274375823a7d2bbaf6afd..57cf6e1dcfb5657aa51e5c5f7c899850
              )
              .await
              .map(|r| match r {
-@@ -2454,3 +2582,32 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
+@@ -2495,3 +2636,32 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
              .await
      }
  }
@@ -1247,7 +1277,7 @@ index 9766ce3362c4f3ab3c70b9c1327caded33e96eb7..ddf171e96f0201ce1f5e88959c45e8bb
      log_counter_with_labels(&CACHE_PLAN_GO_TOTAL, 1, vec![label]);
  }
 diff --git a/crates/application/src/cache/mod.rs b/crates/application/src/cache/mod.rs
-index f2ce3618db84b2a064f5d59110bf616634643431..cca930e6f7cfcd4f923106e0f17bcebe103352be 100644
+index 91c27eda71bc207a7afe978aae987de4ebb55a1c..98c4c3f32f26e012b065ade3e965f0ac05bc3796 100644
 --- a/crates/application/src/cache/mod.rs
 +++ b/crates/application/src/cache/mod.rs
 @@ -41,6 +41,7 @@ use common::{
@@ -1314,7 +1344,19 @@ index f2ce3618db84b2a064f5d59110bf616634643431..cca930e6f7cfcd4f923106e0f17bcebe
      ) -> anyhow::Result<Option<(CacheResult, BTreeMap<TableName, TableStats>)>> {
          let pause_client = self.rt.pause_client();
          pause_client.wait("perform_cache_op").await;
-@@ -705,6 +713,7 @@ impl<RT: Runtime> CacheManager<RT> {
+@@ -697,7 +705,10 @@ impl<RT: Runtime> CacheManager<RT> {
+                     },
+                     Ok((path_and_args, returns_validator, visibility_info)) => {
+                         let component = path_and_args.path().component;
+-                        let permit = self.function_router.acquire_permit(UdfType::Query).await?;
++                        let permit = self
++                            .function_router
++                            .acquire_permit(UdfType::Query, scheduler_dependency)
++                            .await?;
+                         let (mut tx, outcome) = self
+                             .function_router
+                             .execute_query_or_mutation(
+@@ -707,6 +718,7 @@ impl<RT: Runtime> CacheManager<RT> {
                                  UdfType::Query,
                                  journal.clone(),
                                  context,
@@ -1322,7 +1364,7 @@ index f2ce3618db84b2a064f5d59110bf616634643431..cca930e6f7cfcd4f923106e0f17bcebe
                              )
                              .await?;
                          let FunctionOutcome::Query(mut query_outcome) = outcome else {
-@@ -893,6 +902,7 @@ impl QueryCache {
+@@ -895,6 +907,7 @@ impl QueryCache {
          identity: &'a Identity,
          ts: Timestamp,
          context: ExecutionContext,
@@ -1330,7 +1372,7 @@ index f2ce3618db84b2a064f5d59110bf616634643431..cca930e6f7cfcd4f923106e0f17bcebe
      ) -> Option<(CacheOp<'a>, StoredCacheKey)> {
          let go = |sender: Option<(Sender<_>, u64)>| {
              let (sender, waiting_entry_id) = match sender {
-@@ -938,12 +948,22 @@ impl QueryCache {
+@@ -940,12 +953,22 @@ impl QueryCache {
                  started: peer_started,
                  receiver,
                  ts: peer_ts,
@@ -1353,7 +1395,7 @@ index f2ce3618db84b2a064f5d59110bf616634643431..cca930e6f7cfcd4f923106e0f17bcebe
                  // We don't serialize sampling `now` under the cache lock, and since it can
                  // occur on different threads, we're not guaranteed that
                  // `peer_started < now`. So, if the peer started *after* us,
-@@ -971,7 +991,8 @@ impl QueryCache {
+@@ -973,7 +996,8 @@ impl QueryCache {
              },
              None => {
                  tracing::debug!("No cache value for {:?}, executing UDF...", stored_key);
@@ -1363,7 +1405,7 @@ index f2ce3618db84b2a064f5d59110bf616634643431..cca930e6f7cfcd4f923106e0f17bcebe
                  log_plan_go(GoReason::NoCacheResult);
                  go(Some((sender, executor_id)))
              },
-@@ -1027,6 +1048,7 @@ impl Inner {
+@@ -1029,6 +1053,7 @@ impl Inner {
          key: StoredCacheKey,
          now: tokio::time::Instant,
          ts: Timestamp,
@@ -1371,7 +1413,7 @@ index f2ce3618db84b2a064f5d59110bf616634643431..cca930e6f7cfcd4f923106e0f17bcebe
      ) -> (Sender<CacheResult>, u64) {
          let id = self.next_waiting_id;
          self.next_waiting_id += 1;
-@@ -1038,6 +1060,7 @@ impl Inner {
+@@ -1040,6 +1065,7 @@ impl Inner {
              receiver,
              started: now,
              ts,
@@ -1410,7 +1452,7 @@ index b743c610e78362db81ec45719c96accb6f348687..bc5fa3388ac8efa46cd664ddc42dd58f
 +    NumRunningJobsGaugeGuard
 +}
 diff --git a/crates/application/src/cron_jobs/mod.rs b/crates/application/src/cron_jobs/mod.rs
-index 09a24372bceba7522af26403eede91f78b650bf7..280b6c20b96d769aa93e0aeff70dc6ba0f8c1321 100644
+index ca397992395953472adfcfaa94e0c6df5ad54f36..dd1a1eadb82e8319507378cbae071f64699c3c77 100644
 --- a/crates/application/src/cron_jobs/mod.rs
 +++ b/crates/application/src/cron_jobs/mod.rs
 @@ -37,6 +37,7 @@ use common::{
@@ -1421,7 +1463,7 @@ index 09a24372bceba7522af26403eede91f78b650bf7..280b6c20b96d769aa93e0aeff70dc6ba
          UdfType,
      },
      RequestId,
-@@ -115,6 +116,7 @@ pub struct CronJobExecutor<RT: Runtime> {
+@@ -118,6 +119,7 @@ pub struct CronJobExecutor<RT: Runtime> {
      next_job_ready_time: Option<Timestamp>,
      job_finished_tx: mpsc::Sender<ResolvedDocumentId>,
      job_finished_rx: mpsc::Receiver<ResolvedDocumentId>,
@@ -1429,7 +1471,7 @@ index 09a24372bceba7522af26403eede91f78b650bf7..280b6c20b96d769aa93e0aeff70dc6ba
  }
  
  #[derive(Clone)]
-@@ -127,15 +129,37 @@ pub struct CronJobContext<RT: Runtime> {
+@@ -130,15 +132,37 @@ pub struct CronJobContext<RT: Runtime> {
  }
  
  impl<RT: Runtime> CronJobExecutor<RT> {
@@ -1470,7 +1512,7 @@ index 09a24372bceba7522af26403eede91f78b650bf7..280b6c20b96d769aa93e0aeff70dc6ba
          let mut executor = Self {
              context: CronJobContext {
                  rt,
-@@ -148,6 +172,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
+@@ -151,6 +175,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
              next_job_ready_time: None,
              job_finished_tx,
              job_finished_rx,
@@ -1478,7 +1520,7 @@ index 09a24372bceba7522af26403eede91f78b650bf7..280b6c20b96d769aa93e0aeff70dc6ba
          };
          let mut backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
          tracing::info!("Starting cron job executor");
-@@ -177,7 +202,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
+@@ -180,7 +205,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
  
          self.next_job_ready_time = if is_backend_stopped {
              None
@@ -1487,7 +1529,7 @@ index 09a24372bceba7522af26403eede91f78b650bf7..280b6c20b96d769aa93e0aeff70dc6ba
              self.next_job_ready_time
          } else {
              self.query_and_start_jobs(&mut tx).await?
-@@ -213,7 +238,12 @@ impl<RT: Runtime> CronJobExecutor<RT> {
+@@ -216,7 +241,12 @@ impl<RT: Runtime> CronJobExecutor<RT> {
              job_id = self.job_finished_rx.recv().fuse() => {
                  if let Some(job_id) = job_id {
                      self.context.rt.pause_client().wait(CRON_JOB_EXECUTED).await;
@@ -1501,7 +1543,7 @@ index 09a24372bceba7522af26403eede91f78b650bf7..280b6c20b96d769aa93e0aeff70dc6ba
                  } else {
                      anyhow::bail!("Job results channel closed, this is unexpected!");
                  }
-@@ -242,7 +272,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
+@@ -245,7 +275,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
              // caught up, we can sleep until the timestamp. If we're behind and
              // at our concurrency limit, we can use the timestamp to log how far
              // behind we get.
@@ -1510,7 +1552,7 @@ index 09a24372bceba7522af26403eede91f78b650bf7..280b6c20b96d769aa93e0aeff70dc6ba
                  return Ok(Some(next_ts));
              }
              let sentry_hub = sentry::Hub::with(|hub| sentry::Hub::new_from_top(hub));
-@@ -263,7 +293,9 @@ impl<RT: Runtime> CronJobExecutor<RT> {
+@@ -266,7 +296,9 @@ impl<RT: Runtime> CronJobExecutor<RT> {
                  }
                  .bind_hub(sentry_hub),
              );
@@ -1521,7 +1563,19 @@ index 09a24372bceba7522af26403eede91f78b650bf7..280b6c20b96d769aa93e0aeff70dc6ba
          }
          Ok(None)
      }
-@@ -465,6 +497,7 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -436,7 +468,10 @@ impl<RT: Runtime> CronJobContext<RT> {
+         usage_tracker: FunctionUsageTracker,
+         mutation_retry_count: usize,
+     ) -> anyhow::Result<()> {
+-        let permit = self.runner.acquire_mutation_permit().await;
++        let permit = self
++            .runner
++            .acquire_mutation_permit(SchedulerDependencyClass::Independent)
++            .await;
+         let start = self.rt.monotonic_now();
+         let identity = tx.inert_identity();
+         let caller = FunctionCaller::Cron;
+@@ -469,6 +504,7 @@ impl<RT: Runtime> CronJobContext<RT> {
                          caller.allowed_visibility(),
                          context.clone(),
                          None,
@@ -1529,16 +1583,16 @@ index 09a24372bceba7522af26403eede91f78b650bf7..280b6c20b96d769aa93e0aeff70dc6ba
                      )
                      .await
              };
-@@ -681,6 +714,7 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -685,6 +721,7 @@ impl<RT: Runtime> CronJobContext<RT> {
                          usage_tracker.clone(),
                          context.clone(),
-                         true,
+                         PermitTimeout::WaitIndefinitely,
 +                        SchedulerDependencyClass::Independent,
                      )
                      .await?;
                  let execution_time_f64 = completion.execution_time.as_secs_f64();
 diff --git a/crates/application/src/lib.rs b/crates/application/src/lib.rs
-index 45a7db0679920ceb0345cab95f66d56dcd2b6b8f..ca3c2498627f3cc72af47d30ca9780b4689f0573 100644
+index 47a3af88ca7beb8aa18a1bcf42c01a03ddbb3e05..190d19c563182a2192c7f43ab05144c8a70078ab 100644
 --- a/crates/application/src/lib.rs
 +++ b/crates/application/src/lib.rs
 @@ -150,6 +150,7 @@ use common::{
@@ -1549,7 +1603,7 @@ index 45a7db0679920ceb0345cab95f66d56dcd2b6b8f..ca3c2498627f3cc72af47d30ca9780b4
          TableName,
          Timestamp,
          UdfType,
-@@ -1263,9 +1264,31 @@ impl<RT: Runtime> Application<RT> {
+@@ -1269,9 +1270,31 @@ impl<RT: Runtime> Application<RT> {
          identity: Identity,
          caller: FunctionCaller,
          invocation: QueryInvocation,
@@ -1582,7 +1636,7 @@ index 45a7db0679920ceb0345cab95f66d56dcd2b6b8f..ca3c2498627f3cc72af47d30ca9780b4
              request_context,
              path,
              args,
-@@ -1274,6 +1297,7 @@ impl<RT: Runtime> Application<RT> {
+@@ -1280,6 +1303,7 @@ impl<RT: Runtime> Application<RT> {
              None,
              caller,
              invocation,
@@ -1590,7 +1644,7 @@ index 45a7db0679920ceb0345cab95f66d56dcd2b6b8f..ca3c2498627f3cc72af47d30ca9780b4
          )
          .await
      }
-@@ -1289,6 +1313,32 @@ impl<RT: Runtime> Application<RT> {
+@@ -1295,6 +1319,32 @@ impl<RT: Runtime> Application<RT> {
          journal: Option<Option<String>>,
          caller: FunctionCaller,
          invocation: QueryInvocation,
@@ -1623,7 +1677,7 @@ index 45a7db0679920ceb0345cab95f66d56dcd2b6b8f..ca3c2498627f3cc72af47d30ca9780b4
      ) -> anyhow::Result<RedactedQueryReturn> {
          let request_id = request_context.request_id.clone();
          let persistence_version = self.database.persistence_version();
-@@ -1309,7 +1359,7 @@ impl<RT: Runtime> Application<RT> {
+@@ -1315,7 +1365,7 @@ impl<RT: Runtime> Application<RT> {
                  })
                  .transpose()?;
              self.runner
@@ -1632,7 +1686,7 @@ index 45a7db0679920ceb0345cab95f66d56dcd2b6b8f..ca3c2498627f3cc72af47d30ca9780b4
                      request_context.clone(),
                      path,
                      args,
-@@ -1318,6 +1368,7 @@ impl<RT: Runtime> Application<RT> {
+@@ -1324,6 +1374,7 @@ impl<RT: Runtime> Application<RT> {
                      journal,
                      caller,
                      invocation,
@@ -1640,7 +1694,7 @@ index 45a7db0679920ceb0345cab95f66d56dcd2b6b8f..ca3c2498627f3cc72af47d30ca9780b4
                  )
                  .await?
          });
-@@ -1364,6 +1415,30 @@ impl<RT: Runtime> Application<RT> {
+@@ -1370,6 +1421,30 @@ impl<RT: Runtime> Application<RT> {
          mutation_identifier: Option<SessionRequestIdentifier>,
          caller: FunctionCaller,
          mutation_queue_length: Option<usize>,
@@ -1671,7 +1725,7 @@ index 45a7db0679920ceb0345cab95f66d56dcd2b6b8f..ca3c2498627f3cc72af47d30ca9780b4
      ) -> anyhow::Result<Result<RedactedMutationReturn, RedactedMutationError>> {
          let block_logging = self
              .log_visibility
-@@ -1376,7 +1451,7 @@ impl<RT: Runtime> Application<RT> {
+@@ -1382,7 +1457,7 @@ impl<RT: Runtime> Application<RT> {
          let request_id = request_context.request_id.clone();
          let result = match self
              .runner
@@ -1680,7 +1734,7 @@ index 45a7db0679920ceb0345cab95f66d56dcd2b6b8f..ca3c2498627f3cc72af47d30ca9780b4
                  request_context,
                  path,
                  args,
-@@ -1384,6 +1459,7 @@ impl<RT: Runtime> Application<RT> {
+@@ -1390,6 +1465,7 @@ impl<RT: Runtime> Application<RT> {
                  mutation_identifier,
                  caller,
                  mutation_queue_length,
@@ -1688,7 +1742,7 @@ index 45a7db0679920ceb0345cab95f66d56dcd2b6b8f..ca3c2498627f3cc72af47d30ca9780b4
              )
              .await
          {
-@@ -1427,6 +1503,26 @@ impl<RT: Runtime> Application<RT> {
+@@ -1433,6 +1509,26 @@ impl<RT: Runtime> Application<RT> {
          args: SerializedArgs,
          identity: Identity,
          caller: FunctionCaller,
@@ -1715,7 +1769,7 @@ index 45a7db0679920ceb0345cab95f66d56dcd2b6b8f..ca3c2498627f3cc72af47d30ca9780b4
      ) -> anyhow::Result<Result<RedactedActionReturn, RedactedActionError>> {
          let block_logging = self
              .log_visibility
-@@ -1445,7 +1541,14 @@ impl<RT: Runtime> Application<RT> {
+@@ -1451,7 +1547,14 @@ impl<RT: Runtime> Application<RT> {
              .unwrap_or(Span::noop());
          let run_action = async move {
              runner
@@ -1776,7 +1830,7 @@ index 9a91ceb399cee6d293a5e5a5460d8aefc4f307af..22d787c2d126089b78e6bb8a1509e179
      RUN_SCHEDULED_JOBS_LOOP_SECONDS,
      "Time to run a single loop of the scheduled job executor",
 diff --git a/crates/application/src/scheduled_jobs/mod.rs b/crates/application/src/scheduled_jobs/mod.rs
-index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15c222bc5b 100644
+index e9c59929b1a784daf5746144fa1a3e21f5c08435..abe406bb11c3c528db486f5582c4e185ec5e46ef 100644
 --- a/crates/application/src/scheduled_jobs/mod.rs
 +++ b/crates/application/src/scheduled_jobs/mod.rs
 @@ -64,6 +64,7 @@ use common::{
@@ -1787,7 +1841,7 @@ index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15
          UdfType,
      },
      RequestId,
-@@ -180,6 +181,7 @@ pub struct ScheduledJobExecutor<RT: Runtime> {
+@@ -183,6 +184,7 @@ pub struct ScheduledJobExecutor<RT: Runtime> {
      next_job_ready_time: Option<Timestamp>,
      job_finished_tx: mpsc::Sender<ResolvedDocumentId>,
      job_finished_rx: mpsc::Receiver<ResolvedDocumentId>,
@@ -1795,7 +1849,7 @@ index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15
      /// The last time we logged stats, used to rate limit logging
      last_stats_log: SystemTime,
      /// The last logged value of `next_job_ready_time`
-@@ -197,19 +199,39 @@ pub struct ScheduledJobContext<RT: Runtime> {
+@@ -200,19 +202,39 @@ pub struct ScheduledJobContext<RT: Runtime> {
      function_log: FunctionExecutionLog<RT>,
  }
  
@@ -1805,11 +1859,11 @@ index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15
  impl<RT: Runtime> ScheduledJobExecutor<RT> {
 -    pub async fn run(
 +    pub fn run(
-+        rt: RT,
-+        deployment_name: String,
-+        database: Database<RT>,
-+        runner: Arc<ApplicationFunctionRunner<RT>>,
-+        function_log: FunctionExecutionLog<RT>,
+         rt: RT,
+         deployment_name: String,
+         database: Database<RT>,
+         runner: Arc<ApplicationFunctionRunner<RT>>,
+         function_log: FunctionExecutionLog<RT>,
 +    ) -> impl Future<Output = ()> {
 +        // Resolve strict configuration before the future is spawned. A panic inside the
 +        // executor task would otherwise leave the backend running without
@@ -1826,11 +1880,11 @@ index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15
 +    }
 +
 +    async fn run_with_parallelism(
-         rt: RT,
-         deployment_name: String,
-         database: Database<RT>,
-         runner: Arc<ApplicationFunctionRunner<RT>>,
-         function_log: FunctionExecutionLog<RT>,
++        rt: RT,
++        deployment_name: String,
++        database: Database<RT>,
++        runner: Arc<ApplicationFunctionRunner<RT>>,
++        function_log: FunctionExecutionLog<RT>,
 +        execution_parallelism: usize,
      ) {
 -        let (job_finished_tx, job_finished_rx) =
@@ -1841,7 +1895,7 @@ index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15
          let mut executor = Self {
              context: ScheduledJobContext {
                  rt: rt.clone(),
-@@ -222,6 +244,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
+@@ -225,6 +247,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
              next_job_ready_time: None,
              job_finished_tx,
              job_finished_rx,
@@ -1849,7 +1903,7 @@ index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15
              last_stats_log: rt.system_time(),
              // This value will force the first call to `run_once` to log
              last_logged_ready_time: Some(SystemTime::UNIX_EPOCH),
-@@ -273,7 +296,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
+@@ -276,7 +299,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
              // If the backend is stopped we shouldn't poll. Our subscription will notify us
              // when the backend is started again.
              None
@@ -1858,7 +1912,7 @@ index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15
              // A scheduled job may have been added, but we can't do anything because we're
              // still running jobs at our concurrency limit.
              self.next_job_ready_time
-@@ -338,15 +361,25 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
+@@ -341,15 +364,25 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
          };
          select_biased! {
              num_jobs = self.job_finished_rx
@@ -1886,7 +1940,7 @@ index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15
                  } else {
                      anyhow::bail!("Job results channel closed, this is unexpected!");
                  }
-@@ -404,7 +437,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
+@@ -407,7 +440,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
              // caught up, we can sleep until the timestamp. If we're behind and
              // at our concurrency limit, we can use the timestamp to log how far
              // behind we get.
@@ -1895,7 +1949,7 @@ index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15
                  return Ok(Some(next_ts));
              }
  
-@@ -433,7 +466,9 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
+@@ -436,7 +469,9 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
                  .bind_hub(sentry_hub),
              );
  
@@ -1906,7 +1960,19 @@ index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15
  
              // We might have hit the concurrency limit by adding the new job, so
              // we could check and break immediately if we have.
-@@ -784,6 +819,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+@@ -751,7 +786,10 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+                 // Continue without running function since the job state has changed
+                 return Ok(());
+             };
+-            let permit = self.runner.acquire_mutation_permit().await;
++            let permit = self
++                .runner
++                .acquire_mutation_permit(SchedulerDependencyClass::Independent)
++                .await;
+             let start = self.rt.monotonic_now();
+             let context = ExecutionContext::new(
+                 RequestContext::new_for_system_request(request_id.clone()),
+@@ -789,6 +827,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                          caller.allowed_visibility(),
                          context.clone(),
                          None,
@@ -1914,10 +1980,10 @@ index 9b4073c93fcff3e768bba1f4ce46f7001a43093f..f51021a502d9d39c6dabaa6cf2ca8b15
                      )
                      .await
              };
-@@ -988,6 +1024,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+@@ -993,6 +1032,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                          usage_tracker.clone(),
                          context.clone(),
-                         true,
+                         PermitTimeout::WaitIndefinitely,
 +                        SchedulerDependencyClass::Independent,
                      )
                      .await?;
@@ -2548,7 +2614,7 @@ index 674591dc6030d30e65c83b35c9753bad75cfd1cc..8f57ee5c5bb91d2503aaf75a0c480991
      }
  }
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 6fda80449f3e5ef51d0ec45a14af9472e76f360e..00c27a7c299e563e40174c182f382caf1f7a5fff 100644
+index c5597d01fa052305e92930a20896377a25815590..79c60447de72496abe2177ceb3567f0acf0ffbb1 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -30,6 +30,45 @@ use cmd_util::env::env_config;
@@ -2597,7 +2663,7 @@ index 6fda80449f3e5ef51d0ec45a14af9472e76f360e..00c27a7c299e563e40174c182f382caf
  /// This exists solely to allow knobs to have separate defaults for local
  /// execution and prod (running in Nomad). Don't export this outside of
  /// this module. We assume that if we're running in Nomad, we're in production
-@@ -545,12 +584,13 @@ pub static TRANSACTION_MAX_FILE_READ_SIZE_BYTES: LazyLock<usize> = LazyLock::new
+@@ -555,12 +594,13 @@ pub static TRANSACTION_MAX_FILE_READ_SIZE_BYTES: LazyLock<usize> = LazyLock::new
      env_config("TRANSACTION_MAX_FILE_READ_SIZE_BYTES", 1 << 24) // 16 MiB
  });
  
@@ -2613,7 +2679,7 @@ index 6fda80449f3e5ef51d0ec45a14af9472e76f360e..00c27a7c299e563e40174c182f382caf
  
  /// Initial backoff in milliseconds on a system error from a scheduled job.
  pub static SCHEDULED_JOB_INITIAL_BACKOFF: LazyLock<Duration> =
-@@ -987,13 +1027,29 @@ pub static DATABASE_UDF_SYSTEM_TIMEOUT: LazyLock<Duration> =
+@@ -997,13 +1037,29 @@ pub static DATABASE_UDF_SYSTEM_TIMEOUT: LazyLock<Duration> =
  pub static ISOLATE_ANALYZE_USER_TIMEOUT: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_ANALYZE_USER_TIMEOUT_SECONDS", 4)));
  
@@ -2644,7 +2710,7 @@ index 6fda80449f3e5ef51d0ec45a14af9472e76f360e..00c27a7c299e563e40174c182f382caf
  
  /// The maximum length of time to wait to start running a function when the
  /// isolate scheduler is idle.
-@@ -1007,7 +1063,29 @@ pub static ISOLATE_QUEUE_CONGESTED_TIMEOUT: LazyLock<Duration> =
+@@ -1017,7 +1073,29 @@ pub static ISOLATE_QUEUE_CONGESTED_TIMEOUT: LazyLock<Duration> =
  
  /// Maximum number of isolate worker threads in a function runner process.
  pub static MAX_ISOLATE_WORKERS: LazyLock<usize> =
@@ -2675,7 +2741,7 @@ index 6fda80449f3e5ef51d0ec45a14af9472e76f360e..00c27a7c299e563e40174c182f382caf
  
  /// The size of the pending commits in the committer queue. This is a FIFO
  /// queue, so if the queue is too large, we run into a risk of all requests
-@@ -1480,7 +1558,7 @@ pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
+@@ -1490,7 +1568,7 @@ pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
  /// The maximum number of CPU cores that can be used simultaneously by the
  /// isolates. Zero means no limit.
  pub static FUNRUN_ISOLATE_ACTIVE_THREADS: LazyLock<usize> =
@@ -2684,7 +2750,7 @@ index 6fda80449f3e5ef51d0ec45a14af9472e76f360e..00c27a7c299e563e40174c182f382caf
  
  /// Isolate worker usage at which the funrun load reporter's
  /// `effective_load` saturates to 1.0.
-@@ -2200,3 +2278,26 @@ pub static MAX_LOG_LINES_NODE_ACTIONS: LazyLock<usize> =
+@@ -2219,3 +2297,26 @@ pub static MAX_LOG_LINES_NODE_ACTIONS: LazyLock<usize> =
  /// Max number of log lines in a single query or mutation
  pub static MAX_LOG_LINES_DATABASE_UDFS: LazyLock<usize> =
      LazyLock::new(|| env_config("MAX_LOG_LINES_DATABASE_UDFS", 256).max(1));
@@ -2894,7 +2960,7 @@ index 3756ee776eaac2949dac31ada7ae381a7e71fb0b..9bda5112b01359e5848943a2b9ef1752
                          identity,
                          action_callbacks,
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a413793028a7a4154 100644
+index 0207fcf03d3254a0866db99bdf012717b42170f6..fd2d4d83b67757bb73289c8c321a4e2eb11b2687 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -29,12 +29,13 @@ use common::{
@@ -3092,15 +3158,15 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
  #[derive(Clone)]
  pub struct IsolateConfig {
      // Name of isolate pool, used in metrics.
-@@ -215,7 +366,6 @@ impl IsolateConfig {
-             limiter,
-         }
+@@ -219,7 +370,6 @@ impl IsolateConfig {
+     pub fn max_user_timeout(&self) -> Option<Duration> {
+         self.max_user_timeout
      }
 -
  }
  
  pub struct UdfRequest<RT: Runtime> {
-@@ -232,6 +382,7 @@ pub struct UdfRequest<RT: Runtime> {
+@@ -236,6 +386,7 @@ pub struct UdfRequest<RT: Runtime> {
  pub struct HttpActionRequest<RT: Runtime> {
      pub http_module_path: ValidatedHttpPath,
      pub routed_path: RoutedHttpPath,
@@ -3108,7 +3174,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
      pub http_request: udf::HttpActionRequest,
      pub transaction: Transaction<RT>,
      pub identity: Identity,
-@@ -265,14 +416,30 @@ pub struct Request<RT: Runtime> {
+@@ -269,14 +420,30 @@ pub struct Request<RT: Runtime> {
      pub client_id: String,
      pub inner: RequestType<RT>,
      pub parent_trace: EncodedSpan,
@@ -3139,7 +3205,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          }
      }
  
-@@ -286,12 +453,80 @@ impl<RT: Runtime> Request<RT> {
+@@ -290,12 +457,80 @@ impl<RT: Runtime> Request<RT> {
              | RequestType::EvaluateAuthConfig { .. }
              | RequestType::EvaluateAppDefinitions { .. }
              | RequestType::EvaluateComponentInitializer { .. } => return None,
@@ -3220,7 +3286,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
  }
  
  pub enum RequestType<RT: Runtime> {
-@@ -359,6 +594,18 @@ pub enum RequestType<RT: Runtime> {
+@@ -363,6 +598,18 @@ pub enum RequestType<RT: Runtime> {
          name: ComponentName,
          response: oneshot::Sender<anyhow::Result<BTreeMap<Identifier, Resource>>>,
      },
@@ -3239,7 +3305,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
  }
  
  #[allow(async_fn_in_trait)]
-@@ -439,6 +686,10 @@ impl<RT: Runtime> Request<RT> {
+@@ -443,6 +690,10 @@ impl<RT: Runtime> Request<RT> {
              RequestType::EvaluateComponentInitializer { response, .. } => {
                  let _ = response.send(Err(error));
              },
@@ -3250,7 +3316,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          }
      }
  
-@@ -452,6 +703,8 @@ impl<RT: Runtime> Request<RT> {
+@@ -456,6 +707,8 @@ impl<RT: Runtime> Request<RT> {
              RequestType::EvaluateAuthConfig { response, .. } => response.is_closed(),
              RequestType::EvaluateAppDefinitions { response, .. } => response.is_closed(),
              RequestType::EvaluateComponentInitializer { response, .. } => response.is_closed(),
@@ -3259,7 +3325,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          }
      }
  }
-@@ -464,6 +717,7 @@ impl<RT: Runtime> Clone for IsolateClient<RT> {
+@@ -468,6 +721,7 @@ impl<RT: Runtime> Clone for IsolateClient<RT> {
              scheduler: self.scheduler.clone(),
              sender: self.sender.clone(),
              internal_sender: self.internal_sender.clone(),
@@ -3267,7 +3333,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
              active_workers: self.active_workers.clone(),
              max_workers: self.max_workers,
          }
-@@ -551,6 +805,7 @@ pub struct IsolateClient<RT: Runtime> {
+@@ -555,6 +809,7 @@ pub struct IsolateClient<RT: Runtime> {
      scheduler: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
      sender: CoDelQueueSender<RT, Request<RT>>,
      internal_sender: mpsc::UnboundedSender<Request<RT>>,
@@ -3275,7 +3341,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
      /// Shared with the scheduler. Tracks the total number of in-progress
      /// workers across all clients.
      active_workers: Arc<AtomicUsize>,
-@@ -564,17 +819,50 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -568,17 +823,50 @@ impl<RT: Runtime> IsolateClient<RT> {
          max_isolate_workers: usize,
          isolate_worker: W,
      ) -> anyhow::Result<Self> {
@@ -3331,7 +3397,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          let (internal_sender, internal_receiver) = mpsc::unbounded_channel();
          let handles = Arc::new(Mutex::new(Vec::new()));
          let handles_clone = handles.clone();
-@@ -589,6 +877,9 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -593,6 +881,9 @@ impl<RT: Runtime> IsolateClient<RT> {
                  rt_clone,
                  isolate_worker,
                  max_isolate_workers,
@@ -3341,7 +3407,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
                  handles_clone,
                  max_percent_per_client,
                  _active_workers,
-@@ -599,6 +890,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -603,6 +894,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              rt,
              sender,
              internal_sender,
@@ -3349,7 +3415,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
              scheduler: Arc::new(Mutex::new(Some(scheduler))),
              handles,
              active_workers,
-@@ -641,6 +933,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -645,6 +937,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          instance_name: String,
          function_started_sender: Option<oneshot::Sender<()>>,
          subfunctions_in_same_isolate: bool,
@@ -3357,7 +3423,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          let (tx, rx) = oneshot::channel();
          let request = RequestType::Udf {
-@@ -665,10 +958,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -669,10 +962,11 @@ impl<RT: Runtime> IsolateClient<RT> {
                  Some(self.clone())
              },
          };
@@ -3370,7 +3436,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          ))?;
          let (tx, outcome) = Self::receive_response(rx).await??;
  
-@@ -687,6 +981,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -691,6 +985,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          environment_data: EnvironmentData<RT>,
          instance_name: String,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -3378,7 +3444,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
          let request = RequestType::Action {
-@@ -704,10 +999,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -708,10 +1003,11 @@ impl<RT: Runtime> IsolateClient<RT> {
              log_line_sender,
              function_started_sender,
          };
@@ -3391,7 +3457,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          ))?;
          match Self::receive_response(rx).await? {
              Ok(outcome) => Ok(outcome),
-@@ -723,6 +1019,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -727,6 +1023,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          &self,
          http_module_path: ValidatedHttpPath,
          routed_path: RoutedHttpPath,
@@ -3399,7 +3465,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          http_request: udf::HttpActionRequest,
          identity: Identity,
          action_callbacks: Arc<dyn ActionCallbacks>,
-@@ -740,6 +1037,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -744,6 +1041,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              request: HttpActionRequest {
                  http_module_path,
                  routed_path,
@@ -3407,7 +3473,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
                  http_request,
                  identity,
                  transaction,
-@@ -1055,6 +1353,12 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1059,6 +1357,12 @@ impl<RT: Runtime> IsolateClient<RT> {
      }
  
      pub async fn shutdown(&self) -> anyhow::Result<()> {
@@ -3420,7 +3486,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          {
              let handles: Vec<_> = {
                  let mut handles = self.handles.lock();
-@@ -1067,17 +1371,36 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1071,17 +1375,36 @@ impl<RT: Runtime> IsolateClient<RT> {
                  shutdown_and_join(handle.handle).await?;
              }
          }
@@ -3464,7 +3530,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          Ok(())
      }
  
-@@ -1107,10 +1430,20 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1111,10 +1434,20 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
              function_started_sender: None,
              udf_callback: Some(self.clone()),
          };
@@ -3486,7 +3552,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          let (tx, outcome) = IsolateClient::<RT>::receive_response(rx).await??;
          let outcome = match outcome {
              FunctionOutcome::Query(outcome) | FunctionOutcome::Mutation(outcome) => {
-@@ -1147,13 +1480,7 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -1151,13 +1484,7 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      rt: RT,
      worker: W,
      /// Vec of channels for sending work to individual workers.
@@ -3501,7 +3567,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
      /// Map from client_id to stack of workers (implemented with a deque). The
      /// most recently used worker for a given client is at the front of the
      /// deque. These workers were previously used by this client, but may
-@@ -1165,30 +1492,48 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -1169,30 +1496,48 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      /// Set of futures awaiting a response from an active worker.
      in_progress_workers:
          FuturesUnordered<Join<oneshot::Receiver<IdleWorkerInfo>, Ready<ActiveWorkerState>>>,
@@ -3557,7 +3623,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
  }
  
  impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
-@@ -1196,23 +1541,42 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1200,23 +1545,42 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          rt: RT,
          worker: W,
          max_workers: usize,
@@ -3604,7 +3670,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          }
      }
  
-@@ -1221,25 +1585,27 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1225,25 +1589,27 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          completed_worker: ActiveWorkerState,
          info: IdleWorkerInfo,
      ) {
@@ -3643,7 +3709,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          log_pool_running_count(
              self.worker.config().name,
              new_count,
-@@ -1256,50 +1622,124 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1260,50 +1626,124 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              });
      }
  
@@ -3802,7 +3868,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          let internal_request_stream =
              UnboundedReceiverStream::new(internal_receiver).then(async |request| {
                  // Internal requests (for nested UDFs) get priority because they
-@@ -1315,7 +1755,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1319,7 +1759,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              |&mut ()| PollNext::Left
          ));
          loop {
@@ -3812,7 +3878,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
              tokio::select! {
                  biased;
                  completed_worker = self.in_progress_workers.next(),
-@@ -1334,6 +1775,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1338,6 +1779,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      let Some((request, expired)) = request else {
                          break;
                      };
@@ -3823,7 +3889,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
                      request.expire(expired);
                  }
                  request = next_request_stream.next(),
-@@ -1344,29 +1789,43 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1348,29 +1793,43 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      if request.is_response_closed() {
                          continue;
                      }
@@ -3879,7 +3945,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
                          .is_err()
                      {
                          // Available worker should have an empty channel, so if we fail
-@@ -1377,6 +1836,33 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1381,6 +1840,33 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          );
                          return;
                      }
@@ -3913,7 +3979,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
                  },
                  _ = &mut report_stats => {
                      let heap_stats = self.aggregate_heap_stats();
-@@ -1401,19 +1887,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1405,19 +1891,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      fn get_worker(
          &mut self,
          request: &Request<RT>,
@@ -3941,7 +4007,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
              );
              return Err(RejectedBeforeExecutionReason::PerClientWorkerOverloaded);
          }
-@@ -1527,18 +2011,14 @@ impl SharedIsolateHeapStats {
+@@ -1531,18 +2015,14 @@ impl SharedIsolateHeapStats {
  pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
      async fn service_requests(
          self,
@@ -3962,7 +4028,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
          'recreate_isolate: loop {
              let mut last_client_id: Option<String> = None;
              let mut last_request: Option<String> = None;
-@@ -1560,8 +2040,11 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -1564,8 +2044,11 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                      continue 'recreate_isolate;
                  }
                  heap_stats.store(isolate.heap_stats());
@@ -3975,7 +4041,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
                      let _ = done.send(IdleWorkerInfo {
                          cached_contexts: context_cache.cached_contexts().clone(),
                      });
-@@ -1575,9 +2058,10 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -1579,9 +2062,10 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                      },
                      // First peek the request to decide if we need to make a new isolate.
                      req = reqs.as_mut().peek() => {
@@ -3987,7 +4053,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
                          let reused = last_client_id.is_some();
                          // If we receive a request from a different client (i.e. a different instance),
                          // recreate the isolate. We don't allow an isolate to be reused
-@@ -1594,12 +2078,17 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -1598,12 +2082,17 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                              tracing::debug!("Reusing isolate for client {}", req.client_id);
                          }
                          // Ok, we're ready to accept the request for real.
@@ -4007,7 +4073,7 @@ index 26fa7477b7dd40745b23be118bb4467e156f54fb..091a4d2561baf431a23f6d8a41379302
                          let root = initialize_root_from_parent(
                              func_path!(),
                              req.parent_trace.clone(),
-@@ -1692,3 +2181,858 @@ pub fn should_recreate_isolate<RT: Runtime>(
+@@ -1696,3 +2185,858 @@ pub fn should_recreate_isolate<RT: Runtime>(
  
      false
  }
