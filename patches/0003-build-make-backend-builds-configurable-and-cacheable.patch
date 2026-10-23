@@ -18,15 +18,22 @@ Document local prerequisites, artifact configuration, dependency layering, rollb
 On one constrained builder, the previous Cargo path was stopped after more than 1 hour 20 minutes while repeatedly fetching complete Git histories. With shallow fetches and shared caches, cargo-chef prepare completed in 12 minutes 14 seconds, dependency cooking in 46 seconds, and the final two binaries in about 4 minutes 36 seconds. The then-eager JavaScript install took 13 minutes 20 seconds and included an unrelated Puppeteer download. The image has not been rebuilt after removing that eager install, so no replacement timing is claimed.
 
 Use line-table development debug information to retain useful source locations while reducing local artifact size.
+
+Preserve available optimized function symbols in an optional GNU debug
+companion before image stripping. Keep ordinary release compilation unchanged
+and allow already stripped images or failed companion extraction to package
+normally. Only offline native attribution requires a matching companion;
+image build, reuse and deployment do not.
 ---
  .cargo/config.toml                           |   5 +
  Cargo.toml                                   |   3 +
  crates/AGENTS.md                             |  26 +-
  patches/backend_build_improvements/README.md | 273 +++++++++++++++++++
  scripts/run_cargo.sh                         |  40 +++
- self-hosted/docker-build/Dockerfile.backend  | 114 +++++++-
- self-hosted/docker-build/README.md           |  23 ++
- 7 files changed, 468 insertions(+), 16 deletions(-)
+ self-hosted/README.md                        |  28 ++
+ self-hosted/docker-build/Dockerfile.backend  | 134 ++++++++-
+ self-hosted/docker-build/README.md           |  27 ++
+ 8 files changed, 520 insertions(+), 16 deletions(-)
  create mode 100644 patches/backend_build_improvements/README.md
  create mode 100755 scripts/run_cargo.sh
 
@@ -424,8 +431,47 @@ index 0000000000000000000000000000000000000000..a606797a3cdf3f551b649509eb33fb1a
 +fi
 +
 +exec cargo "$@"
+diff --git a/self-hosted/README.md b/self-hosted/README.md
+index 6ca509a652ae98e4048a66e6e77f1e227a71734d..c52741a996aeb6e66ba94b7af0982a42ee936d14 100644
+--- a/self-hosted/README.md
++++ b/self-hosted/README.md
+@@ -91,6 +91,34 @@ indexes following [these instructions](./advanced/s3_storage.md).
+ You should now be able to use the self-hosted backend. Read on for alternative
+ hosting options for production workloads.
+ 
++## Native profiling symbols in locally built images
++
++`docker-build/Dockerfile.backend` retains `/convex/convex-local-backend.debug`
++when a native symbol table is available, before packaging strips the executable.
++This GNU debug companion preserves the optimized linker's function names without
++enabling debug compilation or changing optimization. Packaging adds a GNU debug
++link when possible; both files preserve the linker's GNU build ID. Copy both
++from the exact image being profiled and keep them together for offline tools. A source revision or image
++tag is not sufficient to match a separately rebuilt binary to samples.
++
++Existing Cargo profile and Docker `debug` settings still control compilation
++and executable stripping. The companion contains any debug information already
++emitted, but ordinary release builds provide function names without source
++lines or inline frames. An existing `.dwp` file is also copied into the image;
++keep it when using split debug information. Profiles that strip the native
++symbol table in Cargo (`strip = "symbols"`) still build normally, without a
++companion. `strip = "debuginfo"` retains function names. The companion is needed
++only for native profile attribution, never for building or running an image.
++If companion extraction fails, packaging reports that attribution is unavailable
++and continues. Offline tools must check the executable and companion identities
++when native attribution is requested.
++
++The extra image storage is the symbol table and any emitted debug information;
++the companion does not retain executable code pages or load into the running
++process. Dependency compilation and cache settings remain unchanged. Previously
++stripped images cannot recover symbols through repackaging; they need a retained
++companion with the matching build ID.
++
+ ## Convex Auth
+ 
+ If you're using Convex Auth, follow the
 diff --git a/self-hosted/docker-build/Dockerfile.backend b/self-hosted/docker-build/Dockerfile.backend
-index 25a6779a3245c26bd00d23a3135d4a9ba0866101..1f94460c03076ed6f3ad8ccda070a8dd609ca26e 100644
+index 25a6779a3245c26bd00d23a3135d4a9ba0866101..115a97e3a78c79a207125cdb515debd3134836da 100644
 --- a/self-hosted/docker-build/Dockerfile.backend
 +++ b/self-hosted/docker-build/Dockerfile.backend
 @@ -13,8 +13,19 @@ WORKDIR /tmp
@@ -508,7 +554,7 @@ index 25a6779a3245c26bd00d23a3135d4a9ba0866101..1f94460c03076ed6f3ad8ccda070a8dd
  COPY . .
  
  # Build the convex-local-backend binary
-@@ -95,16 +140,59 @@ ARG VERGEN_GIT_SHA
+@@ -95,16 +140,79 @@ ARG VERGEN_GIT_SHA
  ARG VERGEN_GIT_COMMIT_TIMESTAMP
  ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
  ENV VERGEN_GIT_COMMIT_TIMESTAMP=${VERGEN_GIT_COMMIT_TIMESTAMP}
@@ -558,6 +604,20 @@ index 25a6779a3245c26bd00d23a3135d4a9ba0866101..1f94460c03076ed6f3ad8ccda070a8dd
 +RUN <<EOF
 +set -euo pipefail
 +cargo_profile_release_debug="${CARGO_PROFILE_RELEASE_DEBUG:-}"
++# Preserve the optimized linker's function table before packaging strips it.
++# This does not change Cargo profiles or invalidate compiled dependencies.
++cd /convex/backend-artifacts
++if readelf -SW convex-local-backend | grep -E '\.symtab[[:space:]]+SYMTAB' >/dev/null &&
++   objcopy --only-keep-debug convex-local-backend convex-local-backend.debug &&
++   chmod 644 convex-local-backend.debug; then
++  echo "Retained native profiling symbols in convex-local-backend.debug"
++else
++  # Cargo strip=symbols is valid for runtime images. Attribution alone needs
++  # the companion, so extraction failure must not block runtime packaging.
++  # Identity checks belong to the offline profiling consumer.
++  rm -f convex-local-backend.debug
++  echo "Native profiling symbols could not be retained; native profile attribution is unavailable" >&2
++fi
 +# Keep the legacy GNU strip only for release builds where Cargo was not asked
 +# to control stripping or emit debuginfo.
 +if [[ -z "${debug:-}" &&
@@ -565,16 +625,22 @@ index 25a6779a3245c26bd00d23a3135d4a9ba0866101..1f94460c03076ed6f3ad8ccda070a8dd
 +      -z "${CARGO_PROFILE_RELEASE_STRIP:-}" ]]; then
 +  case "${cargo_profile_release_debug,,}" in
 +    ""|false|0|none)
-+      strip ./backend-artifacts/convex-local-backend
-+      strip ./backend-artifacts/generate_key
++      strip convex-local-backend
++      strip generate_key
 +      ;;
 +  esac
++fi
++if [[ -f convex-local-backend.debug ]]; then
++  if ! objcopy --add-gnu-debuglink=convex-local-backend.debug convex-local-backend; then
++    # Offline tools can still accept the companion explicitly.
++    echo "Could not add the GNU debug link; select the native companion explicitly for profiling" >&2
++  fi
 +fi
 +EOF
  
  # Final stage: Creates minimal runtime image with only necessary components
  # Uses Ubuntu Noble (24.04) as the base image
-@@ -130,8 +218,8 @@ RUN ln -sf /usr/lib/node_modules/npm/bin/npm-cli.js /usr/bin/npm && \
+@@ -130,8 +238,8 @@ RUN ln -sf /usr/lib/node_modules/npm/bin/npm-cli.js /usr/bin/npm && \
      chmod +x /usr/bin/npm
  RUN ln -sf /usr/lib/node_modules/npm/bin/npx-cli.js /usr/bin/npx && \
      chmod +x /usr/bin/npx
@@ -586,10 +652,10 @@ index 25a6779a3245c26bd00d23a3135d4a9ba0866101..1f94460c03076ed6f3ad8ccda070a8dd
  COPY --chmod=744 self-hosted/docker-build/run_backend.sh .
  COPY --chmod=744 self-hosted/docker-build/generate_admin_key.sh .
 diff --git a/self-hosted/docker-build/README.md b/self-hosted/docker-build/README.md
-index 13a49046afeb79afcfaa96fc2e6f843d39ef1f03..be7ebae0c12f077f3e277bb118049d2685747ae5 100644
+index 13a49046afeb79afcfaa96fc2e6f843d39ef1f03..c14b66734a94583a5821671317fe11c8aa74edba 100644
 --- a/self-hosted/docker-build/README.md
 +++ b/self-hosted/docker-build/README.md
-@@ -11,6 +11,29 @@ Build the backend from scratch by running:
+@@ -11,6 +11,33 @@ Build the backend from scratch by running:
  docker build -t convex-backend -f self-hosted/docker-build/Dockerfile.backend .
  ```
  
@@ -604,8 +670,12 @@ index 13a49046afeb79afcfaa96fc2e6f843d39ef1f03..be7ebae0c12f077f3e277bb118049d26
 +  .
 +```
 +
-+For a release profiling build, request Cargo debuginfo and disable both Cargo's
-+strip setting and the Dockerfile's final strip pass:
++Ordinary optimized images retain available function symbols in
++`/convex/convex-local-backend.debug` before packaging strips the executable.
++This companion is optional for runtime use and required only when requesting
++native profile attribution from a stripped executable. For source lines and
++inline-call information as well, request Cargo debuginfo and disable both
++Cargo's strip setting and the Dockerfile's final strip pass:
 +
 +```sh
 +docker build \
