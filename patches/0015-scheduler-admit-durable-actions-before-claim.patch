@@ -15,14 +15,15 @@ Add bounded admission and claim metrics, focused barrier coverage, patch-train i
  crates/application/src/scheduled_jobs/mod.rs  |  79 +--
  .../src/in_process_function_runner.rs         |   3 +
  crates/function_runner/src/lib.rs             |   2 +
- crates/function_runner/src/server.rs          | 123 +++++
+ crates/function_runner/src/server.rs          | 120 +++++
  crates/isolate/src/client.rs                  |   3 +
- crates/isolate/src/isolate_worker.rs          | 170 ++++---
+ .../environment/udf/context_reuse_tests.rs    |   1 +
+ crates/isolate/src/isolate_worker.rs          | 195 +++++---
  patches/README.md                             |  34 +-
  patches/dependency_capacity/README.md         |   5 +
  patches/isolate_queue_control/README.md       |  21 +-
  patches/scheduled_action_admission/README.md  | 455 ++++++++++++++++++
- 13 files changed, 1039 insertions(+), 122 deletions(-)
+ 14 files changed, 1052 insertions(+), 132 deletions(-)
  create mode 100644 patches/scheduled_action_admission/README.md
 
 diff --git a/crates/application/src/application_function_runner/metrics.rs b/crates/application/src/application_function_runner/metrics.rs
@@ -86,7 +87,7 @@ index 50807602a929157d507cfa672cb1f9392ca4ff83..a12751241e6e7a96ae01f37271d043c7
      UDF_EXECUTOR_RESULT_TOTAL,
      "Number of queries against the module cache",
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73adcfcb86e7 100644
+index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b58c9319a9 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
 @@ -106,6 +106,8 @@ use file_storage::{
@@ -98,7 +99,7 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
          FunctionMetadata,
          HttpActionMetadata,
      },
-@@ -218,7 +220,10 @@ use vector::{
+@@ -219,7 +221,10 @@ use vector::{
      VectorSearch,
  };
  
@@ -109,15 +110,15 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
      function_waiter_timer,
      log_occ_retries,
      log_outstanding_functions,
-@@ -385,6 +390,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
-                     active_javascript_class,
+@@ -386,6 +391,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+                     _ => anyhow::bail!("Invalid database UDF type"),
                  }),
                  None,
 +                None,
                  scheduler_dependency,
              )
              .await?;
-@@ -401,7 +407,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -403,7 +409,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          log_line_sender: mpsc::UnboundedSender<LogLine>,
          context: ExecutionContext,
          permit_timeout: PermitTimeout,
@@ -126,15 +127,15 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let permit = self
-@@ -425,6 +431,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
-                     active_javascript_class: ActiveJavascriptClass::Protected,
+@@ -426,6 +432,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+                     return_validation,
                  }),
                  None,
 +                function_execution_start,
                  scheduler_dependency,
              )
              .await?;
-@@ -457,6 +464,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -458,6 +465,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  Some(log_line_sender),
                  None,
                  Some(http_action_metadata),
@@ -142,7 +143,7 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
                  SchedulerDependencyClass::Independent,
              )
              .await?;
-@@ -480,6 +488,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -481,6 +489,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
          function_metadata: Option<FunctionMetadata>,
          http_action_metadata: Option<HttpActionMetadata>,
@@ -150,7 +151,7 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
          // Read in this transaction so preference changes invalidate cached queries.
-@@ -531,6 +540,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -532,6 +541,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  self.default_system_env_vars.clone(),
                  in_memory_index_last_modified,
                  context,
@@ -158,7 +159,7 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
                  scheduler_dependency,
              ),
              diagnostic.as_ref().map(RuntimeDiagnostic::task),
-@@ -1650,7 +1660,140 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1651,7 +1661,140 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          usage_tracking: FunctionUsageTracker,
          context: ExecutionContext,
          permit_timeout: PermitTimeout,
@@ -300,7 +301,7 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
          let mut diagnostic =
-@@ -1664,6 +1807,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1665,6 +1808,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  usage_tracking,
                  context,
                  permit_timeout,
@@ -308,7 +309,7 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
                  scheduler_dependency,
              ),
              diagnostic.as_ref().map(RuntimeDiagnostic::task),
-@@ -1706,7 +1850,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1707,7 +1851,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          usage_tracking: FunctionUsageTracker,
          context: ExecutionContext,
          permit_timeout: PermitTimeout,
@@ -317,7 +318,7 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
          if path.is_system() && !(identity.is_admin() || identity.is_system()) {
-@@ -1735,6 +1879,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1736,6 +1880,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  (path_and_args, returns_validator)
              },
              Err(js_error) => {
@@ -327,7 +328,7 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
                  return Ok(ActionCompletion {
                      outcome: ValidatedActionOutcome::from_error(
                          js_error,
-@@ -1783,6 +1930,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1788,6 +1935,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          log_line_sender,
                          context.clone(),
                          permit_timeout,
@@ -335,7 +336,7 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
                          scheduler_dependency,
                      )
                      .boxed();
-@@ -1908,6 +2056,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1915,6 +2063,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                      encoded_parent_trace: EncodedSpan::from_parent().0,
                  };
  
@@ -346,7 +347,7 @@ index 9cb02e84a354b1f672502b00e547c91e7294c053..cbd45d26bba7aa81d1a01eced52e73ad
                  let node_outcome_future = self
                      .node_actions
                      .execute(request, log_line_sender, source_maps_callback)
-@@ -1972,6 +2124,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1979,6 +2131,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  })
              },
              ModuleEnvironment::Invalid => {
@@ -654,10 +655,10 @@ index e352f03e50c6d508a3cc65b58c6b0687e4bc201b..e0f00d9da669a5da6091f56c4e1c96c2
      ) -> anyhow::Result<(
          Option<FunctionFinalTransaction>,
 diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
-index fe53f65c94a7f59f796eb271ee5fb65fd5ce47af..b86d342e0fab9b23f260360b9646ac63368aa5aa 100644
+index 2a3b551a621aea16bd4357023b152a9433d6c9fe..59337e71dbe13ec4927d9ab00fff8d69d4dd7c59 100644
 --- a/crates/function_runner/src/server.rs
 +++ b/crates/function_runner/src/server.rs
-@@ -124,6 +124,68 @@ use crate::{
+@@ -125,6 +125,68 @@ use crate::{
      FunctionWrites,
  };
  
@@ -726,7 +727,7 @@ index fe53f65c94a7f59f796eb271ee5fb65fd5ce47af..b86d342e0fab9b23f260360b9646ac63
  pub struct RunRequestArgs {
      pub key_broker: FunctionRunnerKeyBroker,
      pub index_reader: Arc<dyn IndexReader>,
-@@ -135,6 +197,7 @@ pub struct RunRequestArgs {
+@@ -136,6 +198,7 @@ pub struct RunRequestArgs {
      pub fetch_client: Arc<dyn FetchClient>,
      pub log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
      pub function_started_sender: Option<oneshot::Sender<()>>,
@@ -734,7 +735,7 @@ index fe53f65c94a7f59f796eb271ee5fb65fd5ce47af..b86d342e0fab9b23f260360b9646ac63
      pub udf_type: UdfType,
      pub identity: Identity,
      pub existing_writes: FunctionWrites,
-@@ -325,6 +388,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -336,6 +399,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
              fetch_client,
              log_line_sender,
              function_started_sender,
@@ -742,19 +743,16 @@ index fe53f65c94a7f59f796eb271ee5fb65fd5ce47af..b86d342e0fab9b23f260360b9646ac63
              udf_type,
              identity,
              existing_writes,
-@@ -384,6 +448,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -395,6 +459,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
  
          match udf_type {
              UdfType::Query | UdfType::Mutation => {
-+                anyhow::ensure!(
-+                    function_execution_start.is_none(),
-+                    "Database functions cannot have an action execution start barrier"
-+                );
-                 let FunctionMetadata {
-                     path_and_args,
-                     journal,
-@@ -431,6 +499,8 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
-                     function_metadata.context("Missing function metadata for action")?;
++                anyhow::ensure!(function_execution_start.is_none(), "Database functions cannot have an action execution start barrier");
+                 let function_metadata =
+                     function_metadata.context("Missing function metadata for query or mutation")?;
+                 let (path_and_args, journal, active_javascript_class) = match udf_type {
+@@ -475,6 +540,8 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                     };
                  let log_line_sender =
                      log_line_sender.context("Missing log line sender for action")?;
 +                let function_execution_start =
@@ -762,7 +760,7 @@ index fe53f65c94a7f59f796eb271ee5fb65fd5ce47af..b86d342e0fab9b23f260360b9646ac63
                  let outcome = self
                      .isolate_client
                      .execute_action(
-@@ -443,6 +513,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -488,6 +555,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                          environment_data,
                          deployment_name,
                          function_started_sender,
@@ -770,7 +768,7 @@ index fe53f65c94a7f59f796eb271ee5fb65fd5ce47af..b86d342e0fab9b23f260360b9646ac63
                          scheduler_dependency,
                      )
                      .await?;
-@@ -453,6 +524,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -498,6 +566,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                  ))
              },
              UdfType::HttpAction => {
@@ -781,7 +779,7 @@ index fe53f65c94a7f59f796eb271ee5fb65fd5ce47af..b86d342e0fab9b23f260360b9646ac63
                  anyhow::ensure!(
                      scheduler_dependency == SchedulerDependencyClass::Independent,
                      "HTTP actions cannot be dependency-unblocking scheduler requests"
-@@ -620,3 +695,51 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -665,3 +737,51 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
              .await
      }
  }
@@ -834,10 +832,10 @@ index fe53f65c94a7f59f796eb271ee5fb65fd5ce47af..b86d342e0fab9b23f260360b9646ac63
 +    }
 +}
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index db4e96fd7867b9b7ecb9de52828f151ae55d7bf4..aa1e6a985700871c7d61da0f7a606039b2c0d2f4 100644
+index b70a44302b8e3e286a9b89ed65a63b1fca8ee29d..b06922e60b2f7a4909f4f8d64bb9b814b0c0a69c 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
-@@ -1342,6 +1342,7 @@ pub enum RequestType<RT: Runtime> {
+@@ -1344,6 +1344,7 @@ pub enum RequestType<RT: Runtime> {
          fetch_client: Arc<dyn FetchClient>,
          log_line_sender: mpsc::UnboundedSender<LogLine>,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -845,7 +843,7 @@ index db4e96fd7867b9b7ecb9de52828f151ae55d7bf4..aa1e6a985700871c7d61da0f7a606039
      },
      HttpAction {
          request: HttpActionRequest<RT>,
-@@ -1917,6 +1918,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1920,6 +1921,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          environment_data: EnvironmentData<RT>,
          instance_name: String,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -853,7 +851,7 @@ index db4e96fd7867b9b7ecb9de52828f151ae55d7bf4..aa1e6a985700871c7d61da0f7a606039
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
-@@ -1939,6 +1941,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1943,6 +1945,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              fetch_client,
              log_line_sender,
              function_started_sender,
@@ -861,8 +859,20 @@ index db4e96fd7867b9b7ecb9de52828f151ae55d7bf4..aa1e6a985700871c7d61da0f7a606039
          };
          self.send_request(Request::new_with_scheduler_dependency(
              instance_name,
+diff --git a/crates/isolate/src/environment/udf/context_reuse_tests.rs b/crates/isolate/src/environment/udf/context_reuse_tests.rs
+index dcb282dc1c4beee14374f0a2b95ddc7f1d2b21c2..35539ad623e57d9a0aeff5013fcc91c5467f4bfa 100644
+--- a/crates/isolate/src/environment/udf/context_reuse_tests.rs
++++ b/crates/isolate/src/environment/udf/context_reuse_tests.rs
+@@ -1255,6 +1255,7 @@ fn grouped_action_worker_publishes_only_after_uncancelled_delivery() -> anyhow::
+                             fetch_client: Arc::new(common::http::fetch::StaticFetchClient::new()),
+                             log_line_sender,
+                             function_started_sender: None,
++                            function_execution_start: None,
+                         },
+                         EncodedSpan::empty(),
+                     );
 diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
-index a321f06433dca8d2d8ba5963a561a690bb19bfc5..4cd599a507784fc76aa4e134d6798916ddb4bae1 100644
+index 9bb3fe7cc5f83fb6f5dfab3dd4fff0bf51afc39d..273cbc2491cff0e0a74904501496418a7af13570 100644
 --- a/crates/isolate/src/isolate_worker.rs
 +++ b/crates/isolate/src/isolate_worker.rs
 @@ -1,9 +1,11 @@
@@ -898,7 +908,7 @@ index a321f06433dca8d2d8ba5963a561a690bb19bfc5..4cd599a507784fc76aa4e134d6798916
  #[async_trait(?Send)]
  impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
      async fn handle_request_inner(
-@@ -142,68 +158,78 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -142,77 +158,93 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                  fetch_client,
                  log_line_sender,
                  function_started_sender,
@@ -933,12 +943,26 @@ index a321f06433dca8d2d8ba5963a561a690bb19bfc5..4cd599a507784fc76aa4e134d6798916
 -                        permit,
 -                        &mut isolate_clean,
 -                        request.params.clone(),
--                        cancellation,
+-                        cancellation.clone(),
 -                        function_started_sender,
 -                    ),
 -                    execution_observation,
 -                )
--                .await;
+-                .await
+-                .and_then(|(mut outcome, reusable_context)| {
+-                    // Validate with the caller's snapshot before publishing a reusable context.
+-                    outcome.validate_return_value(
+-                        &request.return_validation.returns_validator,
+-                        &request.return_validation.table_mapping,
+-                    )?;
+-                    let reusable_context = if outcome.result.is_ok() { reusable_context } else { None };
+-                    Ok((outcome, reusable_context))
+-                });
+-
+-                let status = match &r {
+-                    Ok((outcome, _)) => {
+-                        if outcome.result.is_ok() {
+-                            RequestStatus::Success
 +                if let Err(error) =
 +                    wait_for_function_execution_start(function_execution_start).await
 +                {
@@ -970,18 +994,22 @@ index a321f06433dca8d2d8ba5963a561a690bb19bfc5..4cd599a507784fc76aa4e134d6798916
 +                            permit,
 +                            &mut isolate_clean,
 +                            request.params.clone(),
-+                            cancellation,
++                            cancellation.clone(),
 +                            function_started_sender,
 +                        ),
 +                        execution_observation,
 +                    )
-+                    .await;
- 
--                let status = match &r {
--                    Ok((outcome, _)) => {
--                        if outcome.result.is_ok() {
--                            RequestStatus::Success
--                        } else {
++                    .await
++                    .and_then(|(mut outcome, reusable_context)| {
++                        // Use the caller's validation snapshot before allowing a
++                        // successful handler result to authorize cache publication.
++                        outcome.validate_return_value(
++                            &request.return_validation.returns_validator,
++                            &request.return_validation.table_mapping,
++                        )?;
++                        let reusable_context = if outcome.result.is_ok() {
++                            reusable_context
+                         } else {
 -                            RequestStatus::DeveloperError
 -                        }
 -                    },
@@ -991,17 +1019,22 @@ index a321f06433dca8d2d8ba5963a561a690bb19bfc5..4cd599a507784fc76aa4e134d6798916
 -                match r {
 -                    Ok((outcome, reusable_context)) => {
 -                        if response.send(Ok(outcome)).is_ok()
+-                            && !cancellation.is_cancelled()
 -                            && let Some(reusable_context) = reusable_context
 -                        {
--                            // Publish only after the result is delivered. A
--                            // dropped caller must not leave a warmed context
--                            // behind from an unobserved action.
+-                            // Caller drop signals cancellation before closing the receiver;
+-                            // a successful send alone cannot authorize publication.
 -                            reusable_context.publish(context_cache);
 -                        }
 -                    },
 -                    Err(error) => {
 -                        let _ = response.send(Err(error));
 -                    },
++                            None
++                        };
++                        Ok((outcome, reusable_context))
++                    });
++
 +                    let status = match &r {
 +                        Ok((outcome, _)) => {
 +                            if outcome.result.is_ok() {
@@ -1016,11 +1049,12 @@ index a321f06433dca8d2d8ba5963a561a690bb19bfc5..4cd599a507784fc76aa4e134d6798916
 +                    match r {
 +                        Ok((outcome, reusable_context)) => {
 +                            if response.send(Ok(outcome)).is_ok()
++                                && !cancellation.is_cancelled()
 +                                && let Some(reusable_context) = reusable_context
 +                            {
-+                                // Publish only after the result is delivered. A
-+                                // dropped caller must not leave a warmed context
-+                                // behind from an unobserved action.
++                                // Caller drop signals cancellation before closing
++                                // the receiver, so a successful send alone cannot
++                                // authorize publication during that interval.
 +                                reusable_context.publish(context_cache);
 +                            }
 +                        },
@@ -1031,7 +1065,15 @@ index a321f06433dca8d2d8ba5963a561a690bb19bfc5..4cd599a507784fc76aa4e134d6798916
                  }
                  log_string
              },
-@@ -414,6 +440,42 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -298,7 +330,6 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+                 match r {
+                     Ok((outcome, reusable_context)) => {
+                         if response.send(Ok(outcome)).is_ok()
+-                            && !cancellation.is_cancelled()
+                             && let Some(reusable_context) = reusable_context
+                         {
+                             // HTTP responses are already streamed separately;
+@@ -424,6 +455,42 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
      }
  }
  

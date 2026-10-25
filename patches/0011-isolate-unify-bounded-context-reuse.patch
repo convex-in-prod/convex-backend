@@ -35,34 +35,48 @@ sharing within nested mutations; context reuse never retains file contents.
 
 Preserve context reuse through the generic action syscall provider boundary. Expose initialization-read and HTTP-stream status through the provider, shut down request tasks before the final checkpoint, and retain request roots and capacity until result delivery.
 
-
 Share complete fixed initialization graphs among explicitly selected ordinary
 actions without changing execution-kind permissions. Keep action and database
 cache kinds separate, preserve per-entry HTTP identity, and document the
 conservative action invalidation boundary and safe opt-in requirements.
+
+Release canceled timer callbacks and completed-fetch cancellation channels before
+retention. Dispose unused action deadlines only after native tasks stop; keep
+unfinished operations and body streams blocking. Validate action returns with
+the caller's snapshot and recheck cancellation after delivery. Cover the full
+lifecycle with actual V8 grouped-action and network-operation regressions.
 ---
  Cargo.lock                                    |    3 +
- .../src/application_function_runner/mod.rs    |  189 +-
+ .../src/application_function_runner/mod.rs    |  209 +-
  crates/application/src/lib.rs                 |    1 +
  crates/application/src/runtime_diagnostics.rs |  205 ++
  crates/common/src/knobs.rs                    |  146 ++
  crates/common/src/memory_pressure.rs          |   58 +-
  .../src/in_process_function_runner.rs         |   46 +-
+ crates/function_runner/src/server.rs          |   40 +-
  crates/isolate/Cargo.toml                     |    3 +
- crates/isolate/src/client.rs                  |  919 ++++++-
+ crates/isolate/src/client.rs                  |  923 ++++++-
  crates/isolate/src/context_cache.rs           | 2140 ++++++++++++++++-
- crates/isolate/src/environment/action/mod.rs  |  496 +++-
+ crates/isolate/src/environment/action/mod.rs  |  599 ++++-
  .../isolate/src/environment/action/phase.rs   |  193 +-
+ crates/isolate/src/environment/action/task.rs |    5 +
+ .../src/environment/action/task_executor.rs   |    6 +-
+ .../src/environment/action/task_order.rs      |    4 +-
  crates/isolate/src/environment/analyze.rs     |  126 +-
- .../environment/udf/context_reuse_tests.rs    |  374 +++
+ crates/isolate/src/environment/async_op.rs    |    9 +-
+ crates/isolate/src/environment/mod.rs         |   13 +
+ .../environment/udf/context_reuse_tests.rs    | 1348 +++++++++++
  crates/isolate/src/environment/udf/mod.rs     |  452 ++--
  crates/isolate/src/execution_observation.rs   |  678 ++++++
  crates/isolate/src/execution_scope.rs         |   42 +-
+ crates/isolate/src/http.rs                    |    1 +
  crates/isolate/src/isolate.rs                 |   41 +-
- crates/isolate/src/isolate_worker.rs          |  112 +-
+ crates/isolate/src/isolate_worker.rs          |  122 +-
  crates/isolate/src/lib.rs                     |    1 +
  crates/isolate/src/metrics.rs                 |  483 +++-
- crates/isolate/src/request_scope.rs           |   32 +
+ crates/isolate/src/ops/mod.rs                 |   33 +
+ crates/isolate/src/ops/time.rs                |   35 +-
+ crates/isolate/src/request_scope.rs           |   48 +
  crates/isolate/src/strings.rs                 |    5 +
  crates/isolate/src/termination.rs             |    3 +
  crates/isolate/src/timeout.rs                 |  151 ++
@@ -71,17 +85,20 @@ conservative action invalidation boundary and safe opt-in requirements.
  crates/node_executor/src/executor.rs          |    3 +-
  crates/pb/protos/common.proto                 |   17 +
  crates/udf/src/execution_observation.rs       |  108 +
+ crates/udf/src/function_outcome.rs            |    8 +-
  crates/udf/src/lib.rs                         |    1 +
  crates/udf/src/metrics.rs                     |   32 +
- crates/udf/src/validation.rs                  |  405 +++-
+ crates/udf/src/validation.rs                  |  474 +++-
+ npm-packages/udf-runtime/src/02_timers.ts     |   13 +-
+ .../udf-runtime/src/03_abort_signal.ts        |   16 +
  patches/README.md                             |   54 +-
  patches/backend_memory_resilience/README.md   |   23 +-
- patches/context_reuse/README.md               |  234 ++
+ patches/context_reuse/README.md               |  247 ++
  patches/context_reuse/design_reference.md     |  218 ++
  .../dependency_capacity/design_reference.md   |   17 +-
  self-hosted/advanced/knobs.md                 |   67 +-
  self-hosted/docker/docker-compose.yml         |    3 +-
- 40 files changed, 7765 insertions(+), 536 deletions(-)
+ 52 files changed, 9076 insertions(+), 617 deletions(-)
  create mode 100644 crates/application/src/runtime_diagnostics.rs
  create mode 100644 crates/isolate/src/environment/udf/context_reuse_tests.rs
  create mode 100644 crates/isolate/src/execution_observation.rs
@@ -117,10 +134,18 @@ index 5500bf83b46af4e9442f8c5a775c63e4d8fa3af6..5e920033d1fa7c7b8b7b4886e03d3426
   "sourcemap",
   "storage",
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac8400324e7be 100644
+index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4b7c87a3d 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
-@@ -241,6 +241,10 @@ use crate::{
+@@ -183,6 +183,7 @@ use udf::{
+     environment::system_env_vars,
+     validation::{
+         validate_schedule_args,
++        ActionReturnValidation,
+         PendingArgsPolicy,
+         ValidatedActionOutcome,
+         ValidatedPathAndArgs,
+@@ -241,6 +242,10 @@ use crate::{
          FunctionExecutionLog,
          OutstandingFunctionState,
      },
@@ -131,7 +156,41 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
      source_map_cache::SourceMapCache,
      ActionError,
      ActionReturn,
-@@ -482,16 +486,37 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -370,9 +375,10 @@ impl<RT: Runtime> FunctionRouter<RT> {
+                 udf_type,
+                 context,
+                 None,
+-                Some(FunctionMetadata {
+-                    journal,
+-                    path_and_args,
++                Some(match udf_type {
++                    UdfType::Query => FunctionMetadata::Query { journal, path_and_args },
++                    UdfType::Mutation => FunctionMetadata::Mutation { journal, path_and_args },
++                    _ => anyhow::bail!("Invalid database UDF type"),
+                 }),
+                 None,
+                 scheduler_dependency,
+@@ -388,6 +394,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+         &self,
+         tx: Transaction<RT>,
+         path_and_args: ValidatedPathAndArgs,
++        return_validation: ActionReturnValidation,
+         log_line_sender: mpsc::UnboundedSender<LogLine>,
+         context: ExecutionContext,
+         permit_timeout: PermitTimeout,
+@@ -409,9 +416,9 @@ impl<RT: Runtime> FunctionRouter<RT> {
+                 UdfType::Action,
+                 context,
+                 Some(log_line_sender),
+-                Some(FunctionMetadata {
+-                    journal: QueryJournal::new(),
++                Some(FunctionMetadata::Action {
+                     path_and_args,
++                    return_validation,
+                 }),
+                 None,
+                 scheduler_dependency,
+@@ -482,16 +489,37 @@ impl<RT: Runtime> FunctionRouter<RT> {
              .in_memory_indexes
              .in_memory_indexes_last_modified();
  
@@ -173,7 +232,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
                  },
                  log_line_sender,
                  function_metadata,
-@@ -500,8 +525,17 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -500,8 +528,17 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  in_memory_index_last_modified,
                  context,
                  scheduler_dependency,
@@ -193,7 +252,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
          timer.finish();
          drop(permit);
  
-@@ -532,6 +566,20 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -532,6 +569,20 @@ impl<RT: Runtime> FunctionRouter<RT> {
              None
          };
  
@@ -214,7 +273,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
          Ok((tx, outcome))
      }
  }
-@@ -1047,13 +1095,23 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1047,13 +1098,23 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Note that we use different context for every mutation attempt.
              // This so every JS function run gets a different executionId.
              let context = ExecutionContext::new(request_context.clone(), &caller);
@@ -239,7 +298,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
              let pause_client = self.runtime.pause_client();
              pause_client.wait("retry_mutation_loop_start").await;
              let identity = tx.inert_identity();
-@@ -1061,21 +1119,32 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1061,21 +1122,32 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Committed mutations can be replayed even if permit acquisition failed.
              if let Some(result) = self
                  .check_mutation_status(&mut tx, &mutation_identifier)
@@ -283,7 +342,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
                  )
                  .await;
              let (mut tx, mut outcome) = match result {
-@@ -1085,11 +1154,19 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1085,11 +1157,19 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          && (backoff.failures() as usize) < *UDF_EXECUTOR_OCC_MAX_RETRIES
                      {
                          let sleep = backoff.fail(&mut self.runtime.rng());
@@ -303,7 +362,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
                          continue;
                      }
                      if matches!(
-@@ -1099,13 +1176,24 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1099,13 +1179,24 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          < *UDF_FILE_STORAGE_MAX_RETRIES
                      {
                          let sleep = file_storage_backoff.fail(&mut self.runtime.rng());
@@ -328,7 +387,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
                      self.function_log
                          .log_mutation_system_error(
                              &e,
-@@ -1126,7 +1214,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1126,7 +1217,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Save a CommittedMutation object so we won't rerun this mutation if
              // successful.
              self.write_mutation_status(&mut tx, &mutation_identifier, &outcome)
@@ -342,7 +401,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
  
              let stats = tx.take_stats();
              let execution_time = start.elapsed();
-@@ -1136,6 +1229,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1136,6 +1232,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  // If it's an error inside the UDF, log the failed execution and return the
                  // developer error.
                  Err(ref error) => {
@@ -352,7 +411,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
                      drop(tx);
                      self.function_log
                          .log_mutation(
-@@ -1159,21 +1255,37 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1159,21 +1258,37 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Attempt to commit the transaction and log an error if commit failed,
              // even if it was an OCC error. We may decide later to suppress OCC
              // errors from the log.
@@ -394,7 +453,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
                          let js_error = JsError::from_error(e);
                          outcome.result = Err(js_error.clone());
                          Err(MutationError {
-@@ -1185,15 +1297,27 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1185,15 +1300,27 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                              && (backoff.failures() as usize) < *UDF_EXECUTOR_OCC_MAX_RETRIES
                          {
                              let sleep = backoff.fail(&mut self.runtime.rng());
@@ -422,7 +481,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
                              }
                              self.function_log
                                  .log_mutation_occ_error(
-@@ -1512,8 +1636,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1512,8 +1639,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          wait_for_permit: bool,
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
@@ -435,7 +494,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
                  path,
                  arguments,
                  identity,
-@@ -1522,8 +1648,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1522,8 +1651,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  context,
                  permit_timeout,
                  scheduler_dependency,
@@ -455,6 +514,34 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..a8ebee18563465f36264c865e5bac840
          match result.as_ref() {
              Ok(completion) => {
                  let result = if completion.outcome.result.is_ok() {
+@@ -1628,6 +1766,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                     .execute_action(
+                         tx,
+                         path_and_args,
++                        ActionReturnValidation {
++                            returns_validator: returns_validator.clone(),
++                            table_mapping: table_mapping.clone(),
++                        },
+                         log_line_sender,
+                         context.clone(),
+                         permit_timeout,
+@@ -1653,6 +1795,8 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                     .try_into()
+                     .unwrap();
+ 
++                // The worker checks this snapshot before cache publication, but
++                // FunctionOutcome remains an unvalidated transport contract.
+                 let validated_outcome_result = outcome_result.map(|outcome| {
+                     ValidatedActionOutcome::new(outcome, returns_validator, &table_mapping)
+                 });
+@@ -2405,7 +2549,6 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
+         args: SerializedArgs,
+         context: ExecutionContext,
+     ) -> anyhow::Result<FunctionResult> {
+-        let _tx = self.database.begin(identity.clone()).await?;
+         let result = self
+             .run_action_with_scheduler_dependency(
+                 RequestContext::new(context.request_id, context.request_metadata),
 diff --git a/crates/application/src/lib.rs b/crates/application/src/lib.rs
 index 482e50defaf8dd4261e38d0b2ddbf62d789afc4e..e635d4a2639b5d574046afeed27f87f1b0fb4508 100644
 --- a/crates/application/src/lib.rs
@@ -1029,6 +1116,84 @@ index 5d64c4f0b0e40fb4d8dd9b13ae5f3f4c72a63261..196ceb2abba037a06eb06514d1b11835
          let isolate_worker = FunctionRunnerIsolateWorker::new(rt.clone(), isolate_config);
          let server = FunctionRunnerCore::new(rt, storage, max_percent_per_client, isolate_worker)?;
          Ok(Self {
+diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
+index 9bda5112b01359e5848943a2b9ef17527bf38572..878f44e5c0946a86fb0235fd0082741c36ebb782 100644
+--- a/crates/function_runner/src/server.rs
++++ b/crates/function_runner/src/server.rs
+@@ -96,6 +96,7 @@ use tokio::sync::{
+ };
+ use udf::{
+     validation::{
++        ActionReturnValidation,
+         ValidatedHttpPath,
+         ValidatedPathAndArgs,
+     },
+@@ -145,9 +146,19 @@ pub struct RunRequestArgs {
+ }
+ 
+ #[derive(Clone)]
+-pub struct FunctionMetadata {
+-    pub path_and_args: ValidatedPathAndArgs,
+-    pub journal: QueryJournal,
++pub enum FunctionMetadata {
++    Query {
++        path_and_args: ValidatedPathAndArgs,
++        journal: QueryJournal,
++    },
++    Mutation {
++        path_and_args: ValidatedPathAndArgs,
++        journal: QueryJournal,
++    },
++    Action {
++        path_and_args: ValidatedPathAndArgs,
++        return_validation: ActionReturnValidation,
++    },
+ }
+ 
+ pub struct HttpActionMetadata {
+@@ -381,10 +392,12 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+ 
+         match udf_type {
+             UdfType::Query | UdfType::Mutation => {
+-                let FunctionMetadata {
+-                    path_and_args,
+-                    journal,
+-                } = function_metadata.context("Missing function metadata for query or mutation")?;
++                let (path_and_args, journal) = match function_metadata
++                    .context("Missing function metadata for query or mutation")? {
++                    FunctionMetadata::Query { path_and_args, journal }
++                    | FunctionMetadata::Mutation { path_and_args, journal } => (path_and_args, journal),
++                    FunctionMetadata::Action { .. } => anyhow::bail!("Function metadata does not match {udf_type}"),
++                };
+                 // Initialize the UDF's RNG from some high-quality entropy. As with
+                 // `unix_timestamp` below, the UDF is only deterministic modulo this
+                 // system-generated input.
+@@ -422,14 +435,23 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                 ))
+             },
+             UdfType::Action => {
+-                let FunctionMetadata { path_and_args, .. } =
+-                    function_metadata.context("Missing function metadata for action")?;
++                let (path_and_args, return_validation) =
++                    match function_metadata.context("Missing function metadata for action")? {
++                        FunctionMetadata::Action {
++                            path_and_args,
++                            return_validation,
++                        } => (path_and_args, return_validation),
++                        FunctionMetadata::Query { .. } | FunctionMetadata::Mutation { .. } => {
++                            anyhow::bail!("Function metadata does not match {udf_type}")
++                        },
++                    };
+                 let log_line_sender =
+                     log_line_sender.context("Missing log line sender for action")?;
+                 let outcome = self
+                     .isolate_client
+                     .execute_action(
+                         path_and_args,
++                        return_validation,
+                         transaction,
+                         action_callbacks,
+                         fetch_client,
 diff --git a/crates/isolate/Cargo.toml b/crates/isolate/Cargo.toml
 index 466cb0628759670e5507185106df80751a53895b..bdc3ab2aeb7f880f0193701bb7e53cf4944bb20c 100644
 --- a/crates/isolate/Cargo.toml
@@ -1051,7 +1216,7 @@ index 466cb0628759670e5507185106df80751a53895b..bdc3ab2aeb7f880f0193701bb7e53cf4
  udf = { workspace = true, features = ["testing"] }
  usage_tracking = { workspace = true, features = ["testing"] }
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd99754831f5ac32 100644
+index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792abde6f78 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -9,6 +9,7 @@ use std::{
@@ -1097,7 +1262,15 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
      TryStreamExt as _,
  };
  use itertools::Either;
-@@ -181,8 +191,14 @@ use value::identifier::Identifier;
+@@ -165,6 +175,7 @@ use tokio_stream::wrappers::ReceiverStream;
+ use tracing::Instrument as _;
+ use udf::{
+     validation::{
++        ActionReturnValidation,
+         ValidatedHttpPath,
+         ValidatedPathAndArgs,
+     },
+@@ -181,8 +192,14 @@ use value::identifier::Identifier;
  use crate::{
      concurrency_limiter::ConcurrencyLimiter,
      context_cache::{
@@ -1112,7 +1285,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
      },
      isolate::{
          Isolate,
-@@ -210,6 +226,7 @@ use crate::{
+@@ -210,6 +227,7 @@ use crate::{
          queue_timer,
          rejected_before_execution_error,
          RejectedBeforeExecutionReason,
@@ -1120,7 +1293,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
      },
      module_cache::{
          ModuleCache,
-@@ -224,6 +241,74 @@ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
+@@ -224,6 +242,74 @@ pub const PAUSE_RECREATE_CLIENT: &str = "recreate_client";
  pub const PAUSE_REQUEST: &str = "pause_request";
  pub const NO_AVAILABLE_WORKERS: &str = "There is no capacity available to run this function";
  
@@ -1195,7 +1368,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
  struct RequestSchedulingProperties {
      unblocks_ancestor: bool,
-@@ -583,6 +668,30 @@ fn per_client_worker_capacity(max_workers: usize, max_percent_per_client: usize)
+@@ -583,6 +669,30 @@ fn per_client_worker_capacity(max_workers: usize, max_percent_per_client: usize)
      percentage_capacity.max(1).min(max_workers)
  }
  
@@ -1226,7 +1399,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
  impl ActiveRequestGuard {
      fn new(
          active_workers: Arc<AtomicUsize>,
-@@ -708,6 +817,9 @@ pub struct IsolateConfig {
+@@ -708,6 +818,9 @@ pub struct IsolateConfig {
      max_user_timeout: Option<Duration>,
  
      pub(crate) limiter: ConcurrencyLimiter,
@@ -1236,7 +1409,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
  }
  
  impl IsolateConfig {
-@@ -716,12 +828,26 @@ impl IsolateConfig {
+@@ -716,12 +829,26 @@ impl IsolateConfig {
              name,
              max_user_timeout: None,
              limiter,
@@ -1263,7 +1436,15 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
  }
  
  pub struct UdfRequest<RT: Runtime> {
-@@ -805,22 +931,66 @@ impl<RT: Runtime> Request<RT> {
+@@ -748,6 +875,7 @@ pub struct HttpActionRequest<RT: Runtime> {
+ 
+ pub struct ActionRequest<RT: Runtime> {
+     pub params: ActionRequestParams,
++    pub return_validation: ActionReturnValidation,
+     pub transaction: Transaction<RT>,
+     pub identity: Identity,
+     pub context: ExecutionContext,
+@@ -805,22 +933,66 @@ impl<RT: Runtime> Request<RT> {
      }
  
      pub fn module(&self) -> Option<CanonicalizedComponentModulePath> {
@@ -1339,7 +1520,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
      }
  
      fn independent_action_key(&self) -> Option<IndependentActionKey> {
-@@ -897,6 +1067,8 @@ impl<RT: Runtime> Request<RT> {
+@@ -897,6 +1069,8 @@ impl<RT: Runtime> Request<RT> {
  pub enum RequestType<RT: Runtime> {
      Udf {
          request: UdfRequest<RT>,
@@ -1348,7 +1529,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          response: oneshot::Sender<anyhow::Result<(Transaction<RT>, FunctionOutcome)>>,
          queue_timer: Timer<VMHistogram>,
          rng_seed: [u8; 32],
-@@ -906,6 +1078,8 @@ pub enum RequestType<RT: Runtime> {
+@@ -906,6 +1080,8 @@ pub enum RequestType<RT: Runtime> {
      },
      Action {
          request: ActionRequest<RT>,
@@ -1357,7 +1538,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          response: oneshot::Sender<anyhow::Result<ActionOutcome>>,
          queue_timer: Timer<VMHistogram>,
          action_callbacks: Arc<dyn ActionCallbacks>,
-@@ -967,6 +1141,8 @@ pub enum RequestType<RT: Runtime> {
+@@ -967,6 +1143,8 @@ pub enum RequestType<RT: Runtime> {
          can_block_on_descendant: bool,
          is_isolate_action: bool,
          is_control_plane: bool,
@@ -1366,7 +1547,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          fail_worker: bool,
          started: mpsc::UnboundedSender<usize>,
          completion: oneshot::Receiver<()>,
-@@ -989,6 +1165,19 @@ impl<RT: Runtime> RequestType<RT> {
+@@ -989,6 +1167,19 @@ impl<RT: Runtime> RequestType<RT> {
              } => *is_control_plane,
          }
      }
@@ -1386,7 +1567,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
  }
  
  #[allow(async_fn_in_trait)]
-@@ -1213,16 +1402,29 @@ pub struct IsolateClient<RT: Runtime> {
+@@ -1213,16 +1404,29 @@ pub struct IsolateClient<RT: Runtime> {
  }
  
  impl<RT: Runtime> IsolateClient<RT> {
@@ -1420,7 +1601,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          anyhow::ensure!(
              *ISOLATE_QUEUE_SIZE > 0,
              "ISOLATE_QUEUE_SIZE must be greater than zero"
-@@ -1276,9 +1478,39 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1276,9 +1480,39 @@ impl<RT: Runtime> IsolateClient<RT> {
              *ANALYZE_CONCURRENCY,
          )?;
          let delay_control_config = (*ISOLATE_QUEUE_DELAY_CONTROL_ENABLED).then_some(queue_config);
@@ -1461,7 +1642,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
  
          initialize_v8();
          // NB: We don't call V8::Dispose or V8::ShutdownPlatform since we just assume a
-@@ -1365,7 +1597,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1365,7 +1599,11 @@ impl<RT: Runtime> IsolateClient<RT> {
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          let (tx, rx) = oneshot::channel();
@@ -1473,7 +1654,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
              request: UdfRequest {
                  path_and_args,
                  udf_type,
-@@ -1376,6 +1612,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1376,6 +1614,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                  environment_data,
                  file_downloads: FileDownloads::default(),
              },
@@ -1481,7 +1662,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
              response: tx,
              queue_timer: queue_timer(),
              rng_seed,
-@@ -1393,7 +1630,13 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1393,7 +1632,13 @@ impl<RT: Runtime> IsolateClient<RT> {
              EncodedSpan::from_parent(),
              scheduler_dependency,
          ))?;
@@ -1496,7 +1677,15 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
  
          Ok((tx, outcome))
      }
-@@ -1413,7 +1656,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1402,6 +1647,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+     pub async fn execute_action(
+         &self,
+         path_and_args: ValidatedPathAndArgs,
++        return_validation: ActionReturnValidation,
+         transaction: Transaction<RT>,
+         action_callbacks: Arc<dyn ActionCallbacks>,
+         fetch_client: Arc<dyn FetchClient>,
+@@ -1413,14 +1659,20 @@ impl<RT: Runtime> IsolateClient<RT> {
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
@@ -1507,8 +1696,9 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
 +                .map(|observer| observer.task(crate::execution_observation::TaskKind::Runtime)),
              request: ActionRequest {
                  params: ActionRequestParams { path_and_args },
++                return_validation,
                  identity: transaction.identity().clone(),
-@@ -1421,6 +1668,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+                 transaction,
                  context,
                  environment_data,
              },
@@ -1516,7 +1706,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
              response: tx,
              queue_timer: queue_timer(),
              action_callbacks,
-@@ -1434,7 +1682,14 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1434,7 +1686,14 @@ impl<RT: Runtime> IsolateClient<RT> {
              EncodedSpan::from_parent(),
              scheduler_dependency,
          ))?;
@@ -1532,7 +1722,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
              Ok(outcome) => Ok(outcome),
              Err(e) => Err(recapture_stacktrace(e).await),
          }
-@@ -1847,8 +2102,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1847,8 +2106,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
      ) -> anyhow::Result<(Transaction<RT>, NestedUdfOutcome)> {
          let subquery_path = udf_request.path_and_args.path().clone();
          let (tx, rx) = oneshot::channel();
@@ -1546,7 +1736,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
              response: tx,
              queue_timer: queue_timer(),
              rng_seed,
-@@ -1870,7 +2130,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1870,7 +2134,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
              .ok()
              .context("scheduler shut down")?;
          metrics::log_scheduler_request_enqueued(self.pool_name, scheduling_properties.as_label());
@@ -1561,7 +1751,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          let outcome = match outcome {
              FunctionOutcome::Query(outcome) | FunctionOutcome::Mutation(outcome) => {
                  NestedUdfOutcome {
-@@ -1907,6 +2173,15 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -1907,6 +2177,15 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      worker: W,
      /// Vec of channels for sending work to individual workers.
      worker_senders: Vec<mpsc::Sender<IsolateWorkerRequest<RT>>>,
@@ -1577,7 +1767,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
      /// Map from client_id to stack of workers (implemented with a deque). The
      /// most recently used worker for a given client is at the front of the
      /// deque. These workers were previously used by this client, but may
-@@ -1963,6 +2238,14 @@ struct ActiveWorkerState {
+@@ -1963,6 +2242,14 @@ struct ActiveWorkerState {
      scheduling_properties: RequestSchedulingProperties,
  }
  
@@ -1592,7 +1782,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
  impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      pub fn new(
          rt: RT,
-@@ -1993,6 +2276,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1993,6 +2280,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              in_progress_counts_by_client: HashMap::new(),
              in_progress_counts: ActiveRequestCounts::default(),
              active_workers,
@@ -1601,7 +1791,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
              available_workers: HashMap::new(),
              max_workers,
              base_worker_capacity,
-@@ -2012,6 +2297,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2012,6 +2301,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          info: IdleWorkerInfo,
      ) {
          self.release_action_function(completed_worker.action_key.as_ref());
@@ -1610,7 +1800,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          let new_count = match self
              .in_progress_counts_by_client
              .remove_entry(&completed_worker.client_id)
-@@ -2298,8 +2585,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2298,8 +2589,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      let dispatch_state = self.state_snapshot();
                      let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
                          && dispatch_state.dependency_dispatch_uses_reserve();
@@ -1627,7 +1817,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
                          Err(reason) => {
                              metrics::log_scheduler_request_rejected(
                                  self.worker.config().name,
-@@ -2324,6 +2617,28 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2324,6 +2621,28 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          self.worker.config().name,
                          scheduling_properties,
                      );
@@ -1656,7 +1846,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
                      if self.worker_senders[worker_id]
                          .try_send(IsolateWorkerRequest {
                              request,
-@@ -2341,6 +2656,50 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2341,6 +2660,50 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          );
                          return;
                      }
@@ -1707,7 +1897,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
                      if let Some((lane, sojourn)) = dispatch_sojourn {
                          metrics::log_isolate_queue_sojourn(
                              self.worker.config().name,
-@@ -2411,16 +2770,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2411,16 +2774,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  _ = &mut report_stats => {
                      let heap_stats = self.aggregate_heap_stats();
                      log_aggregated_heap_stats(&heap_stats);
@@ -1730,7 +1920,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
      /// `self.available_workers` state, so the caller is responsible for using
      /// the worker and returning it back to `self.available_workers` after it is
      /// done.
-@@ -2428,7 +2791,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2428,7 +2795,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          &mut self,
          request: &Request<RT>,
          state: &SchedulerStateSnapshot,
@@ -1739,7 +1929,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          let client_id = request.client_id.as_str();
          let eligibility = state.request_eligibility(
              request.scheduling_properties(self.control_plane_lane_enabled),
-@@ -2442,28 +2805,96 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2442,28 +2809,96 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              );
              return Err(reason);
          }
@@ -1852,7 +2042,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          }
          // If we've recently started up and haven't yet created `max_workers` threads,
          // create a new worker instead of "stealing" some other client's worker.
-@@ -2484,7 +2915,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2484,7 +2919,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  self.worker.config().name,
                  self.worker_senders.len() - 1
              );
@@ -1868,7 +2058,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          }
          // No existing worker for this client and we've already started the max number
          // of workers -- just grab the least recently used worker. This worker is least
-@@ -2508,13 +2946,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2508,13 +2950,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              .pop_back()
              .expect("Available worker map should never contain an empty list");
          log_worker_stolen(worker.last_used_ts.elapsed());
@@ -1892,7 +2082,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
      }
  
      fn aggregate_heap_stats(&self) -> IsolateHeapStats {
-@@ -2559,6 +3006,7 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2559,6 +3010,7 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
              max_user_timeout, ..
          } = self.config();
          let mut reqs = std::pin::pin!(ReceiverStream::new(reqs).peekable());
@@ -1900,7 +2090,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          let mut ready: Option<(oneshot::Sender<_>, ActiveRequestGuard)> = None;
          'recreate_isolate: loop {
              let mut last_client_id: Option<String> = None;
-@@ -2569,9 +3017,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2569,9 +3021,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                  *ISOLATE_MAX_USER_HEAP_SIZE,
              );
              isolate.set_heap_stats_handle(heap_stats.clone());
@@ -1917,7 +2107,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
                  context_cache.prepare(isolate.isolate());
                  // Check again whether the isolate has enough free heap memory
                  // before starting the next request
-@@ -2591,6 +3045,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2591,6 +3049,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                      });
                  }
                  tokio::select! {
@@ -1933,7 +2123,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
                      // If the isolate isn't "tainted", no need to wait for the idle timeout.
                      _ = self.rt().wait(*ISOLATE_IDLE_TIMEOUT), if last_client_id.is_some() => {
                          tracing::debug!("Restarting isolate for {last_client_id:?} due to idle timeout");
-@@ -2728,6 +3191,7 @@ mod tests {
+@@ -2728,6 +3195,7 @@ mod tests {
          collections::{
              BTreeMap,
              HashMap,
@@ -1941,7 +2131,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          },
          future::Future,
          pin::Pin,
-@@ -2748,7 +3212,9 @@ mod tests {
+@@ -2748,7 +3216,9 @@ mod tests {
      use common::{
          components::{
              CanonicalizedComponentFunctionPath,
@@ -1951,7 +2141,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
              ComponentName,
          },
          fastrace_helpers::EncodedSpan,
-@@ -2763,6 +3229,7 @@ mod tests {
+@@ -2763,6 +3233,7 @@ mod tests {
          types::{
              ModuleEnvironment,
              SchedulerDependencyClass,
@@ -1959,7 +2149,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          },
      };
      use errors::ErrorMetadataAnyhowExt as _;
-@@ -2780,14 +3247,18 @@ mod tests {
+@@ -2780,14 +3251,18 @@ mod tests {
      };
  
      use super::{
@@ -1978,7 +2168,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          IsolateConfig,
          IsolateWorker,
          IsolateWorkerHandle,
-@@ -2802,14 +3273,22 @@ mod tests {
+@@ -2802,14 +3277,22 @@ mod tests {
          SharedIsolateScheduler,
      };
      use crate::{
@@ -2003,7 +2193,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
          ConcurrencyLimiter,
          ConcurrencyPermit,
      };
-@@ -2906,6 +3385,8 @@ mod tests {
+@@ -2906,6 +3389,8 @@ mod tests {
                          can_block_on_descendant: _,
                          is_isolate_action: _,
                          is_control_plane: _,
@@ -2012,7 +2202,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
                          fail_worker,
                          started,
                          completion,
-@@ -3021,6 +3502,8 @@ mod tests {
+@@ -3021,6 +3506,8 @@ mod tests {
              ),
              is_isolate_action: matches!(kind, TestRequestKind::Action),
              is_control_plane: matches!(kind, TestRequestKind::ControlPlane),
@@ -2021,7 +2211,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
              fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
              started,
              completion: completion_receiver,
-@@ -3142,6 +3625,7 @@ mod tests {
+@@ -3142,6 +3629,7 @@ mod tests {
          ) -> Self {
              Self::new_with_policy(
                  rt,
@@ -2029,7 +2219,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
                  max_workers,
                  base_worker_capacity,
                  max_independent_actions,
-@@ -3171,6 +3655,7 @@ mod tests {
+@@ -3171,6 +3659,7 @@ mod tests {
              .unwrap();
              Self::new_with_policy(
                  rt,
@@ -2037,7 +2227,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
                  max_workers,
                  base_worker_capacity,
                  max_independent_actions,
-@@ -3184,6 +3669,7 @@ mod tests {
+@@ -3184,6 +3673,7 @@ mod tests {
          #[allow(clippy::too_many_arguments)]
          fn new_with_policy(
              rt: SchedulerTestRuntime,
@@ -2045,7 +2235,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
              max_workers: usize,
              base_worker_capacity: usize,
              max_independent_actions: usize,
-@@ -3194,7 +3680,7 @@ mod tests {
+@@ -3194,7 +3684,7 @@ mod tests {
          ) -> Self {
              let (sender, receiver) = new_scheduler_queue::<_, Request<_>>(
                  rt.clone(),
@@ -2054,7 +2244,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
                  queue_capacity,
                  max_workers - base_worker_capacity,
                  queue_config,
-@@ -3208,6 +3694,7 @@ mod tests {
+@@ -3208,6 +3698,7 @@ mod tests {
                  TestIsolateWorker {
                      rt: rt.clone(),
                      config: IsolateConfig::new(pool_name, ConcurrencyLimiter::unlimited()),
@@ -2062,7 +2252,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
                  },
                  max_workers,
                  base_worker_capacity,
-@@ -3389,6 +3876,20 @@ mod tests {
+@@ -3389,6 +3880,20 @@ mod tests {
          }
      }
  
@@ -2083,7 +2273,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
      #[test]
      fn dependency_and_descendant_capability_are_independent() {
          assert_eq!(properties(false, false, false).as_label(), "independent");
-@@ -3633,6 +4134,16 @@ mod tests {
+@@ -3633,6 +4138,16 @@ mod tests {
          );
      }
  
@@ -2100,7 +2290,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
      #[test]
      fn per_client_capacity_uses_total_occupancy() {
          let global = ActiveRequestCounts {
-@@ -3661,6 +4172,291 @@ mod tests {
+@@ -3661,6 +4176,291 @@ mod tests {
          assert!(!state.can_start_request(properties(true, false, false), "deployment", None));
      }
  
@@ -2392,7 +2582,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
      #[test]
      fn action_cap_does_not_cap_queries_or_dependency_actions() {
          let active = ActiveRequestCounts {
-@@ -3711,6 +4507,40 @@ mod tests {
+@@ -3711,6 +4511,40 @@ mod tests {
          assert!(error.to_string().contains("greater than zero"));
      }
  
@@ -2433,7 +2623,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..a62ef718e75055f275eff2d4fd997548
      #[test]
      fn congested_scheduler_preserves_worker_and_queue_dependency_reserves() {
          let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
-@@ -3943,6 +4773,7 @@ mod tests {
+@@ -3943,6 +4777,7 @@ mod tests {
                  // ineligible behind A's active request.
                  let mut harness = SchedulerHarness::new_with_policy(
                      scheduler_rt,
@@ -4683,10 +4873,22 @@ index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..814f7d4d54bb743561281f7bfd32449e
 +    }
 +}
 diff --git a/crates/isolate/src/environment/action/mod.rs b/crates/isolate/src/environment/action/mod.rs
-index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab76b6d601 100644
+index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5339b8026 100644
 --- a/crates/isolate/src/environment/action/mod.rs
 +++ b/crates/isolate/src/environment/action/mod.rs
-@@ -26,6 +26,7 @@ use anyhow::{
+@@ -11,7 +11,10 @@ mod task_order;
+ 
+ use std::{
+     cmp::Ordering,
+-    collections::BTreeMap,
++    collections::{
++        BTreeMap,
++        BTreeSet,
++    },
+     marker::PhantomData,
+     sync::{
+         Arc,
+@@ -26,6 +29,7 @@ use anyhow::{
  };
  use common::{
      components::{
@@ -4694,7 +4896,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
          ComponentId,
          ComponentPath,
      },
-@@ -155,9 +156,16 @@ use super::{
+@@ -155,9 +159,16 @@ use super::{
  use crate::{
      client::{
          ActionRequestParams,
@@ -4712,7 +4914,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
      environment::{
          helpers::{
              log_overflow_log_line,
-@@ -187,6 +195,7 @@ use crate::{
+@@ -187,6 +198,7 @@ use crate::{
          log_unawaited_pending_op,
      },
      module_cache::V8ModuleSource,
@@ -4720,7 +4922,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
      ops::V8OpProvider,
      request_scope::{
          RequestScope,
-@@ -237,6 +246,7 @@ pub struct ActionSyscallProvider<RT: Runtime> {
+@@ -237,6 +249,7 @@ pub struct ActionSyscallProvider<RT: Runtime> {
      /// `HTTP_ACTION_RESPONSE_BODY_LIMIT`. Chunks over the limit are dropped,
      /// so `total_bytes_sent` alone never exceeds the limit.
      http_response_too_large: bool,
@@ -4728,7 +4930,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
  
      rt: RT,
  
-@@ -251,6 +261,46 @@ pub struct ActionSyscallProvider<RT: Runtime> {
+@@ -251,12 +264,54 @@ pub struct ActionSyscallProvider<RT: Runtime> {
      http_action_route: Arc<OnceLock<HttpActionRoute>>,
  }
  
@@ -4775,7 +4977,15 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
  pub struct ActionEnvironment<RT: Runtime, S = ActionSyscallProvider<RT>> {
      provider: S,
  
-@@ -280,6 +330,18 @@ pub trait ActionInnerProvider<RT: Runtime>: SyscallProvider<RT> + HeapSize + 'st
+     // We have to store PromiseResolvers separate from TaskRequests because
+     // TaskRequests will be executed in parallel, but PromiseResolvers are not Send.
+     task_promise_resolvers: BTreeMap<TaskId, (v8::Global<v8::PromiseResolver>, TaskType)>,
++    timer_tasks: BTreeMap<u64, TaskId>,
++    cancelled_timer_tasks: BTreeSet<TaskId>,
+     _phantom: PhantomData<RT>,
+ }
+ 
+@@ -280,6 +335,18 @@ pub trait ActionInnerProvider<RT: Runtime>: SyscallProvider<RT> + HeapSize + 'st
      async fn initialize(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()>;
      fn begin_execution(&mut self) -> anyhow::Result<()>;
  
@@ -4794,7 +5004,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
      /// Hands `request` to the task executor, returning the ID that its
      /// `TaskResponse::TaskDone` will carry.
      fn start_task(&mut self, request: TaskRequestEnum) -> anyhow::Result<TaskId>;
-@@ -370,6 +432,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -370,6 +437,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                  log_line_sender,
                  http_response_streamer,
                  http_response_too_large: false,
@@ -4802,7 +5012,33 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
  
                  next_task_id: TaskId(0),
                  pending_task_sender,
-@@ -425,7 +488,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -388,6 +456,8 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+                 http_action_route,
+             },
+             task_promise_resolvers: BTreeMap::new(),
++            timer_tasks: BTreeMap::new(),
++            cancelled_timer_tasks: BTreeSet::new(),
+             _phantom: PhantomData,
+         }
+     }
+@@ -398,6 +468,8 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+         Self {
+             provider,
+             task_promise_resolvers: BTreeMap::new(),
++            timer_tasks: BTreeMap::new(),
++            cancelled_timer_tasks: BTreeSet::new(),
+             _phantom: PhantomData,
+         }
+     }
+@@ -419,13 +491,15 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+         ActionEnvironment {
+             provider: f(self.provider),
+             task_promise_resolvers: self.task_promise_resolvers,
++            timer_tasks: self.timer_tasks,
++            cancelled_timer_tasks: self.cancelled_timer_tasks,
+             _phantom: PhantomData,
+         }
+     }
  
      #[fastrace::trace]
      pub async fn run_http_action(
@@ -4811,7 +5047,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
          isolate: &mut Isolate<RT>,
          context_cache: &mut ContextCache,
          permit: ConcurrencyPermit,
-@@ -434,7 +497,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -434,7 +508,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          routed_path: RoutedHttpPath,
          request: HttpActionRequest,
          function_started: Option<oneshot::Sender<()>>,
@@ -4820,7 +5056,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
          let start_unix_timestamp = self.provider.rt().unix_timestamp();
  
          // Double check that we correctly initialized `ActionEnvironment` with the right
-@@ -443,17 +506,66 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -443,17 +517,66 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          let component_function_path = http_module_path.path();
          anyhow::ensure!(component_function_path.component == self.provider.component());
          let udf_path = &component_function_path.udf_path;
@@ -4892,7 +5128,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
  
          let request_head = request.head.clone();
  
-@@ -465,16 +577,46 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -465,16 +588,46 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
              request,
          )
          .await;
@@ -4901,7 +5137,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
 -
 +        {
 +            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
-+            scope.state_mut()?.environment.provider.shutdown_tasks();
++            scope.state_mut()?.environment.shutdown_tasks();
 +        }
          // Perform a microtask checkpoint one last time before taking the environment
          // to ensure the microtask queue is empty. Otherwise, JS from this request may
@@ -4943,7 +5179,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
          let execution_time = timeout.into_function_execution_time(UdfType::HttpAction);
          match termination_error {
              Ok(Ok(..)) => (),
-@@ -483,10 +625,10 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -483,10 +636,10 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
                  // succeeded, so usage tracking reports the parameterized route
                  // pattern instead of the raw URL path.
                  let route = result.as_ref().ok().and_then(|(route, _)| route.clone());
@@ -4956,7 +5192,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
                      result = Ok((route, HttpActionResult::Streamed))
                  }
              },
-@@ -494,22 +636,86 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -494,22 +647,86 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
                  result = Err(e);
              },
          }
@@ -5049,7 +5285,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
      }
  
      #[fastrace::trace]
-@@ -652,7 +858,9 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -652,7 +869,9 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          let sender_closed_fut = state.environment.provider.http_response_closed()?;
          let sender_closed =
              Box::pin(futures::stream::once(sender_closed_fut).filter_map(|_| async move { None }));
@@ -5060,7 +5296,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
          state
              .environment
              .provider
-@@ -693,45 +901,113 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -693,45 +912,113 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
  
      #[fastrace::trace]
      pub async fn run_action(
@@ -5166,7 +5402,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
  
 +        {
 +            let mut scope = RequestScope::<RT, Self>::enter(isolate_context.scope());
-+            scope.state_mut()?.environment.provider.shutdown_tasks();
++            scope.state_mut()?.environment.shutdown_tasks();
 +        }
          // Perform a microtask checkpoint one last time before taking the environment
          // to ensure the microtask queue is empty. Otherwise, JS from this request may
@@ -5185,7 +5421,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
              Ok(Ok(..)) => (),
              Ok(Err(e)) => {
                  result = Ok(Err(e));
-@@ -740,17 +1016,76 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -740,17 +1027,76 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
                  result = Err(e);
              },
          }
@@ -5267,7 +5503,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
      }
  
      #[fastrace::trace]
-@@ -759,6 +1094,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -759,6 +1105,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          timeout: &mut Timeout<RT>,
          request_params: ActionRequestParams,
          cancellation: BoxFuture<'_, ()>,
@@ -5275,7 +5511,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
      ) -> anyhow::Result<Result<ConvexValue, JsError>> {
          let handle = isolate.handle();
          scope!(let v8_scope, isolate.scope());
-@@ -767,6 +1103,10 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -767,6 +1114,10 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
              let state = scope.state_mut()?;
              state.environment.provider.initialize(timeout).await?;
          }
@@ -5286,7 +5522,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
          let (path, arguments, _) = request_params.path_and_args.consume();
  
          // Don't allow directly running a UDF within the `_deps` directory. We don't
-@@ -789,7 +1129,13 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -789,7 +1140,13 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          };
  
          let module = match scope
@@ -5301,7 +5537,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
              .await?
          {
              Ok(id) => id,
-@@ -1021,7 +1367,12 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1021,7 +1378,12 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
              state.environment.provider.begin_execution()?;
          }
          let global = scope.get_current_context().global(scope);
@@ -5315,7 +5551,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
          // If we hit a system error within a syscall, return `Err`, even if JS thinks it
          // returned successfully. The syscall layer uses
          // `scope.terminate_execution()` when we hit a system error, which
-@@ -1043,7 +1394,11 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1043,7 +1405,11 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          let result: Result<(), JsError> = loop {
              // Advance the user's promise as far as it can go by draining the microtask
              // queue.
@@ -5328,7 +5564,48 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
              pump_message_loop(scope);
              scope.record_heap_stats(&handle)?;
              let request_stream_state = scope.state()?.request_stream_state.as_ref();
-@@ -1204,12 +1559,15 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1172,21 +1538,26 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+                             };
+                         },
+                         TaskResponse::TaskDone { task_id, variant } => {
+-                            let Some((resolver, _)) = environment
+-                                .task_promise_resolvers
+-                                .remove(&task_id) else {
+-                                    anyhow::bail!("Task with id {} did not have a promise", task_id);
++                            // clearTimeout drops the resolver synchronously. A sleep completion
++                            // already in transit still belongs to that cancelled task.
++                            if !environment.cancelled_timer_tasks.remove(&task_id) {
++                                environment.timer_tasks.retain(|_, pending| *pending != task_id);
++                                let Some((resolver, _)) = environment
++                                    .task_promise_resolvers
++                                    .remove(&task_id) else {
++                                        anyhow::bail!("Task with id {} did not have a promise", task_id);
++                                    };
++                                scope!(let result_scope, &mut **scope);
++                                let result_v8 = match variant {
++                                    Ok(v) => Ok(v.into_v8(result_scope)?),
++                                    Err(e) => Err(e),
+                                 };
+-                            scope!(let result_scope, &mut **scope);
+-                            let result_v8 = match variant {
+-                                Ok(v) => Ok(v.into_v8(result_scope)?),
+-                                Err(e) => Err(e),
+-                            };
+-                            resolve_promise_allow_all_errors(
+-                                result_scope,
+-                                resolver,
+-                                result_v8,
+-                            )?;
++                                resolve_promise_allow_all_errors(
++                                    result_scope,
++                                    resolver,
++                                    result_v8,
++                                )?;
++                            }
+                         },
+                     };
+                 },
+@@ -1204,12 +1575,24 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
              timeout.permit = Some(permit);
              handle.check_terminated()?;
          };
@@ -5338,6 +5615,15 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
          Ok(result)
      }
  
++    fn shutdown_tasks(&mut self) {
++        self.provider.shutdown_tasks();
++        // Deadlines only cancel work owned by this invocation. Once that work is
++        // stopped, drop their roots without firing abort handlers in a later
++        // invocation. Ordinary timers and unfinished operations still block reuse.
++        self.task_promise_resolvers
++            .retain(|_, (_, task)| !matches!(task, TaskType::AbortSignalTimeout));
++    }
++
 +    fn has_pending_task_promises(&self) -> bool {
 +        // Sleeps do not produce dangling-operation warnings, but their promises
 +        // still belong to this request and prevent context reuse.
@@ -5347,7 +5633,31 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
      fn dangling_task_counts(&self) -> BTreeMap<String, usize> {
          dangling_task_counts(self.task_promise_resolvers.values().map(|(_, task)| task))
      }
-@@ -1376,6 +1734,32 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
+@@ -1218,12 +1601,12 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+         &mut self,
+         request: TaskRequestEnum,
+         resolver: v8::Global<v8::PromiseResolver>,
+-    ) -> anyhow::Result<()> {
++    ) -> anyhow::Result<TaskId> {
+         let task_type = request.to_type();
+         let task_id = self.provider.start_task(request)?;
+         self.task_promise_resolvers
+             .insert(task_id, (resolver, task_type));
+-        Ok(())
++        Ok(task_id)
+     }
+ }
+ 
+@@ -1341,7 +1724,7 @@ pub fn dangling_task_counts<'a>(
+     let mut counts = BTreeMap::new();
+     for task in tasks
+         .into_iter()
+-        .filter(|task| !matches!(task, TaskType::Sleep))
++        .filter(|task| !matches!(task, TaskType::Sleep | TaskType::AbortSignalTimeout))
+     {
+         *counts.entry(task.name_when_dangling()).or_default() += 1;
+     }
+@@ -1376,6 +1759,32 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
          self.phase.begin_execution()
      }
  
@@ -5380,7 +5690,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
      fn start_task(&mut self, request: TaskRequestEnum) -> anyhow::Result<TaskId> {
          self.phase.require_executing(&request)?;
          let task_id = self.next_task_id.increment();
-@@ -1465,6 +1849,7 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
+@@ -1465,6 +1874,7 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
                  }
                  if streamer.total_bytes_sent() + b.len() > HTTP_ACTION_RESPONSE_BODY_LIMIT {
                      self.http_response_too_large = true;
@@ -5388,7 +5698,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
                      let e = JsError::from_message(format!(
                          "HttpResponseTooLarge: HTTP actions support responses up to {}",
                          HTTP_ACTION_RESPONSE_BODY_LIMIT.format_size(BINARY)
-@@ -1483,13 +1868,18 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
+@@ -1483,13 +1893,18 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
                      let _ = streamer.send_part(HttpActionResponsePart::BodyChunk(b))?;
                  }
              },
@@ -5414,7 +5724,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
          };
          Ok(())
      }
-@@ -1602,15 +1992,15 @@ impl<RT: Runtime> OpProvider for ActionSyscallProvider<RT> {
+@@ -1602,15 +2017,15 @@ impl<RT: Runtime> OpProvider for ActionSyscallProvider<RT> {
  }
  
  impl<RT: Runtime> SyscallProvider<RT> for ActionSyscallProvider<RT> {
@@ -5433,6 +5743,62 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..84f52fc6e74b05b1a5d8e0dd0033bcab
          Ok(result)
      }
  
+@@ -1634,6 +2049,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> JsEnvironment<RT> for ActionEnviro
+         resolver: Self::AsyncResolver,
+     ) -> anyhow::Result<()> {
+         self.start_task(TaskRequestEnum::AsyncSyscall { name, args }, resolver)
++            .map(|_| ())
+     }
+ 
+     fn start_async_op(
+@@ -1642,6 +2058,47 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> JsEnvironment<RT> for ActionEnviro
+         resolver: Self::AsyncResolver,
+     ) -> anyhow::Result<()> {
+         self.start_task(TaskRequestEnum::AsyncOp(request), resolver)
++            .map(|_| ())
++    }
++
++    fn start_timer(
++        &mut self,
++        request: AsyncOpRequest,
++        timer_id: u64,
++        resolver: Self::AsyncResolver,
++    ) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            matches!(request, AsyncOpRequest::Sleep { .. }),
++            "Timer is not a sleep"
++        );
++        anyhow::ensure!(
++            !self.timer_tasks.contains_key(&timer_id),
++            "Timer is already running"
++        );
++        let task_id = self.start_task(TaskRequestEnum::AsyncOp(request), resolver)?;
++        self.timer_tasks.insert(timer_id, task_id);
++        Ok(())
++    }
++
++    fn cancel_timer(&mut self, timer_id: u64) -> anyhow::Result<()> {
++        let Some(task_id) = self.timer_tasks.remove(&timer_id) else {
++            // A fired interval can be cleared inside its callback, after its sleep
++            // resolved.
++            return Ok(());
++        };
++        let (_, task_type) = self
++            .task_promise_resolvers
++            .remove(&task_id)
++            .context("Running timer has no promise resolver")?;
++        anyhow::ensure!(
++            matches!(task_type, TaskType::Sleep),
++            "Timer task is not a sleep"
++        );
++        // The unresolved JS promise is private to the timer implementation. Dropping
++        // this root prevents its callback from running; request shutdown
++        // cancels the native sleep.
++        self.cancelled_timer_tasks.insert(task_id);
++        Ok(())
+     }
+ 
+     fn environment_heap_size(&self) -> usize {
 diff --git a/crates/isolate/src/environment/action/phase.rs b/crates/isolate/src/environment/action/phase.rs
 index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9f1ee1483 100644
 --- a/crates/isolate/src/environment/action/phase.rs
@@ -5743,6 +6109,68 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
      }
  
      pub fn begin_execution(&mut self) -> anyhow::Result<()> {
+diff --git a/crates/isolate/src/environment/action/task.rs b/crates/isolate/src/environment/action/task.rs
+index 6a507ab58c6fe06e5ba690bb6d8df73332833691..c5f138277023bcbee7a5fed259f8fa6ff825c385 100644
+--- a/crates/isolate/src/environment/action/task.rs
++++ b/crates/isolate/src/environment/action/task.rs
+@@ -59,6 +59,9 @@ impl TaskRequestEnum {
+                 TaskType::ParseMultiPart
+             },
+             TaskRequestEnum::AsyncOp(AsyncOpRequest::Sleep { .. }) => TaskType::Sleep,
++            TaskRequestEnum::AsyncOp(AsyncOpRequest::AbortSignalTimeout { .. }) => {
++                TaskType::AbortSignalTimeout
++            },
+             TaskRequestEnum::AsyncOp(AsyncOpRequest::StorageStore { .. }) => TaskType::StorageStore,
+             TaskRequestEnum::AsyncOp(AsyncOpRequest::StorageGet { .. }) => TaskType::StorageGet,
+             TaskRequestEnum::AsyncOp(AsyncOpRequest::SendStream { .. }) => TaskType::SendStream,
+@@ -85,6 +88,7 @@ pub enum TaskType {
+     Fetch,
+     ParseMultiPart,
+     Sleep,
++    AbortSignalTimeout,
+     StorageStore,
+     StorageGet,
+     SendStream,
+@@ -110,6 +114,7 @@ impl TaskType {
+             TaskType::SendStream => "ReadableStream".to_string(),
+             // Sleeps cannot actually be dangling, but we handle it just in case.
+             TaskType::Sleep => "setTimeout".to_string(),
++            TaskType::AbortSignalTimeout => "AbortSignal.timeout".to_string(),
+         }
+     }
+ }
+diff --git a/crates/isolate/src/environment/action/task_executor.rs b/crates/isolate/src/environment/action/task_executor.rs
+index 2588304d0550186f98641aee2e5dd6068434a8f3..be6df00267112732a7ec7235eaa2af5bdf9d69ae 100644
+--- a/crates/isolate/src/environment/action/task_executor.rs
++++ b/crates/isolate/src/environment/action/task_executor.rs
+@@ -162,9 +162,9 @@ impl<RT: Runtime> TaskExecutor<RT> {
+                 .run_parse_multi_part(content_type, request_stream)
+                 .await
+                 .map(TaskResponseEnum::ParseMultiPart),
+-            TaskRequestEnum::AsyncOp(AsyncOpRequest::Sleep { until, .. }) => {
+-                self.run_sleep(until).await.map(TaskResponseEnum::Sleep)
+-            },
++            TaskRequestEnum::AsyncOp(
++                AsyncOpRequest::Sleep { until, .. } | AsyncOpRequest::AbortSignalTimeout { until },
++            ) => self.run_sleep(until).await.map(TaskResponseEnum::Sleep),
+             TaskRequestEnum::AsyncOp(AsyncOpRequest::StorageStore {
+                 body_stream,
+                 content_type,
+diff --git a/crates/isolate/src/environment/action/task_order.rs b/crates/isolate/src/environment/action/task_order.rs
+index a517d5ca4f7f9519ffb644dfeb0de09d9205113f..029c1c80c0f5d7be3776edb1565ed5e66dd37d40 100644
+--- a/crates/isolate/src/environment/action/task_order.rs
++++ b/crates/isolate/src/environment/action/task_order.rs
+@@ -41,7 +41,9 @@ struct TaskOrderInner {
+ impl TaskOrder {
+     pub fn push_running_task(&self, task_request: &TaskRequest) {
+         let mut inner = self.inner.lock();
+-        if let TaskRequestEnum::AsyncOp(AsyncOpRequest::Sleep { until, .. }) = &task_request.variant
++        if let TaskRequestEnum::AsyncOp(
++            AsyncOpRequest::Sleep { until, .. } | AsyncOpRequest::AbortSignalTimeout { until },
++        ) = &task_request.variant
+         {
+             inner.tasks.insert(task_request.task_id, *until);
+             inner.running_sleeps.insert(*until);
 diff --git a/crates/isolate/src/environment/analyze.rs b/crates/isolate/src/environment/analyze.rs
 index 513f0f201c6784b7ad79b0a8637188feace34fca..1757f255a7b6bdfdec01c9076558724831259ceb 100644
 --- a/crates/isolate/src/environment/analyze.rs
@@ -5904,16 +6332,84 @@ index 513f0f201c6784b7ad79b0a8637188feace34fca..1757f255a7b6bdfdec01c90765587248
 +        })
 +    }
 +}
+diff --git a/crates/isolate/src/environment/async_op.rs b/crates/isolate/src/environment/async_op.rs
+index ec79195e7f0643e207e9db831e503b65b5d672f3..f2089db4f49dac0529ddbaa97447574a1a659dbb 100644
+--- a/crates/isolate/src/environment/async_op.rs
++++ b/crates/isolate/src/environment/async_op.rs
+@@ -27,6 +27,9 @@ pub enum AsyncOpRequest {
+         name: String, // setTimeout or setInterval
+         until: UnixTimestamp,
+     },
++    AbortSignalTimeout {
++        until: UnixTimestamp,
++    },
+     StorageStore {
+         body_stream: spsc::UnboundedReceiver<anyhow::Result<bytes::Bytes>>,
+         content_type: Option<String>,
+@@ -48,7 +51,7 @@ impl AsyncOpRequest {
+         match self {
+             Self::Fetch { .. } => "Fetch",
+             Self::ParseMultiPart { .. } => "FormParse",
+-            Self::Sleep { .. } => "Sleep",
++            Self::Sleep { .. } | Self::AbortSignalTimeout { .. } => "Sleep",
+             Self::StorageStore { .. } | Self::StorageGet { .. } => "Storage",
+             Self::SendStream { .. } => "Stream",
+         }
+@@ -59,6 +62,7 @@ impl AsyncOpRequest {
+             Self::Fetch { .. } => "fetch()".to_string(),
+             Self::ParseMultiPart { .. } => "formData()".to_string(),
+             Self::Sleep { name, .. } => name.to_string(),
++            Self::AbortSignalTimeout { .. } => "AbortSignal.timeout()".to_string(),
+             Self::StorageStore { .. } => "storage.store()".to_string(),
+             Self::StorageGet { .. } => "storage.get()".to_string(),
+             Self::SendStream { .. } => "stream".to_string(),
+@@ -96,6 +100,9 @@ impl AsyncOpRequest {
+                 "name": name,
+                 "untilNanos": until.as_nanos().to_string(),
+             }),
++            Self::AbortSignalTimeout { until } => json!({
++                "untilNanos": until.as_nanos().to_string(),
++            }),
+             Self::StorageStore {
+                 body_stream: _,
+                 content_type,
+diff --git a/crates/isolate/src/environment/mod.rs b/crates/isolate/src/environment/mod.rs
+index da0070a36971158aecc84a7b7c76eab045df11fb..4433ac9b216905810639e67d868ceda326d1f48c 100644
+--- a/crates/isolate/src/environment/mod.rs
++++ b/crates/isolate/src/environment/mod.rs
+@@ -78,6 +78,19 @@ pub trait JsEnvironment<RT: Runtime>: 'static {
+         resolver: Self::AsyncResolver,
+     ) -> anyhow::Result<()>;
+ 
++    fn start_timer(
++        &mut self,
++        request: AsyncOpRequest,
++        _timer_id: u64,
++        resolver: Self::AsyncResolver,
++    ) -> anyhow::Result<()> {
++        self.start_async_op(request, resolver)
++    }
++
++    fn cancel_timer(&mut self, _timer_id: u64) -> anyhow::Result<()> {
++        anyhow::bail!("Timer cancellation is not supported in this environment")
++    }
++
+     // The memory allocated by the environment itself.
+     fn environment_heap_size(&self) -> usize {
+         0
 diff --git a/crates/isolate/src/environment/udf/context_reuse_tests.rs b/crates/isolate/src/environment/udf/context_reuse_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..15c3634b27b1ea615bfdb1c44164605420f1e0bb
+index 0000000000000000000000000000000000000000..dcb282dc1c4beee14374f0a2b95ddc7f1d2b21c2
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/context_reuse_tests.rs
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,1348 @@
 +use std::{
 +    collections::BTreeMap,
 +    sync::Arc,
-+    time::Duration,
++    time::{
++        Duration,
++        SystemTime,
++    },
 +};
 +
 +use anyhow::Context;
@@ -5932,6 +6428,7 @@ index 0000000000000000000000000000000000000000..15c3634b27b1ea615bfdb1c441646054
 +        new_unlimited_rate_limiter,
 +        Runtime,
 +    },
++    schemas::validator::Validator,
 +    shutdown::ShutdownSignal,
 +    types::{
 +        ConvexOrigin,
@@ -5956,6 +6453,7 @@ index 0000000000000000000000000000000000000000..15c3634b27b1ea615bfdb1c441646054
 +use model::{
 +    initialize_application_system_tables,
 +    modules::{
++        function_validators::ReturnsValidator,
 +        module_versions::{
 +            AnalyzedModule,
 +            FullModuleSource,
@@ -5988,17 +6486,27 @@ index 0000000000000000000000000000000000000000..15c3634b27b1ea615bfdb1c441646054
 +use storage::LocalDirStorage;
 +use sync_types::types::SerializedArgs;
 +use udf::{
-+    validation::ValidatedPathAndArgs,
++    validation::{
++        ActionReturnValidation,
++        ValidatedPathAndArgs,
++    },
 +    FunctionOutcome,
 +};
 +use value::{
 +    sha256::Sha256Digest,
++    DeveloperDocumentId,
++    InternalId,
++    TableMapping,
 +    TableNamespace,
++    TableNumber,
++    TabletId,
 +};
 +
 +use super::DatabaseUdfEnvironment;
 +use crate::{
 +    client::{
++        ActionRequest,
++        ActionRequestParams,
 +        CancellationSignal,
 +        EnvironmentData,
 +        UdfRequest,
@@ -6047,6 +6555,7 @@ index 0000000000000000000000000000000000000000..15c3634b27b1ea615bfdb1c441646054
 +    modules: Arc<TestModules>,
 +    package: SourcePackageId,
 +    file_storage: TransactionalFileStorage<ProdRuntime>,
++    fetch_client: Arc<common::http::fetch::StaticFetchClient>,
 +}
 +
 +impl Fixture {
@@ -6098,6 +6607,7 @@ index 0000000000000000000000000000000000000000..15c3634b27b1ea615bfdb1c441646054
 +                ConvexOrigin::from("http://localhost".to_owned()),
 +            ),
 +            rt,
++            fetch_client: Arc::new(common::http::fetch::StaticFetchClient::new()),
 +        })
 +    }
 +
@@ -6132,6 +6642,107 @@ index 0000000000000000000000000000000000000000..15c3634b27b1ea615bfdb1c441646054
 +        Ok(())
 +    }
 +
++    fn environment_data(&self) -> EnvironmentData<ProdRuntime> {
++        EnvironmentData {
++            key_broker: KeyBroker::dev().function_runner_keybroker(),
++            default_system_env_vars: BTreeMap::new(),
++            file_storage: self.file_storage.clone(),
++            module_loader: self.modules.clone(),
++            deployment: DeploymentMetadata {
++                name: "context_reuse_test".to_owned(),
++                region: None,
++                class: DeploymentClass::S16,
++            },
++        }
++    }
++
++    async fn action_request(
++        &self,
++        path: &str,
++        argument: JsonValue,
++        options: &ActionOptions,
++    ) -> anyhow::Result<ActionRequest<ProdRuntime>> {
++        let path_and_args = ValidatedPathAndArgs::from_proto(pb::common::ValidatedPathAndArgs {
++            path: Some(path.to_owned()),
++            args: Some(SerializedArgs::from_args(vec![argument])?.into_bytes()),
++            component_path: Some(ComponentPath::root().into()),
++            context_reuse: Some(pb::common::ContextReusePolicy {
++                actions: Some(options.reuse),
++                ..Default::default()
++            }),
++            context_initialization_module: options.grouped.then(|| INITIALIZER.to_owned()),
++            ..Default::default()
++        })?;
++        let mut transaction = self.database.begin(options.identity.clone()).await?;
++        let table_mapping = transaction
++            .table_mapping()
++            .namespace(TableNamespace::root_component());
++        Ok(ActionRequest {
++            params: ActionRequestParams { path_and_args },
++            return_validation: ActionReturnValidation {
++                returns_validator: ReturnsValidator::Unvalidated,
++                table_mapping,
++            },
++            identity: options.identity.clone(),
++            transaction,
++            environment_data: self.environment_data(),
++            context: ExecutionContext::new(
++                RequestContext::new_for_system_request(RequestId::new()),
++                &FunctionCaller::Cron,
++            ),
++        })
++    }
++
++    async fn run_action(
++        &mut self,
++        path: &str,
++        argument: JsonValue,
++        options: ActionOptions,
++    ) -> anyhow::Result<(Result<JsonValue, common::errors::JsError>, bool)> {
++        let request = self.action_request(path, argument, &options).await?;
++        let (log_sender, _log_receiver) = tokio::sync::mpsc::unbounded_channel();
++        let environment = crate::environment::action::ActionEnvironment::new(
++            self.rt.clone(),
++            ComponentId::Root,
++            request.params.path_and_args.path().udf_path.clone(),
++            ComponentPath::root(),
++            request.environment_data,
++            request.identity,
++            request.transaction,
++            Arc::new(NoActionCallbacks),
++            self.fetch_client.clone(),
++            log_sender,
++            None,
++            request.context,
++        );
++        let permit = ConcurrencyLimiter::unlimited()
++            .acquire(Arc::new("context_reuse_test".to_owned()), false)
++            .await;
++        let cancellation = CancellationSignal::new_for_test();
++        if options.cancelled {
++            cancellation.cancel_for_test();
++        }
++        let mut clean = false;
++        let (outcome, candidate) = Box::pin(environment.run_action(
++            &mut self.isolate,
++            &mut self.contexts,
++            permit,
++            &mut clean,
++            request.params,
++            cancellation,
++            None,
++        ))
++        .await?;
++        assert!(clean);
++        let retained = candidate.is_some();
++        if options.deliver {
++            if let Some(candidate) = candidate {
++                candidate.publish(&mut self.contexts);
++            }
++        }
++        Ok((outcome.result.map(|value| value.json_value()), retained))
++    }
++
 +    async fn run(&mut self, entry: &str, arg: i64, reuse: bool) -> anyhow::Result<JsonValue> {
 +        let path_and_args = ValidatedPathAndArgs::from_proto(pb::common::ValidatedPathAndArgs {
 +            path: Some(format!("{entry}:run")),
@@ -6154,17 +6765,7 @@ index 0000000000000000000000000000000000000000..15c3634b27b1ea615bfdb1c441646054
 +                    RequestContext::new_for_system_request(RequestId::new()),
 +                    &FunctionCaller::Cron,
 +                ),
-+                environment_data: EnvironmentData {
-+                    key_broker: KeyBroker::dev().function_runner_keybroker(),
-+                    default_system_env_vars: BTreeMap::new(),
-+                    file_storage: self.file_storage.clone(),
-+                    module_loader: self.modules.clone(),
-+                    deployment: DeploymentMetadata {
-+                        name: "context_reuse_test".to_owned(),
-+                        region: None,
-+                        class: DeploymentClass::S16,
-+                    },
-+                },
++                environment_data: self.environment_data(),
 +            },
 +            0,
 +            "context_reuse_test".to_owned(),
@@ -6283,6 +6884,872 @@ index 0000000000000000000000000000000000000000..15c3634b27b1ea615bfdb1c441646054
 +        })?
 +        .join()
 +        .expect("context reuse test panicked")
++}
++
++mod action_callbacks {
++    use common::{
++        bootstrap_model::components::handles::FunctionHandle,
++        components::{
++            CanonicalizedComponentFunctionPath,
++            ComponentId,
++            ComponentPath,
++        },
++        execution_context::{
++            ExecutionContext,
++            RequestId,
++        },
++        runtime::UnixTimestamp,
++        types::AttributedCaller,
++    };
++    use keybroker::Identity;
++    use model::file_storage::{
++        types::FileStorageEntry,
++        FileStorageId,
++    };
++    use serde_json::Value as JsonValue;
++    use sync_types::types::SerializedArgs;
++    use udf::FunctionResult;
++    use usage_tracking::FunctionUsageStats;
++    use value::DeveloperDocumentId;
++    use vector::PublicVectorSearchQueryResult;
++
++    pub(super) struct NoActionCallbacks;
++
++    #[async_trait::async_trait]
++    #[allow(unused_variables)]
++    impl udf::ActionCallbacks for NoActionCallbacks {
++        async fn create_ai_gateway_token(
++            &self,
++            identity: Identity,
++            caller: AttributedCaller,
++            request_id: RequestId,
++        ) -> anyhow::Result<String> {
++            anyhow::bail!("Unexpected action callback: create_ai_gateway_token")
++        }
++
++        async fn execute_query(
++            &self,
++            identity: Identity,
++            path: CanonicalizedComponentFunctionPath,
++            args: SerializedArgs,
++            context: ExecutionContext,
++        ) -> anyhow::Result<FunctionResult> {
++            anyhow::bail!("Unexpected action callback: execute_query")
++        }
++
++        async fn execute_mutation(
++            &self,
++            identity: Identity,
++            path: CanonicalizedComponentFunctionPath,
++            args: SerializedArgs,
++            context: ExecutionContext,
++        ) -> anyhow::Result<FunctionResult> {
++            anyhow::bail!("Unexpected action callback: execute_mutation")
++        }
++
++        async fn execute_action(
++            &self,
++            identity: Identity,
++            path: CanonicalizedComponentFunctionPath,
++            args: SerializedArgs,
++            context: ExecutionContext,
++        ) -> anyhow::Result<FunctionResult> {
++            anyhow::bail!("Unexpected action callback: execute_action")
++        }
++
++        async fn storage_get_url(
++            &self,
++            identity: Identity,
++            component: ComponentId,
++            storage_id: FileStorageId,
++        ) -> anyhow::Result<Option<String>> {
++            anyhow::bail!("Unexpected action callback: storage_get_url")
++        }
++
++        async fn storage_delete(
++            &self,
++            identity: Identity,
++            component: ComponentId,
++            storage_id: FileStorageId,
++        ) -> anyhow::Result<()> {
++            anyhow::bail!("Unexpected action callback: storage_delete")
++        }
++
++        async fn storage_get_file_entry(
++            &self,
++            identity: Identity,
++            component: ComponentId,
++            storage_id: FileStorageId,
++        ) -> anyhow::Result<Option<(ComponentPath, FileStorageEntry)>> {
++            anyhow::bail!("Unexpected action callback: storage_get_file_entry")
++        }
++
++        async fn storage_store_file_entry(
++            &self,
++            identity: Identity,
++            component: ComponentId,
++            entry: FileStorageEntry,
++        ) -> anyhow::Result<(ComponentPath, DeveloperDocumentId)> {
++            anyhow::bail!("Unexpected action callback: storage_store_file_entry")
++        }
++
++        async fn schedule_job(
++            &self,
++            identity: Identity,
++            scheduling_component: ComponentId,
++            scheduled_path: CanonicalizedComponentFunctionPath,
++            udf_args: SerializedArgs,
++            scheduled_ts: UnixTimestamp,
++            context: ExecutionContext,
++        ) -> anyhow::Result<DeveloperDocumentId> {
++            anyhow::bail!("Unexpected action callback: schedule_job")
++        }
++
++        async fn cancel_job(
++            &self,
++            identity: Identity,
++            virtual_id: DeveloperDocumentId,
++        ) -> anyhow::Result<()> {
++            anyhow::bail!("Unexpected action callback: cancel_job")
++        }
++
++        async fn vector_search(
++            &self,
++            identity: Identity,
++            query: JsonValue,
++        ) -> anyhow::Result<(Vec<PublicVectorSearchQueryResult>, FunctionUsageStats)> {
++            anyhow::bail!("Unexpected action callback: vector_search")
++        }
++
++        async fn lookup_function_handle(
++            &self,
++            identity: Identity,
++            handle: FunctionHandle,
++        ) -> anyhow::Result<CanonicalizedComponentFunctionPath> {
++            anyhow::bail!("Unexpected action callback: lookup_function_handle")
++        }
++
++        async fn create_function_handle(
++            &self,
++            identity: Identity,
++            path: CanonicalizedComponentFunctionPath,
++        ) -> anyhow::Result<FunctionHandle> {
++            anyhow::bail!("Unexpected action callback: create_function_handle")
++        }
++    }
++}
++use action_callbacks::NoActionCallbacks;
++
++struct ActionOptions {
++    reuse: bool,
++    grouped: bool,
++    deliver: bool,
++    cancelled: bool,
++    identity: Identity,
++}
++
++impl Default for ActionOptions {
++    fn default() -> Self {
++        Self {
++            reuse: true,
++            grouped: true,
++            deliver: true,
++            cancelled: false,
++            identity: Identity::Unknown(None),
++        }
++    }
++}
++
++fn action_identity(subject: &str) -> anyhow::Result<Identity> {
++    let attributes = keybroker::UserIdentityAttributes {
++        token_identifier: sync_types::UserIdentifier::construct("https://issuer.invalid", subject),
++        subject: Some(subject.to_owned()),
++        issuer: Some("https://issuer.invalid".to_owned()),
++        ..Default::default()
++    };
++    Ok(Identity::user(
++        keybroker::UserIdentity::from_proto_unchecked(pb::convex_identity::UserIdentity {
++            subject: Some(subject.to_owned()),
++            issuer: Some("https://issuer.invalid".to_owned()),
++            expiration: Some((SystemTime::now() + Duration::from_secs(3600)).into()),
++            attributes: Some(attributes.into()),
++            original_token: Some("fixture-token".to_owned()),
++        })?,
++    ))
++}
++
++#[test]
++fn grouped_action_context_reuses_and_invalidates_with_fresh_request_state() -> anyhow::Result<()> {
++    std::thread::Builder::new()
++        .stack_size(16 * 1024 * 1024)
++        .spawn(|| {
++            crate::client::initialize_v8();
++            let tokio = ProdRuntime::init_tokio()?;
++            let rt = ProdRuntime::new(&tokio);
++            tokio.block_on(Box::pin(async {
++                let mut fixture = Fixture::new(rt).await?;
++                // The counter deliberately exposes retained state so a test cannot
++                // pass by silently running every request in a fresh context.
++                fixture.put("_deps/shared.js", r#"
++                    let calls = 0;
++                    const action = name => ({ isAction: true, invokeAction: async (requestId, args) => {
++                        const identity = JSON.parse(await Convex.asyncSyscall("1.0/getUserIdentity", JSON.stringify({requestId})));
++                        const value = JSON.parse(args)[0];
++                        ++calls;
++                        if (value === "fail") throw new Error("fixture failure");
++                        if (value === "pending") setTimeout(() => {}, 60000);
++                        if (value === "wait") await new Promise(resolve => setTimeout(resolve, 60000));
++                        return JSON.stringify([name, value, calls, identity?.subject ?? null]);
++                    }});
++                    export const first = action("first");
++                    export const second = action("second");
++                "#).await?;
++                fixture.put("a.js", "export { first as run, second as other } from './_deps/shared.js';").await?;
++                fixture.put("b.js", "export { second as run } from './_deps/shared.js';").await?;
++                fixture.put("unused.js", "export const version = 1;").await?;
++                fixture.put(INITIALIZER, "import '../a.js'; import '../b.js'; import '../unused.js';").await?;
++                let (value, retained) = fixture.run_action("a.js:run", json!(10), ActionOptions {
++                    identity: action_identity("first-user")?, ..Default::default()
++                }).await?;
++                assert!(retained);
++                assert_eq!(value?, json!(["first", 10.0, 1.0, "first-user"]));
++                let (value, retained) = fixture.run_action("b.js:run", json!(20), ActionOptions {
++                    identity: action_identity("second-user")?, ..Default::default()
++                }).await?;
++                assert!(retained);
++                assert_eq!(value?, json!(["second", 20.0, 2.0, "second-user"]));
++                let (value, _) = fixture.run_action("a.js:other", json!(30), ActionOptions::default()).await?;
++                assert_eq!(value?, json!(["second", 30.0, 3.0, null]));
++                fixture.put("unused.js", "export const version = 2;").await?;
++                let (value, _) = fixture.run_action("b.js:run", json!(40), ActionOptions::default()).await?;
++                assert_eq!(value?, json!(["second", 40.0, 1.0, null]));
++
++                let mut tx = fixture.database.begin_system().await?;
++                model::environment_variables::EnvironmentVariablesModel::new(&mut tx)
++                    .create(common::types::EnvironmentVariable {
++                        name: "CONTEXT_REUSE_TEST".parse()?, value: "changed".parse()?,
++                    }, &Default::default()).await?;
++                fixture.database.commit_with_write_source(tx, "context_reuse_test").await?;
++                let (value, _) = fixture.run_action("a.js:run", json!(45), ActionOptions::default()).await?;
++                assert_eq!(value?, json!(["first", 45.0, 1.0, null]));
++
++                let (value, retained) = fixture.run_action("a.js:run", json!("fail"), ActionOptions::default()).await?;
++                assert!(value.is_err());
++                assert!(!retained);
++                let (value, _) = fixture.run_action("a.js:run", json!(50), ActionOptions::default()).await?;
++                assert_eq!(value?, json!(["first", 50.0, 1.0, null]));
++                let (value, retained) = fixture.run_action("b.js:run", json!("pending"), ActionOptions::default()).await?;
++                assert!(value.is_ok());
++                assert!(!retained);
++                let (value, _) = fixture.run_action("b.js:run", json!(60), ActionOptions::default()).await?;
++                assert_eq!(value?, json!(["second", 60.0, 1.0, null]));
++
++                let cancelled = fixture.run_action("a.js:run", json!("wait"), ActionOptions {
++                    cancelled: true, ..Default::default()
++                }).await.unwrap_err();
++                assert!(format!("{cancelled:#}").contains("Cancelled"));
++                let (value, _) = fixture.run_action("a.js:run", json!(80), ActionOptions {
++                    deliver: false, ..Default::default()
++                }).await?;
++                assert_eq!(value?, json!(["first", 80.0, 1.0, null]));
++                let (value, _) = fixture.run_action("a.js:run", json!(90), ActionOptions::default()).await?;
++                assert_eq!(value?, json!(["first", 90.0, 1.0, null]));
++
++                // Disabling reuse ignores the initializer and cannot borrow the group.
++                let (value, retained) = fixture.run_action("b.js:run", json!(100), ActionOptions {
++                    reuse: false, ..Default::default()
++                }).await?;
++                assert!(!retained);
++                assert_eq!(value?, json!(["second", 100.0, 1.0, null]));
++                fixture.put("outside.js", "export { first as run } from './_deps/shared.js';").await?;
++                let error = fixture.run_action("outside.js:run", json!(0), ActionOptions::default()).await;
++                assert!(error.is_err());
++                // An ungrouped entry retains its own context and never expands a group.
++                let (value, _) = fixture.run_action("outside.js:run", json!(1), ActionOptions {
++                    grouped: false, ..Default::default()
++                }).await?;
++                assert_eq!(value?, json!(["first", 1.0, 1.0, null]));
++                let (value, _) = fixture.run_action("outside.js:run", json!(2), ActionOptions {
++                    grouped: false, ..Default::default()
++                }).await?;
++                assert_eq!(value?, json!(["first", 2.0, 2.0, null]));
++                Ok(())
++            }))
++        })?
++        .join()
++        .expect("context-reuse test thread panicked")
++}
++
++#[test]
++fn cleared_action_timers_release_callbacks_before_context_reuse() -> anyhow::Result<()> {
++    std::thread::Builder::new()
++        .stack_size(16 * 1024 * 1024)
++        .spawn(|| {
++            crate::client::initialize_v8();
++            let tokio = ProdRuntime::init_tokio()?;
++            let rt = ProdRuntime::new(&tokio);
++            tokio.block_on(Box::pin(async {
++                let mut fixture = Fixture::new(rt).await?;
++                fixture
++                    .put(
++                        "timers.js",
++                        r#"
++                    let calls = 0;
++                    let cancelledCalls = 0;
++                    export const run = { isAction: true, invokeAction: async (_, args) => {
++                        const mode = JSON.parse(args)[0];
++                        ++calls;
++                        const callback = () => { ++cancelledCalls; };
++                        if (mode === "pending") setTimeout(callback, 60000);
++                        if (mode === "timeout") {
++                            const timer = setTimeout(callback, 60000);
++                            clearTimeout(timer);
++                            clearTimeout(timer);
++                        }
++                        if (mode === "interval") {
++                            const timer = setInterval(callback, 60000);
++                            clearTimeout(timer);
++                        }
++                        if (mode === "late-completion") {
++                            const timer = setTimeout(callback, 0);
++                            clearInterval(timer);
++                            // Process the cancelled sleep's response while another task is pending.
++                            await new Promise(resolve => setTimeout(resolve, 5));
++                        }
++                        if (mode === "fired-interval") {
++                            await new Promise(resolve => {
++                                const timer = setInterval(() => {
++                                    clearInterval(timer);
++                                    resolve();
++                                }, 0);
++                            });
++                        }
++                        if (mode === "abort-deadline") {
++                            const controller = new AbortController();
++                            const timer = setTimeout(() => controller.abort(), 60000);
++                            try { await new Promise(resolve => setTimeout(resolve, 0)); }
++                            finally { clearTimeout(timer); }
++                            if (controller.signal.aborted) throw new Error("deadline fired");
++                        }
++                        return JSON.stringify([calls, cancelledCalls]);
++                    }};
++                "#,
++                    )
++                    .await?;
++                for (mode, calls, retained) in [
++                    ("timeout", 1, true),
++                    ("interval", 2, true),
++                    ("late-completion", 3, true),
++                    ("fired-interval", 4, true),
++                    ("abort-deadline", 5, true),
++                    ("pending", 6, false),
++                    ("timeout", 1, true),
++                ] {
++                    let (value, saved) = fixture
++                        .run_action(
++                            "timers.js:run",
++                            json!(mode),
++                            ActionOptions {
++                                grouped: false,
++                                ..Default::default()
++                            },
++                        )
++                        .await?;
++                    assert_eq!(value?, json!([calls as f64, 0.0]), "{mode}");
++                    assert_eq!(saved, retained, "{mode}");
++                }
++                Ok(())
++            }))
++        })?
++        .join()
++        .expect("timer context-reuse test thread panicked")
++}
++
++#[test]
++fn action_deadlines_end_with_the_invocation() -> anyhow::Result<()> {
++    std::thread::Builder::new()
++        .stack_size(16 * 1024 * 1024)
++        .spawn(|| {
++            crate::client::initialize_v8();
++            let tokio = ProdRuntime::init_tokio()?;
++            let rt = ProdRuntime::new(&tokio);
++            tokio.block_on(Box::pin(async {
++                let mut fixture = Fixture::new(rt).await?;
++                fixture.put("deadlines.js", r#"
++                    let calls = 0;
++                    let oldAborts = 0;
++                    export const run = { isAction: true, invokeAction: async (_, args) => {
++                        const mode = JSON.parse(args)[0];
++                        ++calls;
++                        if (mode === "unused") {
++                            AbortSignal.timeout(10).addEventListener("abort", () => ++oldAborts);
++                        } else if (mode === "awaited") {
++                            const signal = AbortSignal.timeout(0);
++                            if (signal.aborted) throw new Error("deadline fired synchronously");
++                            await new Promise(resolve => signal.addEventListener("abort", resolve));
++                            if (!signal.aborted || signal.reason.name !== "TimeoutError") {
++                                throw new Error("deadline did not abort with TimeoutError");
++                            }
++                        } else if (mode === "normalized") {
++                            // Preserve the existing polyfill's timer normalization.
++                            for (const time of [-1, 0.5, NaN, Infinity, "0", undefined]) {
++                                const signal = AbortSignal.timeout(time);
++                                await new Promise(resolve => signal.addEventListener("abort", resolve));
++                                if (signal.reason.name !== "TimeoutError") throw new Error("wrong reason");
++                            }
++                        } else if (mode === "pending") {
++                            AbortSignal.timeout(60000);
++                            setTimeout(() => ++oldAborts, 60000);
++                        }
++                        return JSON.stringify([calls, oldAborts]);
++                    }};
++                "#).await?;
++                for (mode, calls, retained) in [
++                    ("unused", 1, true),
++                    ("awaited", 2, true),
++                    ("normalized", 3, true),
++                    ("pending", 4, false),
++                    ("awaited", 1, true),
++                ] {
++                    let (value, saved) = fixture.run_action("deadlines.js:run", json!(mode), ActionOptions {
++                        grouped: false,
++                        ..Default::default()
++                    }).await?;
++                    assert_eq!(value?, json!([calls as f64, 0.0]), "{mode}");
++                    assert_eq!(saved, retained, "{mode}");
++                    if mode == "unused" {
++                        // Cross the discarded deadline before reentering the same context.
++                        tokio::time::sleep(Duration::from_millis(30)).await;
++                    }
++                }
++                Ok(())
++            }))
++        })?
++        .join()
++        .expect("deadline context-reuse test thread panicked")
++}
++
++#[test]
++fn completed_action_fetches_allow_reuse_but_pending_work_does_not() -> anyhow::Result<()> {
++    use common::http::HttpResponseStream;
++    use futures::{
++        FutureExt,
++        StreamExt,
++    };
++
++    std::thread::Builder::new()
++        .stack_size(16 * 1024 * 1024)
++        .spawn(|| {
++            crate::client::initialize_v8();
++            let tokio = ProdRuntime::init_tokio()?;
++            let rt = ProdRuntime::new(&tokio);
++            tokio.block_on(Box::pin(async {
++                let mut fixture = Fixture::new(rt).await?;
++                let mut fetch_client = common::http::fetch::StaticFetchClient::new();
++                for path in ["body", "pending-body"] {
++                    fetch_client.register_http_route(
++                        format!("https://example.invalid/{path}").parse()?,
++                        http::Method::GET,
++                        move |_| {
++                            async move {
++                                let body = if path == "body" {
++                                    futures::stream::iter([Ok(bytes::Bytes::from_static(
++                                        b"response",
++                                    ))])
++                                    .boxed()
++                                } else {
++                                    futures::stream::pending().boxed()
++                                };
++                                Ok(HttpResponseStream {
++                                    body: Some(body),
++                                    status: http::StatusCode::OK,
++                                    headers: Default::default(),
++                                    url: None,
++                                    request_size: Default::default(),
++                                })
++                            }
++                            .boxed()
++                        },
++                    );
++                }
++                fetch_client.register_http_route(
++                    "https://example.invalid/pending".parse()?,
++                    http::Method::GET,
++                    |_| futures::future::pending().boxed(),
++                );
++                for path in ["upload", "pending-upload"] {
++                    fetch_client.register_http_route(
++                        format!("https://example.invalid/{path}").parse()?,
++                        http::Method::POST,
++                        move |request| {
++                            async move {
++                                if path == "upload" {
++                                    let mut body = request.body.context("Missing request body")?;
++                                    let mut uploaded = Vec::new();
++                                    while let Some(chunk) = body.next().await {
++                                        uploaded.extend(chunk?);
++                                    }
++                                    anyhow::ensure!(uploaded == [1, 2, 3], "Wrong upload contents");
++                                }
++                                // A server may send a response without consuming an unfinished
++                                // upload.
++                                Ok(HttpResponseStream {
++                                    body: Some(
++                                        futures::stream::iter([Ok(bytes::Bytes::from_static(
++                                            b"response",
++                                        ))])
++                                        .boxed(),
++                                    ),
++                                    status: http::StatusCode::OK,
++                                    headers: Default::default(),
++                                    url: None,
++                                    request_size: Default::default(),
++                                })
++                            }
++                            .boxed()
++                        },
++                    );
++                }
++                fixture.fetch_client = Arc::new(fetch_client);
++                fixture
++                    .put(
++                        "fetches.js",
++                        r#"
++                    let calls = 0;
++                    let lateAborts = 0;
++                    export const run = { isAction: true, invokeAction: async (_, args) => {
++                        const mode = JSON.parse(args)[0];
++                        ++calls;
++                        const signal = AbortSignal.timeout(60000);
++                        signal.addEventListener("abort", () => ++lateAborts);
++                        if (mode === "pending-fetch") {
++                            void fetch("https://example.invalid/pending", {signal});
++                        }
++                        const uploading = mode === "upload" || mode === "pending-upload";
++                        const path = uploading ? mode : mode === "pending-body" ? mode : "body";
++                        const options = uploading ? {
++                            signal, method: "POST", body: new ReadableStream({start(controller) {
++                                controller.enqueue(new Uint8Array([1, 2, 3]));
++                                if (mode === "upload") controller.close();
++                            }}),
++                        } : {signal};
++                        const response = await fetch(`https://example.invalid/${path}`, options);
++                        if (mode !== "unread" && mode !== "pending-body") {
++                            if (await response.text() !== "response") throw new Error("wrong body");
++                        }
++                        return JSON.stringify([calls, lateAborts]);
++                    }};
++                "#,
++                    )
++                    .await?;
++                for (mode, calls, retained) in [
++                    ("complete", 1, true),
++                    ("complete", 2, true),
++                    ("unread", 3, false),
++                    ("complete", 1, true),
++                    ("pending-body", 2, false),
++                    ("complete", 1, true),
++                    ("pending-fetch", 2, false),
++                    ("complete", 1, true),
++                    ("upload", 2, true),
++                    ("pending-upload", 3, false),
++                    ("upload", 1, true),
++                ] {
++                    let (value, saved) = fixture
++                        .run_action(
++                            "fetches.js:run",
++                            json!(mode),
++                            ActionOptions {
++                                grouped: false,
++                                ..Default::default()
++                            },
++                        )
++                        .await?;
++                    assert_eq!(value?, json!([calls as f64, 0.0]), "{mode}");
++                    assert_eq!(saved, retained, "{mode}");
++                }
++                assert_eq!(fixture.fetch_client.num_calls(), 12);
++                Ok(())
++            }))
++        })?
++        .join()
++        .expect("fetch context-reuse test thread panicked")
++}
++
++#[test]
++fn grouped_action_worker_publishes_only_after_uncancelled_delivery() -> anyhow::Result<()> {
++    use std::{
++        future::Future,
++        pin::Pin,
++        task::{
++            Context as TaskContext,
++            Wake,
++            Waker,
++        },
++    };
++
++    use common::fastrace_helpers::EncodedSpan;
++
++    use crate::{
++        client::{
++            IsolateConfig,
++            IsolateWorker,
++            Request,
++            RequestType,
++        },
++        context_cache::{
++            CachedContexts,
++            ReusableContextKind,
++        },
++        isolate_worker::FunctionRunnerIsolateWorker,
++    };
++
++    struct CancelOnWake(CancellationSignal);
++    impl Wake for CancelOnWake {
++        fn wake(self: Arc<Self>) {
++            self.0.cancel_for_test();
++        }
++    }
++
++    enum Delivery {
++        Delivered,
++        ReceiverDropped,
++        CancelOnSend,
++        CancelWhileWaiting,
++    }
++
++    std::thread::Builder::new()
++        .stack_size(16 * 1024 * 1024)
++        .spawn(|| {
++            crate::client::initialize_v8();
++            let tokio = ProdRuntime::init_tokio()?;
++            let rt = ProdRuntime::new(&tokio);
++            tokio.block_on(Box::pin(async {
++                let mut fixture = Fixture::new(rt.clone()).await?;
++                fixture
++                    .put(
++                        "_deps/shared.js",
++                        r#"
++                    let calls = 0;
++                    export const run = { isAction: true, invokeAction: async (_, args) => {
++                        const value = JSON.parse(args)[0];
++                        ++calls;
++                        if (value === "malformed") return "{";
++                        if (value === "invalid-return") return JSON.stringify("not an array");
++                        if (value === "waiting") {
++                            console.log("waiting");
++                            await new Promise(resolve => setTimeout(resolve, 60000));
++                        }
++                        return JSON.stringify([value, calls]);
++                    }};
++                "#,
++                    )
++                    .await?;
++                for entry in ["a.js", "b.js"] {
++                    fixture
++                        .put(entry, "export { run } from './_deps/shared.js';")
++                        .await?;
++                }
++                fixture
++                    .put(INITIALIZER, "import '../a.js'; import '../b.js';")
++                    .await?;
++                let limiter = ConcurrencyLimiter::unlimited();
++                let worker = FunctionRunnerIsolateWorker::new(
++                    rt,
++                    IsolateConfig::new("context_reuse_test", limiter.clone()),
++                );
++                let returned_id = DeveloperDocumentId::new(TableNumber::MAX, InternalId::MIN);
++                for (entry, value, delivery, expected_calls, retained) in [
++                    ("a.js", "first", Delivery::Delivered, 1, true),
++                    ("b.js", "second", Delivery::Delivered, 2, true),
++                    ("a.js", "cancelled", Delivery::CancelOnSend, 3, false),
++                    ("b.js", "after-cancellation", Delivery::Delivered, 1, true),
++                    ("a.js", "dropped", Delivery::ReceiverDropped, 2, false),
++                    ("b.js", "after-drop", Delivery::Delivered, 1, true),
++                    ("a.js", "malformed", Delivery::Delivered, 2, false),
++                    ("b.js", "after-malformed", Delivery::Delivered, 1, true),
++                    ("a.js", "invalid-return", Delivery::Delivered, 2, false),
++                    (
++                        "b.js",
++                        "after-return-validation",
++                        Delivery::Delivered,
++                        1,
++                        true,
++                    ),
++                    ("a.js", "waiting", Delivery::CancelWhileWaiting, 2, false),
++                    ("b.js", "after-wait", Delivery::Delivered, 1, true),
++                    ("a.js", "after-eviction", Delivery::Delivered, 1, true),
++                    ("b.js", "id-valid", Delivery::Delivered, 2, true),
++                    ("a.js", "id-invalid", Delivery::Delivered, 3, false),
++                    ("b.js", "after-id-validation", Delivery::Delivered, 1, true),
++                ] {
++                    let argument = if matches!(value, "id-valid" | "id-invalid") {
++                        json!(returned_id.to_string())
++                    } else {
++                        json!(value)
++                    };
++                    let mut action = fixture
++                        .action_request(
++                            &format!("{entry}:run"),
++                            argument.clone(),
++                            &ActionOptions::default(),
++                        )
++                        .await?;
++                    action.return_validation.returns_validator =
++                        ReturnsValidator::Validated(Validator::Array(Box::new(Validator::Any)));
++                    if matches!(value, "id-valid" | "id-invalid") {
++                        // The caller's snapshot can differ from execution metadata.
++                        // Only that snapshot may decide whether this ID is valid,
++                        // and a warm context must not retain the previous validator.
++                        assert!(action
++                            .return_validation
++                            .table_mapping
++                            .name_by_number_if_exists(returned_id.table())
++                            .is_none());
++                        let mut mapping = TableMapping::new();
++                        mapping.insert(
++                            TabletId::MIN,
++                            TableNamespace::root_component(),
++                            returned_id.table(),
++                            "callerTable".parse()?,
++                        );
++                        action.return_validation.table_mapping =
++                            mapping.namespace(TableNamespace::root_component());
++                        let expected_table = if value == "id-valid" {
++                            "callerTable"
++                        } else {
++                            "otherTable"
++                        };
++                        action.return_validation.returns_validator = ReturnsValidator::Validated(
++                            Validator::Array(Box::new(Validator::Union(vec![
++                                Validator::Id(expected_table.parse()?),
++                                Validator::Float64,
++                            ]))),
++                        );
++                    }
++                    let cancellation = CancellationSignal::new_for_test();
++                    let (response, mut receiver) = tokio::sync::oneshot::channel();
++                    if matches!(delivery, Delivery::CancelOnSend) {
++                        // Reproduce caller drop between its cancellation signal and
++                        // receiver destruction. Sending succeeds while waking a caller
++                        // that has already abandoned the invocation.
++                        let waker = Waker::from(Arc::new(CancelOnWake(cancellation.clone())));
++                        assert!(Pin::new(&mut receiver)
++                            .poll(&mut TaskContext::from_waker(&waker))
++                            .is_pending());
++                    }
++                    let receiver = match delivery {
++                        Delivery::ReceiverDropped => {
++                            drop(receiver);
++                            None
++                        },
++                        Delivery::Delivered
++                        | Delivery::CancelOnSend
++                        | Delivery::CancelWhileWaiting => Some(receiver),
++                    };
++                    let (log_line_sender, mut logs) = tokio::sync::mpsc::unbounded_channel();
++                    let request = Request::new(
++                        "context_reuse_test".to_owned(),
++                        RequestType::Action {
++                            request: action,
++                            execution_observation: None,
++                            cancellation: cancellation.clone(),
++                            response,
++                            queue_timer: crate::metrics::queue_timer(),
++                            action_callbacks: Arc::new(NoActionCallbacks),
++                            fetch_client: Arc::new(common::http::fetch::StaticFetchClient::new()),
++                            log_line_sender,
++                            function_started_sender: None,
++                        },
++                        EncodedSpan::empty(),
++                    );
++                    let key = request.module().context("Missing action affinity key")?;
++                    assert_eq!(key.module_path.as_str(), INITIALIZER);
++                    assert!(CachedContexts::new_for_test([(
++                        ReusableContextKind::Action,
++                        key.clone(),
++                    )])
++                    .can_serve_request(&request));
++                    for kind in [
++                        ReusableContextKind::DatabaseUdf,
++                        ReusableContextKind::HttpAction,
++                    ] {
++                        assert!(!CachedContexts::new_for_test([(kind, key.clone())])
++                            .can_serve_request(&request));
++                    }
++                    assert!(!CachedContexts::new_for_test([(
++                        ReusableContextKind::Action,
++                        CanonicalizedComponentModulePath {
++                            component: ComponentId::Child(fixture.package.into()),
++                            module_path: key.module_path,
++                        },
++                    )])
++                    .can_serve_request(&request));
++                    let cancel_waiter = if matches!(delivery, Delivery::CancelWhileWaiting) {
++                        let cancellation = cancellation.clone();
++                        Some(tokio::spawn(async move {
++                            tokio::time::timeout(Duration::from_secs(5), logs.recv())
++                                .await
++                                .expect("action did not reach its handler")
++                                .expect("action log channel closed before handler entry");
++                            cancellation.cancel_for_test();
++                        }))
++                    } else {
++                        None
++                    };
++                    let permit = limiter
++                        .acquire(Arc::new("context_reuse_test".to_owned()), false)
++                        .await;
++                    let (_, clean) = worker
++                        .handle_request_inner(
++                            &mut fixture.isolate,
++                            &mut fixture.contexts,
++                            request,
++                            permit,
++                        )
++                        .await;
++                    assert!(clean);
++                    if let Some(cancel_waiter) = cancel_waiter {
++                        cancel_waiter.await?;
++                    }
++                    if let Some(receiver) = receiver {
++                        let result = receiver.await?;
++                        if value == "malformed" || matches!(delivery, Delivery::CancelWhileWaiting)
++                        {
++                            assert!(result.is_err());
++                        } else if matches!(value, "invalid-return" | "id-invalid") {
++                            let error = result?
++                                .result
++                                .expect_err("return validator accepted an invalid result");
++                            assert!(error.message.starts_with("ReturnsValidationError:"));
++                        } else {
++                            assert_eq!(
++                                result?.result?.json_value(),
++                                json!([argument, expected_calls as f64])
++                            );
++                        }
++                    }
++                    assert_eq!(
++                        cancellation.is_cancelled(),
++                        matches!(
++                            delivery,
++                            Delivery::CancelOnSend | Delivery::CancelWhileWaiting
++                        )
++                    );
++                    assert_eq!(
++                        fixture.contexts.cached_contexts().has_saved_contexts(),
++                        retained
++                    );
++                    if value == "after-wait" {
++                        assert!(fixture.contexts.evict_for_memory_pressure());
++                        assert!(!fixture.contexts.cached_contexts().has_saved_contexts());
++                    }
++                }
++                Ok(())
++            }))
++        })?
++        .join()
++        .expect("context-reuse worker test panicked")
 +}
 diff --git a/crates/isolate/src/environment/udf/mod.rs b/crates/isolate/src/environment/udf/mod.rs
 index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577bae06f06 100644
@@ -7821,6 +9288,18 @@ index 532d540aa393d137f0e19c6e15b46d6e025e6d7f..1eaed1bb6b21c65fd5bdfe5ceeba26c9
      pub async fn eval_user_module(
          &mut self,
          udf_type: UdfType,
+diff --git a/crates/isolate/src/http.rs b/crates/isolate/src/http.rs
+index 5b3b345ce4a98c4272d77bd377dc672ed9032859..530b64b7cbd76861f6dc1da60af2669269f61e76 100644
+--- a/crates/isolate/src/http.rs
++++ b/crates/isolate/src/http.rs
+@@ -80,6 +80,7 @@ impl HttpRequestV8 {
+         let signal = {
+             let (signal_sender, signal_receiver) = spsc::unbounded_channel();
+             provider.new_stream_listener(self.signal, StreamListener::RustStream(signal_sender))?;
++            provider.register_fetch_abort_stream(self.signal)?;
+             let signal_stream = signal_receiver.into_stream();
+             Box::pin(signal_stream.into_future().map(|_| ()))
+         };
 diff --git a/crates/isolate/src/isolate.rs b/crates/isolate/src/isolate.rs
 index 762e8c56094616998750b4138e4b61251719bfcb..31425796d28061e937a458fd9921cff486d2c70b 100644
 --- a/crates/isolate/src/isolate.rs
@@ -7882,7 +9361,7 @@ index 762e8c56094616998750b4138e4b61251719bfcb..31425796d28061e937a458fd9921cff4
                  .terminate(IsolateTerminationReason::OutOfMemory.into());
              return Err(IsolateNotClean::TooMuchMemoryCarryOver(
 diff --git a/crates/isolate/src/isolate_worker.rs b/crates/isolate/src/isolate_worker.rs
-index def74d47a808666c972a94cb3c7139a778b38c5b..eeb098313c1f3be57ffc5c4bdf66bec79fb91d14 100644
+index def74d47a808666c972a94cb3c7139a778b38c5b..bc308b11f11e30ceac67e25c75087da2259e8840 100644
 --- a/crates/isolate/src/isolate_worker.rs
 +++ b/crates/isolate/src/isolate_worker.rs
 @@ -3,7 +3,6 @@ use common::{
@@ -7992,7 +9471,7 @@ index def74d47a808666c972a94cb3c7139a778b38c5b..eeb098313c1f3be57ffc5c4bdf66bec7
                  queue_timer,
                  action_callbacks,
                  fetch_client,
-@@ -147,20 +163,22 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -147,20 +163,31 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                      None,
                      request.context,
                  );
@@ -8006,14 +9485,23 @@ index def74d47a808666c972a94cb3c7139a778b38c5b..eeb098313c1f3be57ffc5c4bdf66bec7
                          &mut isolate_clean,
                          request.params.clone(),
 -                        response.closed().boxed(),
-+                        cancellation,
++                        cancellation.clone(),
                          function_started_sender,
 -                    )
 -                    .await;
 +                    ),
 +                    execution_observation,
 +                )
-+                .await;
++                .await
++                .and_then(|(mut outcome, reusable_context)| {
++                    // Validate with the caller's snapshot before publishing a reusable context.
++                    outcome.validate_return_value(
++                        &request.return_validation.returns_validator,
++                        &request.return_validation.table_mapping,
++                    )?;
++                    let reusable_context = if outcome.result.is_ok() { reusable_context } else { None };
++                    Ok((outcome, reusable_context))
++                });
  
                  let status = match &r {
 -                    Ok(outcome) => {
@@ -8021,7 +9509,7 @@ index def74d47a808666c972a94cb3c7139a778b38c5b..eeb098313c1f3be57ffc5c4bdf66bec7
                          if outcome.result.is_ok() {
                              RequestStatus::Success
                          } else {
-@@ -170,7 +188,21 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -170,7 +197,21 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                      Err(_) => RequestStatus::SystemError,
                  };
                  finish_service_request_timer(timer, status);
@@ -8029,11 +9517,11 @@ index def74d47a808666c972a94cb3c7139a778b38c5b..eeb098313c1f3be57ffc5c4bdf66bec7
 +                match r {
 +                    Ok((outcome, reusable_context)) => {
 +                        if response.send(Ok(outcome)).is_ok()
++                            && !cancellation.is_cancelled()
 +                            && let Some(reusable_context) = reusable_context
 +                        {
-+                            // Publish only after the result is delivered. A
-+                            // dropped caller must not leave a warmed context
-+                            // behind from an unobserved action.
++                            // Caller drop signals cancellation before closing the receiver;
++                            // a successful send alone cannot authorize publication.
 +                            reusable_context.publish(context_cache);
 +                        }
 +                    },
@@ -8044,7 +9532,7 @@ index def74d47a808666c972a94cb3c7139a778b38c5b..eeb098313c1f3be57ffc5c4bdf66bec7
                  log_string
              },
              RequestType::Analyze {
-@@ -238,7 +270,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -238,7 +279,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                      )
                      .await;
                  let status = match &r {
@@ -8053,7 +9541,7 @@ index def74d47a808666c972a94cb3c7139a778b38c5b..eeb098313c1f3be57ffc5c4bdf66bec7
                          // Note that the stream could potentially encounter errors later
                          HttpActionResult::Streamed => RequestStatus::Success,
                          HttpActionResult::Error(_) => RequestStatus::DeveloperError,
-@@ -246,7 +278,21 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -246,7 +287,22 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                      Err(_) => RequestStatus::SystemError,
                  };
                  finish_service_request_timer(timer, status);
@@ -8061,6 +9549,7 @@ index def74d47a808666c972a94cb3c7139a778b38c5b..eeb098313c1f3be57ffc5c4bdf66bec7
 +                match r {
 +                    Ok((outcome, reusable_context)) => {
 +                        if response.send(Ok(outcome)).is_ok()
++                            && !cancellation.is_cancelled()
 +                            && let Some(reusable_context) = reusable_context
 +                        {
 +                            // HTTP responses are already streamed separately;
@@ -8076,7 +9565,7 @@ index def74d47a808666c972a94cb3c7139a778b38c5b..eeb098313c1f3be57ffc5c4bdf66bec7
                  log_string
              },
              RequestType::EvaluateSchema {
-@@ -299,7 +345,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
+@@ -299,7 +355,7 @@ impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
                  // AppDefinitionEvaluator doesn't use the prewarmed V8 context
                  // because it uses an arbitrary number of contexts. This call is
                  // rare and not particularly latency-sensitive though
@@ -8623,27 +10112,175 @@ index 3df6fd4b47e0dc95259f0bb50fdf3293e8c39ec0..1ac9e1debd352c29c1b77c243b6bf29a
  #[cfg(test)]
  mod tests {
      use prometheus::core::Collector;
+diff --git a/crates/isolate/src/ops/mod.rs b/crates/isolate/src/ops/mod.rs
+index 3975df49d8fd455dc390087c7f8ab383d72e5076..dece8c0232a47dc32139024627d8902e261f33f7 100644
+--- a/crates/isolate/src/ops/mod.rs
++++ b/crates/isolate/src/ops/mod.rs
+@@ -108,7 +108,9 @@ use self::{
+         op_text_encoder_normalize_label,
+     },
+     time::{
++        async_op_abort_signal_timeout,
+         async_op_sleep,
++        op_cancel_timer,
+         op_now_call,
+         op_performance_now_call,
+         op_performance_time_origin_call,
+@@ -152,7 +154,17 @@ pub trait V8OpProvider<'b>: OpProvider {
+         resolver: v8::Global<v8::PromiseResolver>,
+     ) -> anyhow::Result<()>;
+ 
++    fn start_timer(
++        &mut self,
++        request: AsyncOpRequest,
++        timer_id: u64,
++        resolver: v8::Global<v8::PromiseResolver>,
++    ) -> anyhow::Result<()>;
++
++    fn cancel_timer(&mut self, timer_id: u64) -> anyhow::Result<()>;
++
+     fn create_stream(&mut self) -> anyhow::Result<Uuid>;
++    fn register_fetch_abort_stream(&mut self, stream_id: Uuid) -> anyhow::Result<()>;
+     fn extend_stream(
+         &mut self,
+         id: Uuid,
+@@ -265,6 +277,25 @@ impl<'a, 's: 'a, 'i, RT: Runtime, E: V8IsolateEnvironment<RT>> V8OpProvider<'i>
+         self.state_mut()?.create_stream()
+     }
+ 
++    fn register_fetch_abort_stream(&mut self, stream_id: Uuid) -> anyhow::Result<()> {
++        self.state_mut()?.register_fetch_abort_stream(stream_id)
++    }
++
++    fn start_timer(
++        &mut self,
++        request: AsyncOpRequest,
++        timer_id: u64,
++        resolver: v8::Global<v8::PromiseResolver>,
++    ) -> anyhow::Result<()> {
++        self.state_mut()?
++            .environment
++            .start_timer(request, timer_id, resolver)
++    }
++
++    fn cancel_timer(&mut self, timer_id: u64) -> anyhow::Result<()> {
++        self.state_mut()?.environment.cancel_timer(timer_id)
++    }
++
+     fn extend_stream(
+         &mut self,
+         id: Uuid,
+@@ -408,6 +439,7 @@ op_table! {
+         "validateReturns" => op_validate_returns,
+     },
+     v8: {
++        "cancelTimer" => op_cancel_timer,
+         "throwUncatchableDeveloperError" => op_throw_uncatchable_developer_error,
+         "console/message" => op_console_message,
+         "console/trace" => op_console_trace,
+@@ -495,6 +527,7 @@ pub fn start_async_op<'b, P: V8OpProvider<'b>>(
+         "fetch" => async_op_fetch(provider, args, resolver.clone())?,
+         "form/parseMultiPart" => async_op_parse_multi_part(provider, args, resolver.clone())?,
+         "sleep" => async_op_sleep(provider, args, resolver.clone())?,
++        "abortSignalTimeout" => async_op_abort_signal_timeout(provider, args, resolver.clone())?,
+         "storage/store" => async_op_storage_store(provider, args, resolver.clone())?,
+         "storage/get" => async_op_storage_get(provider, args, resolver.clone())?,
+         "stream/readPart" => async_op_stream_read_part(provider, args, resolver.clone())?,
+diff --git a/crates/isolate/src/ops/time.rs b/crates/isolate/src/ops/time.rs
+index 30f4b5029c5a5cfd7efe7a33fe022486e91f8210..e0429ce5efbea8a4c737d9c58f030b3b50786a40 100644
+--- a/crates/isolate/src/ops/time.rs
++++ b/crates/isolate/src/ops/time.rs
+@@ -1,5 +1,6 @@
+ use std::time::Duration;
+ 
++use common::runtime::UnixTimestamp;
+ use deno_core::{
+     serde_v8,
+     v8::{
+@@ -23,22 +24,48 @@ pub fn async_op_sleep<'b, P: V8OpProvider<'b>>(
+     let name: String = serde_v8::from_v8(&mut provider.scope(), args.get(1))?;
+     let millis: f64 = serde_v8::from_v8(&mut provider.scope(), args.get(2))?;
+     let request = sleep_request(provider, name, millis)?;
+-    provider.start_async_op(request, resolver)
++    let timer_id: u64 = serde_v8::from_v8(&mut provider.scope(), args.get(3))?;
++    provider.start_timer(request, timer_id, resolver)
++}
++
++pub fn async_op_abort_signal_timeout<'b, P: V8OpProvider<'b>>(
++    provider: &mut P,
++    args: v8::FunctionCallbackArguments,
++    resolver: v8::Global<v8::PromiseResolver>,
++) -> anyhow::Result<()> {
++    let millis: f64 = serde_v8::from_v8(&mut provider.scope(), args.get(1))?;
++    let until = sleep_deadline(provider, millis)?;
++    provider.start_async_op(AsyncOpRequest::AbortSignalTimeout { until }, resolver)
++}
++
++#[convex_macro::v8_op]
++pub fn op_cancel_timer<'b, P: V8OpProvider<'b>>(
++    provider: &mut P,
++    timer_id: u64,
++) -> anyhow::Result<()> {
++    provider.cancel_timer(timer_id)
+ }
+ 
+ pub(super) fn sleep_request<P: OpProvider>(
+     provider: &mut P,
+     name: String,
+-    mut millis: f64,
++    millis: f64,
+ ) -> anyhow::Result<AsyncOpRequest> {
++    let until = sleep_deadline(provider, millis)?;
++    Ok(AsyncOpRequest::Sleep { name, until })
++}
++
++fn sleep_deadline<P: OpProvider>(
++    provider: &mut P,
++    mut millis: f64,
++) -> anyhow::Result<UnixTimestamp> {
+     // Negative, infinite and NaN delays fire immediately, as in browsers.
+     if millis < 0.0 || !millis.is_finite() {
+         millis = 0.0;
+     }
+     let duration = Duration::from_millis(millis as u64);
+ 
+-    let until = provider.unix_timestamp()? + duration;
+-    Ok(AsyncOpRequest::Sleep { name, until })
++    Ok(provider.unix_timestamp()? + duration)
+ }
+ 
+ #[convex_macro::op]
 diff --git a/crates/isolate/src/request_scope.rs b/crates/isolate/src/request_scope.rs
-index 57572cd038baf51d4e5d16417d02b3c6c0dc06a1..a3486878df9c670cac4d9d9ef25bec676a742882 100644
+index 57572cd038baf51d4e5d16417d02b3c6c0dc06a1..c9f7d650776c74b09e9d36a78a6b70392fadac4f 100644
 --- a/crates/isolate/src/request_scope.rs
 +++ b/crates/isolate/src/request_scope.rs
-@@ -101,6 +101,7 @@ pub struct RequestState<RT: Runtime, E: V8IsolateEnvironment<RT>> {
+@@ -1,6 +1,7 @@
+ use std::{
+     collections::{
+         BTreeMap,
++        BTreeSet,
+         VecDeque,
+     },
+     marker::PhantomData,
+@@ -101,6 +102,8 @@ pub struct RequestState<RT: Runtime, E: V8IsolateEnvironment<RT>> {
      pub stream_listeners: WithHeapSize<BTreeMap<uuid::Uuid, StreamListener>>,
      /// Tracks bytes read in HTTP action requests
      pub request_stream_state: Option<RequestStreamState>,
 +    http_action_abort_stream_id: Option<uuid::Uuid>,
++    fetch_abort_stream_ids: BTreeSet<uuid::Uuid>,
      pub console_timers: WithHeapSize<BTreeMap<String, UnixTimestamp>>,
  }
  
-@@ -113,6 +114,7 @@ impl<RT: Runtime, E: V8IsolateEnvironment<RT>> RequestState<RT, E> {
+@@ -113,6 +116,8 @@ impl<RT: Runtime, E: V8IsolateEnvironment<RT>> RequestState<RT, E> {
              streams: WithHeapSize::default(),
              stream_listeners: WithHeapSize::default(),
              request_stream_state: None,
 +            http_action_abort_stream_id: None,
++            fetch_abort_stream_ids: BTreeSet::new(),
              console_timers: WithHeapSize::default(),
          }
      }
-@@ -183,6 +185,36 @@ impl<RT: Runtime, E: V8IsolateEnvironment<RT>> RequestState<RT, E> {
+@@ -183,6 +188,49 @@ impl<RT: Runtime, E: V8IsolateEnvironment<RT>> RequestState<RT, E> {
          Ok(uuid)
      }
  
@@ -8657,12 +10294,25 @@ index 57572cd038baf51d4e5d16417d02b3c6c0dc06a1..a3486878df9c670cac4d9d9ef25bec67
 +        Ok(uuid)
 +    }
 +
++    pub fn register_fetch_abort_stream(&mut self, stream_id: uuid::Uuid) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            self.streams.contains_key(&stream_id),
++            "Unknown fetch abort stream"
++        );
++        self.fetch_abort_stream_ids.insert(stream_id);
++        Ok(())
++    }
++
 +    pub fn has_pending_stream_work_for_context_reuse(&self) -> bool {
-+        let abort_stream_id = self.http_action_abort_stream_id;
-+        // The abort listener is expected to wait for client disconnect. Its Rust
-+        // resolver root is dropped with RequestState and must not disable reuse.
++        let is_abort_stream = |stream_id: &uuid::Uuid| {
++            Some(*stream_id) == self.http_action_abort_stream_id
++                || self.fetch_abort_stream_ids.contains(stream_id)
++        };
++        // Cancellation channels can stay open after useful work finishes. Their
++        // roots are dropped with RequestState after native tasks stop. Pending
++        // fetch promises and request/response bodies still prevent reuse.
 +        let has_pending_stream = self.streams.iter().any(|(stream_id, stream)| {
-+            if Some(*stream_id) == abort_stream_id {
++            if is_abort_stream(stream_id) {
 +                return false;
 +            }
 +            match stream {
@@ -8673,7 +10323,7 @@ index 57572cd038baf51d4e5d16417d02b3c6c0dc06a1..a3486878df9c670cac4d9d9ef25bec67
 +        let has_pending_listener = self
 +            .stream_listeners
 +            .keys()
-+            .any(|stream_id| Some(*stream_id) != abort_stream_id);
++            .any(|stream_id| !is_abort_stream(stream_id));
 +        has_pending_stream || has_pending_listener
 +    }
 +
@@ -9336,6 +10986,25 @@ index 0000000000000000000000000000000000000000..9ef4be4aca33c843bcda60455ccde2b8
 +    /// primary lane timer, but its CPU is not measured by this diagnostic.
 +    pub primary_prestarted_transaction_nanos: u64,
 +}
+diff --git a/crates/udf/src/function_outcome.rs b/crates/udf/src/function_outcome.rs
+index d5b0c8123efbab7c7d4b49e5d5bf6f7e09313f24..15cbf344240fa1559562a274de2efee0165f7299 100644
+--- a/crates/udf/src/function_outcome.rs
++++ b/crates/udf/src/function_outcome.rs
+@@ -16,10 +16,10 @@ use crate::{
+     UdfOutcome,
+ };
+ 
+-/// A `FunctionOutcome` represents a successful execution of a developer's
+-/// function by our V8 layer before it has had its returns validator run. It
+-/// slightly differs from `UdfExecution`, which is what we store in memory for
+-/// logs.
++/// A `FunctionOutcome` carries a developer function's execution result without
++/// attesting final application validation. Ordinary V8 actions also validate
++/// returns before cache publication. This differs from `UdfExecution`, which
++/// is what we store in memory for logs.
+ #[derive(Clone, Debug)]
+ pub enum FunctionOutcome {
+     Query(UdfOutcome),
 diff --git a/crates/udf/src/lib.rs b/crates/udf/src/lib.rs
 index 87f8de82a09e0889c6390cc3b6f377401f14484e..9906e26a3d01c63ecba70805d28813ffeab88f40 100644
 --- a/crates/udf/src/lib.rs
@@ -9396,7 +11065,7 @@ index 8309e206817ade15d508f8df79fc0dc242c4431d..4bbcc9fd9305b84d6aef28883965ae3d
      match &outcome {
          FunctionOutcome::Query(UdfOutcome { result, .. }) => result.is_ok(),
 diff --git a/crates/udf/src/validation.rs b/crates/udf/src/validation.rs
-index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..23bacbeb57f0aca2fa44047df9c657d9b7464a38 100644
+index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c296369f10f 100644
 --- a/crates/udf/src/validation.rs
 +++ b/crates/udf/src/validation.rs
 @@ -55,7 +55,9 @@ use model::{
@@ -9970,6 +11639,166 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..23bacbeb57f0aca2fa44047df9c657d9
          })
      }
  }
+@@ -1045,6 +1396,41 @@ impl ValidatedUdfOutcome {
+     }
+ }
+ 
++/// The return validator and table mapping must come from the same validation
++/// transaction, even when execution runs against a later database snapshot.
++#[derive(Clone)]
++pub struct ActionReturnValidation {
++    pub returns_validator: ReturnsValidator,
++    pub table_mapping: NamespacedTableMapping,
++}
++
++impl ActionOutcome {
++    pub fn validate_return_value(
++        &mut self,
++        returns_validator: &ReturnsValidator,
++        table_mapping: &NamespacedTableMapping,
++    ) -> anyhow::Result<()> {
++        if returns_validator.needs_validation()
++            && let Ok(json_packed_value) = &self.result
++        {
++            let output = json_packed_value.unpack().map_err(|e| {
++                e.wrap_error_message(|msg| {
++                    format!(
++                        "Action {} return value invalid: {msg}",
++                        self.path.debug_str()
++                    )
++                })
++            })?;
++            if let Some(js_err) =
++                returns_validator.check_output(&output, table_mapping, virtual_system_mapping())
++            {
++                self.result = Err(js_err);
++            }
++        }
++        Ok(())
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub struct ValidatedActionOutcome {
+     pub path: CanonicalizedComponentFunctionPath,
+@@ -1064,11 +1450,14 @@ pub struct ValidatedActionOutcome {
+ 
+ impl ValidatedActionOutcome {
+     pub fn new(
+-        outcome: ActionOutcome,
++        mut outcome: ActionOutcome,
+         returns_validator: ReturnsValidator,
+         table_mapping: &NamespacedTableMapping,
+     ) -> Self {
+-        let mut validated = ValidatedActionOutcome {
++        if let Err(mut error) = outcome.validate_return_value(&returns_validator, table_mapping) {
++            report_error_sync(&mut error);
++        }
++        ValidatedActionOutcome {
+             path: outcome.path,
+             arguments: outcome.arguments,
+             identity: outcome.identity,
+@@ -1078,34 +1467,7 @@ impl ValidatedActionOutcome {
+             udf_server_version: outcome.udf_server_version,
+             mutation_queue_length: None,
+             user_execution_time: outcome.user_execution_time,
+-        };
+-
+-        if returns_validator.needs_validation()
+-            && let Ok(json_packed_value) = &validated.result
+-        {
+-            match json_packed_value.unpack() {
+-                Ok(output) => {
+-                    if let Some(js_err) = returns_validator.check_output(
+-                        &output,
+-                        table_mapping,
+-                        virtual_system_mapping(),
+-                    ) {
+-                        validated.result = Err(js_err);
+-                    }
+-                },
+-                Err(e) => {
+-                    let mut e = e.wrap_error_message(|msg| {
+-                        format!(
+-                            "Action {} return value invalid: {msg}",
+-                            validated.path.debug_str(),
+-                        )
+-                    });
+-                    report_error_sync(&mut e);
+-                },
+-            }
+         }
+-
+-        validated
+     }
+ 
+     pub fn from_error(
+diff --git a/npm-packages/udf-runtime/src/02_timers.ts b/npm-packages/udf-runtime/src/02_timers.ts
+index 8f349449cab28f4182fbd24f676d12e20397a2c5..c042887417627932d5b2f36fb9b0dd6d7fa41c3b 100644
+--- a/npm-packages/udf-runtime/src/02_timers.ts
++++ b/npm-packages/udf-runtime/src/02_timers.ts
+@@ -2,7 +2,7 @@
+ // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html
+ 
+ import { throwNotImplementedMethodError } from "./helpers";
+-import { performAsyncOp } from "./syscall";
++import { performAsyncOp, performOp } from "./syscall";
+ 
+ const ACTIVE_TIMERS = new Map();
+ 
+@@ -25,11 +25,12 @@ const setInterval = (
+ };
+ 
+ const clearTimeout = (id: number) => {
+-  ACTIVE_TIMERS.delete(id);
+-};
+-const clearInterval = (id: number) => {
+-  ACTIVE_TIMERS.delete(id);
++  if (ACTIVE_TIMERS.delete(id)) {
++    // Drop the request-owned resolver as well as the callback's JS registration.
++    performOp("cancelTimer", id);
++  }
+ };
++const clearInterval = clearTimeout;
+ 
+ const timerInitialization = (
+   name: string,
+@@ -74,7 +75,7 @@ const runAfterTimeout = (
+ ) => {
+   const startTime = Date.now();
+   ACTIVE_TIMERS.set(timerKey, startTime + timeoutMs);
+-  void performAsyncOp("sleep", name, timeoutMs).then(() => {
++  void performAsyncOp("sleep", name, timeoutMs, timerKey).then(() => {
+     // TODO(CX-4534) Wait until any invocations of this algorithm,
+     // that started before this one, and whose milliseconds is equal to or less
+     // than this one's, have completed.
+diff --git a/npm-packages/udf-runtime/src/03_abort_signal.ts b/npm-packages/udf-runtime/src/03_abort_signal.ts
+index f49d4b56eee13416ad178e24e963536046eb5cdc..5b1fa503daa4424f68f522854d9c29adc8465d2c 100644
+--- a/npm-packages/udf-runtime/src/03_abort_signal.ts
++++ b/npm-packages/udf-runtime/src/03_abort_signal.ts
+@@ -2,6 +2,22 @@ import {
+   AbortController,
+   AbortSignal,
+ } from "abortcontroller-polyfill/dist/abortcontroller";
++import { performAsyncOp } from "./syscall";
++
++// These alarms belong to one invocation. Unlike setTimeout, an unused deadline
++// has no callback registration in ACTIVE_TIMERS that could survive reuse.
++AbortSignal.timeout = (time: number): AbortSignal => {
++  const controller = new AbortController();
++  // Keep the polyfill's existing setTimeout coercion and reason while changing
++  // ownership of the alarm.
++  const timeoutMs = time ? Number(time) : 0;
++  void performAsyncOp("abortSignalTimeout", timeoutMs).then(() => {
++    controller.abort(
++      new DOMException(`This signal is timeout in ${time}ms`, "TimeoutError"),
++    );
++  });
++  return controller.signal;
++};
+ 
+ Object.defineProperty(AbortController.prototype, Symbol.toStringTag, {
+   value: "AbortController",
 diff --git a/patches/README.md b/patches/README.md
 index 4d1117817afde2f65e701f1aa24193a68c51e0e2..c8ff548957d11d14423c062beae53bb19d42278d 100644
 --- a/patches/README.md
@@ -10107,10 +11936,10 @@ index 775c63926d8cc54a03a65cb231b6b55f06183d4d..f0df0ad9d65e4af55a21c9f17b1684b2
  involved, but an older image does not understand the new environment variables or emit the new
 diff --git a/patches/context_reuse/README.md b/patches/context_reuse/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..49b0a75a1247853bc888e0f9fc2e6de68f3eccaf
+index 0000000000000000000000000000000000000000..55297984fee1928b2774e1298d2292b01bc1b461
 --- /dev/null
 +++ b/patches/context_reuse/README.md
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,247 @@
 +# Context Reuse
 +
 +This patch makes V8 context reuse one policy-controlled feature covering queries, mutations, ordinary
@@ -10205,6 +12034,19 @@ index 0000000000000000000000000000000000000000..49b0a75a1247853bc888e0f9fc2e6de6
 +streamed response, an open isolate response stream at finalization, and successful delivery of the
 +outcome to the function-runner response channel. Later forwarding from that channel to an outer HTTP
 +transport is not a cache-publication boundary.
++
++Clearing an action timer releases its native promise resolver. A canceled sleep completion
++already in transit is consumed without invoking JavaScript, while normal execution-permit
++reacquisition still occurs. Unused `AbortSignal.timeout` deadlines release their roots after
++native tasks stop and before the final microtask checkpoint. Deadline coercion and timeout
++reasons retain the runtime's existing behavior.
++
++Outbound fetch cancellation channels may remain open after useful work completes. They are
++tracked separately from response and upload bodies and do not alone prevent reuse. Pending
++fetch promises, unread response bodies, unfinished uploads, ordinary timers, and unrelated
++stream listeners still reject context retention. Application and package code must not retain
++request signals or controllers in module state. Actual V8 tests cover timer cancellation,
++late completions, deadline firing and disposal, consumed fetch bodies, and unfinished uploads.
 +
 +## Adoption and rollback
 +
