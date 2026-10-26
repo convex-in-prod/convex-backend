@@ -45,6 +45,14 @@ retention. Dispose unused action deadlines only after native tasks stop; keep
 unfinished operations and body streams blocking. Validate action returns with
 the caller's snapshot and recheck cancellation after delivery. Cover the full
 lifecycle with actual V8 grouped-action and network-operation regressions.
+
+Support versioned database and action initializer selections through analysis,
+persistence and the internal protocol. Preserve legacy shared roots while older
+workers fall back to per-entry initialization for split selections. Track action
+initialization dependencies at module and observed-environment granularity, retain
+the source snapshot for later imports, and revoke retention after handler-time
+module loading. Finish initialization before action execution and HTTP routing
+completion; keep request resources invocation-owned.
 ---
  Cargo.lock                                    |    3 +
  .../src/application_function_runner/mod.rs    |  209 +-
@@ -57,12 +65,12 @@ lifecycle with actual V8 grouped-action and network-operation regressions.
  crates/isolate/Cargo.toml                     |    3 +
  crates/isolate/src/client.rs                  |  923 ++++++-
  crates/isolate/src/context_cache.rs           | 2140 ++++++++++++++++-
- crates/isolate/src/environment/action/mod.rs  |  599 ++++-
- .../isolate/src/environment/action/phase.rs   |  193 +-
+ crates/isolate/src/environment/action/mod.rs  |  616 ++++-
+ .../isolate/src/environment/action/phase.rs   |  337 ++-
  crates/isolate/src/environment/action/task.rs |    5 +
  .../src/environment/action/task_executor.rs   |    6 +-
  .../src/environment/action/task_order.rs      |    4 +-
- crates/isolate/src/environment/analyze.rs     |  126 +-
+ crates/isolate/src/environment/analyze.rs     |  170 +-
  crates/isolate/src/environment/async_op.rs    |    9 +-
  crates/isolate/src/environment/mod.rs         |   13 +
  .../environment/udf/context_reuse_tests.rs    | 1348 +++++++++++
@@ -81,30 +89,32 @@ lifecycle with actual V8 grouped-action and network-operation regressions.
  crates/isolate/src/termination.rs             |    3 +
  crates/isolate/src/timeout.rs                 |  151 ++
  crates/local_backend/src/lib.rs               |    3 +-
- crates/model/src/modules/module_versions.rs   |  217 +-
+ crates/model/src/modules/module_versions.rs   |  435 +++-
  crates/node_executor/src/executor.rs          |    3 +-
- crates/pb/protos/common.proto                 |   17 +
+ crates/pb/protos/common.proto                 |   28 +
  crates/udf/src/execution_observation.rs       |  108 +
  crates/udf/src/function_outcome.rs            |    8 +-
  crates/udf/src/lib.rs                         |    1 +
  crates/udf/src/metrics.rs                     |   32 +
- crates/udf/src/validation.rs                  |  474 +++-
+ crates/udf/src/validation.rs                  |  587 ++++-
  npm-packages/udf-runtime/src/02_timers.ts     |   13 +-
  .../udf-runtime/src/03_abort_signal.ts        |   16 +
  patches/README.md                             |   54 +-
  patches/backend_memory_resilience/README.md   |   23 +-
- patches/context_reuse/README.md               |  247 ++
- patches/context_reuse/design_reference.md     |  218 ++
+ patches/context_reuse/README.md               |  325 +++
+ patches/context_reuse/design_reference.md     |  253 ++
+ .../context_reuse/selective_invalidation.md   |  116 +
  .../dependency_capacity/design_reference.md   |   17 +-
  self-hosted/advanced/knobs.md                 |   67 +-
  self-hosted/docker/docker-compose.yml         |    3 +-
- 52 files changed, 9076 insertions(+), 617 deletions(-)
+ 53 files changed, 9841 insertions(+), 628 deletions(-)
  create mode 100644 crates/application/src/runtime_diagnostics.rs
  create mode 100644 crates/isolate/src/environment/udf/context_reuse_tests.rs
  create mode 100644 crates/isolate/src/execution_observation.rs
  create mode 100644 crates/udf/src/execution_observation.rs
  create mode 100644 patches/context_reuse/README.md
  create mode 100644 patches/context_reuse/design_reference.md
+ create mode 100644 patches/context_reuse/selective_invalidation.md
 
 diff --git a/Cargo.lock b/Cargo.lock
 index 5500bf83b46af4e9442f8c5a775c63e4d8fa3af6..5e920033d1fa7c7b8b7b4886e03d3426f5d69554 100644
@@ -4873,7 +4883,7 @@ index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..814f7d4d54bb743561281f7bfd32449e
 +    }
 +}
 diff --git a/crates/isolate/src/environment/action/mod.rs b/crates/isolate/src/environment/action/mod.rs
-index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5339b8026 100644
+index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4bb0659b5 100644
 --- a/crates/isolate/src/environment/action/mod.rs
 +++ b/crates/isolate/src/environment/action/mod.rs
 @@ -11,7 +11,10 @@ mod task_order;
@@ -4985,10 +4995,13 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
      _phantom: PhantomData<RT>,
  }
  
-@@ -280,6 +335,18 @@ pub trait ActionInnerProvider<RT: Runtime>: SyscallProvider<RT> + HeapSize + 'st
-     async fn initialize(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()>;
-     fn begin_execution(&mut self) -> anyhow::Result<()>;
+@@ -278,7 +333,20 @@ pub trait ActionInnerProvider<RT: Runtime>: SyscallProvider<RT> + HeapSize + 'st
+     fn syscall_trace(&self) -> SyscallTrace;
  
+     async fn initialize(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()>;
+-    fn begin_execution(&mut self) -> anyhow::Result<()>;
++    async fn begin_execution(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()>;
++
 +    // Context reuse depends on the provider's initialization reads, including
 +    // when a provider wrapper records or replays action inputs.
 +    fn snoop_context_reads(&mut self) -> anyhow::Result<()>;
@@ -4998,13 +5011,13 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
 +        timeout: &mut Timeout<RT>,
 +    ) -> anyhow::Result<bool>;
 +    fn take_context_read_set(&mut self) -> anyhow::Result<Option<ContextReadSet>>;
++    fn context_reuse_allowed(&self) -> bool;
 +    fn http_action_had_execution_error(&self) -> bool;
 +    fn http_response_is_closed(&self) -> anyhow::Result<bool>;
-+
+ 
      /// Hands `request` to the task executor, returning the ID that its
      /// `TaskResponse::TaskDone` will carry.
-     fn start_task(&mut self, request: TaskRequestEnum) -> anyhow::Result<TaskId>;
-@@ -370,6 +437,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -370,6 +438,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                  log_line_sender,
                  http_response_streamer,
                  http_response_too_large: false,
@@ -5012,7 +5025,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
  
                  next_task_id: TaskId(0),
                  pending_task_sender,
-@@ -388,6 +456,8 @@ impl<RT: Runtime> ActionEnvironment<RT> {
+@@ -388,6 +457,8 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                  http_action_route,
              },
              task_promise_resolvers: BTreeMap::new(),
@@ -5021,7 +5034,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
              _phantom: PhantomData,
          }
      }
-@@ -398,6 +468,8 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -398,6 +469,8 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          Self {
              provider,
              task_promise_resolvers: BTreeMap::new(),
@@ -5030,7 +5043,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
              _phantom: PhantomData,
          }
      }
-@@ -419,13 +491,15 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -419,13 +492,15 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          ActionEnvironment {
              provider: f(self.provider),
              task_promise_resolvers: self.task_promise_resolvers,
@@ -5047,7 +5060,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
          isolate: &mut Isolate<RT>,
          context_cache: &mut ContextCache,
          permit: ConcurrencyPermit,
-@@ -434,7 +508,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -434,7 +509,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          routed_path: RoutedHttpPath,
          request: HttpActionRequest,
          function_started: Option<oneshot::Sender<()>>,
@@ -5056,7 +5069,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
          let start_unix_timestamp = self.provider.rt().unix_timestamp();
  
          // Double check that we correctly initialized `ActionEnvironment` with the right
-@@ -443,17 +517,66 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -443,17 +518,66 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          let component_function_path = http_module_path.path();
          anyhow::ensure!(component_function_path.component == self.provider.component());
          let udf_path = &component_function_path.udf_path;
@@ -5128,7 +5141,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
  
          let request_head = request.head.clone();
  
-@@ -465,16 +588,46 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -465,16 +589,46 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
              request,
          )
          .await;
@@ -5179,7 +5192,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
          let execution_time = timeout.into_function_execution_time(UdfType::HttpAction);
          match termination_error {
              Ok(Ok(..)) => (),
-@@ -483,10 +636,10 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -483,10 +637,10 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
                  // succeeded, so usage tracking reports the parameterized route
                  // pattern instead of the raw URL path.
                  let route = result.as_ref().ok().and_then(|(route, _)| route.clone());
@@ -5192,7 +5205,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
                      result = Ok((route, HttpActionResult::Streamed))
                  }
              },
-@@ -494,22 +647,86 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -494,22 +648,87 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
                  result = Err(e);
              },
          }
@@ -5201,6 +5214,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
 +        // into an HTTP stream outcome. Do not cache that context while its Rust state
 +        // is being dropped.
 +        let can_save_http_action_context = reuse_context
++            && environment.provider.context_reuse_allowed()
 +            && clean_termination
 +            && !has_pending_request_work
 +            && !environment.has_pending_task_promises()
@@ -5285,7 +5299,16 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
      }
  
      #[fastrace::trace]
-@@ -652,7 +869,9 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -566,6 +785,8 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+                 handle.check_terminated()?;
+                 let state = scope.state_mut()?;
+                 let provider = &mut state.environment.provider;
++                // A successful 404 still has an initialized router to retain.
++                provider.begin_execution(timeout).await?;
+                 let response_parts = HttpActionResponsePart::from_text(
+                     StatusCode::NOT_FOUND,
+                     "No matching routes found".into(),
+@@ -652,7 +873,9 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          let sender_closed_fut = state.environment.provider.http_response_closed()?;
          let sender_closed =
              Box::pin(futures::stream::once(sender_closed_fut).filter_map(|_| async move { None }));
@@ -5296,7 +5319,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
          state
              .environment
              .provider
-@@ -693,45 +912,113 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -693,45 +916,113 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
  
      #[fastrace::trace]
      pub async fn run_action(
@@ -5421,7 +5444,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
              Ok(Ok(..)) => (),
              Ok(Err(e)) => {
                  result = Ok(Err(e));
-@@ -740,17 +1027,76 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -740,17 +1031,77 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
                  result = Err(e);
              },
          }
@@ -5452,6 +5475,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
 +        // must leave before the token, which is declared before the V8 scopes.
 +        let mut environment = isolate_context.take_environment();
 +        let can_save_action_context = reuse_context
++            && environment.provider.context_reuse_allowed()
 +            && clean_termination
 +            && !cancellation.is_cancelled()
 +            && !has_pending_request_work
@@ -5503,7 +5527,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
      }
  
      #[fastrace::trace]
-@@ -759,6 +1105,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -759,6 +1110,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          timeout: &mut Timeout<RT>,
          request_params: ActionRequestParams,
          cancellation: BoxFuture<'_, ()>,
@@ -5511,7 +5535,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
      ) -> anyhow::Result<Result<ConvexValue, JsError>> {
          let handle = isolate.handle();
          scope!(let v8_scope, isolate.scope());
-@@ -767,6 +1114,10 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -767,6 +1119,10 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
              let state = scope.state_mut()?;
              state.environment.provider.initialize(timeout).await?;
          }
@@ -5522,7 +5546,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
          let (path, arguments, _) = request_params.path_and_args.consume();
  
          // Don't allow directly running a UDF within the `_deps` directory. We don't
-@@ -789,7 +1140,13 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -789,7 +1145,13 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          };
  
          let module = match scope
@@ -5537,8 +5561,12 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
              .await?
          {
              Ok(id) => id,
-@@ -1021,7 +1378,12 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
-             state.environment.provider.begin_execution()?;
+@@ -1018,10 +1380,15 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+             // This enforces on database access in the router.
+             // We might relax this to e.g. implement a JavaScript router with
+             // auth middleware which affected the matched route.
+-            state.environment.provider.begin_execution()?;
++            state.environment.provider.begin_execution(timeout).await?;
          }
          let global = scope.get_current_context().global(scope);
 -        let promise_r = scope.with_try_catch(|s| v8_function.call(s, global.into(), v8_args));
@@ -5551,7 +5579,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
          // If we hit a system error within a syscall, return `Err`, even if JS thinks it
          // returned successfully. The syscall layer uses
          // `scope.terminate_execution()` when we hit a system error, which
-@@ -1043,7 +1405,11 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1043,7 +1410,11 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          let result: Result<(), JsError> = loop {
              // Advance the user's promise as far as it can go by draining the microtask
              // queue.
@@ -5564,7 +5592,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
              pump_message_loop(scope);
              scope.record_heap_stats(&handle)?;
              let request_stream_state = scope.state()?.request_stream_state.as_ref();
-@@ -1172,21 +1538,26 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1172,21 +1543,26 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
                              };
                          },
                          TaskResponse::TaskDone { task_id, variant } => {
@@ -5605,7 +5633,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
                          },
                      };
                  },
-@@ -1204,12 +1575,24 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1204,12 +1580,24 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
              timeout.permit = Some(permit);
              handle.check_terminated()?;
          };
@@ -5633,7 +5661,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
      fn dangling_task_counts(&self) -> BTreeMap<String, usize> {
          dangling_task_counts(self.task_promise_resolvers.values().map(|(_, task)| task))
      }
-@@ -1218,12 +1601,12 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1218,12 +1606,12 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          &mut self,
          request: TaskRequestEnum,
          resolver: v8::Global<v8::PromiseResolver>,
@@ -5648,7 +5676,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
      }
  }
  
-@@ -1341,7 +1724,7 @@ pub fn dangling_task_counts<'a>(
+@@ -1341,7 +1729,7 @@ pub fn dangling_task_counts<'a>(
      let mut counts = BTreeMap::new();
      for task in tasks
          .into_iter()
@@ -5657,10 +5685,16 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
      {
          *counts.entry(task.name_when_dangling()).or_default() += 1;
      }
-@@ -1376,6 +1759,32 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
-         self.phase.begin_execution()
+@@ -1372,8 +1760,38 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
+         self.phase.initialize(timeout).await
      }
  
+-    fn begin_execution(&mut self) -> anyhow::Result<()> {
+-        self.phase.begin_execution()
++    async fn begin_execution(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()> {
++        self.phase.begin_execution(timeout).await
++    }
++
 +    fn snoop_context_reads(&mut self) -> anyhow::Result<()> {
 +        self.phase.snoop_reads()
 +    }
@@ -5679,18 +5713,20 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
 +        self.phase.take_context_read_set()
 +    }
 +
++    fn context_reuse_allowed(&self) -> bool {
++        self.phase.context_reuse_allowed()
++    }
++
 +    fn http_action_had_execution_error(&self) -> bool {
 +        self.http_action_had_execution_error
 +    }
 +
 +    fn http_response_is_closed(&self) -> anyhow::Result<bool> {
 +        Ok(self.http_response_streamer()?.sender.is_closed())
-+    }
-+
+     }
+ 
      fn start_task(&mut self, request: TaskRequestEnum) -> anyhow::Result<TaskId> {
-         self.phase.require_executing(&request)?;
-         let task_id = self.next_task_id.increment();
-@@ -1465,6 +1874,7 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
+@@ -1465,6 +1883,7 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
                  }
                  if streamer.total_bytes_sent() + b.len() > HTTP_ACTION_RESPONSE_BODY_LIMIT {
                      self.http_response_too_large = true;
@@ -5698,7 +5734,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
                      let e = JsError::from_message(format!(
                          "HttpResponseTooLarge: HTTP actions support responses up to {}",
                          HTTP_ACTION_RESPONSE_BODY_LIMIT.format_size(BINARY)
-@@ -1483,13 +1893,18 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
+@@ -1483,13 +1902,18 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
                      let _ = streamer.send_part(HttpActionResponsePart::BodyChunk(b))?;
                  }
              },
@@ -5724,7 +5760,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
          };
          Ok(())
      }
-@@ -1602,15 +2017,15 @@ impl<RT: Runtime> OpProvider for ActionSyscallProvider<RT> {
+@@ -1602,15 +2026,15 @@ impl<RT: Runtime> OpProvider for ActionSyscallProvider<RT> {
  }
  
  impl<RT: Runtime> SyscallProvider<RT> for ActionSyscallProvider<RT> {
@@ -5743,7 +5779,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
          Ok(result)
      }
  
-@@ -1634,6 +2049,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> JsEnvironment<RT> for ActionEnviro
+@@ -1634,6 +2058,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> JsEnvironment<RT> for ActionEnviro
          resolver: Self::AsyncResolver,
      ) -> anyhow::Result<()> {
          self.start_task(TaskRequestEnum::AsyncSyscall { name, args }, resolver)
@@ -5751,7 +5787,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
      }
  
      fn start_async_op(
-@@ -1642,6 +2058,47 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> JsEnvironment<RT> for ActionEnviro
+@@ -1642,6 +2067,47 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> JsEnvironment<RT> for ActionEnviro
          resolver: Self::AsyncResolver,
      ) -> anyhow::Result<()> {
          self.start_task(TaskRequestEnum::AsyncOp(request), resolver)
@@ -5800,12 +5836,16 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..ea24bbccc093d42dbd0875292f0cc2f5
  
      fn environment_heap_size(&self) -> usize {
 diff --git a/crates/isolate/src/environment/action/phase.rs b/crates/isolate/src/environment/action/phase.rs
-index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9f1ee1483 100644
+index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..c524ccc855e1ff5f936551ff796457aebdfe5288 100644
 --- a/crates/isolate/src/environment/action/phase.rs
 +++ b/crates/isolate/src/environment/action/phase.rs
-@@ -1,6 +1,10 @@
+@@ -1,6 +1,13 @@
  use std::{
-     collections::BTreeMap,
+-    collections::BTreeMap,
++    collections::{
++        btree_map::Entry,
++        BTreeMap,
++    },
      mem,
 +    ops::{
 +        Deref,
@@ -5814,7 +5854,15 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
      str::FromStr,
      sync::Arc,
      time::Duration,
-@@ -27,6 +31,7 @@ use common::{
+@@ -10,6 +17,7 @@ use anyhow::Context;
+ use common::{
+     bootstrap_model::components::EnvBinding,
+     components::{
++        CanonicalizedComponentModulePath,
+         ComponentId,
+         Reference,
+         Resource,
+@@ -27,6 +35,7 @@ use common::{
  };
  use database::{
      BootstrapComponentsModel,
@@ -5822,19 +5870,33 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
      Transaction,
  };
  use errors::ErrorMetadata;
-@@ -44,7 +49,10 @@ use model::{
+@@ -39,12 +48,20 @@ use model::{
+             EnvVarValue,
+         },
+         EnvironmentVariablesModel,
++        PreloadedEnvironmentVariables,
++        ENVIRONMENT_VARIABLES_TABLE,
+     },
+     modules::{
          types::ModuleMetadata,
          ModuleModel,
      },
 -    source_packages::SourcePackageModel,
 +    source_packages::{
-+        types::SourcePackage,
++        types::{
++            SourcePackage,
++            SourcePackageId,
++        },
 +        SourcePackageModel,
 +    },
      udf_config::UdfConfigModel,
  };
  use parking_lot::Mutex;
-@@ -67,6 +75,10 @@ use value::{
+@@ -64,9 +81,14 @@ use udf::environment::{
+ use value::{
+     identifier::Identifier,
+     ConvexValue,
++    TableNamespace,
  };
  
  use crate::{
@@ -5845,7 +5907,7 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
      environment::{
          action::task::TaskRequestEnum,
          helpers::{
-@@ -110,7 +122,7 @@ struct ComponentEnvCtx {
+@@ -110,7 +132,7 @@ struct ComponentEnvCtx {
  
  enum ActionPreloaded<RT: Runtime> {
      Created {
@@ -5854,16 +5916,20 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
          module_loader: Arc<dyn ModuleCache<RT>>,
          default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
          resources: Arc<Mutex<BTreeMap<Reference, Resource>>>,
-@@ -119,6 +131,8 @@ enum ActionPreloaded<RT: Runtime> {
+@@ -119,6 +141,12 @@ enum ActionPreloaded<RT: Runtime> {
      Preloading,
      Ready {
          module_loader: Arc<dyn ModuleCache<RT>>,
 +        module_metadata: BTreeMap<CanonicalizedModulePath, Arc<ParsedDocument<ModuleMetadata>>>,
-+        source_package: Option<Arc<ParsedDocument<SourcePackage>>>,
++        source_packages: BTreeMap<SourcePackageId, Arc<ParsedDocument<SourcePackage>>>,
++        latest_source_package: Option<Arc<ParsedDocument<SourcePackage>>>,
++        initialization_tx: Option<MaybeSnooped<RT>>,
++        preloaded_user_env_vars: Option<PreloadedEnvironmentVariables>,
++        context_reuse_allowed: bool,
          modules: BTreeMap<
              CanonicalizedModulePath,
              (Arc<ParsedDocument<ModuleMetadata>>, Arc<V8ModuleSource>),
-@@ -129,9 +143,35 @@ enum ActionPreloaded<RT: Runtime> {
+@@ -129,9 +157,35 @@ enum ActionPreloaded<RT: Runtime> {
          rng: Option<ChaCha12Rng>,
          import_time_unix_timestamp: Option<UnixTimestamp>,
          performance_api: Option<PerformanceApi>,
@@ -5899,7 +5965,7 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
  impl<RT: Runtime> ActionPhase<RT> {
      pub fn new(
          rt: RT,
-@@ -147,7 +187,7 @@ impl<RT: Runtime> ActionPhase<RT> {
+@@ -147,7 +201,7 @@ impl<RT: Runtime> ActionPhase<RT> {
              phase: Phase::Importing,
              rt,
              preloaded: ActionPreloaded::Created {
@@ -5908,22 +5974,41 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
                  module_loader,
                  default_system_env_vars,
                  resources,
-@@ -184,29 +224,17 @@ impl<RT: Runtime> ActionPhase<RT> {
+@@ -184,32 +238,53 @@ impl<RT: Runtime> ActionPhase<RT> {
                      .map(|c| ChaCha12Rng::from_seed(c.import_phase_rng_seed));
                  let import_time_unix_timestamp =
                      udf_config.as_ref().map(|c| c.import_phase_unix_timestamp);
 -
-                 let module_metadata = ModuleModel::new(&mut tx)
+-                let module_metadata = ModuleModel::new(&mut tx)
++                // Actions can import after the initialization transaction ends. Keep
++                // their source snapshot, but only imports evaluated during initialization
++                // become resident dependencies. Pending writes must remain visible.
++                let pending_modules = ModuleModel::new(&mut tx).has_pending_module(component_id);
++                let mut snapshot_tx = tx.clone_for_snapshot_query();
++                let preload_tx = if pending_modules {
++                    &mut *tx
++                } else {
++                    &mut snapshot_tx
++                };
++                let module_metadata = ModuleModel::new(preload_tx)
                      .get_all_metadata(component_id)
                      .await?;
-                 let source_package = SourcePackageModel::new(&mut tx, component_id.into())
-                     .get_latest()
-                     .await?;
+-                let source_package = SourcePackageModel::new(&mut tx, component_id.into())
+-                    .get_latest()
+-                    .await?;
 -                let mut modules = BTreeMap::new();
 -                for metadata in module_metadata {
 -                    if metadata.path.is_system() {
 -                        continue;
--                    }
++                let mut source_packages = BTreeMap::new();
++                for metadata in &module_metadata {
++                    if let Entry::Vacant(entry) = source_packages.entry(metadata.source_package_id)
++                    {
++                        let package = SourcePackageModel::new(preload_tx, component_id.into())
++                            .get(metadata.source_package_id)
++                            .await?;
++                        entry.insert(package);
+                     }
 -                    let path = metadata.path.clone();
 -                    let module = module_loader
 -                        .get_module_with_metadata(
@@ -5934,7 +6019,15 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
 -                        )
 -                        .await?;
 -                    modules.insert(path, (metadata, module));
--                }
+                 }
++                let latest_source_package = if pending_modules {
++                    None
++                } else {
++                    source_packages
++                        .values()
++                        .max_by_key(|package| package.creation_time())
++                        .cloned()
++                };
 +                let module_metadata = module_metadata
 +                    .into_iter()
 +                    .filter(|metadata| !metadata.path.is_system())
@@ -5942,24 +6035,71 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
 +                    .collect();
  
                  {
-                     let loaded_resources = ComponentsModel::new(&mut tx)
-@@ -278,15 +306,26 @@ impl<RT: Runtime> ActionPhase<RT> {
-                     )
-                 };
+-                    let loaded_resources = ComponentsModel::new(&mut tx)
++                    // Task resources are only resolved after require_executing.
++                    // Rebuild them per invocation without capturing the complete
++                    // function inventory as an initialization dependency.
++                    let resources_tx = if tx.is_readonly() {
++                        &mut snapshot_tx
++                    } else {
++                        &mut *tx
++                    };
++                    let loaded_resources = ComponentsModel::new(resources_tx)
+                         .preload_resources(component_id)
+                         .await?;
+                     let mut resources = resources.lock();
+@@ -227,8 +302,22 @@ impl<RT: Runtime> ActionPhase<RT> {
+                 let system_env_var_overrides = parse_system_env_var_overrides(canonical_urls)?;
+                 let mut env_vars = default_system_env_vars;
+                 env_vars.extend(system_env_var_overrides);
++                let pending_env_vars = tx
++                    .table_mapping()
++                    .namespace(TableNamespace::Global)
++                    .id_if_exists(&ENVIRONMENT_VARIABLES_TABLE)
++                    .is_some_and(|tablet| tx.has_pending_write(tablet));
++                let mut preloaded_user_env_vars = None;
+                 if self.component.is_root() {
+-                    let user_env_vars = EnvironmentVariablesModel::new(&mut tx).get_all().await?;
++                    preloaded_user_env_vars =
++                        Some(EnvironmentVariablesModel::new(&mut tx).preload().await?);
++                    let user_env_vars = EnvironmentVariablesModel::new(if pending_env_vars {
++                        &mut *tx
++                    } else {
++                        &mut snapshot_tx
++                    })
++                    .get_all()
++                    .await?;
+                     env_vars.extend(user_env_vars);
+                 } else {
+                     // Non-root components with an HTTP prefix see a prefixed
+@@ -258,7 +347,15 @@ impl<RT: Runtime> ActionPhase<RT> {
+                         .await?;
+                     let parent_env_vars =
+                         if env.values().any(|b| matches!(b, EnvBinding::EnvVar(_))) {
+-                            EnvironmentVariablesModel::new(&mut tx).get_all().await?
++                            preloaded_user_env_vars =
++                                Some(EnvironmentVariablesModel::new(&mut tx).preload().await?);
++                            EnvironmentVariablesModel::new(if pending_env_vars {
++                                &mut *tx
++                            } else {
++                                &mut snapshot_tx
++                            })
++                            .get_all()
++                            .await?
+                         } else {
+                             BTreeMap::new()
+                         };
+@@ -280,13 +377,20 @@ impl<RT: Runtime> ActionPhase<RT> {
  
-+                let context_read_set = match tx {
-+                    MaybeSnooped::Tx(_) => None,
-+                    MaybeSnooped::SnoopedTx(snooped_tx) => {
-+                        let (mut tx, read_set) = snooped_tx.finish_snoop();
-+                        ContextCache::capture_context_read_set(read_set, &mut tx).await?
-+                    },
-+                };
-+
                  Ok(ActionPreloaded::Ready {
                      module_loader,
 -                    modules,
 +                    module_metadata,
-+                    source_package,
++                    source_packages,
++                    latest_source_package,
++                    initialization_tx: Some(tx),
++                    preloaded_user_env_vars,
++                    context_reuse_allowed: true,
 +                    modules: BTreeMap::new(),
                      env_vars,
                      component_arguments,
@@ -5967,11 +6107,11 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
                      rng,
                      import_time_unix_timestamp,
                      performance_api: import_time_unix_timestamp.map(PerformanceApi::new),
-+                    context_read_set,
++                    context_read_set: None,
                  })
              })
              .await?;
-@@ -298,34 +337,128 @@ impl<RT: Runtime> ActionPhase<RT> {
+@@ -298,48 +402,190 @@ impl<RT: Runtime> ActionPhase<RT> {
          self.component
      }
  
@@ -6041,6 +6181,16 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
 +            .await
 +    }
 +
++    pub fn context_reuse_allowed(&self) -> bool {
++        matches!(
++            &self.preloaded,
++            ActionPreloaded::Ready {
++                context_reuse_allowed: true,
++                ..
++            }
++        )
++    }
++
 +    pub fn take_context_read_set(&mut self) -> anyhow::Result<Option<ContextReadSet>> {
 +        let ActionPreloaded::Ready {
 +            context_read_set, ..
@@ -6062,7 +6212,10 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
              ref module_loader,
 -            ref modules,
 +            ref module_metadata,
-+            ref source_package,
++            ref source_packages,
++            ref latest_source_package,
++            ref mut initialization_tx,
++            ref mut context_reuse_allowed,
 +            ref mut modules,
              ..
          } = self.preloaded
@@ -6072,6 +6225,25 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
 -        let module = modules.get(&module_path.clone().canonicalize());
  
 -        let Some((module, source)) = module else {
++        if let Some(tx) = initialization_tx {
++            timeout
++                .with_release_permit(PauseReason::LoadModule, async {
++                    // Include missing paths: a caught failed import is still an
++                    // initialization dependency when that module is later published.
++                    ModuleModel::new(tx)
++                        .get_metadata(CanonicalizedComponentModulePath {
++                            component: self.component,
++                            module_path: canonical_path.clone(),
++                        })
++                        .await
++                })
++                .await?;
++        } else {
++            // Handler-time imports observe execution RNG/time and can expand a
++            // warm module map. Never publish that expanded context with its old reads.
++            *context_reuse_allowed = false;
++        }
++
 +        if let Some((module, source)) = modules.get(&canonical_path) {
 +            let code_cache_result = module_loader.clone().code_cache_result(module);
 +            return Ok(Some((source.clone(), code_cache_result)));
@@ -6097,8 +6269,9 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
 +                PauseReason::LoadModule,
 +                module_loader.get_module_with_metadata(
 +                    module_metadata,
-+                    source_package
++                    latest_source_package
 +                        .as_ref()
++                        .or_else(|| source_packages.get(&module_metadata.source_package_id))
 +                        .context("source package not found")?,
 +                ),
 +            )
@@ -6108,7 +6281,72 @@ index 3771c1d06f4d690f23d46be7fd359b2e77ffb2b5..373d61ed0fde358b08d37135e3ac8de9
 +        Ok(Some((source, code_cache_result)))
      }
  
-     pub fn begin_execution(&mut self) -> anyhow::Result<()> {
+-    pub fn begin_execution(&mut self) -> anyhow::Result<()> {
++    pub async fn begin_execution(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()> {
+         if self.phase != Phase::Importing {
+             anyhow::bail!("Phase was already {:?}", self.phase)
+         }
+         let ActionPreloaded::Ready {
+             ref mut rng,
+             ref mut performance_api,
++            ref mut initialization_tx,
++            ref mut context_read_set,
+             ..
+         } = self.preloaded
+         else {
+             anyhow::bail!("Phase not initialized");
+         };
++        let tx = initialization_tx
++            .take()
++            .context("initialization transaction missing")?;
++        if let MaybeSnooped::SnoopedTx(tx) = tx {
++            let (mut tx, reads) = tx.finish_snoop();
++            *context_read_set = timeout
++                .with_release_permit(
++                    PauseReason::UdfInitialize,
++                    ContextCache::capture_context_read_set(reads, &mut tx),
++                )
++                .await?;
++        }
++        // Do not retain a database transaction across external action work.
+         self.phase = Phase::Executing;
+         let rng_seed = self.rt.rng().random();
+         *rng = Some(ChaCha12Rng::from_seed(rng_seed));
+@@ -356,6 +602,8 @@ impl<RT: Runtime> ActionPhase<RT> {
+         let ActionPreloaded::Ready {
+             ref env_vars,
+             ref component_env,
++            ref preloaded_user_env_vars,
++            ref mut initialization_tx,
+             ..
+         } = self.preloaded
+         else {
+@@ -370,10 +618,25 @@ impl<RT: Runtime> ActionPhase<RT> {
+                     return Ok(Some(s.parse()?));
+                 },
+                 EnvBinding::EnvVar(parent_name) => {
++                    if let Some(tx) = initialization_tx {
++                        return preloaded_user_env_vars
++                            .as_ref()
++                            .context("parent environment not preloaded")?
++                            .get(tx, parent_name);
++                    }
+                     return Ok(component_env.parent_env_vars.get(parent_name).cloned());
+                 },
+             }
+         }
++        if self.component.is_root()
++            && let Some(tx) = initialization_tx
++            && let Some(value) = preloaded_user_env_vars
++                .as_ref()
++                .context("root environment not preloaded")?
++                .get(tx, &name)?
++        {
++            return Ok(Some(value));
++        }
+         Ok(env_vars.get(&name).cloned())
+     }
+ 
 diff --git a/crates/isolate/src/environment/action/task.rs b/crates/isolate/src/environment/action/task.rs
 index 6a507ab58c6fe06e5ba690bb6d8df73332833691..c5f138277023bcbee7a5fed259f8fa6ff825c385 100644
 --- a/crates/isolate/src/environment/action/task.rs
@@ -6172,24 +6410,19 @@ index a517d5ca4f7f9519ffb644dfeb0de09d9205113f..029c1c80c0f5d7be3776edb1565ed5e6
              inner.tasks.insert(task_request.task_id, *until);
              inner.running_sleeps.insert(*until);
 diff --git a/crates/isolate/src/environment/analyze.rs b/crates/isolate/src/environment/analyze.rs
-index 513f0f201c6784b7ad79b0a8637188feace34fca..1757f255a7b6bdfdec01c9076558724831259ceb 100644
+index 513f0f201c6784b7ad79b0a8637188feace34fca..7137e1bfe3265f9f8e1b08e6d61cea38beb918d0 100644
 --- a/crates/isolate/src/environment/analyze.rs
 +++ b/crates/isolate/src/environment/analyze.rs
-@@ -57,11 +57,13 @@ use model::{
-         },
-         module_versions::{
-             invalid_function_name_error,
-+            parse_context_initialization_module,
-             AnalyzedFunction,
-             AnalyzedHttpRoute,
+@@ -62,6 +62,8 @@ use model::{
              AnalyzedHttpRoutes,
              AnalyzedModule,
              AnalyzedSourcePosition,
++            ContextInitializationModule,
 +            ContextReusePolicy,
              Visibility,
          },
          user_error::{
-@@ -448,22 +450,59 @@ impl AnalyzeEnvironment {
+@@ -448,22 +450,102 @@ impl AnalyzeEnvironment {
                  None
              });
  
@@ -6219,16 +6452,56 @@ index 513f0f201c6784b7ad79b0a8637188feace34fca..1757f255a7b6bdfdec01c90765587248
 +                    .get(&scope, strings::initializationModule.create(&scope)?.into())
 +                    .context("Failed to read context initialization module")?;
 +                if !initializer.is_undefined() {
-+                    anyhow::ensure!(
-+                        initializer.is_string(),
-+                        ErrorMetadata::bad_request(
-+                            "InvalidContextInitializationModule",
-+                            "Context initialization module must be a string",
-+                        )
++                    let invalid = ErrorMetadata::bad_request(
++                        "InvalidContextInitializationModule",
++                        "Context initialization module must be a canonical path or a version 2 \
++                         object",
 +                    );
-+                    context_initialization_module = Some(parse_context_initialization_module(
-+                        &initializer.to_rust_string_lossy(&scope),
-+                    )?);
++                    // Read only the bounded primitive fields. Untagged serde_v8
++                    // decoding recursively buffers unknown values (including
++                    // cycles), and can panic on a throwing getter. JSON.stringify
++                    // would instead let toJSON replace the policy being validated.
++                    let encoded = if initializer.is_string() {
++                        JsonValue::String(initializer.to_rust_string_lossy(&scope))
++                    } else {
++                        anyhow::ensure!(
++                            initializer.is_object() && !initializer.is_array(),
++                            invalid.clone()
++                        );
++                        let object = initializer.to_object(&scope).context(invalid.clone())?;
++                        let keys = object
++                            .get_own_property_names(&scope, GetPropertyNamesArgs::default())
++                            .context(invalid.clone())?;
++                        anyhow::ensure!(keys.length() <= 3, invalid.clone());
++                        let mut fields = serde_json::Map::new();
++                        for index in 0..keys.length() {
++                            let key = keys.get_index(&scope, index).context(invalid.clone())?;
++                            anyhow::ensure!(key.is_string(), invalid.clone());
++                            let name = key.to_rust_string_lossy(&scope);
++                            anyhow::ensure!(
++                                matches!(name.as_str(), "version" | "database" | "action"),
++                                invalid.clone()
++                            );
++                            let value = object.get(&scope, key).context(invalid.clone())?;
++                            let value = if name == "version" {
++                                anyhow::ensure!(value.is_uint32(), invalid.clone());
++                                JsonValue::from(
++                                    value.uint32_value(&scope).context(invalid.clone())?,
++                                )
++                            } else if value.is_null_or_undefined() {
++                                JsonValue::Null
++                            } else {
++                                anyhow::ensure!(value.is_string(), invalid.clone());
++                                JsonValue::String(value.to_rust_string_lossy(&scope))
++                            };
++                            fields.insert(name, value);
++                        }
++                        JsonValue::Object(fields)
++                    };
++                    context_initialization_module = Some(
++                        serde_json::from_value::<ContextInitializationModule>(encoded)
++                            .context(invalid)?,
++                    );
 +                }
 +                let property = |name: &'static strings::StaticString| -> anyhow::Result<bool> {
 +                    let name = name.create(&scope)?;
@@ -6246,6 +6519,9 @@ index 513f0f201c6784b7ad79b0a8637188feace34fca..1757f255a7b6bdfdec01c90765587248
 +            _ => ContextReusePolicy::default(),
 +        };
  
++        if let Some(initializer) = &context_initialization_module {
++            initializer.validate(context_reuse)?;
++        }
          Ok(Ok(AnalyzedModule {
              functions,
              http_routes,
@@ -6257,7 +6533,7 @@ index 513f0f201c6784b7ad79b0a8637188feace34fca..1757f255a7b6bdfdec01c90765587248
          }))
      }
  }
-@@ -1088,3 +1127,74 @@ fn cron_analyze<RT: Runtime>(
+@@ -1088,3 +1170,75 @@ fn cron_analyze<RT: Runtime>(
  
      Ok(Ok(cron_specs))
  }
@@ -6324,6 +6600,7 @@ index 513f0f201c6784b7ad79b0a8637188feace34fca..1757f255a7b6bdfdec01c90765587248
 +                decoded
 +                    .context_initialization_module
 +                    .as_ref()
++                    .and_then(|p| p.for_type(UdfType::Query))
 +                    .map(|p| p.as_str()),
 +                Some("_deps/context_init.js")
 +            );
@@ -6399,7 +6676,7 @@ index da0070a36971158aecc84a7b7c76eab045df11fb..4433ac9b216905810639e67d868ceda3
          0
 diff --git a/crates/isolate/src/environment/udf/context_reuse_tests.rs b/crates/isolate/src/environment/udf/context_reuse_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..dcb282dc1c4beee14374f0a2b95ddc7f1d2b21c2
+index 0000000000000000000000000000000000000000..3ea3bc07c92d5fdf30f344ed29899ee1e91e330d
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/context_reuse_tests.rs
 @@ -0,0 +1,1348 @@
@@ -7131,7 +7408,7 @@ index 0000000000000000000000000000000000000000..dcb282dc1c4beee14374f0a2b95ddc7f
 +                    }, &Default::default()).await?;
 +                fixture.database.commit_with_write_source(tx, "context_reuse_test").await?;
 +                let (value, _) = fixture.run_action("a.js:run", json!(45), ActionOptions::default()).await?;
-+                assert_eq!(value?, json!(["first", 45.0, 1.0, null]));
++                assert_eq!(value?, json!(["first", 45.0, 2.0, null]));
 +
 +                let (value, retained) = fixture.run_action("a.js:run", json!("fail"), ActionOptions::default()).await?;
 +                assert!(value.is_err());
@@ -10541,7 +10818,7 @@ index 223c5ad42e424872406bc48195e8a01e394786db..6a0457c2a33ff05643e65811f746df03
  
      let application = Application::new(
 diff --git a/crates/model/src/modules/module_versions.rs b/crates/model/src/modules/module_versions.rs
-index b51709ccdfdad81e56a88329b696be85c5834bba..e2a698d4111c92e2f02ff1ab5591f6b8b579e629 100644
+index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c84451a627f55 100644
 --- a/crates/model/src/modules/module_versions.rs
 +++ b/crates/model/src/modules/module_versions.rs
 @@ -5,6 +5,7 @@ use std::{
@@ -10552,7 +10829,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..e2a698d4111c92e2f02ff1ab5591f6b8
  use async_lru::async_lru::SizedValue;
  use common::{
      http::RoutedHttpPath,
-@@ -89,6 +90,76 @@ impl SizedValue for FullModuleSource {
+@@ -89,6 +90,212 @@ impl SizedValue for FullModuleSource {
      }
  }
  
@@ -10626,10 +10903,146 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..e2a698d4111c92e2f02ff1ab5591f6b8
 +    Ok(module)
 +}
 +
++/// A legacy root applies to database UDFs and ordinary actions. Version 2
++/// selects a root for each context class; a missing root means per-entry reuse.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(
++    try_from = "SerializedContextInitializationModule",
++    into = "SerializedContextInitializationModule"
++)]
++pub enum ContextInitializationModule {
++    Legacy(CanonicalizedModulePath),
++    Separate {
++        database: Option<CanonicalizedModulePath>,
++        action: Option<CanonicalizedModulePath>,
++    },
++}
++
++#[derive(Serialize, Deserialize)]
++#[serde(untagged)]
++enum SerializedContextInitializationModule {
++    Legacy(String),
++    Separate(SerializedSeparateContextInitializationModules),
++}
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct SerializedSeparateContextInitializationModules {
++    version: u32,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    database: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    action: Option<String>,
++}
++
++impl TryFrom<SerializedContextInitializationModule> for ContextInitializationModule {
++    type Error = anyhow::Error;
++
++    fn try_from(value: SerializedContextInitializationModule) -> anyhow::Result<Self> {
++        match value {
++            SerializedContextInitializationModule::Legacy(path) => {
++                Ok(Self::Legacy(parse_context_initialization_module(&path)?))
++            },
++            SerializedContextInitializationModule::Separate(value) => Self::separate(
++                value.version,
++                value.database.as_deref(),
++                value.action.as_deref(),
++            ),
++        }
++    }
++}
++
++impl From<ContextInitializationModule> for SerializedContextInitializationModule {
++    fn from(value: ContextInitializationModule) -> Self {
++        match value {
++            ContextInitializationModule::Legacy(path) => Self::Legacy(path.as_str().to_owned()),
++            ContextInitializationModule::Separate { database, action } => {
++                Self::Separate(SerializedSeparateContextInitializationModules {
++                    version: 2,
++                    database: database.map(|path| path.as_str().to_owned()),
++                    action: action.map(|path| path.as_str().to_owned()),
++                })
++            },
++        }
++    }
++}
++
++impl ContextInitializationModule {
++    pub fn separate(
++        version: u32,
++        database: Option<&str>,
++        action: Option<&str>,
++    ) -> anyhow::Result<Self> {
++        anyhow::ensure!(
++            version == 2,
++            ErrorMetadata::bad_request(
++                "InvalidContextInitializationModule",
++                "Unsupported context initialization module version",
++            )
++        );
++        let database = database
++            .map(parse_context_initialization_module)
++            .transpose()?;
++        let action = action
++            .map(parse_context_initialization_module)
++            .transpose()?;
++        anyhow::ensure!(
++            database.is_some() || action.is_some(),
++            ErrorMetadata::bad_request(
++                "InvalidContextInitializationModule",
++                "Version 2 context initialization requires at least one module",
++            )
++        );
++        Ok(Self::Separate { database, action })
++    }
++
++    pub fn validate(&self, policy: ContextReusePolicy) -> anyhow::Result<()> {
++        // Legacy roots were allowed independently of permissions. Preserve that
++        // behavior while rejecting contradictory new metadata at ingress.
++        if let Self::Separate { database, action } = self {
++            anyhow::ensure!(
++                (database.is_some() || action.is_some())
++                    && (database.is_none() || policy.queries || policy.mutations)
++                    && (action.is_none() || policy.actions),
++                ErrorMetadata::bad_request(
++                    "InvalidContextInitializationModule",
++                    "Context initialization modules require their execution-kind reuse permission",
++                )
++            );
++        }
++        Ok(())
++    }
++
++    pub fn for_type(&self, udf_type: UdfType) -> Option<&CanonicalizedModulePath> {
++        match (self, udf_type) {
++            (_, UdfType::HttpAction) => None,
++            (Self::Legacy(path), UdfType::Query | UdfType::Mutation | UdfType::Action) => {
++                Some(path)
++            },
++            (Self::Separate { database, .. }, UdfType::Query | UdfType::Mutation) => {
++                database.as_ref()
++            },
++            (Self::Separate { action, .. }, UdfType::Action) => action.as_ref(),
++        }
++    }
++}
++
++impl HeapSize for ContextInitializationModule {
++    fn heap_size(&self) -> usize {
++        match self {
++            Self::Legacy(path) => path.as_str().len(),
++            Self::Separate { database, action } => {
++                database.as_ref().map_or(0, |path| path.as_str().len())
++                    + action.as_ref().map_or(0, |path| path.as_str().len())
++            },
++        }
++    }
++}
++
  #[derive(Debug, Clone, PartialEq, Eq, Default)]
  pub struct AnalyzedModule {
      pub functions: WithHeapSize<Vec<AnalyzedFunction>>,
-@@ -96,12 +167,15 @@ pub struct AnalyzedModule {
+@@ -96,12 +303,15 @@ pub struct AnalyzedModule {
      pub cron_specs: Option<WithHeapSize<BTreeMap<CronIdentifier, CronSpec>>>,
      /// Index of the module's original source in the source map.
      pub source_index: Option<u32>,
@@ -10644,25 +11057,22 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..e2a698d4111c92e2f02ff1ab5591f6b8
 +    /// non-deterministically leak between executions (e.g. on the global
 +    /// object or module attributes).
 +    pub context_reuse: ContextReusePolicy,
-+    /// A fixed import root for grouped database or ordinary-action contexts.
-+    /// Omission keeps per-entry reuse; the root does not grant any
-+    /// execution-kind permission.
-+    pub context_initialization_module: Option<CanonicalizedModulePath>,
++    /// Import roots for grouped database and ordinary-action contexts.
++    /// Omission keeps per-entry reuse; roots do not grant execution-kind
++    /// permission.
++    pub context_initialization_module: Option<ContextInitializationModule>,
  }
  
  impl HeapSize for AnalyzedModule {
-@@ -110,6 +184,10 @@ impl HeapSize for AnalyzedModule {
+@@ -110,6 +320,7 @@ impl HeapSize for AnalyzedModule {
              + self.http_routes.heap_size()
              + self.cron_specs.heap_size()
              + self.source_index.heap_size()
-+            + self
-+                .context_initialization_module
-+                .as_ref()
-+                .map_or(0, |path| path.as_str().len())
++            + self.context_initialization_module.heap_size()
      }
  }
  
-@@ -120,6 +198,15 @@ pub struct SerializedAnalyzedModule {
+@@ -120,6 +331,15 @@ pub struct SerializedAnalyzedModule {
      http_routes: Option<Vec<SerializedAnalyzedHttpRoute>>,
      cron_specs: Option<Vec<SerializedNamedCronSpec>>,
      source_mapped: Option<SerializedMappedModule>,
@@ -10671,47 +11081,62 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..e2a698d4111c92e2f02ff1ab5591f6b8
 +    #[serde(default, skip_serializing_if = "Option::is_none")]
 +    context_reuse: Option<ContextReusePolicy>,
 +    #[serde(default, skip_serializing_if = "Option::is_none")]
-+    context_initialization_module: Option<String>,
++    context_initialization_module: Option<ContextInitializationModule>,
 +    // Keep the old field for rolling protocol compatibility. Older backends
 +    // ignore `contextReuse`, while newer backends decode this field as the
 +    // legacy database policy when the typed field is absent.
      #[serde(default)]
      #[serde(skip_serializing_if = "std::ops::Not::not")]
      reuse_context: bool,
-@@ -149,7 +236,11 @@ impl TryFrom<AnalyzedModule> for SerializedAnalyzedModule {
+@@ -129,6 +349,9 @@ impl TryFrom<AnalyzedModule> for SerializedAnalyzedModule {
+     type Error = anyhow::Error;
+ 
+     fn try_from(m: AnalyzedModule) -> anyhow::Result<Self> {
++        if let Some(initializer) = &m.context_initialization_module {
++            initializer.validate(m.context_reuse)?;
++        }
+         let source_mapped = m
+             .source_index
+             .as_ref()
+@@ -149,7 +372,9 @@ impl TryFrom<AnalyzedModule> for SerializedAnalyzedModule {
                  .map(|specs| specs.into_iter().map(TryFrom::try_from).try_collect())
                  .transpose()?,
              source_mapped,
 -            reuse_context: m.reuse_context,
 +            context_reuse: Some(m.context_reuse),
-+            context_initialization_module: m
-+                .context_initialization_module
-+                .map(|path| path.as_str().to_owned()),
++            context_initialization_module: m.context_initialization_module,
 +            reuse_context: m.context_reuse.allows_legacy_database_reuse(),
          })
      }
  }
-@@ -178,7 +269,18 @@ impl TryFrom<SerializedAnalyzedModule> for AnalyzedModule {
+@@ -158,6 +383,16 @@ impl TryFrom<SerializedAnalyzedModule> for AnalyzedModule {
+     type Error = anyhow::Error;
+ 
+     fn try_from(m: SerializedAnalyzedModule) -> anyhow::Result<Self> {
++        let context_reuse = m.context_reuse.unwrap_or_else(|| {
++            if m.reuse_context {
++                ContextReusePolicy::database()
++            } else {
++                ContextReusePolicy::default()
++            }
++        });
++        if let Some(initializer) = &m.context_initialization_module {
++            initializer.validate(context_reuse)?;
++        }
+         Ok(Self {
+             functions: m
+                 .functions
+@@ -178,7 +413,8 @@ impl TryFrom<SerializedAnalyzedModule> for AnalyzedModule {
              source_index: m
                  .source_mapped
                  .and_then(|mapped_module| mapped_module.source_index),
 -            reuse_context: m.reuse_context,
-+            context_reuse: m.context_reuse.unwrap_or_else(|| {
-+                if m.reuse_context {
-+                    ContextReusePolicy::database()
-+                } else {
-+                    ContextReusePolicy::default()
-+                }
-+            }),
-+            context_initialization_module: m
-+                .context_initialization_module
-+                .as_deref()
-+                .map(parse_context_initialization_module)
-+                .transpose()?,
++            context_reuse,
++            context_initialization_module: m.context_initialization_module,
          })
      }
  }
-@@ -670,4 +772,103 @@ mod tests {
+@@ -670,4 +906,187 @@ mod tests {
          }
      }
  
@@ -10736,6 +11161,90 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..e2a698d4111c92e2f02ff1ab5591f6b8
 +            module["reuseContext"] = reuse_context.into();
 +        }
 +        module
++    }
++
++    #[test]
++    fn initialization_metadata_round_trips_and_selects_context_class() -> anyhow::Result<()> {
++        use serde_json::json;
++        for (initializer, database, action) in [
++            (
++                json!("_deps/legacy.js"),
++                Some("_deps/legacy.js"),
++                Some("_deps/legacy.js"),
++            ),
++            (
++                json!({"version": 2, "database": "_deps/db.js", "action": "_deps/actions.js"}),
++                Some("_deps/db.js"),
++                Some("_deps/actions.js"),
++            ),
++            (
++                json!({"version": 2, "database": "_deps/db.js"}),
++                Some("_deps/db.js"),
++                None,
++            ),
++            (
++                json!({"version": 2, "action": "_deps/actions.js"}),
++                None,
++                Some("_deps/actions.js"),
++            ),
++        ] {
++            let mut value = empty_serialized_module_with_reuse_fields(
++                Some(json!({
++                    "queries": true, "mutations": true, "actions": true,
++                })),
++                None,
++            );
++            value["contextInitializationModule"] = initializer.clone();
++            let analyzed = AnalyzedModule::try_from(serialized_module(value))?;
++            let module = analyzed.context_initialization_module.as_ref().unwrap();
++            for kind in [UdfType::Query, UdfType::Mutation] {
++                assert_eq!(module.for_type(kind).map(|path| path.as_str()), database);
++            }
++            assert_eq!(
++                module.for_type(UdfType::Action).map(|path| path.as_str()),
++                action
++            );
++            assert!(module.for_type(UdfType::HttpAction).is_none());
++            let encoded =
++                serde_json::to_value(SerializedAnalyzedModule::try_from(analyzed.clone())?)?;
++            assert_eq!(encoded["contextInitializationModule"], initializer);
++            assert_eq!(
++                AnalyzedModule::try_from(serialized_module(encoded))?,
++                analyzed
++            );
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn initialization_metadata_rejects_malformed_or_inconsistent_split_policy() {
++        use serde_json::json;
++        for initializer in [
++            json!({"version": 1, "database": "_deps/db.js"}),
++            json!({"version": 3, "action": "_deps/actions.js"}),
++            json!({"database": "_deps/db.js"}),
++            json!({"version": 2}),
++            json!({"version": 2, "database": "entry.js"}),
++            json!({"version": 2, "action": "_deps/./actions.js"}),
++            json!({"version": 2, "database": false}),
++            json!({"version": 2, "database": "_deps/db.js", "actions": "_deps/actions.js"}),
++        ] {
++            assert!(serde_json::from_value::<ContextInitializationModule>(initializer).is_err());
++        }
++        for (policy, initializer) in [
++            (
++                json!({"actions": true}),
++                json!({"version": 2, "database": "_deps/db.js"}),
++            ),
++            (
++                json!({"queries": true}),
++                json!({"version": 2, "action": "_deps/actions.js"}),
++            ),
++        ] {
++            let mut value = empty_serialized_module_with_reuse_fields(Some(policy), None);
++            value["contextInitializationModule"] = initializer;
++            assert!(AnalyzedModule::try_from(serialized_module(value)).is_err());
++        }
 +    }
 +
 +    #[test]
@@ -10830,10 +11339,10 @@ index 2c722b8c2ec18ff6f0d377c2c3a7e1cb517a152e..5af7b8613dff18af963377a940c60afd
              result.insert(path, module);
          }
 diff --git a/crates/pb/protos/common.proto b/crates/pb/protos/common.proto
-index 6e47db9a428a58826b188daa89d674297b32bac0..781aa03698ed8486b491bddc92c92c50b2e0573b 100644
+index 6e47db9a428a58826b188daa89d674297b32bac0..438987f77a4936ba633eae2bce8d231c415aa6dc 100644
 --- a/crates/pb/protos/common.proto
 +++ b/crates/pb/protos/common.proto
-@@ -4,13 +4,27 @@ package common;
+@@ -4,13 +4,38 @@ package common;
  
  import "google/protobuf/empty.proto";
  
@@ -10843,6 +11352,14 @@ index 6e47db9a428a58826b188daa89d674297b32bac0..781aa03698ed8486b491bddc92c92c50
 +  optional bool mutations = 2;
 +  optional bool actions = 3;
 +  optional bool http_actions = 4;
++}
++
++// Version 2 uses separate host-context classes. Missing paths mean per-entry
++// initialization, never fallback to the other execution kind.
++message ContextInitializationModules {
++  uint32 version = 1;
++  optional string database = 2;
++  optional string action = 3;
 +}
 +
  message ValidatedPathAndArgs {
@@ -10856,12 +11373,15 @@ index 6e47db9a428a58826b188daa89d674297b32bac0..781aa03698ed8486b491bddc92c92c50
    optional bool reuse_context = 6;
 +  // Authoritative when present.
 +  optional ContextReusePolicy context_reuse = 7;
-+  // Fixed import root for database context reuse. Does not grant reuse permission.
++  // Legacy fixed root for database and ordinary-action reuse.
 +  optional string context_initialization_module = 8;
++  // Mutually exclusive with the legacy root. Old consumers ignore this field
++  // and retain per-entry behavior; producers must not also send field 8.
++  optional ContextInitializationModules context_initialization_modules = 9;
  }
  
  message ValidatedHttpPath {
-@@ -18,7 +32,10 @@ message ValidatedHttpPath {
+@@ -18,7 +43,10 @@ message ValidatedHttpPath {
    optional ComponentPath component_path = 22;
    optional string component_id = 3;
    optional string npm_version = 4;
@@ -11065,20 +11585,21 @@ index 8309e206817ade15d508f8df79fc0dc242c4431d..4bbcc9fd9305b84d6aef28883965ae3d
      match &outcome {
          FunctionOutcome::Query(UdfOutcome { result, .. }) => result.is_ok(),
 diff --git a/crates/udf/src/validation.rs b/crates/udf/src/validation.rs
-index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c296369f10f 100644
+index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22b6933062 100644
 --- a/crates/udf/src/validation.rs
 +++ b/crates/udf/src/validation.rs
-@@ -55,7 +55,9 @@ use model::{
+@@ -55,7 +55,10 @@ use model::{
      modules::{
          function_validators::ReturnsValidator,
          module_versions::{
 +            parse_context_initialization_module,
              AnalyzedFunction,
++            ContextInitializationModule,
 +            ContextReusePolicy,
              Visibility,
          },
          ModuleModel,
-@@ -66,7 +68,11 @@ use model::{
+@@ -66,7 +69,11 @@ use model::{
  use rand::Rng;
  use roles::RequireDeploymentOp;
  use serde_json::Value as JsonValue;
@@ -11091,7 +11612,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
  use value::{
      heap_size::HeapSize,
      serialized_args_ext::SerializedArgsExt,
-@@ -83,6 +89,7 @@ use crate::{
+@@ -83,6 +90,7 @@ use crate::{
          validate_pending_udf_args_size,
          validate_udf_args_size,
      },
@@ -11099,7 +11620,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
      ActionOutcome,
      SyscallTrace,
      UdfOutcome,
-@@ -447,15 +454,18 @@ impl VisibilityInfo {
+@@ -447,15 +455,18 @@ impl VisibilityInfo {
  /// - Checking the args size.
  /// - Checking that the args pass validation.
  ///
@@ -11117,11 +11638,11 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
      npm_version: Option<Version>,
 -    reuse_context: bool,
 +    context_reuse: ContextReusePolicy,
-+    context_initialization_module: Option<CanonicalizedModulePath>,
++    context_initialization_module: Option<ContextInitializationModule>,
  }
  
  impl ValidatedPathAndArgs {
-@@ -538,7 +548,8 @@ impl ValidatedPathAndArgs {
+@@ -538,7 +549,8 @@ impl ValidatedPathAndArgs {
                      path,
                      args,
                      npm_version: None,
@@ -11131,7 +11652,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
                  },
                  ReturnsValidator::Unvalidated,
                  visibility_info,
-@@ -626,7 +637,8 @@ impl ValidatedPathAndArgs {
+@@ -626,7 +638,8 @@ impl ValidatedPathAndArgs {
              pending_args_policy,
              analyzed_function,
              udf_version,
@@ -11141,17 +11662,17 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
          )? {
              Ok((validated_udf_path_and_args, visibility_info)) => Ok(Ok((
                  validated_udf_path_and_args,
-@@ -646,7 +658,8 @@ impl ValidatedPathAndArgs {
+@@ -646,7 +659,8 @@ impl ValidatedPathAndArgs {
          pending_args_policy: PendingArgsPolicy,
          analyzed_function: AnalyzedFunction,
          version: Version,
 -        reuse_context: bool,
 +        context_reuse: ContextReusePolicy,
-+        context_initialization_module: Option<CanonicalizedModulePath>,
++        context_initialization_module: Option<ContextInitializationModule>,
      ) -> anyhow::Result<Result<(ValidatedPathAndArgs, VisibilityInfo), JsError>> {
          let visibility_info = VisibilityInfo {
              visibility: analyzed_function.visibility.clone(),
-@@ -718,12 +731,17 @@ impl ValidatedPathAndArgs {
+@@ -718,12 +732,17 @@ impl ValidatedPathAndArgs {
              ))));
          }
  
@@ -11170,16 +11691,17 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
              },
              visibility_info,
          )))
-@@ -759,6 +777,8 @@ impl ValidatedPathAndArgs {
+@@ -759,6 +778,9 @@ impl ValidatedPathAndArgs {
              component_path,
              component_id,
              reuse_context,
 +            context_reuse,
 +            context_initialization_module,
++            context_initialization_modules,
          }: pb::common::ValidatedPathAndArgs,
      ) -> anyhow::Result<Self> {
          let args =
-@@ -768,20 +788,290 @@ impl ValidatedPathAndArgs {
+@@ -768,20 +790,383 @@ impl ValidatedPathAndArgs {
              .context("Missing component_path in proto")?
              .try_into()
              .context("Invalid component path in proto")?;
@@ -11194,6 +11716,31 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
 +                    ContextReusePolicy::default()
 +                }
 +            });
++        anyhow::ensure!(
++            context_initialization_module.is_none() || context_initialization_modules.is_none(),
++            ErrorMetadata::bad_request(
++                "InvalidContextInitializationModule",
++                "Conflicting context initialization modules"
++            )
++        );
++        let initializer = if is_system_module {
++            None
++        } else if let Some(modules) = context_initialization_modules {
++            Some(ContextInitializationModule::separate(
++                modules.version,
++                modules.database.as_deref(),
++                modules.action.as_deref(),
++            )?)
++        } else {
++            context_initialization_module
++                .as_deref()
++                .map(parse_context_initialization_module)
++                .transpose()?
++                .map(ContextInitializationModule::Legacy)
++        };
++        if let Some(initializer) = &initializer {
++            initializer.validate(context_reuse)?;
++        }
          Ok(Self {
              path: ResolvedComponentFunctionPath {
                  component,
@@ -11211,14 +11758,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
 +            } else {
 +                context_reuse
 +            },
-+            context_initialization_module: if is_system_module {
-+                None
-+            } else {
-+                context_initialization_module
-+                    .as_deref()
-+                    .map(parse_context_initialization_module)
-+                    .transpose()?
-+            },
++            context_initialization_module: initializer,
          })
      }
  
@@ -11241,7 +11781,9 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
 +            UdfType::Query | UdfType::Mutation | UdfType::Action
 +        ) && self.reuse_context(udf_type)
 +        {
-+            self.context_initialization_module.as_ref()
++            self.context_initialization_module
++                .as_ref()
++                .and_then(|module| module.for_type(udf_type))
 +        } else {
 +            None
 +        }
@@ -11262,6 +11804,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
 +    use sync_types::types::SerializedArgs;
 +
 +    use super::{
++        ContextInitializationModule,
 +        ContextReusePolicy,
 +        ValidatedHttpPath,
 +        ValidatedPathAndArgs,
@@ -11320,7 +11863,9 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
 +    #[test]
 +    fn grouped_context_protocol_keeps_type_and_system_boundaries() -> anyhow::Result<()> {
 +        let mut value = marked_path_and_args();
-+        value.context_initialization_module = Some("_deps/init.js".parse()?);
++        value.context_initialization_module = Some(ContextInitializationModule::Legacy(
++            "_deps/init.js".parse()?,
++        ));
 +        value.context_reuse.mutations = false;
 +        value.context_reuse.actions = true;
 +        value.context_reuse.http_actions = true;
@@ -11364,6 +11909,76 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
 +                .expect("Malformed initializer path was accepted");
 +            assert!(error.is_bad_request(), "{invalid}");
 +            assert_eq!(error.short_msg(), "InvalidContextInitializationModule");
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn split_context_protocol_selects_roots_and_downgrades_without_cross_kind_fallback(
++    ) -> anyhow::Result<()> {
++        for action in [Some("_deps/actions.js"), None] {
++            let mut value = marked_path_and_args();
++            value.context_reuse.actions = true;
++            value.context_initialization_module = Some(ContextInitializationModule::separate(
++                2,
++                Some("_deps/db.js"),
++                action,
++            )?);
++            let proto: pb::common::ValidatedPathAndArgs = value.try_into()?;
++            assert!(proto.context_initialization_module.is_none());
++            let decoded = ValidatedPathAndArgs::from_proto(proto.clone())?;
++            for kind in [UdfType::Query, UdfType::Mutation] {
++                assert_eq!(
++                    decoded
++                        .context_initialization_module(kind)
++                        .map(|p| p.as_str()),
++                    Some("_deps/db.js")
++                );
++            }
++            assert_eq!(
++                decoded
++                    .context_initialization_module(UdfType::Action)
++                    .map(|p| p.as_str()),
++                action
++            );
++            assert!(decoded
++                .context_initialization_module(UdfType::HttpAction)
++                .is_none());
++            // Old readers drop unknown field 9. Field 8 must stay absent so an
++            // action never loads the database group's additional wrappers.
++            let mut old_reader = proto.clone();
++            old_reader.context_initialization_modules = None;
++            let legacy = ValidatedPathAndArgs::from_proto(old_reader)?;
++            for kind in [UdfType::Query, UdfType::Mutation, UdfType::Action] {
++                assert!(legacy.reuse_context(kind));
++                assert!(legacy.context_initialization_module(kind).is_none());
++            }
++            let mut conflict = proto.clone();
++            conflict.context_initialization_module = Some("_deps/legacy.js".to_owned());
++            assert!(ValidatedPathAndArgs::from_proto(conflict).is_err());
++            let mut system = proto;
++            system.path = Some("_system/internal.js:run".to_owned());
++            let system = ValidatedPathAndArgs::from_proto(system)?;
++            assert!(!system.reuse_context(UdfType::Action));
++            assert!(system
++                .context_initialization_module(UdfType::Query)
++                .is_none());
++        }
++        for (version, database, action) in [
++            (1, Some("_deps/db.js"), None),
++            (2, None, None),
++            (2, Some("entry.js"), None),
++            (2, Some("_deps/db.js"), Some("_deps/../actions.js")),
++            // The base policy grants no action permission.
++            (2, None, Some("_deps/actions.js")),
++        ] {
++            let mut proto: pb::common::ValidatedPathAndArgs = marked_path_and_args().try_into()?;
++            proto.context_initialization_modules = Some(pb::common::ContextInitializationModules {
++                version,
++                database: database.map(str::to_owned),
++                action: action.map(str::to_owned),
++            });
++            assert!(ValidatedPathAndArgs::from_proto(proto).is_err());
 +        }
 +        Ok(())
 +    }
@@ -11474,7 +12089,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
      }
  }
  
-@@ -793,7 +1083,8 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
+@@ -793,9 +1178,28 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
              path,
              args,
              npm_version,
@@ -11483,16 +12098,36 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
 +            context_initialization_module,
          }: ValidatedPathAndArgs,
      ) -> anyhow::Result<Self> {
++        if let Some(initializer) = &context_initialization_module {
++            initializer.validate(context_reuse)?;
++        }
++        let (context_initialization_module, context_initialization_modules) =
++            match context_initialization_module {
++                None => (None, None),
++                Some(ContextInitializationModule::Legacy(path)) => {
++                    (Some(path.as_str().to_owned()), None)
++                },
++                Some(ContextInitializationModule::Separate { database, action }) => (
++                    None,
++                    Some(pb::common::ContextInitializationModules {
++                        version: 2,
++                        database: database.map(|path| path.as_str().to_owned()),
++                        action: action.map(|path| path.as_str().to_owned()),
++                    }),
++                ),
++            };
          let args = args.get().as_bytes().to_vec();
-@@ -804,20 +1095,41 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
+         let component_path = Some(path.component_path.into());
+         Ok(Self {
+@@ -804,20 +1208,41 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
              npm_version: npm_version.map(|v| v.to_string()),
              component_path,
              component_id: path.component.serialize_to_string(),
 -            reuse_context: Some(reuse_context),
 +            reuse_context: Some(context_reuse.allows_legacy_database_reuse()),
 +            context_reuse: Some(context_reuse_policy_to_proto(context_reuse)),
-+            context_initialization_module: context_initialization_module
-+                .map(|path| path.as_str().to_owned()),
++            context_initialization_module,
++            context_initialization_modules,
          })
      }
  }
@@ -11530,7 +12165,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
  }
  
  impl ValidatedHttpPath {
-@@ -851,14 +1163,32 @@ impl ValidatedHttpPath {
+@@ -851,14 +1276,32 @@ impl ValidatedHttpPath {
              Ok(udf_version) => udf_version,
              Err(e) => return Ok(Err(e)),
          };
@@ -11568,7 +12203,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
          }))
      }
  
-@@ -870,13 +1200,20 @@ impl ValidatedHttpPath {
+@@ -870,13 +1313,20 @@ impl ValidatedHttpPath {
          &self.path
      }
  
@@ -11590,7 +12225,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
          }: pb::common::ValidatedHttpPath,
      ) -> anyhow::Result<Self> {
          let component = ComponentId::deserialize_from_string(component_id.as_deref())?;
-@@ -884,14 +1221,25 @@ impl ValidatedHttpPath {
+@@ -884,14 +1334,25 @@ impl ValidatedHttpPath {
              .context("Missing component_path in proto")?
              .try_into()
              .context("Invalid component path in proto")?;
@@ -11618,7 +12253,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
          })
      }
  }
-@@ -903,7 +1251,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+@@ -903,7 +1364,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
          ValidatedHttpPath {
              path,
              npm_version,
@@ -11627,7 +12262,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
          }: ValidatedHttpPath,
      ) -> anyhow::Result<Self> {
          let component_path = Some(path.component_path.into());
-@@ -912,7 +1260,10 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+@@ -912,7 +1373,10 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
              npm_version: npm_version.map(|v| v.to_string()),
              component_path,
              component_id: path.component.serialize_to_string(),
@@ -11639,7 +12274,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
          })
      }
  }
-@@ -1045,6 +1396,41 @@ impl ValidatedUdfOutcome {
+@@ -1045,6 +1509,41 @@ impl ValidatedUdfOutcome {
      }
  }
  
@@ -11681,7 +12316,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
  #[derive(Debug, Clone)]
  pub struct ValidatedActionOutcome {
      pub path: CanonicalizedComponentFunctionPath,
-@@ -1064,11 +1450,14 @@ pub struct ValidatedActionOutcome {
+@@ -1064,11 +1563,14 @@ pub struct ValidatedActionOutcome {
  
  impl ValidatedActionOutcome {
      pub fn new(
@@ -11698,7 +12333,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..45dc76c5bb7dd5d9f212a7f638ba8c29
              path: outcome.path,
              arguments: outcome.arguments,
              identity: outcome.identity,
-@@ -1078,34 +1467,7 @@ impl ValidatedActionOutcome {
+@@ -1078,34 +1580,7 @@ impl ValidatedActionOutcome {
              udf_server_version: outcome.udf_server_version,
              mutation_queue_length: None,
              user_execution_time: outcome.user_execution_time,
@@ -11936,23 +12571,40 @@ index 775c63926d8cc54a03a65cb231b6b55f06183d4d..f0df0ad9d65e4af55a21c9f17b1684b2
  involved, but an older image does not understand the new environment variables or emit the new
 diff --git a/patches/context_reuse/README.md b/patches/context_reuse/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..55297984fee1928b2774e1298d2292b01bc1b461
+index 0000000000000000000000000000000000000000..e227717b19639cb4184c7ef7c59f22b06ea1acab
 --- /dev/null
 +++ b/patches/context_reuse/README.md
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,325 @@
 +# Context Reuse
 +
-+This patch makes V8 context reuse one policy-controlled feature covering queries, mutations, ordinary
-+Convex-runtime actions, and HTTP actions. It keeps one bounded isolate-local cache for all three
-+execution kinds and reinstalls request-owned Rust state on every invocation.
++This patch lets a self-hosted Convex backend keep an initialized V8 JavaScript
++context for later calls, avoiding repeated module evaluation. It supports queries,
++mutations, actions running in the Convex runtime, and HTTP actions. Node.js actions
++use a separate runtime and are outside this patch.
 +
-+The cache is an optimization, not a correctness boundary. Reuse preserves JavaScript module and
-+global state, so an application must opt in only for module graphs that are safe when state survives
-+between executions. The backend does not contain an application module allowlist.
++Module and global state survive reuse; caller identity, transactions, and other
++request state are replaced for every call. Applications must enable reuse only
++when one request cannot leave JavaScript state that changes later requests. Read-only module
++constants can be retained; saving the current caller in a module variable cannot.
++The backend checks lifecycle and initialization dependencies, but it does not
++prove application code is safe to reuse.
++
++Three parts work together:
++
++- This backend patch reads the deployed reuse policy and manages cached contexts.
++- The [CLI bundling patch](https://github.com/convex-in-prod/convex-js/tree/main/patches/default_database_context_reuse)
++  can emit that policy from `convex.json` and group entries that share initialization.
++- The compiler's [context-reuse analyzer](https://github.com/convex-in-prod/convex-wasm-compiler/tree/main#context-reuse-analysis)
++  supplies source-graph and dependency-policy checks for applications adopting reuse.
++
++This feature runs JavaScript in V8. The separate
++[Static Hermes Wasm UDF patch](../static_hermes_wasm_udfs) consumes compiled Wasm
++artifacts; it also uses context-reuse analysis, but has its own runtime and caches.
 +
 +## Application policy
 +
-+An entry module can opt into each execution kind independently:
++An entry module can opt into each execution kind independently. For a manually
++managed policy, export:
 +
 +```js
 +export const experimental_reuseContext = {
@@ -11969,6 +12621,12 @@ index 0000000000000000000000000000000000000000..55297984fee1928b2774e1298d2292b0
 +applicable permission. HTTP actions use the same analyzed module policy and no longer require a
 +startup-time backend permission knob.
 +
++When the CLI emits policy through `bundler.experimentalContextReuse`, configure
++it in `convex.json` instead of also exporting a source marker. The
++[CLI configuration guide](https://github.com/convex-in-prod/convex-js/tree/main/patches/default_database_context_reuse#purpose)
++describes defaults, exclusions, and action selection. The backend receives the
++resulting module policy, not an application allowlist.
++
 +Review the complete static and dynamic import graph before enabling a permission. Do not enable it
 +for code that retains arguments, identities, transactions, documents, request or response objects,
 +callbacks, errors, promises, streams, or other request-derived state in module globals or imported
@@ -11976,11 +12634,29 @@ index 0000000000000000000000000000000000000000..55297984fee1928b2774e1298d2292b0
 +
 +## Grouped initialization
 +
-+The typed policy also accepts `initializationModule: "_deps/context_init_<hash>.js"` for queries,
-+mutations, and ordinary actions. This optional module statically imports a fixed group of entry
-+modules. The backend evaluates that complete graph during cold initialization and uses the
-+initializer path as the cache and scheduler-affinity key within the execution kind. Omission
-+retains per-entry reuse. The field does not grant a reuse permission or change HTTP-action cache keys.
++Grouping lets several entry modules reuse one initialized dependency graph. For
++example, two generated entries that only re-export functions from the same
++shared chunk can use one context instead of retaining a copy per entry.
++
++The typed policy accepts a versioned initializer selection:
++
++```js
++initializationModule: {
++  version: 2,
++  database: "_deps/context_init_<database-hash>.js",
++  action: "_deps/context_init_<action-hash>.js",
++}
++```
++
++Queries and mutations use `database`; ordinary actions use `action`. Each optional module
++statically imports a fixed group of entry modules. A missing path retains per-entry reuse;
++actions never fall back to the database path. At least one path must be present, each must be
++a canonical root-level `_deps/*.js` path, and its execution kind must have reuse permission.
++Unknown versions and fields are rejected during analysis and persistence decoding.
++The backend evaluates the selected graph during cold initialization and uses its path as the
++cache and scheduler-affinity key within the execution kind. The field grants no reuse permission
++and does not change HTTP-action cache keys. The legacy string-valued `initializationModule`
++continues to select the same root for every permitted query, mutation, or ordinary action.
 +
 +A warm invocation must find its original entry already loaded; it cannot expand the group. All
 +member metadata and dependencies participate in the cold initialization read set, including
@@ -11988,39 +12664,57 @@ index 0000000000000000000000000000000000000000..55297984fee1928b2774e1298d2292b0
 +authorization, arguments and logging continue to use the original function path. Components and
 +execution kinds remain separate; concurrent calls can still initialize independent replicas.
 +
-+The companion CLI patch automatically groups forwarding-only outputs with identical ordered
-+static chunk imports under its existing experimental reuse opt-in. The initializer imports those
++The CLI's [shared initialization groups](https://github.com/convex-in-prod/convex-js/tree/main/patches/default_database_context_reuse#shared-initialization-groups)
++automatically group outputs containing only imports and re-exports with identical
++ordered static chunk imports, when reuse is enabled. The initializer imports those
 +entries without rebundling them. This shares an already-common dependency graph while adding only
 +the forwarding entries and policy exports. It does not combine arbitrary modules with different
 +initialization behavior. Group membership and contents determine the generated path. Ordinary
-+action entries are explicitly selected with `experimentalContextReuse.actions.entries`; the CLI
-+partitions groups by action permission, and `actions.grouping: false` keeps selected entries
-+separate. All action exports in each selected module share the permission and retained context.
++action entries are explicitly selected with `bundler.experimentalContextReuse.actions.entries`.
++Database groups include all eligible entries, regardless of action permission. Separate action
++groups include only eligible selected entries. `actions.grouping: false` keeps actions per-entry
++without splitting their database group. All action exports in each selected module share the
++permission and retained context. Database and action contexts remain different classes because
++their retained host callbacks bind different Rust environment state.
 +
-+For database UDFs, grouping adds entry-metadata reads and broadens invalidation. Actions already
-+snapshot all component module metadata and the source package during initialization, so even a
-+change outside the group can invalidate an action resident. Grouping can reduce duplicate contexts;
++For database UDFs and actions, grouping adds entry-metadata reads and broadens invalidation to
++all initialized group members. Actions retain a component source snapshot for later imports,
++but that preload does not make unrelated modules initialization dependencies. Loading a new module
++during an action handler prevents retaining that context. Grouping can reduce duplicate contexts;
 +every member must remain safe for reuse, and count limits still do not imply equal RSS.
++See [selective publication invalidation](selective_invalidation.md) for the separate module,
++runtime-selection and query-result contracts, including the conservative Wasm dependency scope.
 +
-+Older typed-policy backends ignore the initializer and retain per-entry reuse. An upstream backend
-+that accepts only the boolean marker treats the typed object as disabled. Deploy the backend
-+support before adopting grouped output to obtain the optimization.
++The maintained single-root backend rejects an object-valued `initializationModule` during
++analysis. Upgrade it before deploying version 2 output; adding an ignored action-specific sibling
++field to a legacy string would incorrectly initialize database-only wrappers for actions.
++Earlier typed-policy backends that ignore the whole initializer retain per-entry reuse, and
++boolean-only backends treat the typed policy as disabled. Internal protocol producers send split
++roots only in the new versioned field, with the legacy root absent, so old workers retain safe
++per-entry initialization. Persisted version 2 objects cannot be read by the single-root backend;
++restore legacy metadata with a compatible deployment before rolling back that backend.
 +
 +## What is bounded and safe
 +
-+Each isolate retains at most one probationary plus the configured protected number of contexts. The
-+default is five protected residents (`5+1`).
++Each V8 isolate has one context cache. A retained context is called a resident.
++Queries and mutations share the database cache kind; ordinary actions and HTTP
++actions each have a separate kind. All three compete for the same resident budget.
++
++Each isolate retains at most one probationary context plus the configured number
++of protected contexts. New candidates enter the probationary slot; frequency-based
++admission favors repeatedly used contexts in the protected segment. The default
++is five protected residents plus one probationary resident (`5+1`).
 +`ISOLATE_CONTEXT_CACHE_PROTECTED_RESIDENTS_PER_ISOLATE` changes the protected segment; the shared
 +pool bound and optional `ISOLATE_CONTEXT_CACHE_MAX_RESIDENTS` setting are derived and validated by
-+the existing cache-capacity machinery. Database-UDF, ordinary-action, and HTTP-action contexts
-+have distinct cache kinds and cannot alias, but they compete for the same bounded resident budget.
++the existing cache-capacity machinery. Contexts from different kinds cannot alias.
 +
 +Reuse is best effort. A miss creates a fresh context, and cache frequency, memory pressure, worker
 +capacity, isolate recreation, and concurrent use can all prevent retention. The scheduler advertises
 +only resident keys through a thread-safe mirror; V8 roots stay on their owning isolate thread.
 +
-+After taking a resident, the backend validates its initialization read set. Deploys, environment
-+changes, component resources, or other initialization changes therefore force a fresh context.
++Before reusing a context, the backend validates the module metadata, environment,
++and other dependencies read during initialization (its initialization read set).
++Changes to those dependencies force a fresh context.
 +Every request gets fresh identity, transaction, callbacks, streams, task state, and timeout state.
 +Mutation file-download caches also belong to the invocation and are shared with its nested
 +mutations, never retained in a reusable context. Sampled runtime diagnostics distinguish file-storage
@@ -12048,6 +12742,21 @@ index 0000000000000000000000000000000000000000..55297984fee1928b2774e1298d2292b0
 +request signals or controllers in module state. Actual V8 tests cover timer cancellation,
 +late completions, deadline firing and disposal, consumed fetch bodies, and unfinished uploads.
 +
++## V8 shadow executions with Wasm primary
++
++With the [Static Hermes Wasm UDF patch](../static_hermes_wasm_udfs/README.md#primary-and-verifier-modes),
++a Wasm-primary query or mutation can run a V8 shadow execution for comparison.
++That verifier uses the ordinary V8 execution path and the deployed module's
++reuse policy. It can take a valid cached context and retain a context after
++successful execution, subject to the same initialization checks, request cleanup,
++and cache limits as a V8 primary. The verifier role does not force a fresh context
++or create a separate context-cache namespace.
++
++Each verifier still has its own transaction and request state; its writes are
++discarded. These transaction boundaries do not require repeating module
++initialization. Shadow traffic can therefore keep V8 contexts warm, and timing
++comparisons should distinguish initialization misses from reused executions.
++
 +## Adoption and rollback
 +
 +Apply this patch after backend memory resilience and the current isolate scheduler/cache-capacity
@@ -12055,11 +12764,13 @@ index 0000000000000000000000000000000000000000..55297984fee1928b2774e1298d2292b0
 +module-evaluation, cache, isolate-memory, termination, and recreation baselines before enabling
 +application permissions.
 +
-+Roll out the backend first, then enable one reviewed module or execution kind at a time. To roll
-+back semantic reuse, remove the corresponding property (or the legacy marker) and redeploy the
-+module. That prevents future reuse for the disabled kind. Restart backend workers only when
-+immediate disposal of already retained process-local roots is required. There is no backend-wide
-+HTTP reuse switch.
++Roll out the backend first, then enable reviewed modules or execution kinds.
++Disable reuse at the place that supplies the policy: remove the source property
++or marker for a manually managed module, or update the CLI's defaults, exclusions,
++or action selection. Redeploy the affected modules so the backend sees the new
++policy. This prevents future reuse for the disabled kind. Restart backend workers
++only if already retained contexts must be discarded immediately. There is no
++backend-wide HTTP reuse switch.
 +
 +See [the design reference](design_reference.md) for lifecycle ordering, protocol compatibility,
 +metrics, scheduler affinity, cancellation, and interactions with dependency and degradable-query
@@ -12067,8 +12778,9 @@ index 0000000000000000000000000000000000000000..55297984fee1928b2774e1298d2292b0
 +
 +## Non-reusing action placement
 +
-+A V8 or HTTP action without context reuse prefers the most recently completed
-+same-client idle worker with no saved contexts. Its separate fresh context
++A V8 or HTTP action without context reuse prefers an idle worker for the same
++client with no saved contexts, searching from most recently completed (MRU) to
++least recently completed. Its separate fresh context
 +prevents overwriting residents, but running the action on a populated worker
 +would still make those residents unavailable to concurrent requests, including
 +the action's database calls. The search stops at the first empty cache in MRU
@@ -12159,6 +12871,8 @@ index 0000000000000000000000000000000000000000..55297984fee1928b2774e1298d2292b0
 +can also leave the scheduler holding an empty old mirror. Absence of an observed
 +resident is not proof that no busy worker owns one.
 +
++### Sampled runtime diagnostics
++
 +`runtime_attempt_diagnostic` samples queries, mutation attempts and actions at
 +approximately 1/128 eligible attempts, capped at 60 starts per minute and eight
 +concurrent observations. Sampler-lock contention skips observation. Caller records
@@ -12171,7 +12885,6 @@ index 0000000000000000000000000000000000000000..55297984fee1928b2774e1298d2292b0
 +Query result-cache hits do not enter this sampler: use the existing query-cache
 +metrics. An empty observation is not evidence of a cache hit. Nested or paired
 +runtime observers can suppress an outer sample's runtime detail.
-+
 +
 +The record message is `runtime_attempt_diagnostic {JSON}` with `version: 1`.
 +Collectors retaining text can extract the JSON payload; a JSON tracing formatter
@@ -12189,10 +12902,10 @@ index 0000000000000000000000000000000000000000..55297984fee1928b2774e1298d2292b0
 +The log record contains no errors, arguments, results or environment values.
 diff --git a/patches/context_reuse/design_reference.md b/patches/context_reuse/design_reference.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..30e9a8e8e893fae241b8b577f21359e245235190
+index 0000000000000000000000000000000000000000..3f420aca65afe9a71e53041bde6eb672fd688f62
 --- /dev/null
 +++ b/patches/context_reuse/design_reference.md
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,253 @@
 +# Context reuse design reference
 +
 +This note records the implementation contract behind the concise
@@ -12220,20 +12933,55 @@ index 0000000000000000000000000000000000000000..30e9a8e8e893fae241b8b577f21359e2
 +Trusted protocol reconstruction also clears all reuse permissions for system-module paths; system
 +code cannot opt itself into retaining a reusable request context.
 +
-+An optional canonical `_deps` path in the policy's `initializationModule` property is stored in
-+analyzed metadata and carried in `ValidatedPathAndArgs.context_initialization_module`. Its absence
-+means per-entry reuse. Consumers apply it only to a query, mutation, or ordinary action whose
-+corresponding reuse permission is enabled; system paths clear it and HTTP actions ignore it.
-+Older consumers omit or ignore the field and keep their previous per-entry behavior.
++The policy's optional `initializationModule` is either a legacy canonical `_deps` path or a
++version 2 object with optional `database` and `action` paths. The legacy string retains its actual
++behavior: the same root serves every permitted database UDF and ordinary action. Version 2
++selects `database` for queries/mutations and `action` for ordinary actions; an absent path means
++per-entry initialization without cross-kind fallback. Analysis and persistence reject unsupported
++versions, unknown fields, invalid paths, empty selections, and roots without their execution-kind
++permission. The selection is part of analyzed module equality, so policy-only changes invalidate
++module compatibility even when source bytes and package compatibility are unchanged.
++
++The version must be the integer `2`; strings and fractional numbers are rejected.
++Within a version 2 object, absent, `undefined` (JavaScript only), and `null` paths
++all mean per-entry initialization and are persisted with the path omitted. At
++least one non-null path is required. Analysis reads only these primitive fields,
++without invoking `toJSON` or recursively traversing unexpected values. Cycles,
++non-string paths, unknown fields and throwing getters fail analysis. An omitted
++or `undefined` top-level `initializationModule` means no grouped initialization;
++an explicit top-level `null` in the JavaScript policy is invalid. Optional durable
++metadata fields may decode `null` as absence for existing storage compatibility.
++
++`ValidatedPathAndArgs` preserves this selection until the actual execution kind is known. The
++scheduler, cache lookup/publication, and environment initialization all use its same accessor.
++System paths clear reuse and initializer authority; HTTP actions ignore initializer selection.
++The internal protocol's legacy field 8 carries only legacy strings. Version 2 uses field 9
++(`context_initialization_modules`), and consumers reject conflicting fields. Producers leave
++field 8 absent for split selections: an old worker that drops field 9 therefore keeps per-entry
++reuse instead of initializing the database group for an action.
++
++The maintained single-root analyzer rejects non-string `initializationModule` values. Emitting
++the versioned object in that same property makes unsupported deployments fail before publication,
++without a separate capability negotiation. Earlier analyzers that ignore initializers remain
++legacy-safe. Persisted objects also fail decoding on the single-root backend, so a rollback must
++first restore legacy module metadata. The version 2 representation does not permit a mixed
++storage-reader rollout with that backend version.
 +
 +For a group, cold initialization evaluates the initializer inside the existing read-snooping
 +boundary, including every entry's module metadata. Both cold and warm calls require the original
 +entry in that module map. A missing entry fails the invocation and cannot publish a resident.
 +Database UDFs already prohibit handler-time dynamic imports, so warm calls cannot add modules
 +outside the saved initialization read set. No incremental group expansion or read-set merging is
-+needed. Selected ordinary-action graphs must likewise exclude runtime dynamic imports; the action
-+runtime still supports them for fresh execution. Action read validation conservatively covers all
-+component module metadata and the latest source package, including modules outside the group.
++needed. Actions still support handler-time dynamic imports, but loading a module after initialization
++revokes retention for that invocation, including when it started with a warm context. Action source
++preloads use the initialization snapshot without adding a dependency on every module. Point reads
++record the modules actually loaded and user environment names observed during initialization,
++including missing names. Component bindings, canonical URLs and import RNG/time
++configuration remain initialization dependencies. Task resource resolution is only available during
++execution; its full function inventory is rebuilt per invocation without becoming an initialization
++dependency. The initialization transaction ends before the
++handler starts; later imports use the preloaded source snapshot. See
++[selective publication invalidation](selective_invalidation.md) for publication and runtime authority.
 +The initializer path changes cache identity only; the validated function path still owns
 +function selection, visibility, arguments, and request accounting.
 +
@@ -12411,6 +13159,128 @@ index 0000000000000000000000000000000000000000..30e9a8e8e893fae241b8b577f21359e2
 +Removing one property disables new reuse for that kind after redeployment, but already saved roots
 +are process-local. Restart workers for an immediate clean cache. Removing the legacy boolean disables
 +database query/mutation reuse in the same way.
+diff --git a/patches/context_reuse/selective_invalidation.md b/patches/context_reuse/selective_invalidation.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..01c19420f2a1702aa3261df39a3f0394d56531e3
+--- /dev/null
++++ b/patches/context_reuse/selective_invalidation.md
+@@ -0,0 +1,116 @@
++# Selective publication invalidation
++
++Module metadata and runtime activation have separate responsibilities. A module row
++identifies its source and source map, execution environment, analyzed functions,
++reuse permissions and optional initialization group. Publishing a newer package
++preserves that row when these fields are unchanged. For isolate modules, Node
++versions, external dependency packages and Node pool topology are unrelated;
++Node modules retain those package compatibility checks. Wasm and native resident
++generation descriptors belong to the latest source-package activation record and
++do not force unchanged JavaScript module rows to be rewritten.
++
++This uses the existing module-content comparison, not a proof that different
++JavaScript programs are equivalent. Source-map or analyzed-policy changes can
++still invalidate a module even if its successful return values would be equal.
++
++## Runtime authority and query dependencies
++
++Every actual source-keyed Wasm execution selects the exact committed generation
++at its transaction's start timestamp. Source authentication checks the entry
++module and package identity at the same snapshot before execution. Catalog
++selection, cohort selection, retained generation ownership and authentication
++remain required even when code was unchanged by publication. Older transactions
++continue to select their older generation. The source-selection helper uses a
++snapshot clone only when there are no pending module or package writes; otherwise
++it reads through the caller's transaction so standalone and pending publications
++remain visible.
++
++Source authentication rejects pending module-table writes: the persisted package
++digest cannot prove the contents of an independently edited transaction-local
++graph, even when its entry module is unchanged. Normal publication executes
++routes after commit. Ad-hoc packages have no paired generation and select V8;
++pending activation-only records with unchanged module rows can still authenticate.
++
++Activation reads alone do not become query-result dependencies. This relies on
++an explicit execution invariant: authenticated artifacts and engines for unchanged
++JavaScript implement the same application semantics. A generation descriptor is
++execution authority, not application-visible result data. Code, initialization
++configuration, observed environment variables and application data still need
++complete dependency coverage. An explicit application read of deployment metadata
++continues to read the activation record transactionally, so native-resident
++metadata changes still invalidate that observation and participate in OCC.
++
++V8 records the imported module graph through ordinary module reads. Generated
++Wasm artifacts currently authenticate a complete package without exposing a
++validated per-route JavaScript import closure to the query read tracker. Their
++invocations therefore record the full module-metadata index interval as a
++behavioral dependency, without fetching every row. This includes additions and
++deletions and preserves query validity across generation-only publication when
++module metadata is unchanged. **Unrelated module changes still invalidate Wasm
++query results.** Narrowing this scope requires a complete authenticated import
++closure, including negative dependencies; an entry-module hash alone is insufficient.
++This conservative coverage is independent of Wasm resident/cohort cache identity.
++
++The query cache refreshes the complete transaction token before returning a hit;
++subscriptions observe the same indexed read dependencies. A result-cache hit
++executes no function, so it needs no runtime selection or generation authentication.
++Context reuse alone never permits returning a cached query result. Application-data
++writes continue to invalidate results and subscriptions, while leaving an initialized
++context reusable when its initialization inputs did not change.
++
++## Action initialization
++
++Actions preload source metadata and package references at their initialization
++snapshot because later imports must still see that snapshot after the transaction
++ends. Those preload reads are separate from resident validation. The initialization
++transaction records point reads for loaded modules and observed user environment
++names, including absent names. A grouped initializer records every loaded member;
++the entry module, component and execution kind retain their existing contracts.
++Component environment bindings, canonical URLs, component arguments and import-time
++RNG/time configuration remain conservatively tracked. Task resources include the
++full function inventory; they are only resolved during execution and are reloaded
++for each invocation without becoming initialization dependencies.
++
++Before entering an action handler, the backend captures initialization hashes and
++drops the transaction. A successful HTTP response without a matching route also
++finishes initialization. Warm invocations validate and apply the saved read set
++before using their module map; they keep that saved set when retained again.
++Module loading during execution revokes retention for both cold and warm actions:
++new module state may depend on execution-time RNG, time or request state and must
++not be saved with the previous initialization dependencies. Imports of already
++initialized modules do not expand the graph. Fresh request environment values,
++identity, callbacks and task state remain invocation-owned.
++
++Pending module or environment writes use the original transaction where a snapshot
++clone would lose them. These exceptional paths can retain broader dependencies;
++initialization hashes that cannot be captured safely prevent retention.
++
++## Focused regression coverage
++
++The isolate context-reuse tests exercise unchanged-source republication with new
++Wasm/native generation metadata, unrelated modules and unused environment names,
++imported-code changes, actual data-change invalidation, live subscription tokens,
++observed environment absence/presence, action configuration changes, cold/warm
++lazy-import revocation and an action deployment-snapshot race. Existing grouped
++tests cover uncalled members, missing group entries, reuse opt-out, execution-kind
++and component separation, cancellation and response-delivery boundaries.
++
++The generated-source test exercises unchanged module publication, activation
++selection before and after a commit, pending package/module writes, explicit
++deployment-metadata invalidation and conservative dependency additions. These are
++behavior tests requiring the native isolate test build; documentation is not a
++claim that they have been executed or that runtime performance is accepted.
++
++## Execution-kind initializer policy
++
++Analyzed module equality includes the complete initializer selection, including the distinction
++between legacy shared roots and version 2 database/action roots. A policy-only change therefore
++replaces module metadata and invalidates residents that loaded that module, even if its JavaScript
++bytes and package compatibility are unchanged. The stable JavaScript package identity and
++transaction-authenticated runtime selection are unaffected.
++
++Database initialization can include eligible entries both with and without action permission.
++Action initialization loads only its selected action group. Its existing import point reads do
++not include the additional database-only wrappers, so changing one of those wrappers invalidates
++the database resident while preserving an action resident whose loaded graph is unchanged.
++A dependency loaded by both groups, or metadata of an entry in both groups, invalidates both.
 diff --git a/patches/dependency_capacity/design_reference.md b/patches/dependency_capacity/design_reference.md
 index 22fe2ac3f66882be5907f53d3fe6e83069d23244..478f01ad80d6d64b2bed0de7d173628e2656768d 100644
 --- a/patches/dependency_capacity/design_reference.md
