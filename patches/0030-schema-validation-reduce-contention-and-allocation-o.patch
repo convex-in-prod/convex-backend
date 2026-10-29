@@ -1,0 +1,1933 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Thu, 29 Oct 2026 22:27:59 +0800
+Subject: [PATCH 30/31] schema validation: reduce contention and allocation
+ overhead
+
+Keep application writes that fail a pending schema independent of validation
+progress updates. Leave inactive attempt cleanup to bounded worker transactions,
+fence initialization and checkpoints on the owning schema, and preserve staged
+attempts under active schemas. Bound historical schema deletion and retain
+SQLite-backed regressions for both commit orders and schema replacement.
+
+Borrow document object validators instead of cloning the root union per document.
+Share value traversal between ordinary diagnostics and union alternatives whose
+errors are discarded, constructing diagnostic clones and context paths only when
+they will be returned. Preserve acceptance, alternative order, root system-field
+filtering, singleton errors, and final union diagnostics.
+
+Keep the schema worker, lifecycle, attempt ownership, and SQLite test dependency
+in one independently adoptable patch before optional Wasm execution. Document the
+adoption boundary and include validator regressions and an ignored benchmark for
+comparing the same fixtures before and after the allocation optimization.
+---
+ Cargo.lock                                    |   1 +
+ crates/application/Cargo.toml                 |   1 +
+ crates/application/src/schema_worker/mod.rs   | 127 ++++-
+ crates/application/src/schema_worker/tests.rs | 377 ++++++++++++++
+ crates/common/src/schemas/mod.rs              |  27 +-
+ crates/common/src/schemas/tests.rs            | 468 ++++++++++++++++++
+ crates/common/src/schemas/validator.rs        | 176 +++++--
+ .../src/bootstrap_model/schema/mod.rs         | 107 ++--
+ .../bootstrap_model/schema_validations/mod.rs |  69 ++-
+ patches/README.md                             |  13 +
+ .../schema_validation_scalability/README.md   | 118 +++++
+ 11 files changed, 1354 insertions(+), 130 deletions(-)
+ create mode 100644 crates/application/src/schema_worker/tests.rs
+ create mode 100644 crates/common/src/schemas/tests.rs
+ create mode 100644 patches/schema_validation_scalability/README.md
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 47075173900a1531d58969e9d52c33d5a2452026..da955253c650323cef80910750bf1192d5d31510 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -468,6 +468,7 @@ dependencies = [
+  "short_future",
+  "slugify",
+  "smallvec",
++ "sqlite",
+  "storage",
+  "storage_zip_reader",
+  "streaming_export",
+diff --git a/crates/application/Cargo.toml b/crates/application/Cargo.toml
+index 54cb47cad12f179d49eb2a5c0dc05049a67a25c3..290e8985e9c33994845a7cd62dcd74c73161fa64 100644
+--- a/crates/application/Cargo.toml
++++ b/crates/application/Cargo.toml
+@@ -152,6 +152,7 @@ runtime = { workspace = true, features = ["testing"] }
+ search = { workspace = true, features = ["testing"] }
+ search_index_workers = { workspace = true, features = ["testing"] }
+ shape_inference = { workspace = true, features = ["testing"] }
++sqlite = { workspace = true }
+ storage = { workspace = true, features = ["testing"] }
+ storage_zip_reader = { workspace = true, features = ["testing"] }
+ streaming_export = { workspace = true, features = ["testing"] }
+diff --git a/crates/application/src/schema_worker/mod.rs b/crates/application/src/schema_worker/mod.rs
+index 2f33298dd0845a464480136a7f36200f76f546ac..cd5f1107700b42fc16ea33baa689fe99f4c97828 100644
+--- a/crates/application/src/schema_worker/mod.rs
++++ b/crates/application/src/schema_worker/mod.rs
+@@ -41,6 +41,7 @@ use database::{
+     IndexModel,
+     SchemaModel,
+     SchemaValidationModel,
++    SchemasTable,
+     Snapshot,
+     TableShape,
+     TableShapes,
+@@ -49,9 +50,14 @@ use database::{
+     ValidationAttemptUpdate,
+     ValidationState,
+     SCHEMAS_TABLE,
++    SCHEMA_VALIDATIONS_TABLE,
+ };
+ use errors::ErrorMetadataAnyhowExt;
+ use futures::{
++    future::{
++        select,
++        Either,
++    },
+     pin_mut,
+     stream,
+     Future,
+@@ -85,6 +91,9 @@ use crate::metrics::log_worker_starting;
+ 
+ mod metrics;
+ 
++#[cfg(test)]
++mod tests;
++
+ const INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+ const MAX_BACKOFF: Duration = Duration::from_secs(5);
+ const MAX_OCC_FAILURES: u32 = 3;
+@@ -103,6 +112,26 @@ impl WalkConfig {
+     }
+ }
+ 
++const MAX_INACTIVE_VALIDATIONS_PER_TRANSACTION: usize = 32;
++
++async fn exact_schema_is_pending<RT: Runtime>(
++    tx: &mut Transaction<RT>,
++    namespace: TableNamespace,
++    schema_id: ResolvedDocumentId,
++) -> anyhow::Result<bool> {
++    if !tx
++        .table_mapping()
++        .namespace(namespace)
++        .name_exists(&SCHEMAS_TABLE)
++    {
++        return Ok(false);
++    }
++    Ok(tx
++        .get_system::<SchemasTable>(namespace, schema_id.developer_id)
++        .await?
++        .is_some_and(|schema| schema.id() == schema_id && schema.state == SchemaState::Pending))
++}
++
+ #[derive(Clone)]
+ pub struct SchemaWorker<RT: Runtime> {
+     runtime: RT,
+@@ -167,6 +196,8 @@ enum WalkOutcome {
+ 
+ pub struct SchemaValidationResult {
+     pub token: Token,
++    /// Wake for bounded cleanup even when no validation is runnable.
++    pub cleanup_token: Option<Token>,
+     /// Tables scanned for enforced or staged validation, grouped by namespace.
+     pub walked_tables: BTreeMap<TableNamespace, BTreeSet<TableName>>,
+ }
+@@ -185,6 +216,7 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                 let result: anyhow::Result<()> = async {
+                     let SchemaValidationResult {
+                         token,
++                        cleanup_token,
+                         walked_tables,
+                     } = Box::pin(worker.run()).await?;
+                     let num_walked: usize = walked_tables.values().map(|tables| tables.len()).sum();
+@@ -195,10 +227,22 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                             walked_tables.len()
+                         );
+                     }
+-                    worker
+-                        .database
+-                        .subscribe_and_wait_for_invalidation(token)
+-                        .await?;
++                    if let Some(cleanup_token) = cleanup_token {
++                        let schema_invalidation =
++                            worker.database.subscribe_and_wait_for_invalidation(token);
++                        let attempt_invalidation = worker
++                            .database
++                            .subscribe_and_wait_for_invalidation(cleanup_token);
++                        pin_mut!(schema_invalidation, attempt_invalidation);
++                        match select(schema_invalidation, attempt_invalidation).await {
++                            Either::Left((result, _)) | Either::Right((result, _)) => result?,
++                        };
++                    } else {
++                        worker
++                            .database
++                            .subscribe_and_wait_for_invalidation(token)
++                            .await?;
++                    }
+                     Ok(())
+                 }
+                 .await;
+@@ -321,6 +365,7 @@ impl<RT: Runtime> SchemaWorker<RT> {
+         let pending_validations = SchemaWorker::pending_schema_validations(&mut tx).await?;
+         let staged_validations = SchemaWorker::staged_schema_validations(&mut tx).await?;
+         let token = tx.into_token()?;
++        let cleanup_token = self.delete_inactive_schema_validations().await?;
+ 
+         let mut walked_tables: BTreeMap<TableNamespace, BTreeSet<TableName>> = BTreeMap::new();
+         if pending_validations.is_empty() && staged_validations.is_empty() {
+@@ -328,6 +373,7 @@ impl<RT: Runtime> SchemaWorker<RT> {
+             tracing::debug!("SchemaWorker waiting...");
+             return Ok(SchemaValidationResult {
+                 token,
++                cleanup_token: Some(cleanup_token),
+                 walked_tables,
+             });
+         }
+@@ -379,10 +425,56 @@ impl<RT: Runtime> SchemaWorker<RT> {
+         tracing::debug!("SchemaWorker waiting...");
+         Ok(SchemaValidationResult {
+             token,
++            cleanup_token: None,
+             walked_tables,
+         })
+     }
+ 
++    async fn delete_inactive_schema_validations(&self) -> anyhow::Result<Token> {
++        // Discover under a read-only token, then recheck each ID in a separate
++        // bounded write transaction so cleanup does not carry a table-range read.
++        let (inactive, token) = {
++            let mut tx = self.database.begin_system().await?;
++            let mut inactive = BTreeMap::new();
++            let mut remaining = MAX_INACTIVE_VALIDATIONS_PER_TRANSACTION;
++            let namespaces: Vec<_> = tx
++                .table_mapping()
++                .namespaces_for_name(&SCHEMA_VALIDATIONS_TABLE);
++            for namespace in namespaces {
++                if remaining == 0 {
++                    break;
++                }
++                let mapping = tx.table_mapping().namespace(namespace);
++                if !mapping.name_exists(&SCHEMA_VALIDATIONS_TABLE)
++                    || !mapping.name_exists(&SCHEMAS_TABLE)
++                {
++                    continue;
++                }
++                let attempt_ids = SchemaValidationModel::new(&mut tx, namespace)
++                    .inactive_attempt_ids(remaining)
++                    .await?;
++                remaining -= attempt_ids.len();
++                if !attempt_ids.is_empty() {
++                    inactive.insert(namespace, attempt_ids);
++                }
++            }
++            let token = tx.into_token()?;
++            (inactive, token)
++        };
++        for (namespace, attempt_ids) in inactive {
++            let mut tx = self.database.begin_system().await?;
++            let deleted = SchemaValidationModel::new(&mut tx, namespace)
++                .delete_inactive_attempts(&attempt_ids)
++                .await?;
++            if deleted > 0 {
++                self.database
++                    .commit_with_write_source(tx, "schema_validation_attempt_cleanup")
++                    .await?;
++            }
++        }
++        Ok(token)
++    }
++
+     async fn validate_tables(
+         &self,
+         pending_validation: PendingSchemaValidation,
+@@ -405,6 +497,10 @@ impl<RT: Runtime> SchemaWorker<RT> {
+ 
+         let table_mapping = Arc::new(table_mapping.clone());
+         let mut tx = self.database.begin_system().await?;
++        if !exact_schema_is_pending(&mut tx, namespace, id).await? {
++            timer.finish_with("canceled");
++            return Ok(());
++        }
+         let mut progress = SchemaValidationModel::new(&mut tx, namespace);
+         let mut walks = Vec::new();
+         for (table_name, total_docs) in per_table_totals {
+@@ -449,7 +545,8 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                 WalkOutcome::Complete => {},
+                 WalkOutcome::Canceled => return Ok(()),
+                 WalkOutcome::Violation(schema_error) => {
+-                    self.database
++                    let (_, schema_is_failed, _) = self
++                        .database
+                         .execute_with_occ_retries(
+                             Identity::system(),
+                             FunctionUsageTracker::new(),
+@@ -467,12 +564,20 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                             },
+                         )
+                         .await?;
+-                    timer.finish_developer_error();
++                    if schema_is_failed {
++                        timer.finish_developer_error();
++                    } else {
++                        timer.finish_with("canceled");
++                    }
+                     return Ok(());
+                 },
+             }
+         }
+         let mut tx = self.database.begin(Identity::system()).await?;
++        if !exact_schema_is_pending(&mut tx, namespace, id).await? {
++            timer.finish_with("canceled");
++            return Ok(());
++        }
+         if let Err(error) = SchemaModel::new(&mut tx, namespace)
+             .mark_validated(id)
+             .await
+@@ -491,8 +596,8 @@ impl<RT: Runtime> SchemaWorker<RT> {
+         Ok(())
+     }
+ 
+-    /// Validate the staged validators of an Active schema, one table at a
+-    /// time. Each table resolves independently: a violation fails only that
++    /// Validate a schema's staged validators with bounded concurrent table
++    /// walks. Each table resolves independently: a violation fails only that
+     /// table's validation document, and the remaining tables keep validating.
+     /// Returns the tables that were actually walked.
+     async fn validate_staged_tables(
+@@ -796,9 +901,9 @@ impl<RT: Runtime> SchemaWorker<RT> {
+     }
+ }
+ 
+-/// Flush progress to the table's document every 5% of the table or 500
+-/// documents, whichever is smaller, so progress stays fresh without slowing
+-/// validation down with writes.
++/// Require 5% of the table or 500 documents, whichever is smaller, before
++/// flushing progress. The walk also enforces a minimum time between updates
++/// and flushes any remainder before completion.
+ fn progress_update_threshold(total_docs: Option<u64>) -> NonZeroU64 {
+     NonZeroU64::new(
+         total_docs
+diff --git a/crates/application/src/schema_worker/tests.rs b/crates/application/src/schema_worker/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..366652146e35e13fca0761944e40d06eb771ed97
+--- /dev/null
++++ b/crates/application/src/schema_worker/tests.rs
+@@ -0,0 +1,377 @@
++use std::{
++    future::Future,
++    sync::Arc,
++};
++
++use anyhow::Context as _;
++use common::{
++    bootstrap_model::schema::{
++        SchemaMetadata,
++        SchemaState,
++    },
++    db_schema,
++    object_validator,
++    persistence::Persistence,
++    runtime::new_unlimited_rate_limiter,
++    schemas::{
++        validator::{
++            FieldValidator,
++            Validator,
++        },
++        DatabaseSchema,
++        DocumentSchema,
++    },
++    shutdown::ShutdownSignal,
++};
++use database::{
++    Database,
++    SchemaModel,
++    SchemaValidationModel,
++    UserFacingModel,
++    ValidationAttemptUpdate,
++};
++use errors::ErrorMetadataAnyhowExt;
++use indexing::index_cache::IndexCache;
++use keybroker::Identity;
++use runtime::prod::ProdRuntime;
++use search::searcher::SearcherStub;
++use sqlite::SqlitePersistence;
++use value::{
++    ConvexObject,
++    ResolvedDocumentId,
++    TableName,
++    TableNamespace,
++};
++
++use super::{
++    SchemaWorker,
++    WalkConfig,
++};
++
++const TEST_NAMESPACE: TableNamespace = TableNamespace::root_component();
++
++fn run_schema_test<F, Fut>(name: &'static str, test: F) -> anyhow::Result<()>
++where
++    F: FnOnce(ProdRuntime) -> Fut,
++    Fut: Future<Output = anyhow::Result<()>>,
++{
++    let tokio = ProdRuntime::init_tokio()?;
++    let runtime = ProdRuntime::new(&tokio);
++    runtime.block_on(name, test(runtime.clone()))
++}
++
++async fn new_test_database(runtime: ProdRuntime) -> anyhow::Result<Database<ProdRuntime>> {
++    let persistence: Arc<dyn Persistence> = Arc::new(SqlitePersistence::new(":memory:")?);
++    let (deleted_tablet_sender, _deleted_tablet_receiver) = tokio::sync::mpsc::channel(16);
++    let database = Database::load(
++        persistence,
++        runtime.clone(),
++        Arc::new(SearcherStub),
++        ShutdownSignal::panic(),
++        model::virtual_system_mapping().clone(),
++        IndexCache::new(1 << 20).new_handle(),
++        Arc::new(new_unlimited_rate_limiter(runtime)),
++        deleted_tablet_sender,
++        "schema_worker_tests".to_owned(),
++    )
++    .await?;
++    model::initialize_application_system_tables(&database).await?;
++    Ok(database)
++}
++
++async fn submit_active_and_pending_schema(
++    database: &Database<ProdRuntime>,
++    table_name: &TableName,
++) -> anyhow::Result<ResolvedDocumentId> {
++    let mut tx = database.begin_system().await?;
++    let (active_id, active_state) = SchemaModel::new(&mut tx, TEST_NAMESPACE)
++        .submit_pending(db_schema!(table_name => DocumentSchema::Any))
++        .await?;
++    assert_eq!(active_state, SchemaState::Pending);
++    SchemaModel::new(&mut tx, TEST_NAMESPACE)
++        .mark_validated(active_id)
++        .await?;
++    SchemaModel::new(&mut tx, TEST_NAMESPACE)
++        .mark_active(active_id)
++        .await?;
++    let pending_schema: DatabaseSchema = db_schema!(
++        table_name => DocumentSchema::Union(vec![object_validator!(
++            "required" => FieldValidator::required_field_type(Validator::Int64)
++        )]),
++    );
++    let (pending_id, pending_state) = SchemaModel::new(&mut tx, TEST_NAMESPACE)
++        .submit_pending(pending_schema)
++        .await?;
++    assert_eq!(pending_state, SchemaState::Pending);
++    database
++        .commit_with_write_source(tx, "test_schema_setup")
++        .await?;
++    Ok(pending_id)
++}
++
++async fn pending_schema_with_attempt(
++    database: &Database<ProdRuntime>,
++    table_name: &TableName,
++) -> anyhow::Result<(ResolvedDocumentId, ResolvedDocumentId)> {
++    let schema_id = submit_active_and_pending_schema(database, table_name).await?;
++    let mut tx = database.begin_system().await?;
++    let validation_id = SchemaValidationModel::new(&mut tx, TEST_NAMESPACE)
++        .start_table_validation(schema_id, table_name.clone(), None, Some(10))
++        .await?;
++    database
++        .commit_with_write_source(tx, "test_validation_setup")
++        .await?;
++    Ok((schema_id, validation_id))
++}
++
++#[test]
++fn schema_failure_write_commits_after_progress_checkpoint() -> anyhow::Result<()> {
++    run_schema_test(
++        "schema_failure_write_commits_after_progress_checkpoint",
++        |runtime| async move {
++            let database = new_test_database(runtime.clone()).await?;
++            let table_name: TableName = "documents".parse()?;
++            let (schema_id, validation_id) =
++                pending_schema_with_attempt(&database, &table_name).await?;
++
++            // The application transaction stages its schema failure first.
++            let mut application_tx = database.begin(Identity::Unknown(None)).await?;
++            let document_id = UserFacingModel::new(&mut application_tx, TEST_NAMESPACE)
++                .insert(table_name.clone(), ConvexObject::empty())
++                .await?;
++            let local_schema = application_tx
++                .get(schema_id)
++                .await?
++                .context("pending schema disappeared in application transaction")?;
++            let local_schema = SchemaMetadata::try_from(local_schema.into_value().into_value())?;
++            assert!(matches!(local_schema.state, SchemaState::Failed { .. }));
++
++            // A worker checkpoint lands before that application transaction commits.
++            let worker = SchemaWorker {
++                runtime: runtime.clone(),
++                database: database.clone(),
++                walk_config: WalkConfig::new(1),
++            };
++            assert!(
++                worker
++                    .commit_progress_write(
++                        TEST_NAMESPACE,
++                        validation_id,
++                        ValidationAttemptUpdate::RecordProgress {
++                            additional_docs_validated: 1,
++                            total_docs: Some(10)
++                        },
++                        "test_progress_checkpoint",
++                    )
++                    .await?
++            );
++            database
++                .commit_with_write_source(application_tx, "test_schema_failing_write")
++                .await?;
++
++            let mut verify_tx = database.begin_system().await?;
++            let schema = verify_tx
++                .get(schema_id)
++                .await?
++                .context("failed schema disappeared before verification")?;
++            let schema = SchemaMetadata::try_from(schema.into_value().into_value())?;
++            assert!(matches!(schema.state, SchemaState::Failed { .. }));
++            let resolved_document_id =
++                verify_tx.resolve_developer_id(&document_id, TEST_NAMESPACE)?;
++            assert!(verify_tx.get(resolved_document_id).await?.is_some());
++            assert_eq!(
++                SchemaValidationModel::new(&mut verify_tx, TEST_NAMESPACE)
++                    .progress(validation_id)
++                    .await?
++                    .num_docs_validated,
++                1
++            );
++            drop(verify_tx);
++
++            // Failure leaves cleanup to the worker, after the application write.
++            let worker = SchemaWorker {
++                runtime,
++                database: database.clone(),
++                walk_config: WalkConfig::new(1),
++            };
++            worker.delete_inactive_schema_validations().await?;
++            let mut verify_tx = database.begin_system().await?;
++            assert!(SchemaValidationModel::new(&mut verify_tx, TEST_NAMESPACE)
++                .validations_for_schema(schema_id)
++                .await?
++                .is_empty());
++            Ok(())
++        },
++    )
++}
++
++#[test]
++fn stale_progress_checkpoint_loses_to_schema_failure() -> anyhow::Result<()> {
++    run_schema_test(
++        "stale_progress_checkpoint_loses_to_schema_failure",
++        |runtime| async move {
++            let database = new_test_database(runtime).await?;
++            let table_name: TableName = "documents".parse()?;
++            let (schema_id, validation_id) =
++                pending_schema_with_attempt(&database, &table_name).await?;
++
++            let mut stale_checkpoint = database.begin_system().await?;
++            assert!(
++                SchemaValidationModel::new(&mut stale_checkpoint, TEST_NAMESPACE)
++                    .update_attempt(
++                        validation_id,
++                        ValidationAttemptUpdate::RecordProgress {
++                            additional_docs_validated: 1,
++                            total_docs: Some(10),
++                        },
++                    )
++                    .await?
++            );
++
++            let mut application_tx = database.begin(Identity::Unknown(None)).await?;
++            let document_id = UserFacingModel::new(&mut application_tx, TEST_NAMESPACE)
++                .insert(table_name, ConvexObject::empty())
++                .await?;
++            database
++                .commit_with_write_source(application_tx, "test_schema_failing_write")
++                .await?;
++
++            let error = database
++                .commit_with_write_source(stale_checkpoint, "test_stale_schema_checkpoint")
++                .await
++                .expect_err("a checkpoint based on Pending must lose to Failed");
++            assert!(error.is_occ(), "expected OCC, got {error:#}");
++
++            let mut verify_tx = database.begin_system().await?;
++            let schema = verify_tx
++                .get(schema_id)
++                .await?
++                .context("failed schema disappeared before verification")?;
++            let schema = SchemaMetadata::try_from(schema.into_value().into_value())?;
++            assert!(matches!(schema.state, SchemaState::Failed { .. }));
++            let resolved_document_id =
++                verify_tx.resolve_developer_id(&document_id, TEST_NAMESPACE)?;
++            assert!(verify_tx.get(resolved_document_id).await?.is_some());
++            assert_eq!(
++                SchemaValidationModel::new(&mut verify_tx, TEST_NAMESPACE)
++                    .progress(validation_id)
++                    .await?
++                    .num_docs_validated,
++                0
++            );
++            Ok(())
++        },
++    )
++}
++
++#[test]
++fn staged_checkpoint_tracks_schema_ownership() -> anyhow::Result<()> {
++    run_schema_test(
++        "staged_checkpoint_tracks_schema_ownership",
++        |runtime| async move {
++            for activate in [false, true] {
++                let database = new_test_database(runtime.clone()).await?;
++                let table_name: TableName = "documents".parse()?;
++                let mut schema = db_schema!(&table_name => DocumentSchema::Any);
++                schema
++                    .tables
++                    .get_mut(&table_name)
++                    .unwrap()
++                    .staged_document_type = Some(DocumentSchema::Union(vec![object_validator!(
++                    "required" => FieldValidator::required_field_type(Validator::Int64)
++                )]));
++                let mut tx = database.begin_system().await?;
++                let (schema_id, _) = SchemaModel::new(&mut tx, TEST_NAMESPACE)
++                    .submit_pending(schema)
++                    .await?;
++                if activate {
++                    SchemaModel::new(&mut tx, TEST_NAMESPACE)
++                        .mark_validated(schema_id)
++                        .await?;
++                    SchemaModel::new(&mut tx, TEST_NAMESPACE)
++                        .mark_active(schema_id)
++                        .await?;
++                }
++                let attempt_id = SchemaValidationModel::new(&mut tx, TEST_NAMESPACE)
++                    .validation_metadata_for_table(schema_id, &table_name)
++                    .await?
++                    .unwrap()
++                    .id();
++                database
++                    .commit_with_write_source(tx, "test_staged_setup")
++                    .await?;
++
++                let worker = SchemaWorker {
++                    runtime: runtime.clone(),
++                    database: database.clone(),
++                    walk_config: WalkConfig::new(1),
++                };
++                let checkpoint = ValidationAttemptUpdate::RecordProgress {
++                    additional_docs_validated: 1,
++                    total_docs: Some(10),
++                };
++                // An active schema still owns its staged walk; enforced-only guards
++                // would cancel this work and leave staged validation stuck.
++                assert!(
++                    worker
++                        .commit_progress_write(
++                            TEST_NAMESPACE,
++                            attempt_id,
++                            checkpoint.clone(),
++                            "test_active_staged_checkpoint"
++                        )
++                        .await?
++                );
++                let mut stale_checkpoint = database.begin_system().await?;
++                assert!(
++                    SchemaValidationModel::new(&mut stale_checkpoint, TEST_NAMESPACE)
++                        .update_attempt(attempt_id, checkpoint.clone())
++                        .await?
++                );
++
++                let mut replacement = database.begin_system().await?;
++                let (next_id, _) = SchemaModel::new(&mut replacement, TEST_NAMESPACE)
++                    .submit_pending(db_schema!(&table_name => DocumentSchema::Any))
++                    .await?;
++                SchemaModel::new(&mut replacement, TEST_NAMESPACE)
++                    .mark_validated(next_id)
++                    .await?;
++                SchemaModel::new(&mut replacement, TEST_NAMESPACE)
++                    .mark_active(next_id)
++                    .await?;
++                database
++                    .commit_with_write_source(replacement, "test_replace_staged_schema")
++                    .await?;
++                let error = database
++                    .commit_with_write_source(stale_checkpoint, "test_stale_staged_checkpoint")
++                    .await
++                    .expect_err("overwriting the owner must fence a staged checkpoint");
++                assert!(error.is_occ(), "expected OCC, got {error:#}");
++
++                // Replacing a pending schema defers cleanup; active schema
++                // replacement deletes attempts immediately. Both fence proofs.
++                let mut tx = database.begin_system().await?;
++                assert_eq!(tx.get(attempt_id).await?.is_some(), !activate);
++                assert!(
++                    !SchemaValidationModel::new(&mut tx, TEST_NAMESPACE)
++                        .update_attempt(attempt_id, ValidationAttemptUpdate::MarkValid)
++                        .await?
++                );
++                if !activate {
++                    assert_eq!(
++                        SchemaValidationModel::new(&mut tx, TEST_NAMESPACE)
++                            .progress(attempt_id)
++                            .await?
++                            .num_docs_validated,
++                        1
++                    );
++                }
++                drop(tx);
++                worker.delete_inactive_schema_validations().await?;
++                let mut tx = database.begin_system().await?;
++                assert!(tx.get(attempt_id).await?.is_none());
++            }
++            Ok(())
++        },
++    )
++}
+diff --git a/crates/common/src/schemas/mod.rs b/crates/common/src/schemas/mod.rs
+index 9de28d5633fd0e4a0d607b8df4c6fe1d99febe7b..3d1efd12c3aae05c8d19be407738269dd161c4ec 100644
+--- a/crates/common/src/schemas/mod.rs
++++ b/crates/common/src/schemas/mod.rs
+@@ -54,6 +54,9 @@ use crate::{
+ pub mod json;
+ pub mod validator;
+ 
++#[cfg(test)]
++mod tests;
++
+ pub const MAX_INDEXES_PER_TABLE: usize = 64;
+ #[derive(derive_more::Display, Debug, Clone, PartialEq)]
+ pub enum SchemaValidationError {
+@@ -739,30 +742,6 @@ pub enum DocumentSchema {
+ }
+ 
+ impl DocumentSchema {
+-    fn check_value(
+-        &self,
+-        value: &ConvexObject,
+-        table_mapping: &NamespacedTableMapping,
+-        virtual_system_mapping: &VirtualSystemMapping,
+-    ) -> Result<(), ValidationError> {
+-        match self {
+-            DocumentSchema::Any => {},
+-            DocumentSchema::Union(t) => {
+-                let value = value.clone().filter_system_fields();
+-                let schema_type = t
+-                    .iter()
+-                    .map(|obj_schema| Validator::Object(obj_schema.clone()))
+-                    .collect();
+-                Validator::Union(schema_type).check_value(
+-                    &ConvexValue::Object(value),
+-                    table_mapping,
+-                    virtual_system_mapping,
+-                )?;
+-            },
+-        }
+-        Ok(())
+-    }
+-
+     /// Returns `true` when it is sometimes possible to have a field with the
+     /// given path on the document if this table definition is enforced, or
+     /// `false` when it is never possible.
+diff --git a/crates/common/src/schemas/tests.rs b/crates/common/src/schemas/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b267f21c785c8cbfbb72ade3a427cd6dd3432a8
+--- /dev/null
++++ b/crates/common/src/schemas/tests.rs
+@@ -0,0 +1,468 @@
++use std::{
++    hint::black_box,
++    time::Instant,
++};
++
++use value::{
++    obj,
++    val,
++    ConvexObject,
++    ConvexValue,
++    DeveloperDocumentId,
++    InternalId,
++    TableMapping,
++    TableNamespace,
++    TableNumber,
++    TabletId,
++};
++
++use super::{
++    validator::{
++        FieldValidator,
++        FunctionValidator,
++        LiteralValidator,
++        ObjectValidator,
++        ValidationContext,
++        ValidationError,
++        Validator,
++    },
++    DocumentSchema,
++};
++use crate::{
++    object_validator,
++    virtual_system_mapping::VirtualSystemMapping,
++};
++
++#[test]
++fn union_alternatives_preserve_acceptance() -> anyhow::Result<()> {
++    let table_mapping = TableMapping::new().namespace(TableNamespace::root_component());
++    let virtual_mapping = VirtualSystemMapping::default();
++    let object = object_validator!(
++        "required" => FieldValidator::required_field_type(Validator::Int64),
++        "optional" => FieldValidator::optional_field_type(Validator::String),
++    );
++    let validators = vec![
++        Validator::Null,
++        Validator::Float64,
++        Validator::Int64,
++        Validator::CommitTs,
++        Validator::Boolean,
++        Validator::String,
++        Validator::Bytes,
++        Validator::Id("items".parse()?),
++        Validator::Function(FunctionValidator::default()),
++        Validator::Literal(LiteralValidator::Float64(f64::NAN.into())),
++        Validator::Literal(LiteralValidator::Float64((-0.0).into())),
++        Validator::Literal(LiteralValidator::Int64(1)),
++        Validator::Literal(LiteralValidator::Boolean(true)),
++        Validator::Literal(LiteralValidator::String("tag".try_into()?)),
++        Validator::Array(Box::new(Validator::Int64)),
++        Validator::Record(Box::new(Validator::String), Box::new(Validator::Boolean)),
++        Validator::Record(
++            Box::new(Validator::Literal(LiteralValidator::String(
++                "key".try_into()?,
++            ))),
++            Box::new(Validator::Array(Box::new(Validator::Int64))),
++        ),
++        Validator::Object(object.clone()),
++        Validator::Array(Box::new(Validator::Object(object))),
++        Validator::Union(vec![]),
++        Validator::Union(vec![Validator::String]),
++        Validator::Union(vec![Validator::Int64, Validator::String]),
++        Validator::Any,
++    ];
++    let values = vec![
++        val!(null),
++        val!(true),
++        val!(false),
++        val!(1i64),
++        val!(2i64),
++        val!(1.0),
++        val!(0.0),
++        val!(-0.0),
++        ConvexValue::Float64(f64::NAN),
++        val!("tag"),
++        val!("other"),
++        val!("invalid id"),
++        ConvexValue::from(DeveloperDocumentId::MIN),
++        val!(format!("function://{}", DeveloperDocumentId::MIN)),
++        ConvexValue::Bytes(vec![1, 2].try_into()?),
++        val!([]),
++        val!([1i64, 2i64]),
++        val!([1i64, "wrong"]),
++        val!({}),
++        val!({"key" => true}),
++        val!({"key" => [1i64]}),
++        val!({"wrong" => [1i64]}),
++        val!({"required" => 1i64}),
++        val!({"required" => 1i64, "optional" => "present"}),
++        val!({"required" => 1i64, "optional" => false}),
++        val!({"required" => 1i64, "extra" => false}),
++        val!([{"required" => 1i64}]),
++        val!([{"required" => "wrong"}]),
++    ];
++    for validator in validators {
++        // A second impossible alternative exercises validation without diagnostics.
++        let union = Validator::Union(vec![validator.clone(), Validator::Union(vec![])]);
++        for value in &values {
++            assert_eq!(
++                union
++                    .check_value(value, &table_mapping, &virtual_mapping)
++                    .is_ok(),
++                validator
++                    .check_value(value, &table_mapping, &virtual_mapping)
++                    .is_ok(),
++                "validator {validator}, value {value}",
++            );
++        }
++    }
++    Ok(())
++}
++
++#[test]
++fn document_unions_preserve_diagnostics_and_system_fields() -> anyhow::Result<()> {
++    let table_mapping = TableMapping::new().namespace(TableNamespace::root_component());
++    let virtual_mapping = VirtualSystemMapping::default();
++    let first = object_validator!(
++        "kind" => FieldValidator::required_field_type(Validator::Literal(
++            LiteralValidator::String("first".try_into()?),
++        )),
++        "count" => FieldValidator::optional_field_type(Validator::Int64),
++    );
++    let second = object_validator!(
++        "kind" => FieldValidator::required_field_type(Validator::Literal(
++            LiteralValidator::String("second".try_into()?),
++        )),
++    );
++    let documents = vec![
++        obj!()?,
++        obj!("kind" => "first")?,
++        obj!("kind" => "second")?,
++        obj!("kind" => "third")?,
++        obj!("kind" => "first", "count" => "wrong")?,
++        obj!("kind" => "first", "extra" => true)?,
++        obj!("kind" => "first", "_id" => "system field", "_creationTime" => 1.0)?,
++    ];
++    for alternatives in [vec![], vec![first.clone()], vec![first.clone(), second]] {
++        let schema = DocumentSchema::Union(alternatives.clone());
++        let owned_union =
++            Validator::Union(alternatives.into_iter().map(Validator::Object).collect());
++        for document in &documents {
++            assert_eq!(
++                schema.check_value(document, &table_mapping, &virtual_mapping),
++                owned_union.check_value(
++                    &ConvexValue::Object(document.clone().filter_system_fields()),
++                    &table_mapping,
++                    &virtual_mapping,
++                ),
++            );
++            assert!(DocumentSchema::Any
++                .check_value(document, &table_mapping, &virtual_mapping)
++                .is_ok());
++        }
++    }
++    let schema = DocumentSchema::Union(vec![first.clone()]);
++    assert_eq!(
++        schema.check_value(&obj!()?, &table_mapping, &virtual_mapping),
++        Err(ValidationError::MissingRequiredField {
++            object: obj!()?,
++            field_name: "kind".parse()?,
++            object_validator: first.clone(),
++            context: ValidationContext::new(),
++        }),
++    );
++    let extra = obj!("kind" => "first", "extra" => true)?;
++    assert_eq!(
++        schema.check_value(&extra, &table_mapping, &virtual_mapping),
++        Err(ValidationError::ExtraField {
++            object: extra,
++            field_name: "extra".parse()?,
++            object_validator: first,
++            context: ValidationContext::new(),
++        }),
++    );
++    Ok(())
++}
++
++#[test]
++fn system_fields_are_filtered_only_at_document_roots() -> anyhow::Result<()> {
++    let table_mapping = TableMapping::new().namespace(TableNamespace::root_component());
++    let virtual_mapping = VirtualSystemMapping::default();
++    let nested_validator = object_validator!();
++    let root_validator = object_validator!(
++        "nested" => FieldValidator::required_field_type(Validator::Object(nested_validator.clone())),
++    );
++    let schema = DocumentSchema::Union(vec![root_validator.clone()]);
++    let document = obj!("_id" => "root", "nested" => {})?;
++    assert_eq!(
++        schema.check_value(&document, &table_mapping, &virtual_mapping),
++        Ok(()),
++    );
++    assert_eq!(
++        Validator::Object(root_validator.clone()).check_value(
++            &ConvexValue::Object(document.clone()),
++            &table_mapping,
++            &virtual_mapping,
++        ),
++        Err(ValidationError::ExtraField {
++            object: document,
++            field_name: "_id".parse()?,
++            object_validator: root_validator,
++            context: ValidationContext::new(),
++        }),
++    );
++
++    let nested = obj!("_id" => "nested")?;
++    let document = obj!("_id" => "root", "nested" => nested.clone())?;
++    let error = schema
++        .check_value(&document, &table_mapping, &virtual_mapping)
++        .unwrap_err();
++    let ValidationError::ExtraField {
++        object,
++        field_name,
++        object_validator,
++        context,
++    } = &error
++    else {
++        panic!("Unexpected diagnostic: {error}");
++    };
++    assert_eq!(object, &nested);
++    assert_eq!(field_name.to_string(), "_id");
++    assert_eq!(object_validator, &nested_validator);
++    assert_eq!(context.to_string(), "Path: .nested");
++    assert_eq!(
++        error.to_string(),
++        "Object contains extra field `_id` that is not in the validator.\nPath: .nested\nObject: \
++         {_id: \"nested\"}\nValidator: v.object({})",
++    );
++    Ok(())
++}
++
++#[test]
++fn nested_union_diagnostics_preserve_context() -> anyhow::Result<()> {
++    let table_mapping = TableMapping::new().namespace(TableNamespace::root_component());
++    let virtual_mapping = VirtualSystemMapping::default();
++    for alternatives in [
++        vec![],
++        vec![Validator::Int64],
++        vec![Validator::Int64, Validator::Null],
++    ] {
++        let union = Validator::Union(alternatives.clone());
++        let validator = Validator::Object(object_validator!(
++            "items" => FieldValidator::required_field_type(Validator::Array(Box::new(
++                Validator::Record(Box::new(Validator::String), Box::new(union.clone())),
++            ))),
++        ));
++        let error = validator
++            .check_value(
++                &val!({"items" => [{"key" => "wrong"}]}),
++                &table_mapping,
++                &virtual_mapping,
++            )
++            .unwrap_err();
++        let ValidationError::NoMatch {
++            value,
++            validator,
++            context,
++        } = &error
++        else {
++            panic!("Unexpected diagnostic: {error}");
++        };
++        assert_eq!(value, &val!("wrong"));
++        assert_eq!(
++            validator,
++            if alternatives.len() == 1 {
++                &Validator::Int64
++            } else {
++                &union
++            }
++        );
++        assert_eq!(context.to_string(), "Path: .items[0].values()");
++    }
++    let key_validator = Validator::Literal(LiteralValidator::String("allowed".try_into()?));
++    let validator = Validator::Array(Box::new(Validator::Record(
++        Box::new(key_validator),
++        Box::new(Validator::Any),
++    )));
++    let error = validator
++        .check_value(&val!([{"wrong" => true}]), &table_mapping, &virtual_mapping)
++        .unwrap_err();
++    let ValidationError::LiteralValuesDoNotMatch { context, .. } = error else {
++        panic!("Expected a literal mismatch");
++    };
++    assert_eq!(context.to_string(), "Path: [0].keys()");
++
++    let validator = Validator::Array(Box::new(Validator::Object(object_validator!(
++        "required" => FieldValidator::required_field_type(Validator::Int64),
++    ))));
++    for value in [val!([{}]), val!([{"required" => 1i64, "extra" => true}])] {
++        let error = validator
++            .check_value(&value, &table_mapping, &virtual_mapping)
++            .unwrap_err();
++        match error {
++            ValidationError::MissingRequiredField { context, .. } => {
++                assert_eq!(value, val!([{}]));
++                assert_eq!(context.to_string(), "Path: [0]");
++            },
++            ValidationError::ExtraField { context, .. } => {
++                assert_eq!(value, val!([{"required" => 1i64, "extra" => true}]));
++                assert_eq!(context.to_string(), "Path: [0]");
++            },
++            error => panic!("Unexpected diagnostic: {error}"),
++        }
++    }
++    Ok(())
++}
++
++#[test]
++fn id_union_alternatives_preserve_table_checks() -> anyhow::Result<()> {
++    let table_number = TableNumber::try_from(10000u32)?;
++    let id = DeveloperDocumentId::new(table_number, InternalId::MIN);
++    let value = ConvexValue::from(id);
++    let virtual_mapping = VirtualSystemMapping::default();
++    let validator = Validator::Id("items".parse()?);
++    for name in ["items", "other", "_system"] {
++        let mut tables = TableMapping::new();
++        tables.insert(
++            TabletId::MIN,
++            TableNamespace::root_component(),
++            table_number,
++            name.parse()?,
++        );
++        let tables = tables.namespace(TableNamespace::root_component());
++        let result = validator.check_value(&value, &tables, &virtual_mapping);
++        match name {
++            "items" => assert_eq!(result, Ok(())),
++            "other" => assert!(matches!(
++                result,
++                Err(ValidationError::TableNamesDoNotMatch { .. })
++            )),
++            "_system" => assert!(matches!(
++                result,
++                Err(ValidationError::SystemTableReference { .. })
++            )),
++            _ => unreachable!(),
++        }
++        let union = Validator::Union(vec![validator.clone(), Validator::Null]);
++        assert_eq!(
++            union.check_value(&value, &tables, &virtual_mapping).is_ok(),
++            name == "items"
++        );
++    }
++    Ok(())
++}
++
++fn nested_tagged_schema(alternatives: usize) -> anyhow::Result<DocumentSchema> {
++    let payload = ObjectValidator(
++        (0..12)
++            .map(|field| {
++                Ok((
++                    format!("field{field:02}").parse()?,
++                    FieldValidator::required_field_type(Validator::Int64),
++                ))
++            })
++            .collect::<anyhow::Result<_>>()?,
++    );
++    let values = Validator::Array(Box::new(Validator::Object(payload)));
++    let nested = Validator::Union(
++        (0..8)
++            .map(|variant| {
++                anyhow::Ok(Validator::Object(object_validator!(
++                    "kind" => FieldValidator::required_field_type(Validator::Literal(
++                        LiteralValidator::String(format!("nested{variant}").try_into()?),
++                    )),
++                    "values" => FieldValidator::required_field_type(values.clone()),
++                )))
++            })
++            .collect::<anyhow::Result<_>>()?,
++    );
++    Ok(DocumentSchema::Union(
++        (0..alternatives)
++            .map(|variant| {
++                anyhow::Ok(object_validator!(
++                    "kind" => FieldValidator::required_field_type(Validator::Literal(
++                        LiteralValidator::String(format!("variant{variant}").try_into()?),
++                    )),
++                    "payload" => FieldValidator::required_field_type(nested.clone()),
++                ))
++            })
++            .collect::<anyhow::Result<_>>()?,
++    ))
++}
++
++fn tagged_document(variant: usize) -> anyhow::Result<ConvexObject> {
++    let payload = ConvexObject::try_from(
++        (0..12)
++            .map(|field| {
++                Ok((
++                    format!("field{field:02}").parse()?,
++                    ConvexValue::Int64(field),
++                ))
++            })
++            .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()?,
++    )?;
++    obj!(
++        "_id" => "system field",
++        "_creationTime" => 1.0,
++        "kind" => format!("variant{variant}"),
++        "payload" => {"kind" => "nested7", "values" => [payload.clone(), payload]},
++    )
++}
++
++#[test]
++fn nested_tagged_documents_match_each_alternative() -> anyhow::Result<()> {
++    let table_mapping = TableMapping::new().namespace(TableNamespace::root_component());
++    let virtual_mapping = VirtualSystemMapping::default();
++    let schema = nested_tagged_schema(24)?;
++    for variant in 0..24 {
++        assert_eq!(
++            schema.check_value(&tagged_document(variant)?, &table_mapping, &virtual_mapping),
++            Ok(()),
++        );
++    }
++    assert!(schema
++        .check_value(&tagged_document(24)?, &table_mapping, &virtual_mapping)
++        .is_err());
++    assert!(schema
++        .check_value(
++            &obj!("kind" => "variant23", "payload" => {"kind" => "nested7", "values" => [{"field00" => "wrong"}]})?,
++            &table_mapping,
++            &virtual_mapping,
++        )
++        .is_err());
++    Ok(())
++}
++
++#[test]
++#[ignore = "manual timing: run in release mode with --ignored --nocapture"]
++fn benchmark_document_schema_validation() -> anyhow::Result<()> {
++    let table_mapping = TableMapping::new().namespace(TableNamespace::root_component());
++    let virtual_mapping = VirtualSystemMapping::default();
++    // Keep this fixture independent of the validation implementation so it can
++    // be run unchanged before and after changes to the validation traversal.
++    for (name, alternatives, variant) in [("singleton", 1, 0), ("first", 24, 0), ("last", 24, 23)] {
++        let schema = nested_tagged_schema(alternatives)?;
++        let document = tagged_document(variant)?;
++        for _ in 0..100 {
++            schema
++                .check_value(&document, &table_mapping, &virtual_mapping)
++                .unwrap();
++        }
++        let mut samples = Vec::new();
++        for _ in 0..7 {
++            let start = Instant::now();
++            for _ in 0..2000 {
++                black_box(&schema)
++                    .check_value(black_box(&document), &table_mapping, &virtual_mapping)
++                    .unwrap();
++            }
++            samples.push(start.elapsed().as_nanos() / 2000);
++        }
++        samples.sort_unstable();
++        println!(
++            "{name}: median {} ns/document; samples {samples:?}",
++            samples[3]
++        );
++    }
++    Ok(())
++}
+diff --git a/crates/common/src/schemas/validator.rs b/crates/common/src/schemas/validator.rs
+index 0b8b105d28b84def48e76b93cd7bb249d997b4b8..e0bfb2155db31a1721c7040b224da1c0ce0fd7d1 100644
+--- a/crates/common/src/schemas/validator.rs
++++ b/crates/common/src/schemas/validator.rs
+@@ -112,11 +112,11 @@ impl Validator {
+         self.check_value_internal(value, &all_tables_number_to_name)
+     }
+ 
+-    fn check_value_internal(
++    fn check_value_internal<E: ValidationFailure>(
+         &self,
+         value: &ConvexValue,
+         all_tables_number_to_name: &impl Fn(TableNumber) -> anyhow::Result<TableName>,
+-    ) -> Result<(), ValidationError> {
++    ) -> Result<(), E> {
+         match (self, value) {
+             (Validator::Id(validator_table), ConvexValue::String(s)) => {
+                 if let Ok(id) = DeveloperDocumentId::decode(s)
+@@ -124,26 +124,26 @@ impl Validator {
+                 {
+                     if &table_name != validator_table {
+                         if table_name.is_system() {
+-                            return Err(ValidationError::SystemTableReference {
++                            return Err(E::new(|| ValidationError::SystemTableReference {
+                                 id,
+                                 validator_table: validator_table.clone(),
+                                 context: ValidationContext::new(),
+-                            });
++                            }));
+                         } else {
+-                            return Err(ValidationError::TableNamesDoNotMatch {
++                            return Err(E::new(|| ValidationError::TableNamesDoNotMatch {
+                                 id,
+                                 found_table_name: table_name,
+                                 validator_table: validator_table.clone(),
+                                 context: ValidationContext::new(),
+-                            });
++                            }));
+                         }
+                     }
+                 } else {
+-                    return Err(ValidationError::NoMatch {
++                    return Err(E::new(|| ValidationError::NoMatch {
+                         value: value.clone(),
+                         validator: self.clone(),
+                         context: ValidationContext::new(),
+-                    });
++                    }));
+                 }
+             },
+             (Validator::Null, ConvexValue::Null)
+@@ -155,98 +155,73 @@ impl Validator {
+             | (Validator::Bytes, ConvexValue::Bytes(_)) => return Ok(()),
+             (Validator::Function(_), ConvexValue::String(s)) => {
+                 if s.parse::<FunctionHandle>().is_err() {
+-                    return Err(ValidationError::NoMatch {
++                    return Err(E::new(|| ValidationError::NoMatch {
+                         value: value.clone(),
+                         validator: self.clone(),
+                         context: ValidationContext::new(),
+-                    });
++                    }));
+                 }
+                 return Ok(());
+             },
+             (Validator::Literal(literal), value) => {
+                 let literal_as_value: ConvexValue = literal.clone().into();
+                 if value != &literal_as_value {
+-                    return Err(ValidationError::LiteralValuesDoNotMatch {
++                    return Err(E::new(|| ValidationError::LiteralValuesDoNotMatch {
+                         value: value.clone(),
+                         literal_validator: literal.clone(),
+                         context: ValidationContext::new(),
+-                    });
++                    }));
+                 }
+             },
+             (Validator::Array(t), ConvexValue::Array(v)) => {
+                 for (i, elt) in v.into_iter().enumerate() {
+-                    t.check_value_internal(elt, all_tables_number_to_name)
+-                        .map_err(|e| e.with_context(format!("[{i}]")))?;
++                    t.check_value_internal::<E>(elt, all_tables_number_to_name)
++                        .map_err(|e| e.with_context(|| format!("[{i}]")))?;
+                 }
+             },
+             (Validator::Record(key_type, value_type), ConvexValue::Object(object)) => {
+                 for (key, value) in object.iter() {
+                     key_type
+-                        .check_value_internal(
++                        .check_value_internal::<E>(
+                             &ConvexValue::from(key.clone()),
+                             all_tables_number_to_name,
+                         )
+-                        .map_err(|e| e.with_context(".keys()".to_string()))?;
++                        .map_err(|e| e.with_context(|| ".keys()".to_string()))?;
+                     value_type
+-                        .check_value_internal(value, all_tables_number_to_name)
+-                        .map_err(|e| e.with_context(".values()".to_string()))?;
++                        .check_value_internal::<E>(value, all_tables_number_to_name)
++                        .map_err(|e| e.with_context(|| ".values()".to_string()))?;
+                 }
+             },
+             (Validator::Object(object_validator), ConvexValue::Object(object)) => {
+-                for (field_name, field_type) in &object_validator.0 {
+-                    let maybe_value = object.get::<str>(field_name.borrow());
+-                    if let Some(value) = maybe_value {
+-                        field_type
+-                            .validator
+-                            .check_value_internal(value, all_tables_number_to_name)
+-                            .map_err(|e| e.with_context(format!(".{field_name}")))?
+-                    } else if !field_type.optional {
+-                        return Err(ValidationError::MissingRequiredField {
+-                            object: object.clone(),
+-                            field_name: field_name.clone(),
+-                            object_validator: object_validator.clone(),
+-                            context: ValidationContext::new(),
+-                        });
+-                    }
+-                }
+-                for field in object.keys() {
+-                    if !object_validator.0.contains_key::<str>(field.borrow()) {
+-                        return Err(ValidationError::ExtraField {
+-                            object: object.clone(),
+-                            field_name: field.clone(),
+-                            object_validator: object_validator.clone(),
+-                            context: ValidationContext::new(),
+-                        });
+-                    }
+-                }
++                return object_validator.check_value_internal(object, all_tables_number_to_name);
+             },
+             (Validator::Union(validators), value) => {
+                 if validators.len() == 1 {
+                     return validators[0].check_value_internal(value, all_tables_number_to_name);
+                 }
+ 
+-                // TODO: This is dropping the error messages from the individual
+-                // validators. Maybe we should combine them if this fails?
++                // Only the union's error is returned, so do not construct diagnostics
++                // for alternatives that fail before a later alternative matches.
+                 for t in validators {
+-                    if t.check_value_internal(value, all_tables_number_to_name)
++                    if t.check_value_internal::<()>(value, all_tables_number_to_name)
+                         .is_ok()
+                     {
+                         return Ok(());
+                     }
+                 }
+-                return Err(ValidationError::NoMatch {
++                return Err(E::new(|| ValidationError::NoMatch {
+                     value: value.clone(),
+                     validator: self.clone(),
+                     context: ValidationContext::new(),
+-                });
++                }));
+             },
+             (Validator::Any, _) => return Ok(()),
+             (..) => {
+-                return Err(ValidationError::NoMatch {
++                return Err(E::new(|| ValidationError::NoMatch {
+                     value: value.clone(),
+                     validator: self.clone(),
+                     context: ValidationContext::new(),
+-                })
++                }))
+             },
+         };
+         Ok(())
+@@ -822,9 +797,7 @@ impl TryFrom<ConvexValue> for LiteralValidator {
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+-pub struct ObjectValidator(
+-    pub BTreeMap<IdentifierFieldName, FieldValidator>,
+-);
++pub struct ObjectValidator(pub BTreeMap<IdentifierFieldName, FieldValidator>);
+ 
+ #[macro_export]
+ macro_rules! object_validator {
+@@ -854,6 +827,40 @@ pub enum AddTopLevelFields {
+ }
+ 
+ impl ObjectValidator {
++    fn check_value_internal<E: ValidationFailure>(
++        &self,
++        object: &ConvexObject,
++        all_tables_number_to_name: &impl Fn(TableNumber) -> anyhow::Result<TableName>,
++    ) -> Result<(), E> {
++        for (field_name, field_type) in &self.0 {
++            let maybe_value = object.get::<str>(field_name.borrow());
++            if let Some(value) = maybe_value {
++                field_type
++                    .validator
++                    .check_value_internal::<E>(value, all_tables_number_to_name)
++                    .map_err(|e| e.with_context(|| format!(".{field_name}")))?
++            } else if !field_type.optional {
++                return Err(E::new(|| ValidationError::MissingRequiredField {
++                    object: object.clone(),
++                    field_name: field_name.clone(),
++                    object_validator: self.clone(),
++                    context: ValidationContext::new(),
++                }));
++            }
++        }
++        for field in object.keys() {
++            if !self.0.contains_key::<str>(field.borrow()) {
++                return Err(E::new(|| ValidationError::ExtraField {
++                    object: object.clone(),
++                    field_name: field.clone(),
++                    object_validator: self.clone(),
++                    context: ValidationContext::new(),
++                }));
++            }
++        }
++        Ok(())
++    }
++
+     pub fn has_validator_for_system_field(&self) -> bool {
+         let fields = &self.0;
+         fields.keys().any(|f| f.is_system())
+@@ -912,6 +919,43 @@ impl ObjectValidator {
+     }
+ }
+ 
++impl DocumentSchema {
++    pub(super) fn check_value(
++        &self,
++        value: &ConvexObject,
++        table_mapping: &NamespacedTableMapping,
++        virtual_system_mapping: &VirtualSystemMapping,
++    ) -> Result<(), ValidationError> {
++        let validators = match self {
++            DocumentSchema::Any => return Ok(()),
++            DocumentSchema::Union(validators) => validators,
++        };
++        let value = value.clone().filter_system_fields();
++        let all_tables_number_to_name =
++            all_tables_number_to_name(table_mapping, virtual_system_mapping);
++        if let [validator] = validators.as_slice() {
++            return validator.check_value_internal(&value, &all_tables_number_to_name);
++        }
++        for validator in validators {
++            if validator
++                .check_value_internal::<()>(&value, &all_tables_number_to_name)
++                .is_ok()
++            {
++                return Ok(());
++            }
++        }
++        // Borrow the schema during successful checks; materialize the union only
++        // when it is needed for the existing diagnostic format.
++        Err(ValidationError::NoMatch {
++            value: ConvexValue::Object(value),
++            validator: Validator::Union(
++                validators.iter().cloned().map(Validator::Object).collect(),
++            ),
++            context: ValidationContext::new(),
++        })
++    }
++}
++
+ /// Object fields can be optional.
+ #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+ pub struct FieldValidator {
+@@ -1033,3 +1077,27 @@ impl ValidationError {
+         self
+     }
+ }
++
++// Both modes use the same traversal so acceptance cannot diverge. Union
++// alternatives use `()` to skip cloning rejected values and validators, and to
++// skip formatting context paths that would immediately be discarded.
++trait ValidationFailure: Sized {
++    fn new(error: impl FnOnce() -> ValidationError) -> Self;
++    fn with_context(self, context: impl FnOnce() -> String) -> Self;
++}
++
++impl ValidationFailure for ValidationError {
++    fn new(error: impl FnOnce() -> ValidationError) -> Self {
++        error()
++    }
++
++    fn with_context(self, context: impl FnOnce() -> String) -> Self {
++        self.with_context(context())
++    }
++}
++
++impl ValidationFailure for () {
++    fn new(_error: impl FnOnce() -> ValidationError) -> Self {}
++
++    fn with_context(self, _context: impl FnOnce() -> String) -> Self {}
++}
+diff --git a/crates/database/src/bootstrap_model/schema/mod.rs b/crates/database/src/bootstrap_model/schema/mod.rs
+index 1be7ee0c4a4a0fc2fe02062772578b67d3a99e54..38c58186bf37ef11d9d00f02addf3f94a36407da 100644
+--- a/crates/database/src/bootstrap_model/schema/mod.rs
++++ b/crates/database/src/bootstrap_model/schema/mod.rs
+@@ -62,6 +62,7 @@ pub static SCHEMA_STATE_FIELD: LazyLock<FieldPath> =
+     LazyLock::new(|| "state".parse().expect("invalid state field"));
+ 
+ const MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS: Duration = Duration::from_secs(60 * 60); // 1 hour
++const MAX_SCHEMA_HISTORY_DELETIONS_PER_TRANSACTION: usize = 32;
+ 
+ pub struct SchemasTable;
+ impl SystemTable for SchemasTable {
+@@ -145,7 +146,10 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+                 if let Err(enforcement_error) =
+                     in_progress_schema.check_delete_table(active_table_to_delete)
+                 {
+-                    self.mark_failed(id, enforcement_error.into()).await?;
++                    anyhow::ensure!(
++                        self.mark_failed(id, enforcement_error.into()).await?,
++                        "In-progress schema changed state within one enforcement transaction"
++                    );
+                 }
+             },
+             (Some(_), Some(_)) => {
+@@ -196,7 +200,10 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+                     table_mapping_for_schema,
+                     self.tx.virtual_system_mapping(),
+                 ) {
+-                    self.mark_failed(id, enforcement_error.into()).await?;
++                    anyhow::ensure!(
++                        self.mark_failed(id, enforcement_error.into()).await?,
++                        "In-progress schema changed state within one enforcement transaction"
++                    );
+                 }
+                 // Staged validation runs from the moment a schema is
+                 // submitted, so its validations need the same write checks
+@@ -514,20 +521,18 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+     }
+ 
+     #[async_recursion]
+-    /// Mark pending or validated schemas as failed. Error if the schema is
+-    /// already active, and do nothing if it is already overwritten or failed.
++    /// Mark pending or validated schemas as failed. Return false if a worker's
++    /// schema was overwritten or removed before its failure transaction began.
+     pub async fn mark_failed(
+         &mut self,
+         document_id: ResolvedDocumentId,
+         error: SchemaValidationError,
+-    ) -> anyhow::Result<()> {
+-        let doc = self
+-            .tx
+-            .get(document_id)
+-            .await?
+-            .context("Schema to mark as failed must exist.")?;
++    ) -> anyhow::Result<bool> {
++        let Some(doc) = self.tx.get(document_id).await? else {
++            return Ok(false);
++        };
+         let schema = SchemaMetadata::try_from(doc.into_value().into_value())?;
+-        match schema.state {
++        let schema_is_failed = match schema.state {
+             SchemaState::Pending | SchemaState::Validated => {
+                 let error_message = error.to_string();
+                 let table_name = match error {
+@@ -551,16 +556,18 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+                         )?,
+                     )
+                     .await?;
++                true
+             },
+             SchemaState::Active => {
+                 anyhow::bail!("Active schemas cannot be marked as failed.")
+             },
+-            SchemaState::Failed { .. } | SchemaState::Overwritten => {},
+-        }
+-        self.delete_old_failed_and_overwritten_schemas().await?;
+-        let mut model = SchemaValidationModel::new(self.tx, self.namespace);
+-        model.delete_validations_for_schema(document_id).await?;
+-        Ok(())
++            SchemaState::Failed { .. } => true,
++            SchemaState::Overwritten => false,
++        };
++        // Application writes can fail a pending schema. Keep validation progress
++        // out of that transaction; the schema worker fences its checkpoints on
++        // this state and removes the canceled attempts separately.
++        Ok(schema_is_failed)
+     }
+ 
+     pub async fn overwrite_all(&mut self) -> anyhow::Result<bool> {
+@@ -591,53 +598,73 @@ impl<'a, RT: Runtime> SchemaModel<'a, RT> {
+         }
+     }
+ 
+-    /// Deletes failed and overwritten schemas older than an hour, returning the
+-    /// number of documents deleted. Keeps schemas table small.
+-    async fn delete_old_failed_and_overwritten_schemas(&mut self) -> anyhow::Result<usize> {
++    /// Deletes a bounded batch of failed and overwritten schemas older than an
++    /// hour, returning the number of documents deleted.
++    async fn delete_old_failed_and_overwritten_schemas(
++        &mut self,
++        schema_to_keep: ResolvedDocumentId,
++    ) -> anyhow::Result<usize> {
+         let mut num_deleted = 0;
+-        for schema_doc in self
++        let oldest_creation_time_to_keep: common::document::CreationTime = (*self
+             .tx
+-            .query_system(
+-                self.namespace,
+-                &SystemIndex::<SchemasTable>::by_creation_time(),
+-            )?
+-            .all()
+-            .await?
+-        {
++            .begin_timestamp()
++            .sub(MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS)
++            .context("Should be able to subtract an hour from creation time")?)
++        .try_into()?;
++        let creation_time_index = SystemIndex::<SchemasTable>::by_creation_time();
++        let mut schemas = self
++            .tx
++            .query_system(self.namespace, &creation_time_index)?
++            .build();
++        while let Some(schema_doc) = schemas.next().await? {
+             // Only delete failed and overwritten schemas
+             match schema_doc.state {
+                 SchemaState::Failed { .. } | SchemaState::Overwritten => {},
+                 SchemaState::Active | SchemaState::Pending | SchemaState::Validated => continue,
+             }
++            // The schema changed in this transaction can still have an
++            // in-flight checkpoint from before the transition.
++            if schema_doc.id() == schema_to_keep {
++                continue;
++            }
+             // Break if the schemas are not old enough to be deleted
+-            if schema_doc.creation_time()
+-                > (*self
+-                    .tx
+-                    .begin_timestamp()
+-                    .sub(MAX_TIME_TO_KEEP_FAILED_AND_OVERWRITTEN_SCHEMAS)
+-                    .context("Should be able to subtract an hour from creation time")?)
+-                .try_into()?
+-            {
++            if schema_doc.creation_time() > oldest_creation_time_to_keep {
+                 break;
+             }
+-            SystemMetadataModel::new(self.tx, self.namespace)
++            SystemMetadataModel::new(schemas.tx(), self.namespace)
+                 .delete(schema_doc.id())
+                 .await?;
+             num_deleted += 1;
++            if num_deleted >= MAX_SCHEMA_HISTORY_DELETIONS_PER_TRANSACTION {
++                break;
++            }
+         }
+         Ok(num_deleted)
+     }
+ 
+     async fn mark_overwritten(&mut self, id: ResolvedDocumentId) -> anyhow::Result<()> {
++        let doc = self
++            .tx
++            .get(id)
++            .await?
++            .context("Schema to mark as overwritten must exist")?;
++        let schema = SchemaMetadata::try_from(doc.into_value().into_value())?;
++        anyhow::ensure!(
++            schema.state.is_unique(),
++            "Only a unique schema state can be overwritten"
++        );
+         SystemMetadataModel::new(self.tx, self.namespace)
+             .patch(
+                 id,
+                 patch_value!("state" => Some(SchemaState::Overwritten.try_into()?))?,
+             )
+             .await?;
+-        self.delete_old_failed_and_overwritten_schemas().await?;
+-        let mut model = SchemaValidationModel::new(self.tx, self.namespace);
+-        model.delete_validations_for_schema(id).await?;
++        self.delete_old_failed_and_overwritten_schemas(id).await?;
++        if schema.state != SchemaState::Pending {
++            SchemaValidationModel::new(self.tx, self.namespace)
++                .delete_validations_for_schema(id)
++                .await?;
++        }
+         Ok(())
+     }
+ }
+diff --git a/crates/database/src/bootstrap_model/schema_validations/mod.rs b/crates/database/src/bootstrap_model/schema_validations/mod.rs
+index f89498a1c5b140c79a6bdb7e726279b6647f36e6..3ba4f2fcc7f4cf3afa6dff70acf66c3da31591d7 100644
+--- a/crates/database/src/bootstrap_model/schema_validations/mod.rs
++++ b/crates/database/src/bootstrap_model/schema_validations/mod.rs
+@@ -9,7 +9,10 @@ use std::{
+ };
+ 
+ use common::{
+-    bootstrap_model::schema::SchemaState,
++    bootstrap_model::schema::{
++        SchemaMetadata,
++        SchemaState,
++    },
+     document::{
+         ParseDocument,
+         ParsedDocument,
+@@ -144,6 +147,64 @@ impl<'a, RT: Runtime> SchemaValidationModel<'a, RT> {
+             .collect())
+     }
+ 
++    async fn attempt_is_active(
++        tx: &mut Transaction<RT>,
++        namespace: TableNamespace,
++        metadata: &SchemaValidationMetadata,
++    ) -> anyhow::Result<bool> {
++        let schema_id = tx.resolve_developer_id(&metadata.schema_id, namespace)?;
++        let Some(schema) = tx.get(schema_id).await? else {
++            return Ok(false);
++        };
++        let schema = SchemaMetadata::try_from(schema.into_value().into_value())?;
++        Ok(match schema.state {
++            SchemaState::Pending | SchemaState::Validated => true,
++            SchemaState::Active => metadata.validator_hash.is_some(),
++            SchemaState::Failed { .. } | SchemaState::Overwritten => false,
++        })
++    }
++
++    /// Stream inactive attempts without putting a table-range read in the
++    /// transactions that delete them. The limit bounds retained IDs, while an
++    /// active prefix may still require a longer scan.
++    pub async fn inactive_attempt_ids(
++        &mut self,
++        limit: usize,
++    ) -> anyhow::Result<Vec<ResolvedDocumentId>> {
++        anyhow::ensure!(limit > 0, "inactive attempt scan requires a positive limit");
++        let by_id_index = SystemIndex::<SchemaValidationTable>::by_id();
++        let mut validations = self.tx.query_system(self.namespace, &by_id_index)?.build();
++        let mut inactive = Vec::new();
++        while let Some(validation) = validations.next().await? {
++            if !Self::attempt_is_active(validations.tx(), self.namespace, &validation).await? {
++                inactive.push(validation.id());
++                if inactive.len() == limit {
++                    break;
++                }
++            }
++        }
++        Ok(inactive)
++    }
++
++    /// Recheck ownership by document ID before deleting a discovered batch.
++    pub async fn delete_inactive_attempts(
++        &mut self,
++        attempt_ids: &[ResolvedDocumentId],
++    ) -> anyhow::Result<usize> {
++        let mut deleted = 0;
++        for attempt_id in attempt_ids {
++            let Some(doc) = self.tx.get(*attempt_id).await? else {
++                continue;
++            };
++            let validation: ParsedDocument<SchemaValidationMetadata> = doc.parse()?;
++            if !Self::attempt_is_active(self.tx, self.namespace, &validation).await? {
++                self.delete_attempt(*attempt_id).await?;
++                deleted += 1;
++            }
++        }
++        Ok(deleted)
++    }
++
+     /// The validation for one table under `schema_id`, if any.
+     pub async fn validation_metadata_for_table(
+         &mut self,
+@@ -240,6 +301,12 @@ impl<'a, RT: Runtime> SchemaValidationModel<'a, RT> {
+         };
+         let validation: ParsedDocument<SchemaValidationMetadata> = doc.parse()?;
+         let (id, mut metadata) = validation.into_id_and_value();
++        // Failed and overwritten pending schemas retain attempts until cleanup.
++        // Fence both enforced and staged walks on their current schema owner;
++        // a pending attempt row alone no longer proves that work is still active.
++        if !Self::attempt_is_active(self.tx, self.namespace, &metadata).await? {
++            return Ok(false);
++        }
+         match metadata.state {
+             ValidationState::Pending => {},
+             ValidationState::Valid | ValidationState::Failed { .. } => return Ok(false),
+diff --git a/patches/README.md b/patches/README.md
+index 289745d7c73842bd1e6b31b222debb9fcc8aeb97..ee943c7497106c87b5906d5891bbceaefb4cc392 100644
+--- a/patches/README.md
++++ b/patches/README.md
+@@ -52,6 +52,19 @@ adoption contract documented in the backend essay.
+ - Activation: only through the privileged repair endpoint; dry-run is the default.
+ - Rollback: do not execute a stale plan. There is no generic undo after destructive finalization.
+ 
++## Schema validation
++
++### [Schema validation scalability](schema_validation_scalability/README.md)
++
++- Purpose: keep validation progress and cleanup out of application-write conflicts,
++  fence worker updates on schema ownership, bound cleanup batches, and avoid
++  redundant validator clones and discarded union diagnostics.
++- Prerequisites: upstream per-table validation attempts and separate progress counters;
++  independent of Wasm execution and the other runtime patches.
++- Activation: automatic in the backend; no configuration, protocol, or data migration.
++- Rollback: restore the previous backend; validation allocation costs and
++  progress-cleanup contention return.
++
+ ## Operation error propagation
+ 
+ ### [Request-local operation failures](terminal_occ/README.md)
+diff --git a/patches/schema_validation_scalability/README.md b/patches/schema_validation_scalability/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..59072d957665e399441fbd8ee92202a21eb15b89
+--- /dev/null
++++ b/patches/schema_validation_scalability/README.md
+@@ -0,0 +1,118 @@
++# Schema Validation Scalability
++
++This patch reduces transaction contention and allocation overhead during schema
++validation. It keeps application writes independent of frequently updated
++validation progress and avoids building validators and diagnostics that the
++validation traversal immediately discards.
++
++## Scope and prerequisites
++
++The patch uses upstream's per-table validation attempts and separate progress
++counters. It applies to both enforced and staged validators. The shared value
++validator optimization also benefits ordinary document writes, function argument
++and return validation, and component validation.
++
++It is independent of the Static Hermes Wasm runtime and belongs before that
++patch in the maintained source train. The schema worker and validator changes
++use existing backend APIs; the worker's SQLite tests add only a development
++dependency. No Wasm feature, runtime selector, or downstream CLI is required.
++
++The patch preserves stored schema and progress formats, accepted values,
++diagnostics, and progress APIs. It does not introduce a migration, cache,
++configuration knob, or new validation concurrency policy. Upstream's table-walk
++concurrency and the minimum interval between progress checkpoints remain in effect.
++
++## Keep progress out of application failure transactions
++
++An application write can satisfy the active schema while violating a pending
++schema. That write marks the pending schema failed. If its transaction also
++reads and deletes the pending schema's validation attempts and progress, a
++concurrent worker checkpoint can cause the application transaction to fail OCC
++and retry.
++
++The application transaction now changes the schema state without reading or
++deleting that schema's validation progress. Pending-schema replacement similarly
++leaves attempt cleanup to the worker. The owning schema document remains the
++ordering point:
++
++- Enforced validation initialization and completion require the exact schema to
++  remain pending.
++- Each attempt update reads its owning schema. A concurrent failure or
++  replacement invalidates a checkpoint's read and preserves normal OCC.
++- Staged attempts remain eligible under an active schema. Restricting every
++  attempt to pending schemas would incorrectly stop staged validation.
++- A worker that observes an overwritten or removed schema treats its old work
++  as canceled instead of marking the replacement failed.
++
++The worker discovers inactive attempts in a read-only transaction and then
++rechecks ownership while deleting exact attempt IDs in separate transactions.
++Each cleanup pass selects at most 32 attempts across namespaces. Discovery may
++scan a longer active prefix; the limit bounds selected attempts, not all reads.
++When no validation is runnable, the worker also subscribes to cleanup discovery
++dependencies so remaining cleanup can make progress.
++
++Historical failed and overwritten schema deletion retains the one-hour age
++threshold, deletes at most 32 schemas per transaction, and preserves the schema
++being transitioned so an in-flight checkpoint can still observe its owner.
++
++## Avoid redundant validation allocations
++
++Document validation previously cloned every root object validator into an owned
++union for every document. It now borrows the existing object validators and
++materializes that union only when a final rejection needs it for diagnostics.
++Root system-field filtering retains its existing behavior and value cloning.
++Nested objects and generic object validators do not acquire this filtering.
++
++Union alternatives share one traversal with two private failure representations.
++Ordinary validation produces the existing `ValidationError`. Alternatives whose
++errors will be discarded use `()`, leaving diagnostic value and validator clones
++and context formatting inside unevaluated closures. This avoids revalidating a
++value merely to recover its error.
++
++Empty and multiple-alternative unions retain their final `NoMatch` diagnostic.
++Singleton unions retain their detailed inner error. Alternative order, field
++order, optional fields, table-ID checks, nested context paths, and displayed
++diagnostics remain unchanged. No discriminator index or compiled validator is
++introduced.
++
++## Verification
++
++The SQLite-backed schema-worker tests exercise both commit orders of an
++application failure and a progress checkpoint, deferred cleanup, and staged
++attempt ownership during pending and active schema replacement. The common
++validator tests cover acceptance, union diagnostics, root-only system-field
++filtering, nested paths, table-ID checks, and tagged object alternatives.
++
++```sh
++scripts/run_cargo.sh test -p common --lib schemas::tests::
++scripts/run_cargo.sh test -p application --lib schema_worker::tests::
++scripts/run_cargo.sh clippy -p common -p application --lib --tests -- -D warnings
++scripts/run_cargo.sh test -p common --release --lib schemas::tests::benchmark_document_schema_validation -- --ignored --nocapture
++```
++
++The ignored benchmark measures singleton and first/last matching document
++variants in a schema with nested unions. For an allocation-optimization baseline,
++copy `crates/common/src/schemas/tests.rs` unchanged to the parent revision and
++register it with `#[cfg(test)] mod tests;` in `schemas/mod.rs`. Run both revisions
++with the same toolchain, release settings, and fixtures. The benchmark excludes
++database reads and worker coordination; its timings do not establish end-to-end
++schema-scan throughput. No numerical speedup is claimed without measurements.
++
++## Activation and rollback
++
++The behavior is automatic when the backend binary is replaced. No coordinated
++dashboard, CLI, or application deployment and no data conversion are required.
++Restoring the preceding backend restores the previous allocation costs and
++progress-cleanup contention. Keep the worker, schema lifecycle, and attempt
++ownership changes together when carrying or reverting this patch.
++
++## Source ownership
++
++- `crates/application/src/schema_worker/{mod.rs,tests.rs}` owns worker lifecycle,
++  cleanup scheduling, and commit-order regressions.
++- `crates/database/src/bootstrap_model/schema/mod.rs` owns schema transitions
++  and bounded history deletion.
++- `crates/database/src/bootstrap_model/schema_validations/mod.rs` owns attempt
++  eligibility, progress fencing, and inactive-attempt cleanup.
++- `crates/common/src/schemas/{mod.rs,validator.rs,tests.rs}` owns shared value
++  validation, diagnostics, and the timing fixture.
