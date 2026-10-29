@@ -52,6 +52,19 @@ adoption contract documented in the backend essay.
 - Activation: only through the privileged repair endpoint; dry-run is the default.
 - Rollback: do not execute a stale plan. There is no generic undo after destructive finalization.
 
+## Schema validation
+
+### [Schema validation scalability](schema_validation_scalability/README.md)
+
+- Purpose: keep validation progress and cleanup out of application-write conflicts,
+  fence worker updates on schema ownership, bound cleanup batches, and avoid
+  redundant validator clones and discarded union diagnostics.
+- Prerequisites: upstream per-table validation attempts and separate progress counters;
+  independent of Wasm execution and the other runtime patches.
+- Activation: automatic in the backend; no configuration, protocol, or data migration.
+- Rollback: restore the previous backend; validation allocation costs and
+  progress-cleanup contention return.
+
 ## Operation error propagation
 
 ### [Request-local operation failures](terminal_occ/README.md)

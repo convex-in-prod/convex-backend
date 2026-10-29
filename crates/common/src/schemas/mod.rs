@@ -54,6 +54,9 @@ use crate::{
 pub mod json;
 pub mod validator;
 
+#[cfg(test)]
+mod tests;
+
 pub const MAX_INDEXES_PER_TABLE: usize = 64;
 #[derive(derive_more::Display, Debug, Clone, PartialEq)]
 pub enum SchemaValidationError {
@@ -739,30 +742,6 @@ pub enum DocumentSchema {
 }
 
 impl DocumentSchema {
-    fn check_value(
-        &self,
-        value: &ConvexObject,
-        table_mapping: &NamespacedTableMapping,
-        virtual_system_mapping: &VirtualSystemMapping,
-    ) -> Result<(), ValidationError> {
-        match self {
-            DocumentSchema::Any => {},
-            DocumentSchema::Union(t) => {
-                let value = value.clone().filter_system_fields();
-                let schema_type = t
-                    .iter()
-                    .map(|obj_schema| Validator::Object(obj_schema.clone()))
-                    .collect();
-                Validator::Union(schema_type).check_value(
-                    &ConvexValue::Object(value),
-                    table_mapping,
-                    virtual_system_mapping,
-                )?;
-            },
-        }
-        Ok(())
-    }
-
     /// Returns `true` when it is sometimes possible to have a field with the
     /// given path on the document if this table definition is enforced, or
     /// `false` when it is never possible.
