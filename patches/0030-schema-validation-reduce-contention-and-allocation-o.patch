@@ -31,8 +31,8 @@ comparing the same fixtures before and after the allocation optimization.
  .../src/bootstrap_model/schema/mod.rs         | 107 ++--
  .../bootstrap_model/schema_validations/mod.rs |  69 ++-
  patches/README.md                             |  13 +
- .../schema_validation_scalability/README.md   | 118 +++++
- 11 files changed, 1354 insertions(+), 130 deletions(-)
+ .../schema_validation_scalability/README.md   |  93 ++++
+ 11 files changed, 1329 insertions(+), 130 deletions(-)
  create mode 100644 crates/application/src/schema_worker/tests.rs
  create mode 100644 crates/common/src/schemas/tests.rs
  create mode 100644 patches/schema_validation_scalability/README.md
@@ -1809,125 +1809,100 @@ index 289745d7c73842bd1e6b31b222debb9fcc8aeb97..ee943c7497106c87b5906d5891bbceae
  ### [Request-local operation failures](terminal_occ/README.md)
 diff --git a/patches/schema_validation_scalability/README.md b/patches/schema_validation_scalability/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..59072d957665e399441fbd8ee92202a21eb15b89
+index 0000000000000000000000000000000000000000..a1af76b5ddc7f9c121f30e8e1c97640ad0b80152
 --- /dev/null
 +++ b/patches/schema_validation_scalability/README.md
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,93 @@
 +# Schema Validation Scalability
 +
-+This patch reduces transaction contention and allocation overhead during schema
-+validation. It keeps application writes independent of frequently updated
-+validation progress and avoids building validators and diagnostics that the
-+validation traversal immediately discards.
++This patch reduces avoidable application-write conflicts and CPU allocation work
++while a deployment validates existing data against a new schema. It is useful
++for deployments with large tables, complex union validators, or live writes
++that can invalidate a pending schema.
 +
-+## Scope and prerequisites
++## Adoption
 +
-+The patch uses upstream's per-table validation attempts and separate progress
-+counters. It applies to both enforced and staged validators. The shared value
-+validator optimization also benefits ordinary document writes, function argument
-+and return validation, and component validation.
++Apply this patch to a backend with upstream's per-table validation attempts and
++separate progress counters, then deploy the backend through the normal image
++replacement procedure. The behavior activates automatically. No additional
++setting, data migration, or coordinated CLI, dashboard, or application release
++is required. It does not depend on another downstream patch or function runtime.
 +
-+It is independent of the Static Hermes Wasm runtime and belongs before that
-+patch in the maintained source train. The schema worker and validator changes
-+use existing backend APIs; the worker's SQLite tests add only a development
-+dependency. No Wasm feature, runtime selector, or downstream CLI is required.
++The existing `SCHEMA_WORKER_PAGE_SIZE` and `SCHEMA_WORKER_WALK_CONCURRENCY`
++settings retain their meaning and defaults: 1,000 documents per page and one
++table walk at a time. Keep them unchanged when comparing this patch's effects.
 +
-+The patch preserves stored schema and progress formats, accepted values,
-+diagnostics, and progress APIs. It does not introduce a migration, cache,
-+configuration knob, or new validation concurrency policy. Upstream's table-walk
-+concurrency and the minimum interval between progress checkpoints remain in effect.
++## Effects on application writes and validation
 +
-+## Keep progress out of application failure transactions
++An application write can satisfy the active schema while violating the schema
++being deployed. Convex then fails the pending schema while allowing the write
++under the active schema. Previously, removing validation progress in that same
++transaction could make the write conflict with a worker's progress checkpoint
++and retry repeatedly.
 +
-+An application write can satisfy the active schema while violating a pending
-+schema. That write marks the pending schema failed. If its transaction also
-+reads and deletes the pending schema's validation attempts and progress, a
-+concurrent worker checkpoint can cause the application transaction to fail OCC
-+and retry.
++With this patch, cleanup runs separately from the application write. The schema
++state still determines whether validation may continue: failure or replacement
++cancels obsolete work, and a stale checkpoint cannot override that decision.
++Staged validators can continue checking data after their owning schema becomes
++active. Ordinary optimistic concurrency control (OCC) remains enabled.
 +
-+The application transaction now changes the schema state without reading or
-+deleting that schema's validation progress. Pending-schema replacement similarly
-+leaves attempt cleanup to the worker. The owning schema document remains the
-+ordering point:
++Failed or replaced validation attempts can remain visible until background
++cleanup runs. Cleanup selects at most 32 inactive attempts per pass; finding
++them may still require scanning a longer prefix of active attempts. Historical
++failed and overwritten schemas retain the one-hour age threshold, with at most
++32 deletions per cleanup transaction. These limits bound cleanup batches rather
++than total storage or every discovery read.
 +
-+- Enforced validation initialization and completion require the exact schema to
-+  remain pending.
-+- Each attempt update reads its owning schema. A concurrent failure or
-+  replacement invalidates a checkpoint's read and preserves normal OCC.
-+- Staged attempts remain eligible under an active schema. Restricting every
-+  attempt to pending schemas would incorrectly stop staged validation.
-+- A worker that observes an overwritten or removed schema treats its old work
-+  as canceled instead of marking the replacement failed.
++Successful document validation also avoids copying the full root validator.
++Union matching skips construction of error details for rejected alternatives
++whose errors will be discarded. This reduces allocation work, particularly for
++large nested unions.
++The same optimization applies to document writes, function arguments and
++returns, and component validation. Accepted values and reported validation
++errors remain unchanged.
 +
-+The worker discovers inactive attempts in a read-only transaction and then
-+rechecks ownership while deleting exact attempt IDs in separate transactions.
-+Each cleanup pass selects at most 32 attempts across namespaces. Discovery may
-+scan a longer active prefix; the limit bounds selected attempts, not all reads.
-+When no validation is runnable, the worker also subscribes to cleanup discovery
-+dependencies so remaining cleanup can make progress.
++## Performance limits and verification
 +
-+Historical failed and overwritten schema deletion retains the one-hour age
-+threshold, deletes at most 32 schemas per transaction, and preserves the schema
-+being transitioned so an in-flight checkpoint can still observe its owner.
++The patch does not eliminate required full-table scans. Total validation time
++still depends on document count and size, validator complexity, database read
++latency, and available CPU. It adds no scan parallelism and changes no deployment
++timeout. No numerical speedup has been established for this patch.
 +
-+## Avoid redundant validation allocations
++Compare validation of equivalent schemas over the same data under similar
++traffic and resource limits. Check how many documents were actually scanned:
++Convex can skip tables when existing schema or shape information already proves
++compatibility. A deployment that skips validation is not a useful throughput
++comparison.
 +
-+Document validation previously cloned every root object validator into an owned
-+union for every document. It now borrows the existing object validators and
-+materializes that union only when a final rejection needs it for diagnostics.
-+Root system-field filtering retains its existing behavior and value cloning.
-+Nested objects and generic object validators do not acquire this filtering.
++Use existing schema progress and backend metrics:
 +
-+Union alternatives share one traversal with two private failure representations.
-+Ordinary validation produces the existing `ValidationError`. Alternatives whose
-+errors will be discarded use `()`, leaving diagnostic value and validator clones
-+and context formatting inside unevaluated closures. This avoids revalidating a
-+value merely to recover its error.
++- `convex_local_backend_schema_validation_documents_validated_total` shows live
++  scan progress; its rate indicates aggregate documents validated per second.
++- `convex_local_backend_schema_validation_table_walk_documents_sum` and
++  `convex_local_backend_schema_validation_table_walk_seconds_sum` record work
++  when a table walk exits, including canceled or failed walks. Compare their
++  increases over equivalent runs rather than treating them as live progress.
++- Correlate scan progress with backend CPU, database read latency, and application
++  mutation latency and OCC failures. This patch removes one source of contention;
++  unrelated application conflicts can still occur.
 +
-+Empty and multiple-alternative unions retain their final `NoMatch` diagnostic.
-+Singleton unions retain their detailed inner error. Alternative order, field
-+order, optional fields, table-ID checks, nested context paths, and displayed
-+diagnostics remain unchanged. No discriminator index or compiled validator is
-+introduced.
++The included regression tests cover concurrent schema failure and progress
++updates, schema replacement, staged validation, and validator acceptance and
++diagnostics. A synthetic benchmark isolates validator CPU work; it does not
++measure database access or establish end-to-end deployment speed.
 +
-+## Verification
++## Related patches
 +
-+The SQLite-backed schema-worker tests exercise both commit orders of an
-+application failure and a progress checkpoint, deferred cleanup, and staged
-+attempt ownership during pending and active schema replacement. The common
-+validator tests cover acceptance, union diagnostics, root-only system-field
-+filtering, nested paths, table-ID checks, and tagged object alternatives.
++- [Request-local operation failures](../terminal_occ/README.md) controls how
++  exhausted OCC errors reach callers. It complements this patch's reduction of
++  schema-progress contention; neither patch requires the other.
++- [Paced isolate module analysis](../deployment_analysis_pacing/README.md) limits
++  module-analysis pressure during deployment. Module analysis is a separate phase
++  from scanning stored documents, so slow analysis requires separate diagnosis.
 +
-+```sh
-+scripts/run_cargo.sh test -p common --lib schemas::tests::
-+scripts/run_cargo.sh test -p application --lib schema_worker::tests::
-+scripts/run_cargo.sh clippy -p common -p application --lib --tests -- -D warnings
-+scripts/run_cargo.sh test -p common --release --lib schemas::tests::benchmark_document_schema_validation -- --ignored --nocapture
-+```
++## Rollback
 +
-+The ignored benchmark measures singleton and first/last matching document
-+variants in a schema with nested unions. For an allocation-optimization baseline,
-+copy `crates/common/src/schemas/tests.rs` unchanged to the parent revision and
-+register it with `#[cfg(test)] mod tests;` in `schemas/mod.rs`. Run both revisions
-+with the same toolchain, release settings, and fixtures. The benchmark excludes
-+database reads and worker coordination; its timings do not establish end-to-end
-+schema-scan throughput. No numerical speedup is claimed without measurements.
-+
-+## Activation and rollback
-+
-+The behavior is automatic when the backend binary is replaced. No coordinated
-+dashboard, CLI, or application deployment and no data conversion are required.
-+Restoring the preceding backend restores the previous allocation costs and
-+progress-cleanup contention. Keep the worker, schema lifecycle, and attempt
-+ownership changes together when carrying or reverting this patch.
-+
-+## Source ownership
-+
-+- `crates/application/src/schema_worker/{mod.rs,tests.rs}` owns worker lifecycle,
-+  cleanup scheduling, and commit-order regressions.
-+- `crates/database/src/bootstrap_model/schema/mod.rs` owns schema transitions
-+  and bounded history deletion.
-+- `crates/database/src/bootstrap_model/schema_validations/mod.rs` owns attempt
-+  eligibility, progress fencing, and inactive-attempt cleanup.
-+- `crates/common/src/schemas/{mod.rs,validator.rs,tests.rs}` owns shared value
-+  validation, diagnostics, and the timing fixture.
++Restore the preceding backend image through the normal replacement procedure.
++Stored schemas and progress records need no conversion. The previous allocation
++costs and application-write contention during schema failure return. No client,
++dashboard, application-code, or configuration rollback is needed for this patch.
