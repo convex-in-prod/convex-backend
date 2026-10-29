@@ -39,6 +39,11 @@ adaptive shedding, and the ordinary hard deadline.
 
 ## Why module analysis creates scheduler pressure
 
+For contention and allocation costs while scanning stored documents, see
+[Schema Validation Scalability](../schema_validation_scalability/README.md).
+That patch addresses a separate deployment phase and can be adopted independently
+of module-analysis pacing.
+
 The isolate analyzer does not behave like a typical asynchronous action waiting on network or
 database I/O:
 

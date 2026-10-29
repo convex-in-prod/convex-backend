@@ -112,11 +112,11 @@ impl Validator {
         self.check_value_internal(value, &all_tables_number_to_name)
     }
 
-    fn check_value_internal(
+    fn check_value_internal<E: ValidationFailure>(
         &self,
         value: &ConvexValue,
         all_tables_number_to_name: &impl Fn(TableNumber) -> anyhow::Result<TableName>,
-    ) -> Result<(), ValidationError> {
+    ) -> Result<(), E> {
         match (self, value) {
             (Validator::Id(validator_table), ConvexValue::String(s)) => {
                 if let Ok(id) = DeveloperDocumentId::decode(s)
@@ -124,26 +124,26 @@ impl Validator {
                 {
                     if &table_name != validator_table {
                         if table_name.is_system() {
-                            return Err(ValidationError::SystemTableReference {
+                            return Err(E::new(|| ValidationError::SystemTableReference {
                                 id,
                                 validator_table: validator_table.clone(),
                                 context: ValidationContext::new(),
-                            });
+                            }));
                         } else {
-                            return Err(ValidationError::TableNamesDoNotMatch {
+                            return Err(E::new(|| ValidationError::TableNamesDoNotMatch {
                                 id,
                                 found_table_name: table_name,
                                 validator_table: validator_table.clone(),
                                 context: ValidationContext::new(),
-                            });
+                            }));
                         }
                     }
                 } else {
-                    return Err(ValidationError::NoMatch {
+                    return Err(E::new(|| ValidationError::NoMatch {
                         value: value.clone(),
                         validator: self.clone(),
                         context: ValidationContext::new(),
-                    });
+                    }));
                 }
             },
             (Validator::Null, ConvexValue::Null)
@@ -155,98 +155,73 @@ impl Validator {
             | (Validator::Bytes, ConvexValue::Bytes(_)) => return Ok(()),
             (Validator::Function(_), ConvexValue::String(s)) => {
                 if s.parse::<FunctionHandle>().is_err() {
-                    return Err(ValidationError::NoMatch {
+                    return Err(E::new(|| ValidationError::NoMatch {
                         value: value.clone(),
                         validator: self.clone(),
                         context: ValidationContext::new(),
-                    });
+                    }));
                 }
                 return Ok(());
             },
             (Validator::Literal(literal), value) => {
                 let literal_as_value: ConvexValue = literal.clone().into();
                 if value != &literal_as_value {
-                    return Err(ValidationError::LiteralValuesDoNotMatch {
+                    return Err(E::new(|| ValidationError::LiteralValuesDoNotMatch {
                         value: value.clone(),
                         literal_validator: literal.clone(),
                         context: ValidationContext::new(),
-                    });
+                    }));
                 }
             },
             (Validator::Array(t), ConvexValue::Array(v)) => {
                 for (i, elt) in v.into_iter().enumerate() {
-                    t.check_value_internal(elt, all_tables_number_to_name)
-                        .map_err(|e| e.with_context(format!("[{i}]")))?;
+                    t.check_value_internal::<E>(elt, all_tables_number_to_name)
+                        .map_err(|e| e.with_context(|| format!("[{i}]")))?;
                 }
             },
             (Validator::Record(key_type, value_type), ConvexValue::Object(object)) => {
                 for (key, value) in object.iter() {
                     key_type
-                        .check_value_internal(
+                        .check_value_internal::<E>(
                             &ConvexValue::from(key.clone()),
                             all_tables_number_to_name,
                         )
-                        .map_err(|e| e.with_context(".keys()".to_string()))?;
+                        .map_err(|e| e.with_context(|| ".keys()".to_string()))?;
                     value_type
-                        .check_value_internal(value, all_tables_number_to_name)
-                        .map_err(|e| e.with_context(".values()".to_string()))?;
+                        .check_value_internal::<E>(value, all_tables_number_to_name)
+                        .map_err(|e| e.with_context(|| ".values()".to_string()))?;
                 }
             },
             (Validator::Object(object_validator), ConvexValue::Object(object)) => {
-                for (field_name, field_type) in &object_validator.0 {
-                    let maybe_value = object.get::<str>(field_name.borrow());
-                    if let Some(value) = maybe_value {
-                        field_type
-                            .validator
-                            .check_value_internal(value, all_tables_number_to_name)
-                            .map_err(|e| e.with_context(format!(".{field_name}")))?
-                    } else if !field_type.optional {
-                        return Err(ValidationError::MissingRequiredField {
-                            object: object.clone(),
-                            field_name: field_name.clone(),
-                            object_validator: object_validator.clone(),
-                            context: ValidationContext::new(),
-                        });
-                    }
-                }
-                for field in object.keys() {
-                    if !object_validator.0.contains_key::<str>(field.borrow()) {
-                        return Err(ValidationError::ExtraField {
-                            object: object.clone(),
-                            field_name: field.clone(),
-                            object_validator: object_validator.clone(),
-                            context: ValidationContext::new(),
-                        });
-                    }
-                }
+                return object_validator.check_value_internal(object, all_tables_number_to_name);
             },
             (Validator::Union(validators), value) => {
                 if validators.len() == 1 {
                     return validators[0].check_value_internal(value, all_tables_number_to_name);
                 }
 
-                // TODO: This is dropping the error messages from the individual
-                // validators. Maybe we should combine them if this fails?
+                // Only the union's error is returned, so do not construct diagnostics
+                // for alternatives that fail before a later alternative matches.
                 for t in validators {
-                    if t.check_value_internal(value, all_tables_number_to_name)
+                    if t.check_value_internal::<()>(value, all_tables_number_to_name)
                         .is_ok()
                     {
                         return Ok(());
                     }
                 }
-                return Err(ValidationError::NoMatch {
+                return Err(E::new(|| ValidationError::NoMatch {
                     value: value.clone(),
                     validator: self.clone(),
                     context: ValidationContext::new(),
-                });
+                }));
             },
             (Validator::Any, _) => return Ok(()),
             (..) => {
-                return Err(ValidationError::NoMatch {
+                return Err(E::new(|| ValidationError::NoMatch {
                     value: value.clone(),
                     validator: self.clone(),
                     context: ValidationContext::new(),
-                })
+                }))
             },
         };
         Ok(())
@@ -822,9 +797,7 @@ impl TryFrom<ConvexValue> for LiteralValidator {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ObjectValidator(
-    pub BTreeMap<IdentifierFieldName, FieldValidator>,
-);
+pub struct ObjectValidator(pub BTreeMap<IdentifierFieldName, FieldValidator>);
 
 #[macro_export]
 macro_rules! object_validator {
@@ -854,6 +827,40 @@ pub enum AddTopLevelFields {
 }
 
 impl ObjectValidator {
+    fn check_value_internal<E: ValidationFailure>(
+        &self,
+        object: &ConvexObject,
+        all_tables_number_to_name: &impl Fn(TableNumber) -> anyhow::Result<TableName>,
+    ) -> Result<(), E> {
+        for (field_name, field_type) in &self.0 {
+            let maybe_value = object.get::<str>(field_name.borrow());
+            if let Some(value) = maybe_value {
+                field_type
+                    .validator
+                    .check_value_internal::<E>(value, all_tables_number_to_name)
+                    .map_err(|e| e.with_context(|| format!(".{field_name}")))?
+            } else if !field_type.optional {
+                return Err(E::new(|| ValidationError::MissingRequiredField {
+                    object: object.clone(),
+                    field_name: field_name.clone(),
+                    object_validator: self.clone(),
+                    context: ValidationContext::new(),
+                }));
+            }
+        }
+        for field in object.keys() {
+            if !self.0.contains_key::<str>(field.borrow()) {
+                return Err(E::new(|| ValidationError::ExtraField {
+                    object: object.clone(),
+                    field_name: field.clone(),
+                    object_validator: self.clone(),
+                    context: ValidationContext::new(),
+                }));
+            }
+        }
+        Ok(())
+    }
+
     pub fn has_validator_for_system_field(&self) -> bool {
         let fields = &self.0;
         fields.keys().any(|f| f.is_system())
@@ -909,6 +916,43 @@ impl ObjectValidator {
         self.0
             .values()
             .flat_map(|field| field.validator.foreign_keys())
+    }
+}
+
+impl DocumentSchema {
+    pub(super) fn check_value(
+        &self,
+        value: &ConvexObject,
+        table_mapping: &NamespacedTableMapping,
+        virtual_system_mapping: &VirtualSystemMapping,
+    ) -> Result<(), ValidationError> {
+        let validators = match self {
+            DocumentSchema::Any => return Ok(()),
+            DocumentSchema::Union(validators) => validators,
+        };
+        let value = value.clone().filter_system_fields();
+        let all_tables_number_to_name =
+            all_tables_number_to_name(table_mapping, virtual_system_mapping);
+        if let [validator] = validators.as_slice() {
+            return validator.check_value_internal(&value, &all_tables_number_to_name);
+        }
+        for validator in validators {
+            if validator
+                .check_value_internal::<()>(&value, &all_tables_number_to_name)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        // Borrow the schema during successful checks; materialize the union only
+        // when it is needed for the existing diagnostic format.
+        Err(ValidationError::NoMatch {
+            value: ConvexValue::Object(value),
+            validator: Validator::Union(
+                validators.iter().cloned().map(Validator::Object).collect(),
+            ),
+            context: ValidationContext::new(),
+        })
     }
 }
 
@@ -1032,4 +1076,28 @@ impl ValidationError {
         self.context().reversed_path.push(context);
         self
     }
+}
+
+// Both modes use the same traversal so acceptance cannot diverge. Union
+// alternatives use `()` to skip cloning rejected values and validators, and to
+// skip formatting context paths that would immediately be discarded.
+trait ValidationFailure: Sized {
+    fn new(error: impl FnOnce() -> ValidationError) -> Self;
+    fn with_context(self, context: impl FnOnce() -> String) -> Self;
+}
+
+impl ValidationFailure for ValidationError {
+    fn new(error: impl FnOnce() -> ValidationError) -> Self {
+        error()
+    }
+
+    fn with_context(self, context: impl FnOnce() -> String) -> Self {
+        self.with_context(context())
+    }
+}
+
+impl ValidationFailure for () {
+    fn new(_error: impl FnOnce() -> ValidationError) -> Self {}
+
+    fn with_context(self, _context: impl FnOnce() -> String) -> Self {}
 }
