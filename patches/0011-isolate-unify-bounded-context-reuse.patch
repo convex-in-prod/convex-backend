@@ -77,11 +77,11 @@ completion; keep request resources invocation-owned.
  crates/isolate/src/environment/udf/mod.rs     |  452 ++--
  crates/isolate/src/execution_observation.rs   |  678 ++++++
  crates/isolate/src/execution_scope.rs         |   42 +-
- crates/isolate/src/http.rs                    |    1 +
  crates/isolate/src/isolate.rs                 |   41 +-
  crates/isolate/src/isolate_worker.rs          |  122 +-
  crates/isolate/src/lib.rs                     |    1 +
  crates/isolate/src/metrics.rs                 |  483 +++-
+ crates/isolate/src/ops/http.rs                |    5 +-
  crates/isolate/src/ops/mod.rs                 |   33 +
  crates/isolate/src/ops/time.rs                |   35 +-
  crates/isolate/src/request_scope.rs           |   48 +
@@ -107,7 +107,7 @@ completion; keep request resources invocation-owned.
  .../dependency_capacity/design_reference.md   |   17 +-
  self-hosted/advanced/knobs.md                 |   67 +-
  self-hosted/docker/docker-compose.yml         |    3 +-
- 53 files changed, 9841 insertions(+), 628 deletions(-)
+ 53 files changed, 9844 insertions(+), 629 deletions(-)
  create mode 100644 crates/application/src/runtime_diagnostics.rs
  create mode 100644 crates/isolate/src/environment/udf/context_reuse_tests.rs
  create mode 100644 crates/isolate/src/execution_observation.rs
@@ -117,10 +117,10 @@ completion; keep request resources invocation-owned.
  create mode 100644 patches/context_reuse/selective_invalidation.md
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 5500bf83b46af4e9442f8c5a775c63e4d8fa3af6..5e920033d1fa7c7b8b7b4886e03d3426f5d69554 100644
+index c1e2ec8b8b60720fa7fd87a6aee8d2bf9a778c82..957833b9821fa86814b91957ff5464c6e162528e 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -6052,6 +6052,7 @@ dependencies = [
+@@ -6030,6 +6030,7 @@ dependencies = [
   "headers",
   "http 1.5.0",
   "humansize",
@@ -128,7 +128,7 @@ index 5500bf83b46af4e9442f8c5a775c63e4d8fa3af6..5e920033d1fa7c7b8b7b4886e03d3426
   "indexmap 2.14.0",
   "itertools 0.14.0",
   "js_build",
-@@ -6075,12 +6076,14 @@ dependencies = [
+@@ -6053,12 +6054,14 @@ dependencies = [
   "roles",
   "runtime",
   "scopeguard",
@@ -553,10 +553,10 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
              .run_action_with_scheduler_dependency(
                  RequestContext::new(context.request_id, context.request_metadata),
 diff --git a/crates/application/src/lib.rs b/crates/application/src/lib.rs
-index 482e50defaf8dd4261e38d0b2ddbf62d789afc4e..e635d4a2639b5d574046afeed27f87f1b0fb4508 100644
+index 77a64796af285387a562643bbbf1be71a562002c..6b1c4560a27c86a403e7b23b74ea24ff18e32c01 100644
 --- a/crates/application/src/lib.rs
 +++ b/crates/application/src/lib.rs
-@@ -453,6 +453,7 @@ pub mod log_streaming;
+@@ -451,6 +451,7 @@ pub mod log_streaming;
  pub mod log_visibility;
  mod metrics;
  pub mod redaction;
@@ -776,7 +776,7 @@ index 0000000000000000000000000000000000000000..5ab0775d8623493c27f8c8a9cf350ea2
 +    }
 +}
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 5b9475d08fd51749b7cbe9e64ebd50b5a9cc7edd..ca6a5bd798ea2841c4165c477b92560f9c05c9a8 100644
+index e0920a99f680261fccf2391df763d1329f84de8a..e988ff02a0d5653255a011a006afa70da1616aa0 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -1377,6 +1377,40 @@ pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS",
@@ -9565,18 +9565,6 @@ index 532d540aa393d137f0e19c6e15b46d6e025e6d7f..1eaed1bb6b21c65fd5bdfe5ceeba26c9
      pub async fn eval_user_module(
          &mut self,
          udf_type: UdfType,
-diff --git a/crates/isolate/src/http.rs b/crates/isolate/src/http.rs
-index 5b3b345ce4a98c4272d77bd377dc672ed9032859..530b64b7cbd76861f6dc1da60af2669269f61e76 100644
---- a/crates/isolate/src/http.rs
-+++ b/crates/isolate/src/http.rs
-@@ -80,6 +80,7 @@ impl HttpRequestV8 {
-         let signal = {
-             let (signal_sender, signal_receiver) = spsc::unbounded_channel();
-             provider.new_stream_listener(self.signal, StreamListener::RustStream(signal_sender))?;
-+            provider.register_fetch_abort_stream(self.signal)?;
-             let signal_stream = signal_receiver.into_stream();
-             Box::pin(signal_stream.into_future().map(|_| ()))
-         };
 diff --git a/crates/isolate/src/isolate.rs b/crates/isolate/src/isolate.rs
 index 762e8c56094616998750b4138e4b61251719bfcb..31425796d28061e937a458fd9921cff486d2c70b 100644
 --- a/crates/isolate/src/isolate.rs
@@ -9852,7 +9840,7 @@ index def74d47a808666c972a94cb3c7139a778b38c5b..bc308b11f11e30ceac67e25c75087da2
                      app_definition,
                      component_definitions,
 diff --git a/crates/isolate/src/lib.rs b/crates/isolate/src/lib.rs
-index 2b358d2615e72361c066d91e3c405115421cb042..5d97a6f309171bdce5dd811e65c9fa1ae6c73087 100644
+index 60fde42f28180c290ed3c9cd8e95ed9d0655ef28..bb21c1f345ba9dcb18d11ba4982014738e89bff3 100644
 --- a/crates/isolate/src/lib.rs
 +++ b/crates/isolate/src/lib.rs
 @@ -21,6 +21,7 @@ mod context_local_state;
@@ -9862,7 +9850,7 @@ index 2b358d2615e72361c066d91e3c405115421cb042..5d97a6f309171bdce5dd811e65c9fa1a
 +pub mod execution_observation;
  mod execution_scope;
  pub mod helpers;
- mod http;
+ pub mod http;
 diff --git a/crates/isolate/src/metrics.rs b/crates/isolate/src/metrics.rs
 index 3df6fd4b47e0dc95259f0bb50fdf3293e8c39ec0..1ac9e1debd352c29c1b77c243b6bf29a9a4c77e4 100644
 --- a/crates/isolate/src/metrics.rs
@@ -10389,11 +10377,27 @@ index 3df6fd4b47e0dc95259f0bb50fdf3293e8c39ec0..1ac9e1debd352c29c1b77c243b6bf29a
  #[cfg(test)]
  mod tests {
      use prometheus::core::Collector;
+diff --git a/crates/isolate/src/ops/http.rs b/crates/isolate/src/ops/http.rs
+index 5d70d2cc9da783902b30b5ec8876cba2e39604e6..3721211f3e099b43fe646720f00bf615349f847d 100644
+--- a/crates/isolate/src/ops/http.rs
++++ b/crates/isolate/src/ops/http.rs
+@@ -35,7 +35,10 @@ pub fn async_op_fetch<'b, P: V8OpProvider<'b>>(
+     let arg: HttpRequestV8 = serde_v8::from_v8(&mut provider.scope(), args.get(1))?;
+ 
+     let request = with_argument_error("fetch", || {
+-        arg.into_stream(|stream_id| listen_to_stream(provider, stream_id))
++        let signal = arg.signal;
++        let request = arg.into_stream(|stream_id| listen_to_stream(provider, stream_id))?;
++        provider.register_fetch_abort_stream(signal)?;
++        Ok(request)
+     })?;
+     let response_body_stream_id = provider.create_stream()?;
+     provider.start_async_op(
 diff --git a/crates/isolate/src/ops/mod.rs b/crates/isolate/src/ops/mod.rs
-index 3975df49d8fd455dc390087c7f8ab383d72e5076..dece8c0232a47dc32139024627d8902e261f33f7 100644
+index d693f549abbd59e7417a146514803a7b0a3a6347..8bf40faf565fa57a66b6223b7601835c73e75813 100644
 --- a/crates/isolate/src/ops/mod.rs
 +++ b/crates/isolate/src/ops/mod.rs
-@@ -108,7 +108,9 @@ use self::{
+@@ -109,7 +109,9 @@ use self::{
          op_text_encoder_normalize_label,
      },
      time::{
@@ -10455,7 +10459,7 @@ index 3975df49d8fd455dc390087c7f8ab383d72e5076..dece8c0232a47dc32139024627d8902e
          "throwUncatchableDeveloperError" => op_throw_uncatchable_developer_error,
          "console/message" => op_console_message,
          "console/trace" => op_console_trace,
-@@ -495,6 +527,7 @@ pub fn start_async_op<'b, P: V8OpProvider<'b>>(
+@@ -469,6 +501,7 @@ pub fn start_async_op<'b, P: V8OpProvider<'b>>(
          "fetch" => async_op_fetch(provider, args, resolver.clone())?,
          "form/parseMultiPart" => async_op_parse_multi_part(provider, args, resolver.clone())?,
          "sleep" => async_op_sleep(provider, args, resolver.clone())?,
@@ -10464,7 +10468,7 @@ index 3975df49d8fd455dc390087c7f8ab383d72e5076..dece8c0232a47dc32139024627d8902e
          "storage/get" => async_op_storage_get(provider, args, resolver.clone())?,
          "stream/readPart" => async_op_stream_read_part(provider, args, resolver.clone())?,
 diff --git a/crates/isolate/src/ops/time.rs b/crates/isolate/src/ops/time.rs
-index 30f4b5029c5a5cfd7efe7a33fe022486e91f8210..e0429ce5efbea8a4c737d9c58f030b3b50786a40 100644
+index 455f14bf1245e3428dda2afba7d2af52b591d570..9d52808ebe930281bba4d514300c6d99ac6c8acd 100644
 --- a/crates/isolate/src/ops/time.rs
 +++ b/crates/isolate/src/ops/time.rs
 @@ -1,5 +1,6 @@
@@ -10501,7 +10505,7 @@ index 30f4b5029c5a5cfd7efe7a33fe022486e91f8210..e0429ce5efbea8a4c737d9c58f030b3b
 +    provider.cancel_timer(timer_id)
  }
  
- pub(super) fn sleep_request<P: OpProvider>(
+ pub fn sleep_request<P: OpProvider>(
      provider: &mut P,
      name: String,
 -    mut millis: f64,

@@ -11,20 +11,20 @@ Keep the original streaming reader available for other storage consumers. Docume
  crates/application/src/snapshot_import/mod.rs |  17 +-
  .../application/src/snapshot_import/parse.rs  |  34 +-
  crates/aws_s3/Cargo.toml                      |   1 +
- crates/aws_s3/src/storage.rs                  | 534 +++++++++++++++++-
+ crates/aws_s3/src/storage.rs                  | 530 +++++++++++++++++-
  crates/storage/src/lib.rs                     |  46 +-
  crates/storage_zip_reader/Cargo.toml          |   2 +-
  crates/storage_zip_reader/src/lib.rs          | 517 ++++++++++++++---
  .../README.md                                 | 235 ++++++++
  self-hosted/advanced/s3_storage.md            |  11 +
- 10 files changed, 1297 insertions(+), 103 deletions(-)
+ 10 files changed, 1294 insertions(+), 102 deletions(-)
  create mode 100644 patches/snapshot_import_zip_materialization/README.md
 
 diff --git a/Cargo.lock b/Cargo.lock
-index a3486d358a335c4a6cfd988ca83a72da4d95ed56..3ef42ef0f8ef2019d53d14481d12cc989401f71d 100644
+index 30475a7029d93d9b65e16da6e4a4d4746b5dfdb8..5eb39da69b2688a8a1f4cf1164e812225d6e80ce 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -1494,6 +1494,7 @@ dependencies = [
+@@ -1504,6 +1504,7 @@ dependencies = [
   "runtime",
   "serde_json",
   "storage",
@@ -32,7 +32,7 @@ index a3486d358a335c4a6cfd988ca83a72da4d95ed56..3ef42ef0f8ef2019d53d14481d12cc98
   "tokio",
   "tokio-stream",
  ]
-@@ -11120,7 +11121,6 @@ dependencies = [
+@@ -11096,7 +11097,6 @@ dependencies = [
   "async_zip 0.0.18",
   "async_zip 0.0.9",
   "aws_s3",
@@ -40,7 +40,7 @@ index a3486d358a335c4a6cfd988ca83a72da4d95ed56..3ef42ef0f8ef2019d53d14481d12cc98
   "common",
   "convex_macro",
   "errors",
-@@ -11128,6 +11128,7 @@ dependencies = [
+@@ -11104,6 +11104,7 @@ dependencies = [
   "rc-zip",
   "runtime",
   "storage",
@@ -192,7 +192,7 @@ index 0160a4df1119fe83ebe7715581b560c4be35b659..d9fc9de15dd2efb1eea1bcb04f6b2e4c
  
  [lints]
 diff --git a/crates/aws_s3/src/storage.rs b/crates/aws_s3/src/storage.rs
-index cf44506e20f0bbc3e0caf9912cb946ef0d9ccd7c..5af6e50258510a6e6f2883a1e47f159079466b43 100644
+index 0c02a2bbd2d7e9837215e19e761c16f2c36526db..e33e741d87318cac0232eff28d69a0b7d4bd5edf 100644
 --- a/crates/aws_s3/src/storage.rs
 +++ b/crates/aws_s3/src/storage.rs
 @@ -1,5 +1,7 @@
@@ -203,15 +203,11 @@ index cf44506e20f0bbc3e0caf9912cb946ef0d9ccd7c..5af6e50258510a6e6f2883a1e47f1590
      path::Path,
      pin::Pin,
      sync::Arc,
-@@ -13,10 +15,14 @@ use anyhow::Context;
+@@ -13,9 +15,11 @@ use anyhow::Context;
  use async_trait::async_trait;
  use aws_config::retry::RetryConfig;
  use aws_sdk_s3::{
--    config::IdentityCache,
-+    config::{
-+        IdentityCache,
-+        StalledStreamProtectionConfig,
-+    },
++    config::StalledStreamProtectionConfig,
      error::ProvideErrorMetadata,
      operation::{
          create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
@@ -219,7 +215,7 @@ index cf44506e20f0bbc3e0caf9912cb946ef0d9ccd7c..5af6e50258510a6e6f2883a1e47f1590
          head_object::{
              HeadObjectError,
              HeadObjectOutput,
-@@ -86,8 +92,13 @@ use storage::{
+@@ -82,8 +86,13 @@ use storage::{
      StorageUseCase,
      Upload,
      UploadId,
@@ -233,7 +229,7 @@ index cf44506e20f0bbc3e0caf9912cb946ef0d9ccd7c..5af6e50258510a6e6f2883a1e47f1590
  
  use crate::{
      metrics::sign_url_timer,
-@@ -109,6 +120,9 @@ pub const ACCESS_KEY_MAX_BACKOFF: Duration = Duration::from_secs(5);
+@@ -105,6 +114,9 @@ pub const ACCESS_KEY_MAX_BACKOFF: Duration = Duration::from_secs(5);
  const MIN_S3_INTERMEDIATE_PART_SIZE: usize = 5 * (1 << 20);
  /// S3 maximum part size for multipart upload is 5GiB
  const MAX_S3_INTERMEDIATE_PART_SIZE: usize = 5 * (1 << 30);
@@ -243,7 +239,7 @@ index cf44506e20f0bbc3e0caf9912cb946ef0d9ccd7c..5af6e50258510a6e6f2883a1e47f1590
  
  #[derive(Clone)]
  pub struct S3Storage<RT: Runtime> {
-@@ -215,6 +229,265 @@ impl<RT: Runtime> S3Storage<RT> {
+@@ -211,6 +223,265 @@ impl<RT: Runtime> S3Storage<RT> {
          .await?;
          Ok(s3_upload)
      }
@@ -509,7 +505,7 @@ index cf44506e20f0bbc3e0caf9912cb946ef0d9ccd7c..5af6e50258510a6e6f2883a1e47f1590
  }
  
  /// Inverse of [`Storage::storage_type_proto`].
-@@ -524,9 +797,11 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
+@@ -513,9 +784,11 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
              .await;
          match result {
              Ok(head_attributes) => {
@@ -523,7 +519,7 @@ index cf44506e20f0bbc3e0caf9912cb946ef0d9ccd7c..5af6e50258510a6e6f2883a1e47f1590
                  Ok(Some(ObjectAttributes { size }))
              },
              Err(aws_sdk_s3::error::SdkError::ServiceError(err)) => match err.err() {
-@@ -539,6 +814,79 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
+@@ -528,6 +801,79 @@ impl<RT: Runtime> Storage for S3Storage<RT> {
          }
      }
  
@@ -603,7 +599,7 @@ index cf44506e20f0bbc3e0caf9912cb946ef0d9ccd7c..5af6e50258510a6e6f2883a1e47f1590
      fn storage_type_proto(&self) -> pb::searchlight::StorageType {
          let prefix = self.key_prefix.clone();
          let bucket = self.bucket.clone();
-@@ -901,4 +1249,182 @@ pub fn s3_bucket_name(use_case: &StorageUseCase) -> anyhow::Result<String> {
+@@ -890,4 +1236,182 @@ pub fn s3_bucket_name(use_case: &StorageUseCase) -> anyhow::Result<String> {
      ))
  }
  

@@ -21,13 +21,13 @@ rollback.
 ---
  crates/node_executor/src/executor.rs          |  497 +++-
  crates/node_executor/src/lib.rs               |    1 -
- crates/node_executor/src/local.rs             | 2240 ++++++++++++++++-
+ crates/node_executor/src/local.rs             | 2226 ++++++++++++++++-
  crates/node_executor/src/metrics.rs           |  336 +++
  .../node_executor/tests/stream_completion.rs  |   58 +
  npm-packages/node-executor/src/local.ts       |    4 -
  patches/README.md                             |  220 ++
  .../local_node_executor_resilience/README.md  |  312 +++
- 8 files changed, 3417 insertions(+), 251 deletions(-)
+ 8 files changed, 3411 insertions(+), 243 deletions(-)
  create mode 100644 crates/node_executor/tests/stream_completion.rs
  create mode 100644 patches/README.md
  create mode 100644 patches/local_node_executor_resilience/README.md
@@ -665,7 +665,7 @@ index 5ef903d84d230bb0c336a9d6204e1a39950684a8..53a9569bbf07ac521bef19cbbc36b876
  #![feature(try_blocks)]
  #![feature(try_blocks_heterogeneous)]
 diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
-index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb2323db53a19 100644
+index 7e4cfe11b734dac763619e25fc03e35f334c3f1f..2a0fb0db53e10057dd967061e616296d6d76fc1d 100644
 --- a/crates/node_executor/src/local.rs
 +++ b/crates/node_executor/src/local.rs
 @@ -1,25 +1,42 @@
@@ -718,7 +718,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
      process::{
          Child,
          Command as TokioCommand,
-@@ -30,28 +47,43 @@ use tokio::{
+@@ -30,27 +47,42 @@ use tokio::{
      },
  };
  
@@ -741,7 +741,6 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
 +    EXECUTE_TIMEOUT_RESPONSE_JSON,
  };
  
- const NVMRC_VERSION: &str = include_str!("../../../.nvmrc");
  const HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 +const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 +const MAX_HEALTH_RESPONSE_BYTES: usize = 64 * 1024;
@@ -771,7 +770,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
  struct LocalNodeExecutorConfig {
      node_process_timeout: Duration,
      /// Overrides the initial callback retry backoff in the spawned node
-@@ -59,16 +91,472 @@ struct LocalNodeExecutorConfig {
+@@ -58,16 +90,472 @@ struct LocalNodeExecutorConfig {
      /// callbacks retrying against an unreachable backend settle within test
      /// timeouts.
      callback_initial_backoff: Option<Duration>,
@@ -1247,7 +1246,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
          tracing::info!("Initializing inner local node executor");
          // Create a single temp directory for both source files and Node.js temp files
          let source_dir = TempDir::new()?;
-@@ -79,11 +567,6 @@ impl InnerLocalNodeExecutor {
+@@ -78,11 +566,6 @@ impl InnerLocalNodeExecutor {
          let source_map_path = source_dir.path().join("local.cjs.map");
          fs::write(&source_path, source.as_bytes())?;
          fs::write(source_map_path, source_map.as_bytes())?;
@@ -1259,7 +1258,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
          let socket_path = if cfg!(unix) {
              source_dir.path().join(".executor.sock")
          } else if cfg!(windows) {
-@@ -94,8 +577,6 @@ impl InnerLocalNodeExecutor {
+@@ -93,8 +576,6 @@ impl InnerLocalNodeExecutor {
          } else {
              panic!("not supported");
          };
@@ -1268,7 +1267,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
          // Don't keep idle connections in the pool. The Node HTTP server closes
          // idle keep-alive connections after its (default 5s) `keepAliveTimeout`,
          // but hyper's pool would hold one much longer and reuse it right as the
-@@ -104,36 +585,138 @@ impl InnerLocalNodeExecutor {
+@@ -103,36 +584,138 @@ impl InnerLocalNodeExecutor {
          let mut client_builder = Client::builder().pool_max_idle_per_host(0);
          #[cfg(unix)]
          {
@@ -1418,7 +1417,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
              anyhow::bail!(ErrorMetadata::bad_request(
                  "DeploymentNotConfiguredForNodeActions",
                  "Deployment is not configured to deploy \"use node\" actions. \
-@@ -145,36 +728,123 @@ impl InnerLocalNodeExecutor {
+@@ -144,25 +727,114 @@ impl InnerLocalNodeExecutor {
          Ok(())
      }
  
@@ -1443,7 +1442,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
 +            .is_some_and(|length| length > MAX_HEALTH_RESPONSE_BYTES as u64)
 +        {
 +            return None;
-+        }
+         }
 +        // User modules share the process and can replace serialization globals.
 +        // Bound this watchdog input before accumulating and parsing it.
 +        let mut body = Vec::new();
@@ -1456,7 +1455,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
 +                return None;
 +            }
 +            body.extend_from_slice(&chunk);
-         }
++        }
 +        serde_json::from_slice(&body).ok()
 +    }
 +
@@ -1537,29 +1536,12 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
 -        socket_path: &PathBuf,
 +        socket_path: &Path,
      ) -> anyhow::Result<Child> {
-         let preferred_node_version = NVMRC_VERSION.trim();
- 
-         // Look for node in a few places.
--        let possible_path = home::home_dir()
--            .unwrap()
--            .join(".nvm")
--            .join(format!("versions/node/v{preferred_node_version}/bin/node"));
--        let node_path = if possible_path.exists() {
--            possible_path.to_string_lossy().to_string()
--        } else {
--            "node".to_string()
--        };
-+        let possible_path = home::home_dir().map(|home| {
-+            home.join(".nvm")
-+                .join(format!("versions/node/v{preferred_node_version}/bin/node"))
-+        });
-+        let node_path = possible_path
-+            .filter(|path| path.exists())
-+            .unwrap_or_else(|| PathBuf::from("node"));
-         Self::check_node_version(&node_path).await?;
+-        let node_path = "node";
++        let node_path = Path::new("node");
+         Self::check_node_version(node_path).await?;
  
          let mut cmd = TokioCommand::new(node_path);
-@@ -183,6 +853,11 @@ impl InnerLocalNodeExecutor {
+@@ -171,6 +843,11 @@ impl InnerLocalNodeExecutor {
              .arg(socket_path)
              .arg("--tempdir")
              .arg(temp_dir.path())
@@ -1571,7 +1553,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
              .kill_on_drop(true);
          if let Some(backoff) = config.callback_initial_backoff {
              cmd.env(
-@@ -200,47 +875,165 @@ impl InnerLocalNodeExecutor {
+@@ -188,47 +865,165 @@ impl InnerLocalNodeExecutor {
  impl LocalNodeExecutor {
      pub async fn new(node_process_timeout: Duration) -> anyhow::Result<Self> {
          let executor = Self {
@@ -1764,7 +1746,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
              if let NodeExecutorStreamPart::InvokeComplete(_) = part {
                  yield part;
                  break;
-@@ -250,16 +1043,341 @@ impl LocalNodeExecutor {
+@@ -238,16 +1033,341 @@ impl LocalNodeExecutor {
          }
      }
  
@@ -2115,7 +2097,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
      }
  }
  
-@@ -274,48 +1392,106 @@ impl NodeExecutor for LocalNodeExecutor {
+@@ -262,48 +1382,106 @@ impl NodeExecutor for LocalNodeExecutor {
          request: ExecutorRequest,
          log_line_sender: mpsc::UnboundedSender<LogLine>,
      ) -> anyhow::Result<InvokeResponse> {
@@ -2248,7 +2230,7 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
                  return Err(
                      anyhow::anyhow!(e.without_url()).context(ErrorMetadata::bad_request(
                          "ArgsTooLarge",
-@@ -323,30 +1499,836 @@ impl NodeExecutor for LocalNodeExecutor {
+@@ -311,30 +1489,836 @@ impl NodeExecutor for LocalNodeExecutor {
                      )),
                  );
              }
@@ -2588,9 +2570,10 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
 +                "Detached local Node temp directory cleanup did not finish"
 +            );
 +            std::thread::yield_now();
-+        }
-+    }
-+
+         }
+     }
+ 
+-    fn shutdown(&self) {}
 +    #[test]
 +    fn io_transport_error_classification_is_bounded() {
 +        assert_eq!(
@@ -2939,12 +2922,11 @@ index 4a456ef45b7e3c1fbd46dc2d2699ea9338bd1a4c..e32c1da9153a2fa64ccd1d6b27ebb232
 +            let state = state.lock().await;
 +            assert!(state.inner.is_none());
 +            assert_eq!(state.replacement_for_generation, Some(inner.generation));
-         }
++        }
 +        assert!(inner.server_handle.lock().await.child.is_none());
 +        server_task.abort();
-     }
- 
--    fn shutdown(&self) {}
++    }
++
 +    #[tokio::test]
 +    async fn pre_header_transport_failure_retires_generation() {
 +        let socket_dir = TempDir::new().unwrap();

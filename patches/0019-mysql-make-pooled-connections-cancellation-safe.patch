@@ -28,8 +28,10 @@ cancellation cannot return an interrupted deletion connection to the pool.
  crates/mysql/src/metrics.rs                   |   36 +
  crates/mysql/src/v5/persistence.rs            |   66 +-
  crates/mysql/src/v6/persistence.rs            |   42 +-
+ crates/mysql/src/v6_replica/mod.rs            |    8 +-
+ crates/mysql/src/v6_replica/state.rs          |  117 +-
  patches/README.md                             |   16 +
- .../README.md                                 |  194 ++
+ .../README.md                                 |  198 ++
  self-hosted/docker-build/Dockerfile.backend   |    2 +
  third_party/mysql_async/.gitignore            |    5 +
  third_party/mysql_async/Cargo.toml            |  128 +
@@ -94,7 +96,7 @@ cancellation cannot return an interrupted deletion connection to the pool.
  third_party/mysql_async/test/key.pem          |   27 +
  third_party/mysql_async/tests/exports.rs      |   18 +
  third_party/mysql_async/tests/generic.rs      |   61 +
- 78 files changed, 17867 insertions(+), 199 deletions(-)
+ 80 files changed, 17934 insertions(+), 261 deletions(-)
  create mode 100644 crates/mysql/src/cancellation.rs
  create mode 100644 patches/cancellation_safe_mysql_connections/README.md
  create mode 100644 third_party/mysql_async/.gitignore
@@ -177,10 +179,10 @@ index b1bfb7cdc245b87b1b256933ec6f7eb3e538b219..cc51533ad3bb501a8e7e996e481f2e3c
  !/rust-toolchain
  !/self-hosted/*
 diff --git a/Cargo.lock b/Cargo.lock
-index 48223f5ad111f944a27d78fd699ace80b39d1e6d..7ea6935d10affa56f91bfdaa35399060be99e3ec 100644
+index 9f0cf77cb0149333dd5b619bfa19744dccab8fee..c72bf7f49cd430a4675e851c03ff35d822c6a07e 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -7393,8 +7393,6 @@ dependencies = [
+@@ -7371,8 +7371,6 @@ dependencies = [
  [[package]]
  name = "mysql_async"
  version = "0.37.1"
@@ -190,7 +192,7 @@ index 48223f5ad111f944a27d78fd699ace80b39d1e6d..7ea6935d10affa56f91bfdaa35399060
   "arc-swap",
   "bytes",
 diff --git a/Cargo.toml b/Cargo.toml
-index 74c37b5002777132444bb7fd4ef7cbd2405eb64e..abf4014e8a0f13721a0284f83692ee89ca1899db 100644
+index 5f3bd9b35c033d9f2b14329a93e527b66f5fba00..17701a892984df5953af622f042cc2abd6f7f480 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -1,7 +1,7 @@
@@ -202,7 +204,7 @@ index 74c37b5002777132444bb7fd4ef7cbd2405eb64e..abf4014e8a0f13721a0284f83692ee89
  
  [workspace.dependencies]
  ada-url = "4.0.0"
-@@ -141,7 +141,8 @@ moka = { version = "0.12", features = [ "future", "sync" ] }
+@@ -138,7 +138,8 @@ moka = { version = "0.12", features = [ "future", "sync" ] }
  multer = "3.1.0"
  must-let = { git = "https://github.com/sujayakar/must-let", rev = "5b487d78db235e396e61dd03ce261ced0eafff9d" }
  mysql = { path = "crates/mysql" }
@@ -213,10 +215,10 @@ index 74c37b5002777132444bb7fd4ef7cbd2405eb64e..abf4014e8a0f13721a0284f83692ee89
  oauth2 = { version = "5", default-features = false }
  once_cell = "1.19"
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 73889b648904152387a76db867f34387bdaf01b9..60ba182821aa95c0c9e6da93c0ea60e3cbe87936 100644
+index e6882ae3276669eb2876225c942f99c9cf14a744..080df98a3f2e0ed83d5875b29aab0e196aaa3079 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -1865,6 +1865,18 @@ pub static MYSQL_TIMEOUT: LazyLock<u64> = LazyLock::new(|| env_config("MYSQL_TIM
+@@ -1855,6 +1855,18 @@ pub static MYSQL_TIMEOUT: LazyLock<u64> = LazyLock::new(|| env_config("MYSQL_TIM
  pub static MYSQL_MAX_CONNECTIONS: LazyLock<usize> =
      LazyLock::new(|| env_config("MYSQL_MAX_CONNECTIONS", 128));
  
@@ -1213,7 +1215,7 @@ index 0000000000000000000000000000000000000000..611b11761b7686cde93533ce387a0dfa
 +    }
 +}
 diff --git a/crates/mysql/src/connection.rs b/crates/mysql/src/connection.rs
-index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828f8704e23 100644
+index ef7ace99cee9f8b5e7ec8da93eb2a6e2334a8bbd..498d59f020efa47e6aeb018f581d867cbc120bcf 100644
 --- a/crates/mysql/src/connection.rs
 +++ b/crates/mysql/src/connection.rs
 @@ -1,7 +1,6 @@
@@ -1223,8 +1225,8 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
 -    mem,
      path::PathBuf,
      str::FromStr,
-     time::Duration,
-@@ -30,7 +29,6 @@ use common::{
+     sync::OnceLock,
+@@ -32,7 +31,6 @@ use common::{
      },
      runtime::{
          assert_send,
@@ -1232,7 +1234,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
          Runtime,
      },
  };
-@@ -74,18 +72,26 @@ use prometheus::VMHistogramVec;
+@@ -76,18 +74,26 @@ use prometheus::VMHistogramVec;
  use tokio::time::sleep;
  use url::Url;
  
@@ -1271,7 +1273,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
  };
  
  fn classify_mysql_error(e: mysql_async::Error) -> anyhow::Error {
-@@ -170,9 +176,9 @@ pub(crate) fn is_message_too_large_error(
+@@ -153,9 +159,9 @@ pub(crate) fn is_no_such_table_error(error: &anyhow::Error) -> bool {
  // instances can't start -- and during commit -- which means all future commits
  // fail with OCC errors.
  //
@@ -1284,7 +1286,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
  pub(crate) async fn with_timeout<R, Fut: Future<Output = Result<R, mysql_async::Error>>>(
      f: Fut,
  ) -> anyhow::Result<R> {
-@@ -302,7 +308,7 @@ fn format_mysql_binary_protocol(db_name: &str, statement: &str) -> anyhow::Resul
+@@ -285,7 +291,7 @@ fn format_mysql_binary_protocol(db_name: &str, statement: &str) -> anyhow::Resul
  }
  
  pub(crate) struct MySqlConnection<'a, RT: Runtime> {
@@ -1293,7 +1295,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
      labels: Vec<StaticMetricLabel>,
      pool: &'a ConvexMySqlPool<RT>,
      db_name: &'a str,
-@@ -310,15 +316,195 @@ pub(crate) struct MySqlConnection<'a, RT: Runtime> {
+@@ -293,15 +299,195 @@ pub(crate) struct MySqlConnection<'a, RT: Runtime> {
      _timer: Timer<VMHistogramVec>,
  }
  
@@ -1492,7 +1494,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
              Err(e) if e.is::<DatabaseOperationalError>() => (e, attempt < max_retries),
              Err(e) if e.is::<DatabaseTimeoutError>() => {
                  // Don't retry here as we want the caller to receive some
-@@ -329,41 +515,62 @@ async fn handle_errors_with_retries<R, RT: Runtime>(
+@@ -312,41 +498,62 @@ async fn handle_errors_with_retries<R, RT: Runtime>(
                  // So don't return the connection to the pool.
                  (e, false)
              },
@@ -1572,7 +1574,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
          pool,
          async move |conn| f.take().expect("should never retry")(conn).await,
          0, /* max_retries */
-@@ -377,7 +584,9 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -360,7 +567,9 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
      pub async fn execute_many(&mut self, query: &str) -> anyhow::Result<()> {
          log_execute(self.labels.clone());
          let statement = format_mysql_text_protocol(self.db_name, query, vec![], &self.labels)?;
@@ -1583,7 +1585,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
              // Every statement after the first runs only as its result set is
              // consumed, and reports its error only there. Dropping the result
              // instead leaves them pending on the connection, so they run if it
-@@ -386,8 +595,11 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -369,8 +578,11 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
              with_timeout(result.drop_result()).await?;
              Ok(())
          })
@@ -1597,7 +1599,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
      }
  
      /// Run a readonly query that returns one or zero results.
-@@ -398,30 +610,43 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -381,30 +593,43 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<Option<Row>> {
          log_query(self.labels.clone());
@@ -1651,7 +1653,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
      }
  
      /// Run a readonly query and collect the results, mapping them with `f`
-@@ -435,17 +660,27 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -418,17 +643,27 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
      ) -> anyhow::Result<Vec<R>> {
          let labels = self.labels.clone();
          log_query(labels.clone());
@@ -1687,7 +1689,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
                      let progress_counter = query_progress_counter(size_hint, labels.clone());
                      Self::collect_query_stream(
                          with_timeout(
-@@ -462,10 +697,8 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -445,10 +680,8 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
              ))
              .await
          } else {
@@ -1699,7 +1701,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
                  self.pool,
                  async move |conn| {
                      let progress_counter = query_progress_counter(size_hint, labels.clone());
-@@ -480,7 +713,11 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -463,7 +696,11 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
                  *MYSQL_MAX_QUERY_RETRIES,
              ))
              .await
@@ -1711,7 +1713,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
      }
  
      async fn collect_query_stream<R>(
-@@ -514,53 +751,105 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
+@@ -497,53 +734,105 @@ impl<RT: Runtime> MySqlConnection<'_, RT> {
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<u64> {
          log_execute(self.labels.clone());
@@ -1848,7 +1850,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
      }
  }
  
-@@ -569,6 +858,7 @@ pub(crate) struct MySqlTransaction<'a> {
+@@ -552,6 +841,7 @@ pub(crate) struct MySqlTransaction<'a> {
      use_prepared_statements: bool,
      db_name: &'a str,
      labels: &'a [StaticMetricLabel],
@@ -1856,7 +1858,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
  }
  
  impl MySqlTransaction<'_> {
-@@ -579,15 +869,28 @@ impl MySqlTransaction<'_> {
+@@ -562,15 +852,28 @@ impl MySqlTransaction<'_> {
          statement: &str,
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<Option<Row>> {
@@ -1890,7 +1892,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
      }
  
      /// Executes the given statement and drops the result.
-@@ -596,11 +899,28 @@ impl MySqlTransaction<'_> {
+@@ -579,11 +882,28 @@ impl MySqlTransaction<'_> {
          statement: &str,
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<()> {
@@ -1923,7 +1925,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
      }
  
      /// Execute a SQL statement, returning the number of rows affected.
-@@ -609,15 +929,42 @@ impl MySqlTransaction<'_> {
+@@ -592,15 +912,42 @@ impl MySqlTransaction<'_> {
          statement: &str,
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<u64> {
@@ -1974,7 +1976,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
      }
  
      /// Executes a raw query using the text protocol, even when the connection
-@@ -628,7 +975,12 @@ impl MySqlTransaction<'_> {
+@@ -611,7 +958,12 @@ impl MySqlTransaction<'_> {
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<()> {
          let statement = format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
@@ -1988,7 +1990,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
      }
  
      /// Like [`Self::query_drop`], returning the number of rows affected.
-@@ -638,19 +990,41 @@ impl MySqlTransaction<'_> {
+@@ -621,20 +973,42 @@ impl MySqlTransaction<'_> {
          params: Vec<MySqlValue>,
      ) -> anyhow::Result<u64> {
          let statement = format_mysql_text_protocol(self.db_name, statement, params, self.labels)?;
@@ -2030,12 +2032,13 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
  }
  
  pub struct ConvexMySqlPool<RT: Runtime> {
+     pub(crate) v6_replica: OnceLock<crate::v6_replica::ReplicaTarget<RT>>,
      pool: Pool,
 +    cancellation: MySqlCancellationController<RT>,
      use_prepared_statements: bool,
      runtime: Option<RT>,
      stats: ConnectionPoolStats,
-@@ -680,7 +1054,8 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -664,7 +1038,8 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
          url: &Url,
          use_prepared_statements: bool,
          require_leader: bool,
@@ -2045,7 +2048,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
      ) -> anyhow::Result<Self> {
          let cluster_name = derive_cluster_name(url).to_owned();
          // NOTE: the inactive_connection_ttl only applies to connections > min
-@@ -741,16 +1116,39 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -725,17 +1100,40 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
                  .with_root_certs(vec![ca_file_path.into()]);
              opts = opts.ssl_opts(ssl_opts);
          }
@@ -2066,6 +2069,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
 +            connection_id_topology,
 +        );
          Ok(Self {
+             v6_replica: OnceLock::new(),
              pool: Pool::new(opts),
 +            cancellation,
              use_prepared_statements,
@@ -2086,7 +2090,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
          let pool_get_timer = get_connection_timer(&self.cluster_name);
          let conn = with_timeout(self.pool.get_conn())
              .trace_if_pending(func_path!()) // only trace if slow
-@@ -765,8 +1163,9 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -750,8 +1148,9 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
          db_name: &'a str,
      ) -> anyhow::Result<MySqlConnection<'a, RT>> {
          let conn = self.acquire_internal().await?;
@@ -2097,7 +2101,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
              labels: vec![
                  StaticMetricLabel::new("name", name),
                  StaticMetricLabel::new("cluster_name", self.cluster_name.clone()),
-@@ -791,7 +1190,10 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
+@@ -785,7 +1184,10 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
  
      pub async fn shutdown(&self) -> anyhow::Result<()> {
          tracing::info!("Shutting down ConvexMySqlPool");
@@ -2109,7 +2113,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
      }
  }
  
-@@ -802,9 +1204,144 @@ impl<RT: Runtime> Drop for ConvexMySqlPool<RT> {
+@@ -796,9 +1198,144 @@ impl<RT: Runtime> Drop for ConvexMySqlPool<RT> {
              return;
          };
          let pool = self.pool.clone();
@@ -2257,7 +2261,7 @@ index 02604ef0a74f57a45bdbaf4f257da5c121a578d9..125dda35dd81c5cc516bbf13bcd39828
 +    }
 +}
 diff --git a/crates/mysql/src/deployment_deletion.rs b/crates/mysql/src/deployment_deletion.rs
-index 2415193ef1f3d37e024a939621e940cdc1be238f..e3a2ef12b7244c30b1d5d0c2b45f7b37a37e48f9 100644
+index eae5bfd55685a4d232389c92fe9d952fa5c71fff..27c140fa251d36a63f5e4bd0ace1e1a4bd80ad9b 100644
 --- a/crates/mysql/src/deployment_deletion.rs
 +++ b/crates/mysql/src/deployment_deletion.rs
 @@ -43,6 +43,7 @@ use crate::{
@@ -2280,7 +2284,7 @@ index 2415193ef1f3d37e024a939621e940cdc1be238f..e3a2ef12b7244c30b1d5d0c2b45f7b37
          )?);
          Ok(Self {
              pool,
-@@ -471,20 +475,18 @@ impl<RT: Runtime> DeploymentDeleter<RT> {
+@@ -464,20 +468,18 @@ impl<RT: Runtime> DeploymentDeleter<RT> {
          // The revoked lease excludes valid writers; READ COMMITTED additionally avoids
          // next-key locks blocking unrelated activity around the bounded range.
          let started = Instant::now();
@@ -2309,7 +2313,7 @@ index 2415193ef1f3d37e024a939621e940cdc1be238f..e3a2ef12b7244c30b1d5d0c2b45f7b37
              rows_deleted,
              next_cursor: next_key.map(|key| TableCursor {
 diff --git a/crates/mysql/src/lib.rs b/crates/mysql/src/lib.rs
-index b0f0f899c5c08e4bfaa969dc8c9492025da02e31..e49f304f68c88bd1bb755ce6c4e9ed590156d501 100644
+index 2e881277d402197871c7ae8b411337425cd47853..24c9fdeb6c6b07ebb8d14a9616ef1c756d93f8e6 100644
 --- a/crates/mysql/src/lib.rs
 +++ b/crates/mysql/src/lib.rs
 @@ -2,6 +2,7 @@
@@ -2320,7 +2324,7 @@ index b0f0f899c5c08e4bfaa969dc8c9492025da02e31..e49f304f68c88bd1bb755ce6c4e9ed59
  mod chunks;
  mod connection;
  mod deployment_deletion;
-@@ -18,6 +19,7 @@ use std::{
+@@ -16,6 +17,7 @@ use std::{
      sync::Arc,
  };
  
@@ -2376,10 +2380,10 @@ index 1b03fbe3192c52b771c85dc2c882b315c7a8afb2..c1e692b55f3329fd80789c31a84bd35b
      StaticMetricLabel::new("key", String::from(key))
  }
 diff --git a/crates/mysql/src/v5/persistence.rs b/crates/mysql/src/v5/persistence.rs
-index f37c0f1a971cbabb90f758f4b14b9668eb56ade3..632a33840ce343ddf824fa758ca663609768171c 100644
+index 75d79d97c091f4bf66c2ea6a6bce641a80d159d1..9cb007d5475b9fa3ea12200e4cd3ec96aec0a10f 100644
 --- a/crates/mysql/src/v5/persistence.rs
 +++ b/crates/mysql/src/v5/persistence.rs
-@@ -76,7 +76,6 @@ use common::{
+@@ -75,7 +75,6 @@ use common::{
      },
      sha256::Sha256,
      shutdown::ShutdownSignal,
@@ -2387,7 +2391,7 @@ index f37c0f1a971cbabb90f758f4b14b9668eb56ade3..632a33840ce343ddf824fa758ca66360
      types::{
          IndexId,
          IndexRef,
-@@ -1568,6 +1567,7 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1419,6 +1418,7 @@ impl<RT: Runtime> Lease<RT> {
          tracing::info!("lease acquired with ts {}", ts);
  
          timer.finish();
@@ -2395,7 +2399,7 @@ index f37c0f1a971cbabb90f758f4b14b9668eb56ade3..632a33840ce343ddf824fa758ca66360
          Ok(Self {
              db_name,
              pool,
-@@ -1617,43 +1617,35 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1468,43 +1468,35 @@ impl<RT: Runtime> Lease<RT> {
          F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
      {
          let mut client = self.pool.acquire("transact", &self.db_name).await?;
@@ -2468,10 +2472,10 @@ index f37c0f1a971cbabb90f758f4b14b9668eb56ade3..632a33840ce343ddf824fa758ca66360
  }
  
 diff --git a/crates/mysql/src/v6/persistence.rs b/crates/mysql/src/v6/persistence.rs
-index 33abf1d121c5e55301940052815e843036508c27..fe643e33f8eec5d49ca82375988899b0737a4653 100644
+index 41e07d15a02c47f9ddb3735fedd4c13f86505df2..99dcd0c9cda91422cb24e2ec363fc971d3f7a748 100644
 --- a/crates/mysql/src/v6/persistence.rs
 +++ b/crates/mysql/src/v6/persistence.rs
-@@ -1114,6 +1114,7 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1069,6 +1069,7 @@ impl<RT: Runtime> Lease<RT> {
              "failed to acquire V6 lease: already acquired with higher timestamp, or read-only"
          );
          timer.finish();
@@ -2479,7 +2483,7 @@ index 33abf1d121c5e55301940052815e843036508c27..fe643e33f8eec5d49ca82375988899b0
          Ok(Self {
              pool,
              db_name,
-@@ -1151,30 +1152,23 @@ impl<RT: Runtime> Lease<RT> {
+@@ -1106,30 +1107,23 @@ impl<RT: Runtime> Lease<RT> {
          F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
      {
          let mut client = self.pool.acquire("v6_transact", &self.db_name).await?;
@@ -2527,6 +2531,167 @@ index 33abf1d121c5e55301940052815e843036508c27..fe643e33f8eec5d49ca82375988899b0
      }
  }
  
+diff --git a/crates/mysql/src/v6_replica/mod.rs b/crates/mysql/src/v6_replica/mod.rs
+index 466b18d919eb77edf224d7f6067f057f276a9435..0ed5a2cc54faa7d6bf409157dd48de3e76a3d5b5 100644
+--- a/crates/mysql/src/v6_replica/mod.rs
++++ b/crates/mysql/src/v6_replica/mod.rs
+@@ -50,6 +50,7 @@ use crate::{
+     DeploymentDeletionPool,
+     DeploymentDeletionTarget,
+     IndexesLogMaintenance,
++    MySqlConnectionIdTopology,
+     MySqlOptions,
+ };
+ 
+@@ -64,14 +65,17 @@ pub struct ReplicaTarget<RT: Runtime> {
+ }
+ 
+ impl<RT: Runtime> ReplicaTarget<RT> {
+-    pub fn new(url: &str) -> anyhow::Result<Self> {
++    pub fn new(url: &str, runtime: RT) -> anyhow::Result<Self> {
+         let (parsed, db_name) = config::parse_url(url)?;
+         Ok(Self {
+             pool: Arc::new(ConvexMySqlPool::new(
+                 &parsed,
+                 *DATABASE_USE_PREPARED_STATEMENTS,
+                 true, /* require_leader */
+-                None,
++                runtime,
++                // Replica endpoints have their own connection-ID namespace;
++                // the source pool's topology assertion does not cover them.
++                MySqlConnectionIdTopology::Untrusted,
+             )?),
+             db_name,
+             state_table: Default::default(),
+diff --git a/crates/mysql/src/v6_replica/state.rs b/crates/mysql/src/v6_replica/state.rs
+index 007a794d6403bcb2d0e6d1240d2a2eca927850bc..abcab804c9211eec323b7c58573c666f58e78013 100644
+--- a/crates/mysql/src/v6_replica/state.rs
++++ b/crates/mysql/src/v6_replica/state.rs
+@@ -101,67 +101,64 @@ pub(super) async fn register<RT: Runtime>(
+     source_is_fresh: bool,
+ ) -> anyhow::Result<bool> {
+     let mut connection = pool.acquire("v6_replica_state_register", db_name).await?;
+-    let result = async {
+-        let mut tx = connection
+-            .transaction(
+-                pool.cluster_name(),
+-                Some(mysql_async::IsolationLevel::ReadCommitted),
+-            )
+-            .await?;
+-        let current = tx
+-            .exec_first(
+-                &format!(
+-                    "SELECT {COLUMNS} FROM @db_name.v5_replica_handoffs WHERE deployment_id = ? \
+-                     FOR UPDATE"
+-                ),
+-                vec![state.deployment_id.0.into()],
+-            )
+-            .await?
+-            .map(ReplicaHandoffState::from_row)
+-            .transpose()?;
+-        let replay = match &current {
+-            Some(current) => {
+-                anyhow::ensure!(
+-                    state.lease_ts > current.lease_ts,
+-                    "replica already registered this writer or a newer writer"
+-                );
+-                !current.retired && current.clean_shutdown && current.same_source(state)
++    connection
++        .transaction(
++            pool.cluster_name(),
++            Some(mysql_async::IsolationLevel::ReadCommitted),
++            async |tx| {
++                let current = tx
++                    .exec_first(
++                        &format!(
++                            "SELECT {COLUMNS} FROM @db_name.v5_replica_handoffs WHERE \
++                             deployment_id = ? FOR UPDATE"
++                        ),
++                        vec![state.deployment_id.0.into()],
++                    )
++                    .await?
++                    .map(ReplicaHandoffState::from_row)
++                    .transpose()?;
++                let replay = match &current {
++                    Some(current) => {
++                        anyhow::ensure!(
++                            state.lease_ts > current.lease_ts,
++                            "replica already registered this writer or a newer writer"
++                        );
++                        !current.retired && current.clean_shutdown && current.same_source(state)
++                    },
++                    None => source_is_fresh,
++                };
++                if current.is_some() {
++                    tx.exec_drop(
++                        "UPDATE @db_name.v5_replica_handoffs SET lease_ts = ?, retired = ?, \
++                         clean_shutdown = FALSE WHERE deployment_id = ?",
++                        vec![
++                            state.lease_ts.into(),
++                            (!replay).into(),
++                            state.deployment_id.0.into(),
++                        ],
++                    )
++                    .await?;
++                } else {
++                    tx.exec_drop(
++                        &format!(
++                            "INSERT INTO @db_name.v5_replica_handoffs ({COLUMNS}) VALUES (?, ?, \
++                             ?, ?, ?, ?, FALSE)"
++                        ),
++                        vec![
++                            state.deployment_id.0.into(),
++                            state.cluster_name.clone().into(),
++                            state.db_name.clone().into(),
++                            state.instance_name.clone().into(),
++                            (!replay).into(),
++                            state.lease_ts.into(),
++                        ],
++                    )
++                    .await?;
++                }
++                Ok(replay)
+             },
+-            None => source_is_fresh,
+-        };
+-        if current.is_some() {
+-            tx.exec_drop(
+-                "UPDATE @db_name.v5_replica_handoffs SET lease_ts = ?, retired = ?, \
+-                 clean_shutdown = FALSE WHERE deployment_id = ?",
+-                vec![
+-                    state.lease_ts.into(),
+-                    (!replay).into(),
+-                    state.deployment_id.0.into(),
+-                ],
+-            )
+-            .await?;
+-        } else {
+-            tx.exec_drop(
+-                &format!(
+-                    "INSERT INTO @db_name.v5_replica_handoffs ({COLUMNS}) VALUES (?, ?, ?, ?, ?, \
+-                     ?, FALSE)"
+-                ),
+-                vec![
+-                    state.deployment_id.0.into(),
+-                    state.cluster_name.clone().into(),
+-                    state.db_name.clone().into(),
+-                    state.instance_name.clone().into(),
+-                    (!replay).into(),
+-                    state.lease_ts.into(),
+-                ],
+-            )
+-            .await?;
+-        }
+-        tx.commit().await?;
+-        Ok(replay)
+-    }
+-    .await;
+-    connection.handle_errors(result).await
++        )
++        .await
+ }
+ 
+ /// Call after source writes have stopped and all replay has succeeded.
 diff --git a/patches/README.md b/patches/README.md
 index 2656b7b5a518a4b7b09d0aaf1515270f706819b9..39e64c00c567230a9f557fe5b0d8f01cd2e7a80b 100644
 --- a/patches/README.md
@@ -2556,10 +2721,10 @@ index 2656b7b5a518a4b7b09d0aaf1515270f706819b9..39e64c00c567230a9f557fe5b0d8f01c
  ### [Materialize snapshot import ZIPs](snapshot_import_zip_materialization/README.md)
 diff --git a/patches/cancellation_safe_mysql_connections/README.md b/patches/cancellation_safe_mysql_connections/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..558ade33ccc828543f1c610565db2d856958d143
+index 0000000000000000000000000000000000000000..4c70ec4a86092e2ea7a16ded00330203322ad2fc
 --- /dev/null
 +++ b/patches/cancellation_safe_mysql_connections/README.md
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,198 @@
 +# Cancellation-Safe MySQL Connections
 +
 +Status: the maintained backend patch owns each direct MySQL operation and transaction through a
@@ -2677,8 +2842,12 @@ index 0000000000000000000000000000000000000000..558ade33ccc828543f1c610565db2d85
 +or timeout source. The shared V5/V6 deployment-deletion pool also uses these guards and
 +keeps each READ COMMITTED deletion batch inside the transaction owner through commit and
 +always selects untrusted topology: its administrative cluster URL alone does not prove a shared
-+connection-identifier namespace. The default mode does not establish a control connection or reserve
-+bounded worker capacity. Trusted-single-namespace mode has a cancellation queue with
++connection-identifier namespace. The optional V6 replica target also uses untrusted topology,
++independently of the source pool's setting. Replica handoff registration stays inside the same
++transaction owner through commit, preserving its lease fencing and clean-shutdown checks on
++completion and discarding an interrupted connection on cancellation.
++
++The default mode does not establish a control connection or reserve bounded worker capacity. Trusted-single-namespace mode has a cancellation queue with
 +`MYSQL_MAX_CONNECTIONS` slots and adds one separately bounded, long-lived control connection
 +without changing ordinary data pool capacity or MySQL statement timeout values. Neither mode
 +requires Performance Schema visibility.
