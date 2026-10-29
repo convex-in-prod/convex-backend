@@ -41,6 +41,7 @@ use database::{
     IndexModel,
     SchemaModel,
     SchemaValidationModel,
+    SchemasTable,
     Snapshot,
     TableShape,
     TableShapes,
@@ -49,9 +50,14 @@ use database::{
     ValidationAttemptUpdate,
     ValidationState,
     SCHEMAS_TABLE,
+    SCHEMA_VALIDATIONS_TABLE,
 };
 use errors::ErrorMetadataAnyhowExt;
 use futures::{
+    future::{
+        select,
+        Either,
+    },
     pin_mut,
     stream,
     Future,
@@ -89,6 +95,9 @@ use crate::metrics::log_worker_starting;
 
 mod metrics;
 
+#[cfg(test)]
+mod tests;
+
 const INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_OCC_FAILURES: u32 = 3;
@@ -105,6 +114,26 @@ impl WalkConfig {
             concurrency: concurrency.max(1),
         }
     }
+}
+
+const MAX_INACTIVE_VALIDATIONS_PER_TRANSACTION: usize = 32;
+
+async fn exact_schema_is_pending<RT: Runtime>(
+    tx: &mut Transaction<RT>,
+    namespace: TableNamespace,
+    schema_id: ResolvedDocumentId,
+) -> anyhow::Result<bool> {
+    if !tx
+        .table_mapping()
+        .namespace(namespace)
+        .name_exists(&SCHEMAS_TABLE)
+    {
+        return Ok(false);
+    }
+    Ok(tx
+        .get_system::<SchemasTable>(namespace, schema_id.developer_id)
+        .await?
+        .is_some_and(|schema| schema.id() == schema_id && schema.state == SchemaState::Pending))
 }
 
 #[derive(Clone)]
@@ -172,6 +201,8 @@ enum WalkOutcome {
 
 pub struct SchemaValidationResult {
     pub token: Token,
+    /// Wake for bounded cleanup even when no validation is runnable.
+    pub cleanup_token: Option<Token>,
     /// Tables scanned for enforced or staged validation, grouped by namespace.
     pub walked_tables: BTreeMap<TableNamespace, BTreeSet<TableName>>,
 }
@@ -190,6 +221,7 @@ impl<RT: Runtime> SchemaWorker<RT> {
                 let result: anyhow::Result<()> = async {
                     let SchemaValidationResult {
                         token,
+                        cleanup_token,
                         walked_tables,
                     } = Box::pin(worker.run()).await?;
                     let num_walked: usize = walked_tables.values().map(|tables| tables.len()).sum();
@@ -200,10 +232,22 @@ impl<RT: Runtime> SchemaWorker<RT> {
                             walked_tables.len()
                         );
                     }
-                    worker
-                        .database
-                        .subscribe_and_wait_for_invalidation(token)
-                        .await?;
+                    if let Some(cleanup_token) = cleanup_token {
+                        let schema_invalidation =
+                            worker.database.subscribe_and_wait_for_invalidation(token);
+                        let attempt_invalidation = worker
+                            .database
+                            .subscribe_and_wait_for_invalidation(cleanup_token);
+                        pin_mut!(schema_invalidation, attempt_invalidation);
+                        match select(schema_invalidation, attempt_invalidation).await {
+                            Either::Left((result, _)) | Either::Right((result, _)) => result?,
+                        };
+                    } else {
+                        worker
+                            .database
+                            .subscribe_and_wait_for_invalidation(token)
+                            .await?;
+                    }
                     Ok(())
                 }
                 .await;
@@ -326,6 +370,7 @@ impl<RT: Runtime> SchemaWorker<RT> {
         let pending_validations = SchemaWorker::pending_schema_validations(&mut tx).await?;
         let staged_validations = SchemaWorker::staged_schema_validations(&mut tx).await?;
         let token = tx.into_token()?;
+        let cleanup_token = self.delete_inactive_schema_validations().await?;
 
         let mut walked_tables: BTreeMap<TableNamespace, BTreeSet<TableName>> = BTreeMap::new();
         if pending_validations.is_empty() && staged_validations.is_empty() {
@@ -333,6 +378,7 @@ impl<RT: Runtime> SchemaWorker<RT> {
             tracing::debug!("SchemaWorker waiting...");
             return Ok(SchemaValidationResult {
                 token,
+                cleanup_token: Some(cleanup_token),
                 walked_tables,
             });
         }
@@ -384,8 +430,54 @@ impl<RT: Runtime> SchemaWorker<RT> {
         tracing::debug!("SchemaWorker waiting...");
         Ok(SchemaValidationResult {
             token,
+            cleanup_token: None,
             walked_tables,
         })
+    }
+
+    async fn delete_inactive_schema_validations(&self) -> anyhow::Result<Token> {
+        // Discover under a read-only token, then recheck each ID in a separate
+        // bounded write transaction so cleanup does not carry a table-range read.
+        let (inactive, token) = {
+            let mut tx = self.database.begin_system().await?;
+            let mut inactive = BTreeMap::new();
+            let mut remaining = MAX_INACTIVE_VALIDATIONS_PER_TRANSACTION;
+            let namespaces: Vec<_> = tx
+                .table_mapping()
+                .namespaces_for_name(&SCHEMA_VALIDATIONS_TABLE);
+            for namespace in namespaces {
+                if remaining == 0 {
+                    break;
+                }
+                let mapping = tx.table_mapping().namespace(namespace);
+                if !mapping.name_exists(&SCHEMA_VALIDATIONS_TABLE)
+                    || !mapping.name_exists(&SCHEMAS_TABLE)
+                {
+                    continue;
+                }
+                let attempt_ids = SchemaValidationModel::new(&mut tx, namespace)
+                    .inactive_attempt_ids(remaining)
+                    .await?;
+                remaining -= attempt_ids.len();
+                if !attempt_ids.is_empty() {
+                    inactive.insert(namespace, attempt_ids);
+                }
+            }
+            let token = tx.into_token()?;
+            (inactive, token)
+        };
+        for (namespace, attempt_ids) in inactive {
+            let mut tx = self.database.begin_system().await?;
+            let deleted = SchemaValidationModel::new(&mut tx, namespace)
+                .delete_inactive_attempts(&attempt_ids)
+                .await?;
+            if deleted > 0 {
+                self.database
+                    .commit_with_write_source(tx, "schema_validation_attempt_cleanup")
+                    .await?;
+            }
+        }
+        Ok(token)
     }
 
     async fn validate_tables(
@@ -410,6 +502,10 @@ impl<RT: Runtime> SchemaWorker<RT> {
 
         let table_mapping = Arc::new(table_mapping.clone());
         let mut tx = self.database.begin_system().await?;
+        if !exact_schema_is_pending(&mut tx, namespace, id).await? {
+            timer.finish_with("canceled");
+            return Ok(());
+        }
         let mut progress = SchemaValidationModel::new(&mut tx, namespace);
         let mut walks = Vec::new();
         for (table_name, total_docs) in per_table_totals {
@@ -455,7 +551,8 @@ impl<RT: Runtime> SchemaWorker<RT> {
                 WalkOutcome::Complete => {},
                 WalkOutcome::Canceled => return Ok(()),
                 WalkOutcome::Violation(schema_error) => {
-                    self.database
+                    let (_, schema_is_failed, _) = self
+                        .database
                         .execute_with_occ_retries(
                             Identity::system(),
                             FunctionUsageTracker::new(),
@@ -473,12 +570,20 @@ impl<RT: Runtime> SchemaWorker<RT> {
                             },
                         )
                         .await?;
-                    timer.finish_developer_error();
+                    if schema_is_failed {
+                        timer.finish_developer_error();
+                    } else {
+                        timer.finish_with("canceled");
+                    }
                     return Ok(());
                 },
             }
         }
         let mut tx = self.database.begin(Identity::system()).await?;
+        if !exact_schema_is_pending(&mut tx, namespace, id).await? {
+            timer.finish_with("canceled");
+            return Ok(());
+        }
         if let Err(error) = SchemaModel::new(&mut tx, namespace)
             .mark_validated(id)
             .await
@@ -495,8 +600,8 @@ impl<RT: Runtime> SchemaWorker<RT> {
         Ok(())
     }
 
-    /// Validate the staged validators of an Active schema, one table at a
-    /// time. Each table resolves independently: a violation fails only that
+    /// Validate a schema's staged validators with bounded concurrent table
+    /// walks. Each table resolves independently: a violation fails only that
     /// table's validation document, and the remaining tables keep validating.
     /// Returns the tables that were actually walked.
     async fn validate_staged_tables(
@@ -812,9 +917,9 @@ impl<RT: Runtime> SchemaWorker<RT> {
     }
 }
 
-/// Flush progress to the table's document every 5% of the table or 500
-/// documents, whichever is smaller, so progress stays fresh without slowing
-/// validation down with writes.
+/// Require 5% of the table or 500 documents, whichever is smaller, before
+/// flushing progress. The walk also enforces a minimum time between updates
+/// and flushes any remainder before completion.
 fn progress_update_threshold(total_docs: Option<u64>) -> NonZeroU64 {
     NonZeroU64::new(
         total_docs
