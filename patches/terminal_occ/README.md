@@ -9,6 +9,12 @@ cycle and delay unrelated pending work. Likewise, known action admission failure
 failed request: closing the sync socket would interrupt unrelated actions and subscriptions and
 replay pending mutations. This patch contains both failures using existing response messages.
 
+For conflicts caused by schema-validation progress updates, the separate
+[Schema Validation Scalability patch](../schema_validation_scalability/README.md)
+keeps progress cleanup out of application-write transactions. It addresses that
+source of contention; this patch controls how exhausted errors reach callers.
+Neither patch requires the other.
+
 ## Behavior
 
 The Node callback half recognizes HTTP 503 responses with the exact structured
