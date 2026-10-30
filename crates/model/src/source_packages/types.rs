@@ -36,6 +36,7 @@ pub enum NodeVersion {
     V20x,
     V22x,
     V24x,
+    V26x,
 }
 
 impl NodeVersion {
@@ -53,7 +54,7 @@ impl NodeVersion {
                     )
                 ));
             },
-            NodeVersion::V22x | NodeVersion::V24x => Ok(()),
+            NodeVersion::V22x | NodeVersion::V24x | NodeVersion::V26x => Ok(()),
         }
     }
 }
@@ -67,6 +68,7 @@ impl FromStr for NodeVersion {
             "20" => Ok(NodeVersion::V20x),
             "22" => Ok(NodeVersion::V22x),
             "24" => Ok(NodeVersion::V24x),
+            "26" => Ok(NodeVersion::V26x),
             _ => anyhow::bail!("Invalid node version: {value}"),
         }
     }
@@ -79,6 +81,7 @@ impl From<NodeVersion> for String {
             NodeVersion::V20x => "20".to_string(),
             NodeVersion::V22x => "22".to_string(),
             NodeVersion::V24x => "24".to_string(),
+            NodeVersion::V26x => "26".to_string(),
         }
     }
 }
