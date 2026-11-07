@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Sat, 11 Jul 2026 14:04:19 +0800
-Subject: [PATCH 12/32] isolate: unify bounded context reuse
+Subject: [PATCH 11/30] isolate: unify bounded context reuse
 
 Add one bounded, isolate-local cache for reusable database-UDF, Convex-runtime action, and HTTP-action contexts. Each module declares the execution kinds it permits through the typed experimental_reuseContext policy; the legacy boolean remains compatible for queries and mutations, while omitted properties remain disabled.
 
@@ -55,17 +55,17 @@ module loading. Finish initialization before action execution and HTTP routing
 completion; keep request resources invocation-owned.
 ---
  Cargo.lock                                    |    3 +
- .../src/application_function_runner/mod.rs    |  209 +-
+ .../src/application_function_runner/mod.rs    |  212 +-
  crates/application/src/lib.rs                 |    1 +
  crates/application/src/runtime_diagnostics.rs |  205 ++
  crates/common/src/knobs.rs                    |  146 ++
  crates/common/src/memory_pressure.rs          |   58 +-
  .../src/in_process_function_runner.rs         |   46 +-
- crates/function_runner/src/server.rs          |   40 +-
+ crates/function_runner/src/server.rs          |   49 +-
  crates/isolate/Cargo.toml                     |    3 +
- crates/isolate/src/client.rs                  |  923 ++++++-
+ crates/isolate/src/client.rs                  |  926 ++++++-
  crates/isolate/src/context_cache.rs           | 2140 ++++++++++++++++-
- crates/isolate/src/environment/action/mod.rs  |  616 ++++-
+ crates/isolate/src/environment/action/mod.rs  |  635 ++++-
  .../isolate/src/environment/action/phase.rs   |  337 ++-
  crates/isolate/src/environment/action/task.rs |    5 +
  .../src/environment/action/task_executor.rs   |    6 +-
@@ -89,7 +89,7 @@ completion; keep request resources invocation-owned.
  crates/isolate/src/termination.rs             |    3 +
  crates/isolate/src/timeout.rs                 |  151 ++
  crates/local_backend/src/lib.rs               |    3 +-
- crates/model/src/modules/module_versions.rs   |  435 +++-
+ crates/model/src/modules/module_versions.rs   |  436 +++-
  crates/node_executor/src/executor.rs          |    3 +-
  crates/pb/protos/common.proto                 |   28 +
  crates/udf/src/execution_observation.rs       |  108 +
@@ -107,7 +107,7 @@ completion; keep request resources invocation-owned.
  .../dependency_capacity/design_reference.md   |   17 +-
  self-hosted/advanced/knobs.md                 |   67 +-
  self-hosted/docker/docker-compose.yml         |    3 +-
- 53 files changed, 9844 insertions(+), 629 deletions(-)
+ 53 files changed, 9882 insertions(+), 626 deletions(-)
  create mode 100644 crates/application/src/runtime_diagnostics.rs
  create mode 100644 crates/isolate/src/environment/udf/context_reuse_tests.rs
  create mode 100644 crates/isolate/src/execution_observation.rs
@@ -117,10 +117,10 @@ completion; keep request resources invocation-owned.
  create mode 100644 patches/context_reuse/selective_invalidation.md
 
 diff --git a/Cargo.lock b/Cargo.lock
-index c1e2ec8b8b60720fa7fd87a6aee8d2bf9a778c82..957833b9821fa86814b91957ff5464c6e162528e 100644
+index 53949e975aabd14b6ea486a695d39c8a4a99790b..785f712c9fd97232ca086b8f9aa0c93d38f2c643 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -6030,6 +6030,7 @@ dependencies = [
+@@ -6099,6 +6099,7 @@ dependencies = [
   "headers",
   "http 1.5.0",
   "humansize",
@@ -128,7 +128,7 @@ index c1e2ec8b8b60720fa7fd87a6aee8d2bf9a778c82..957833b9821fa86814b91957ff5464c6
   "indexmap 2.14.0",
   "itertools 0.14.0",
   "js_build",
-@@ -6053,12 +6054,14 @@ dependencies = [
+@@ -6122,12 +6123,14 @@ dependencies = [
   "roles",
   "runtime",
   "scopeguard",
@@ -144,7 +144,7 @@ index c1e2ec8b8b60720fa7fd87a6aee8d2bf9a778c82..957833b9821fa86814b91957ff5464c6
   "sourcemap",
   "storage",
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4b7c87a3d 100644
+index ff6aced72608fca7cba3d83209c7bde5765fc099..1ad7b0140fe5ce9ce9f8af7c0ec0d2bfbfbd3bcd 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
 @@ -183,6 +183,7 @@ use udf::{
@@ -155,7 +155,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
          PendingArgsPolicy,
          ValidatedActionOutcome,
          ValidatedPathAndArgs,
-@@ -241,6 +242,10 @@ use crate::{
+@@ -242,6 +243,10 @@ use crate::{
          FunctionExecutionLog,
          OutstandingFunctionState,
      },
@@ -166,7 +166,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
      source_map_cache::SourceMapCache,
      ActionError,
      ActionReturn,
-@@ -370,9 +375,10 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -371,9 +376,16 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  udf_type,
                  context,
                  None,
@@ -174,13 +174,19 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
 -                    journal,
 -                    path_and_args,
 +                Some(match udf_type {
-+                    UdfType::Query => FunctionMetadata::Query { journal, path_and_args },
-+                    UdfType::Mutation => FunctionMetadata::Mutation { journal, path_and_args },
++                    UdfType::Query => FunctionMetadata::Query {
++                        journal,
++                        path_and_args,
++                    },
++                    UdfType::Mutation => FunctionMetadata::Mutation {
++                        journal,
++                        path_and_args,
++                    },
 +                    _ => anyhow::bail!("Invalid database UDF type"),
                  }),
                  None,
                  scheduler_dependency,
-@@ -388,6 +394,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -389,6 +401,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          &self,
          tx: Transaction<RT>,
          path_and_args: ValidatedPathAndArgs,
@@ -188,7 +194,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
          log_line_sender: mpsc::UnboundedSender<LogLine>,
          context: ExecutionContext,
          permit_timeout: PermitTimeout,
-@@ -409,9 +416,9 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -410,9 +423,9 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  UdfType::Action,
                  context,
                  Some(log_line_sender),
@@ -200,7 +206,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
                  }),
                  None,
                  scheduler_dependency,
-@@ -482,16 +489,37 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -483,16 +496,37 @@ impl<RT: Runtime> FunctionRouter<RT> {
              .in_memory_indexes
              .in_memory_indexes_last_modified();
  
@@ -242,7 +248,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
                  },
                  log_line_sender,
                  function_metadata,
-@@ -500,8 +528,17 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -501,8 +535,17 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  in_memory_index_last_modified,
                  context,
                  scheduler_dependency,
@@ -262,7 +268,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
          timer.finish();
          drop(permit);
  
-@@ -532,6 +569,20 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -533,6 +576,20 @@ impl<RT: Runtime> FunctionRouter<RT> {
              None
          };
  
@@ -283,7 +289,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
          Ok((tx, outcome))
      }
  }
-@@ -1047,13 +1098,23 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1060,13 +1117,23 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Note that we use different context for every mutation attempt.
              // This so every JS function run gets a different executionId.
              let context = ExecutionContext::new(request_context.clone(), &caller);
@@ -308,7 +314,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
              let pause_client = self.runtime.pause_client();
              pause_client.wait("retry_mutation_loop_start").await;
              let identity = tx.inert_identity();
-@@ -1061,21 +1122,32 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1074,21 +1141,32 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Committed mutations can be replayed even if permit acquisition failed.
              if let Some(result) = self
                  .check_mutation_status(&mut tx, &mutation_identifier)
@@ -352,7 +358,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
                  )
                  .await;
              let (mut tx, mut outcome) = match result {
-@@ -1085,11 +1157,19 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1098,11 +1176,19 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          && (backoff.failures() as usize) < *UDF_EXECUTOR_OCC_MAX_RETRIES
                      {
                          let sleep = backoff.fail(&mut self.runtime.rng());
@@ -371,25 +377,26 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
 +                        }
                          continue;
                      }
-                     if matches!(
-@@ -1099,13 +1179,24 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
-                         < *UDF_FILE_STORAGE_MAX_RETRIES
-                     {
-                         let sleep = file_storage_backoff.fail(&mut self.runtime.rng());
-+                        if let Some(diagnostic) = &mut diagnostic {
-+                            diagnostic.outcome = AttemptOutcome::FileStorageRetry;
-+                            diagnostic.selected_backoff = Some(sleep);
-+                        }
-                         tracing::warn!(
-                             "File storage failed ({e:#}), retrying {write_source:?} after \
-                              {sleep:?}",
-                         );
-+                        let backoff_started = Instant::now();
-                         self.runtime.wait(sleep).await;
-+                        if let Some(diagnostic) = &mut diagnostic {
-+                            diagnostic.elapsed_backoff = Some(backoff_started.elapsed());
-+                        }
-                         continue;
+                     let file_storage_error = match e.short_msg() {
+@@ -1116,14 +1202,25 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                         log_mutation_file_storage_failure(short_msg, retry);
+                         if retry {
+                             let sleep = file_storage_backoff.fail(&mut self.runtime.rng());
++                            if let Some(diagnostic) = &mut diagnostic {
++                                diagnostic.outcome = AttemptOutcome::FileStorageRetry;
++                                diagnostic.selected_backoff = Some(sleep);
++                            }
+                             tracing::warn!(
+                                 "File storage failed ({e:#}), retrying {write_source:?} after \
+                                  {sleep:?}",
+                             );
++                            let backoff_started = Instant::now();
+                             self.runtime.wait(sleep).await;
++                            if let Some(diagnostic) = &mut diagnostic {
++                                diagnostic.elapsed_backoff = Some(backoff_started.elapsed());
++                            }
+                             continue;
+                         }
                      }
 +                    if let Some(diagnostic) = &mut diagnostic {
 +                        diagnostic.outcome = AttemptOutcome::SystemError;
@@ -397,7 +404,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
                      self.function_log
                          .log_mutation_system_error(
                              &e,
-@@ -1126,7 +1217,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1144,7 +1241,12 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Save a CommittedMutation object so we won't rerun this mutation if
              // successful.
              self.write_mutation_status(&mut tx, &mutation_identifier, &outcome)
@@ -411,7 +418,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
  
              let stats = tx.take_stats();
              let execution_time = start.elapsed();
-@@ -1136,6 +1232,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1154,6 +1256,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  // If it's an error inside the UDF, log the failed execution and return the
                  // developer error.
                  Err(ref error) => {
@@ -421,18 +428,13 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
                      drop(tx);
                      self.function_log
                          .log_mutation(
-@@ -1159,21 +1258,37 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1177,17 +1282,34 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              // Attempt to commit the transaction and log an error if commit failed,
              // even if it was an OCC error. We may decide later to suppress OCC
              // errors from the log.
--            let result = match self
+-            let result = match self.database.commit(tx, write_source.clone()).await {
 +            let commit_started = Instant::now();
-+            let committed = self
-                 .database
-                 .commit_with_write_source(tx, write_source.clone())
--                .await
--            {
-+                .await;
++            let committed = self.database.commit(tx, write_source.clone()).await;
 +            if let Some(diagnostic) = &mut diagnostic {
 +                diagnostic.commit = Some(commit_started.elapsed());
 +                diagnostic.outcome = if committed.is_ok() {
@@ -463,7 +465,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
                          let js_error = JsError::from_error(e);
                          outcome.result = Err(js_error.clone());
                          Err(MutationError {
-@@ -1185,15 +1300,27 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1199,15 +1321,27 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                              && (backoff.failures() as usize) < *UDF_EXECUTOR_OCC_MAX_RETRIES
                          {
                              let sleep = backoff.fail(&mut self.runtime.rng());
@@ -491,7 +493,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
                              }
                              self.function_log
                                  .log_mutation_occ_error(
-@@ -1512,8 +1639,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1526,8 +1660,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          wait_for_permit: bool,
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
@@ -504,7 +506,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
                  path,
                  arguments,
                  identity,
-@@ -1522,8 +1651,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1536,8 +1672,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  context,
                  permit_timeout,
                  scheduler_dependency,
@@ -524,7 +526,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
          match result.as_ref() {
              Ok(completion) => {
                  let result = if completion.outcome.result.is_ok() {
-@@ -1628,6 +1766,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1642,6 +1787,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                      .execute_action(
                          tx,
                          path_and_args,
@@ -535,7 +537,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
                          log_line_sender,
                          context.clone(),
                          permit_timeout,
-@@ -1653,6 +1795,8 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1667,6 +1816,8 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                      .try_into()
                      .unwrap();
  
@@ -544,7 +546,7 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
                  let validated_outcome_result = outcome_result.map(|outcome| {
                      ValidatedActionOutcome::new(outcome, returns_validator, &table_mapping)
                  });
-@@ -2405,7 +2549,6 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
+@@ -2420,7 +2571,6 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
          args: SerializedArgs,
          context: ExecutionContext,
      ) -> anyhow::Result<FunctionResult> {
@@ -553,10 +555,10 @@ index 97f10c5d1b52082e0726034fe04708aef4cee158..37958f708e2499a39d7be3e8514156d4
              .run_action_with_scheduler_dependency(
                  RequestContext::new(context.request_id, context.request_metadata),
 diff --git a/crates/application/src/lib.rs b/crates/application/src/lib.rs
-index 77a64796af285387a562643bbbf1be71a562002c..6b1c4560a27c86a403e7b23b74ea24ff18e32c01 100644
+index 9b5fdbd87d7f87acd645c984c5062b0cd4960aa9..9074ef77134ca0e306508732345a62a0e3241a79 100644
 --- a/crates/application/src/lib.rs
 +++ b/crates/application/src/lib.rs
-@@ -451,6 +451,7 @@ pub mod log_streaming;
+@@ -450,6 +450,7 @@ pub mod integrations;
  pub mod log_visibility;
  mod metrics;
  pub mod redaction;
@@ -776,10 +778,10 @@ index 0000000000000000000000000000000000000000..5ab0775d8623493c27f8c8a9cf350ea2
 +    }
 +}
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index e0920a99f680261fccf2391df763d1329f84de8a..e988ff02a0d5653255a011a006afa70da1616aa0 100644
+index bb6efed222581ae7a5d59be3e2fca1b535f776c1..7fc5c6302aa0aa229dc606a241a67104898cdc32 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -1377,6 +1377,40 @@ pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS",
+@@ -1383,6 +1383,40 @@ pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS",
  /// heap.
  pub static REUSE_ISOLATES: LazyLock<bool> = LazyLock::new(|| env_config("REUSE_ISOLATES", true));
  
@@ -820,7 +822,7 @@ index e0920a99f680261fccf2391df763d1329f84de8a..e988ff02a0d5653255a011a006afa70d
  /// Duration in seconds before an idle isolate is recreated
  pub static ISOLATE_IDLE_TIMEOUT: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_IDLE_TIMEOUT_SECONDS", 600)));
-@@ -1448,6 +1482,118 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
+@@ -1454,6 +1488,118 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
      )
  });
  
@@ -1036,7 +1038,7 @@ index 420b59cf8c1f313511ea317263ecefb020f85755..1ecd5fb5d6b58878f1739a72b47068eb
          assert!(signal.is_active());
          assert!(*receiver.borrow());
 diff --git a/crates/function_runner/src/in_process_function_runner.rs b/crates/function_runner/src/in_process_function_runner.rs
-index 5d64c4f0b0e40fb4d8dd9b13ae5f3f4c72a63261..196ceb2abba037a06eb06514d1b11835d4976299 100644
+index c5862aa23b1522d90e5cd04b2e3886d825189a21..808a38c8673b63800d95a8b9bfe117c9477e9139 100644
 --- a/crates/function_runner/src/in_process_function_runner.rs
 +++ b/crates/function_runner/src/in_process_function_runner.rs
 @@ -25,9 +25,13 @@ use common::{
@@ -1051,9 +1053,9 @@ index 5d64c4f0b0e40fb4d8dd9b13ae5f3f4c72a63261..196ceb2abba037a06eb06514d1b11835
      log_lines::LogLine,
 +    memory_pressure::MemoryPressureSignal,
      persistence::{
+         index_scan_attribution::IndexScanCaller,
          PersistenceReader,
-         RepeatablePersistence,
-@@ -62,6 +66,7 @@ use futures::{
+@@ -64,6 +68,7 @@ use indexing::index_reader::AttributedIndexReader;
  use isolate::{
      isolate_worker::FunctionRunnerIsolateWorker,
      ConcurrencyLimiter,
@@ -1061,7 +1063,7 @@ index 5d64c4f0b0e40fb4d8dd9b13ae5f3f4c72a63261..196ceb2abba037a06eb06514d1b11835
      IsolateConfig,
  };
  use keybroker::{
-@@ -132,6 +137,11 @@ pub struct InProcessFunctionRunner<RT: Runtime> {
+@@ -134,6 +139,11 @@ pub struct InProcessFunctionRunner<RT: Runtime> {
  const ACTIVE_CONCURRENCY_PERMITS_LOG_FREQUENCY: Duration = Duration::from_secs(10);
  
  impl<RT: Runtime> InProcessFunctionRunner<RT> {
@@ -1073,7 +1075,7 @@ index 5d64c4f0b0e40fb4d8dd9b13ae5f3f4c72a63261..196ceb2abba037a06eb06514d1b11835
      pub fn new(
          deployment: DeploymentMetadata,
          keybroker: FunctionRunnerKeyBroker,
-@@ -141,9 +151,42 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
+@@ -143,9 +153,42 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
          storage: DeploymentStorage,
          database: Database<RT>,
          fetch_client: Arc<dyn FetchClient>,
@@ -1116,7 +1118,7 @@ index 5d64c4f0b0e40fb4d8dd9b13ae5f3f4c72a63261..196ceb2abba037a06eb06514d1b11835
          let concurrency_limiter = if *FUNRUN_ISOLATE_ACTIVE_THREADS > 0 {
              ConcurrencyLimiter::new(*FUNRUN_ISOLATE_ACTIVE_THREADS)
          } else {
-@@ -153,7 +196,8 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
+@@ -155,7 +198,8 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
              "concurrency_logger",
              concurrency_limiter.go_log(rt.clone(), ACTIVE_CONCURRENCY_PERMITS_LOG_FREQUENCY),
          );
@@ -1127,7 +1129,7 @@ index 5d64c4f0b0e40fb4d8dd9b13ae5f3f4c72a63261..196ceb2abba037a06eb06514d1b11835
          let server = FunctionRunnerCore::new(rt, storage, max_percent_per_client, isolate_worker)?;
          Ok(Self {
 diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
-index 9bda5112b01359e5848943a2b9ef17527bf38572..878f44e5c0946a86fb0235fd0082741c36ebb782 100644
+index 92069c1a1061504e1e722d6c4fe88d2bcdc065eb..d83f665c1fddb95d43cc4ae1ec6efb4224ad6e0a 100644
 --- a/crates/function_runner/src/server.rs
 +++ b/crates/function_runner/src/server.rs
 @@ -96,6 +96,7 @@ use tokio::sync::{
@@ -1161,24 +1163,33 @@ index 9bda5112b01359e5848943a2b9ef17527bf38572..878f44e5c0946a86fb0235fd0082741c
  }
  
  pub struct HttpActionMetadata {
-@@ -381,10 +392,12 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -381,10 +392,21 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
  
          match udf_type {
-             UdfType::Query | UdfType::Mutation => {
+             UdfType::Query | UdfType::Mutation | UdfType::Init => {
 -                let FunctionMetadata {
 -                    path_and_args,
 -                    journal,
 -                } = function_metadata.context("Missing function metadata for query or mutation")?;
 +                let (path_and_args, journal) = match function_metadata
-+                    .context("Missing function metadata for query or mutation")? {
-+                    FunctionMetadata::Query { path_and_args, journal }
-+                    | FunctionMetadata::Mutation { path_and_args, journal } => (path_and_args, journal),
-+                    FunctionMetadata::Action { .. } => anyhow::bail!("Function metadata does not match {udf_type}"),
++                    .context("Missing function metadata for query or mutation")?
++                {
++                    FunctionMetadata::Query {
++                        path_and_args,
++                        journal,
++                    }
++                    | FunctionMetadata::Mutation {
++                        path_and_args,
++                        journal,
++                    } => (path_and_args, journal),
++                    FunctionMetadata::Action { .. } => {
++                        anyhow::bail!("Function metadata does not match {udf_type}")
++                    },
 +                };
                  // Initialize the UDF's RNG from some high-quality entropy. As with
                  // `unix_timestamp` below, the UDF is only deterministic modulo this
                  // system-generated input.
-@@ -422,14 +435,23 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -422,14 +444,23 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                  ))
              },
              UdfType::Action => {
@@ -1226,7 +1237,7 @@ index 466cb0628759670e5507185106df80751a53895b..bdc3ab2aeb7f880f0193701bb7e53cf4
  udf = { workspace = true, features = ["testing"] }
  usage_tracking = { workspace = true, features = ["testing"] }
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792abde6f78 100644
+index 9a473dfde118b7284949f62a1bacb78dd14bccf3..e56172547c6fb3968827f92dd15e9a314149f18a 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -9,6 +9,7 @@ use std::{
@@ -1454,7 +1465,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
      pub transaction: Transaction<RT>,
      pub identity: Identity,
      pub context: ExecutionContext,
-@@ -805,22 +933,66 @@ impl<RT: Runtime> Request<RT> {
+@@ -805,22 +933,69 @@ impl<RT: Runtime> Request<RT> {
      }
  
      pub fn module(&self) -> Option<CanonicalizedComponentModulePath> {
@@ -1521,16 +1532,19 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
 +            #[cfg(test)]
 +            RequestType::Test {
 +                reusable_udf_type, ..
-+            } => reusable_udf_type.map(|udf_type| match udf_type {
-+                UdfType::Query | UdfType::Mutation => ReusableContextKind::DatabaseUdf,
-+                UdfType::Action => ReusableContextKind::Action,
-+                UdfType::HttpAction => ReusableContextKind::HttpAction,
++            } => reusable_udf_type.and_then(|udf_type| {
++                Some(match udf_type {
++                    UdfType::Query | UdfType::Mutation => ReusableContextKind::DatabaseUdf,
++                    UdfType::Action => ReusableContextKind::Action,
++                    UdfType::HttpAction => ReusableContextKind::HttpAction,
++                    UdfType::Init => return None,
++                })
 +            }),
 +        }
      }
  
      fn independent_action_key(&self) -> Option<IndependentActionKey> {
-@@ -897,6 +1069,8 @@ impl<RT: Runtime> Request<RT> {
+@@ -897,6 +1072,8 @@ impl<RT: Runtime> Request<RT> {
  pub enum RequestType<RT: Runtime> {
      Udf {
          request: UdfRequest<RT>,
@@ -1539,7 +1553,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          response: oneshot::Sender<anyhow::Result<(Transaction<RT>, FunctionOutcome)>>,
          queue_timer: Timer<VMHistogram>,
          rng_seed: [u8; 32],
-@@ -906,6 +1080,8 @@ pub enum RequestType<RT: Runtime> {
+@@ -906,6 +1083,8 @@ pub enum RequestType<RT: Runtime> {
      },
      Action {
          request: ActionRequest<RT>,
@@ -1548,7 +1562,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          response: oneshot::Sender<anyhow::Result<ActionOutcome>>,
          queue_timer: Timer<VMHistogram>,
          action_callbacks: Arc<dyn ActionCallbacks>,
-@@ -967,6 +1143,8 @@ pub enum RequestType<RT: Runtime> {
+@@ -967,6 +1146,8 @@ pub enum RequestType<RT: Runtime> {
          can_block_on_descendant: bool,
          is_isolate_action: bool,
          is_control_plane: bool,
@@ -1557,7 +1571,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          fail_worker: bool,
          started: mpsc::UnboundedSender<usize>,
          completion: oneshot::Receiver<()>,
-@@ -989,6 +1167,19 @@ impl<RT: Runtime> RequestType<RT> {
+@@ -989,6 +1170,19 @@ impl<RT: Runtime> RequestType<RT> {
              } => *is_control_plane,
          }
      }
@@ -1577,7 +1591,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
  }
  
  #[allow(async_fn_in_trait)]
-@@ -1213,16 +1404,29 @@ pub struct IsolateClient<RT: Runtime> {
+@@ -1213,16 +1407,29 @@ pub struct IsolateClient<RT: Runtime> {
  }
  
  impl<RT: Runtime> IsolateClient<RT> {
@@ -1611,7 +1625,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          anyhow::ensure!(
              *ISOLATE_QUEUE_SIZE > 0,
              "ISOLATE_QUEUE_SIZE must be greater than zero"
-@@ -1276,9 +1480,39 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1276,9 +1483,39 @@ impl<RT: Runtime> IsolateClient<RT> {
              *ANALYZE_CONCURRENCY,
          )?;
          let delay_control_config = (*ISOLATE_QUEUE_DELAY_CONTROL_ENABLED).then_some(queue_config);
@@ -1652,7 +1666,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
  
          initialize_v8();
          // NB: We don't call V8::Dispose or V8::ShutdownPlatform since we just assume a
-@@ -1365,7 +1599,11 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1365,7 +1602,11 @@ impl<RT: Runtime> IsolateClient<RT> {
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          let (tx, rx) = oneshot::channel();
@@ -1664,7 +1678,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
              request: UdfRequest {
                  path_and_args,
                  udf_type,
-@@ -1376,6 +1614,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1376,6 +1617,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                  environment_data,
                  file_downloads: FileDownloads::default(),
              },
@@ -1672,7 +1686,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
              response: tx,
              queue_timer: queue_timer(),
              rng_seed,
-@@ -1393,7 +1632,13 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1393,7 +1635,13 @@ impl<RT: Runtime> IsolateClient<RT> {
              EncodedSpan::from_parent(),
              scheduler_dependency,
          ))?;
@@ -1687,7 +1701,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
  
          Ok((tx, outcome))
      }
-@@ -1402,6 +1647,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1402,6 +1650,7 @@ impl<RT: Runtime> IsolateClient<RT> {
      pub async fn execute_action(
          &self,
          path_and_args: ValidatedPathAndArgs,
@@ -1695,7 +1709,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          transaction: Transaction<RT>,
          action_callbacks: Arc<dyn ActionCallbacks>,
          fetch_client: Arc<dyn FetchClient>,
-@@ -1413,14 +1659,20 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1413,14 +1662,20 @@ impl<RT: Runtime> IsolateClient<RT> {
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
@@ -1716,7 +1730,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
              response: tx,
              queue_timer: queue_timer(),
              action_callbacks,
-@@ -1434,7 +1686,14 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1434,7 +1689,14 @@ impl<RT: Runtime> IsolateClient<RT> {
              EncodedSpan::from_parent(),
              scheduler_dependency,
          ))?;
@@ -1732,7 +1746,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
              Ok(outcome) => Ok(outcome),
              Err(e) => Err(recapture_stacktrace(e).await),
          }
-@@ -1847,8 +2106,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1847,8 +2109,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
      ) -> anyhow::Result<(Transaction<RT>, NestedUdfOutcome)> {
          let subquery_path = udf_request.path_and_args.path().clone();
          let (tx, rx) = oneshot::channel();
@@ -1746,7 +1760,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
              response: tx,
              queue_timer: queue_timer(),
              rng_seed,
-@@ -1870,7 +2134,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
+@@ -1870,7 +2137,13 @@ impl<RT: Runtime> UdfCallback<RT> for &IsolateClient<RT> {
              .ok()
              .context("scheduler shut down")?;
          metrics::log_scheduler_request_enqueued(self.pool_name, scheduling_properties.as_label());
@@ -1761,7 +1775,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          let outcome = match outcome {
              FunctionOutcome::Query(outcome) | FunctionOutcome::Mutation(outcome) => {
                  NestedUdfOutcome {
-@@ -1907,6 +2177,15 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -1907,6 +2180,15 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      worker: W,
      /// Vec of channels for sending work to individual workers.
      worker_senders: Vec<mpsc::Sender<IsolateWorkerRequest<RT>>>,
@@ -1777,7 +1791,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
      /// Map from client_id to stack of workers (implemented with a deque). The
      /// most recently used worker for a given client is at the front of the
      /// deque. These workers were previously used by this client, but may
-@@ -1963,6 +2242,14 @@ struct ActiveWorkerState {
+@@ -1963,6 +2245,14 @@ struct ActiveWorkerState {
      scheduling_properties: RequestSchedulingProperties,
  }
  
@@ -1792,7 +1806,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
  impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      pub fn new(
          rt: RT,
-@@ -1993,6 +2280,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -1993,6 +2283,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              in_progress_counts_by_client: HashMap::new(),
              in_progress_counts: ActiveRequestCounts::default(),
              active_workers,
@@ -1801,7 +1815,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
              available_workers: HashMap::new(),
              max_workers,
              base_worker_capacity,
-@@ -2012,6 +2301,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2012,6 +2304,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          info: IdleWorkerInfo,
      ) {
          self.release_action_function(completed_worker.action_key.as_ref());
@@ -1810,7 +1824,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          let new_count = match self
              .in_progress_counts_by_client
              .remove_entry(&completed_worker.client_id)
-@@ -2298,8 +2589,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2298,8 +2592,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      let dispatch_state = self.state_snapshot();
                      let dependency_reserve_dispatch = scheduling_properties.unblocks_ancestor
                          && dispatch_state.dependency_dispatch_uses_reserve();
@@ -1827,7 +1841,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
                          Err(reason) => {
                              metrics::log_scheduler_request_rejected(
                                  self.worker.config().name,
-@@ -2324,6 +2621,28 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2324,6 +2624,28 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          self.worker.config().name,
                          scheduling_properties,
                      );
@@ -1856,7 +1870,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
                      if self.worker_senders[worker_id]
                          .try_send(IsolateWorkerRequest {
                              request,
-@@ -2341,6 +2660,50 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2341,6 +2663,50 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          );
                          return;
                      }
@@ -1907,7 +1921,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
                      if let Some((lane, sojourn)) = dispatch_sojourn {
                          metrics::log_isolate_queue_sojourn(
                              self.worker.config().name,
-@@ -2411,16 +2774,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2411,16 +2777,20 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  _ = &mut report_stats => {
                      let heap_stats = self.aggregate_heap_stats();
                      log_aggregated_heap_stats(&heap_stats);
@@ -1930,7 +1944,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
      /// `self.available_workers` state, so the caller is responsible for using
      /// the worker and returning it back to `self.available_workers` after it is
      /// done.
-@@ -2428,7 +2795,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2428,7 +2798,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          &mut self,
          request: &Request<RT>,
          state: &SchedulerStateSnapshot,
@@ -1939,7 +1953,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          let client_id = request.client_id.as_str();
          let eligibility = state.request_eligibility(
              request.scheduling_properties(self.control_plane_lane_enabled),
-@@ -2442,28 +2809,96 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2442,28 +2812,96 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              );
              return Err(reason);
          }
@@ -2052,7 +2066,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          }
          // If we've recently started up and haven't yet created `max_workers` threads,
          // create a new worker instead of "stealing" some other client's worker.
-@@ -2484,7 +2919,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2484,7 +2922,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  self.worker.config().name,
                  self.worker_senders.len() - 1
              );
@@ -2068,7 +2082,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          }
          // No existing worker for this client and we've already started the max number
          // of workers -- just grab the least recently used worker. This worker is least
-@@ -2508,13 +2950,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2508,13 +2953,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              .pop_back()
              .expect("Available worker map should never contain an empty list");
          log_worker_stolen(worker.last_used_ts.elapsed());
@@ -2092,7 +2106,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
      }
  
      fn aggregate_heap_stats(&self) -> IsolateHeapStats {
-@@ -2559,6 +3010,7 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2559,6 +3013,7 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
              max_user_timeout, ..
          } = self.config();
          let mut reqs = std::pin::pin!(ReceiverStream::new(reqs).peekable());
@@ -2100,7 +2114,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          let mut ready: Option<(oneshot::Sender<_>, ActiveRequestGuard)> = None;
          'recreate_isolate: loop {
              let mut last_client_id: Option<String> = None;
-@@ -2569,9 +3021,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2569,9 +3024,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                  *ISOLATE_MAX_USER_HEAP_SIZE,
              );
              isolate.set_heap_stats_handle(heap_stats.clone());
@@ -2117,7 +2131,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
                  context_cache.prepare(isolate.isolate());
                  // Check again whether the isolate has enough free heap memory
                  // before starting the next request
-@@ -2591,6 +3049,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
+@@ -2591,6 +3052,15 @@ pub trait IsolateWorker<RT: Runtime>: Clone + Send + 'static {
                      });
                  }
                  tokio::select! {
@@ -2133,7 +2147,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
                      // If the isolate isn't "tainted", no need to wait for the idle timeout.
                      _ = self.rt().wait(*ISOLATE_IDLE_TIMEOUT), if last_client_id.is_some() => {
                          tracing::debug!("Restarting isolate for {last_client_id:?} due to idle timeout");
-@@ -2728,6 +3195,7 @@ mod tests {
+@@ -2728,6 +3198,7 @@ mod tests {
          collections::{
              BTreeMap,
              HashMap,
@@ -2141,7 +2155,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          },
          future::Future,
          pin::Pin,
-@@ -2748,7 +3216,9 @@ mod tests {
+@@ -2748,7 +3219,9 @@ mod tests {
      use common::{
          components::{
              CanonicalizedComponentFunctionPath,
@@ -2151,7 +2165,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
              ComponentName,
          },
          fastrace_helpers::EncodedSpan,
-@@ -2763,6 +3233,7 @@ mod tests {
+@@ -2763,6 +3236,7 @@ mod tests {
          types::{
              ModuleEnvironment,
              SchedulerDependencyClass,
@@ -2159,7 +2173,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          },
      };
      use errors::ErrorMetadataAnyhowExt as _;
-@@ -2780,14 +3251,18 @@ mod tests {
+@@ -2780,14 +3254,18 @@ mod tests {
      };
  
      use super::{
@@ -2178,7 +2192,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          IsolateConfig,
          IsolateWorker,
          IsolateWorkerHandle,
-@@ -2802,14 +3277,22 @@ mod tests {
+@@ -2802,14 +3280,22 @@ mod tests {
          SharedIsolateScheduler,
      };
      use crate::{
@@ -2203,7 +2217,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
          ConcurrencyLimiter,
          ConcurrencyPermit,
      };
-@@ -2906,6 +3389,8 @@ mod tests {
+@@ -2906,6 +3392,8 @@ mod tests {
                          can_block_on_descendant: _,
                          is_isolate_action: _,
                          is_control_plane: _,
@@ -2212,7 +2226,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
                          fail_worker,
                          started,
                          completion,
-@@ -3021,6 +3506,8 @@ mod tests {
+@@ -3021,6 +3509,8 @@ mod tests {
              ),
              is_isolate_action: matches!(kind, TestRequestKind::Action),
              is_control_plane: matches!(kind, TestRequestKind::ControlPlane),
@@ -2221,7 +2235,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
              fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
              started,
              completion: completion_receiver,
-@@ -3142,6 +3629,7 @@ mod tests {
+@@ -3142,6 +3632,7 @@ mod tests {
          ) -> Self {
              Self::new_with_policy(
                  rt,
@@ -2229,7 +2243,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
                  max_workers,
                  base_worker_capacity,
                  max_independent_actions,
-@@ -3171,6 +3659,7 @@ mod tests {
+@@ -3171,6 +3662,7 @@ mod tests {
              .unwrap();
              Self::new_with_policy(
                  rt,
@@ -2237,7 +2251,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
                  max_workers,
                  base_worker_capacity,
                  max_independent_actions,
-@@ -3184,6 +3673,7 @@ mod tests {
+@@ -3184,6 +3676,7 @@ mod tests {
          #[allow(clippy::too_many_arguments)]
          fn new_with_policy(
              rt: SchedulerTestRuntime,
@@ -2245,7 +2259,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
              max_workers: usize,
              base_worker_capacity: usize,
              max_independent_actions: usize,
-@@ -3194,7 +3684,7 @@ mod tests {
+@@ -3194,7 +3687,7 @@ mod tests {
          ) -> Self {
              let (sender, receiver) = new_scheduler_queue::<_, Request<_>>(
                  rt.clone(),
@@ -2254,7 +2268,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
                  queue_capacity,
                  max_workers - base_worker_capacity,
                  queue_config,
-@@ -3208,6 +3698,7 @@ mod tests {
+@@ -3208,6 +3701,7 @@ mod tests {
                  TestIsolateWorker {
                      rt: rt.clone(),
                      config: IsolateConfig::new(pool_name, ConcurrencyLimiter::unlimited()),
@@ -2262,7 +2276,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
                  },
                  max_workers,
                  base_worker_capacity,
-@@ -3389,6 +3880,20 @@ mod tests {
+@@ -3389,6 +3883,20 @@ mod tests {
          }
      }
  
@@ -2283,7 +2297,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
      #[test]
      fn dependency_and_descendant_capability_are_independent() {
          assert_eq!(properties(false, false, false).as_label(), "independent");
-@@ -3633,6 +4138,16 @@ mod tests {
+@@ -3633,6 +4141,16 @@ mod tests {
          );
      }
  
@@ -2300,7 +2314,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
      #[test]
      fn per_client_capacity_uses_total_occupancy() {
          let global = ActiveRequestCounts {
-@@ -3661,6 +4176,291 @@ mod tests {
+@@ -3661,6 +4179,291 @@ mod tests {
          assert!(!state.can_start_request(properties(true, false, false), "deployment", None));
      }
  
@@ -2592,7 +2606,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
      #[test]
      fn action_cap_does_not_cap_queries_or_dependency_actions() {
          let active = ActiveRequestCounts {
-@@ -3711,6 +4511,40 @@ mod tests {
+@@ -3711,6 +4514,40 @@ mod tests {
          assert!(error.to_string().contains("greater than zero"));
      }
  
@@ -2633,7 +2647,7 @@ index 9a473dfde118b7284949f62a1bacb78dd14bccf3..7fa8ca98361fe3ecbc2c0593e621f792
      #[test]
      fn congested_scheduler_preserves_worker_and_queue_dependency_reserves() {
          let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
-@@ -3943,6 +4777,7 @@ mod tests {
+@@ -3943,6 +4780,7 @@ mod tests {
                  // ineligible behind A's active request.
                  let mut harness = SchedulerHarness::new_with_policy(
                      scheduler_rt,
@@ -4883,7 +4897,7 @@ index a9cd510365f4892a3e4ae1111ec0d9520ecb63e3..814f7d4d54bb743561281f7bfd32449e
 +    }
 +}
 diff --git a/crates/isolate/src/environment/action/mod.rs b/crates/isolate/src/environment/action/mod.rs
-index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4bb0659b5 100644
+index fda468365510e22033b5300b987ec4d894f0fed8..195775c411ddc7c507fc7a8eb3b18cddc2890d50 100644
 --- a/crates/isolate/src/environment/action/mod.rs
 +++ b/crates/isolate/src/environment/action/mod.rs
 @@ -11,7 +11,10 @@ mod task_order;
@@ -5192,23 +5206,21 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
          let execution_time = timeout.into_function_execution_time(UdfType::HttpAction);
          match termination_error {
              Ok(Ok(..)) => (),
-@@ -483,10 +637,10 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -483,22 +637,85 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
                  // succeeded, so usage tracking reports the parameterized route
                  // pattern instead of the raw URL path.
                  let route = result.as_ref().ok().and_then(|(route, _)| route.clone());
--                if !self.provider.http_response_has_started()? {
-+                if !environment.provider.http_response_has_started()? {
-                     result = Ok((route, HttpActionResult::Error(e)));
-                 } else {
--                    self.provider.handle_http_streamed_part(Err(e))?;
-+                    environment.provider.handle_http_streamed_part(Err(e))?;
-                     result = Ok((route, HttpActionResult::Streamed))
-                 }
+-                result = http_action_failed(&mut self.provider, e).map(|result| (route, result));
++                result =
++                    http_action_failed(&mut environment.provider, e).map(|result| (route, result));
              },
-@@ -494,22 +648,87 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+             Err(e) => {
                  result = Err(e);
              },
          }
+-        let dangling_task_counts = self.dangling_task_counts();
+-        finish_http_action(
+-            self.provider,
 +        // A streamed response can still leave request-owned task promises, streams,
 +        // dynamic imports, unhandled rejections, or a termination that was converted
 +        // into an HTTP stream outcome. Do not cache that context while its Rust state
@@ -5238,31 +5250,17 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
 +        } else {
 +            None
 +        };
-         let user_execution_time = execution_time.elapsed;
--        self.provider.add_http_response_size_warning()?;
--        let dangling_task_counts = self.dangling_task_counts();
--        add_warnings_to_log_lines(&mut self.provider, dangling_task_counts, execution_time)?;
-+        environment.provider.add_http_response_size_warning()?;
 +        let dangling_task_counts = environment.dangling_task_counts();
-+        add_warnings_to_log_lines(
++        let outcome = prepare_http_action_outcome(
 +            &mut environment.provider,
-+            dangling_task_counts,
-+            execution_time,
-+        )?;
-         let (route, result) = result?;
-         let outcome = HttpActionOutcome::new(
-             route,
+             dangling_task_counts,
+             &http_module_path,
              request_head,
--            self.provider.identity().clone().into(),
-+            environment.provider.identity().clone().into(),
              start_unix_timestamp,
+             execution_time,
              result,
--            Some(self.provider.syscall_trace()),
-+            Some(environment.provider.syscall_trace()),
-             http_module_path.npm_version().clone(),
-             user_execution_time,
-         );
--        Ok(self.provider.into_http_outcome(outcome))
+-        )
++        )?;
 +        let reusable_context = if let Some((module_map, v8_context, read_set)) = reusable_context {
 +            // The response receiver can close during warning/result finalization.
 +            // Keep the token guard live until these final checks complete. Its
@@ -5299,7 +5297,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
      }
  
      #[fastrace::trace]
-@@ -566,6 +785,8 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -555,6 +772,8 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
                  handle.check_terminated()?;
                  let state = scope.state_mut()?;
                  let provider = &mut state.environment.provider;
@@ -5308,7 +5306,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
                  let response_parts = HttpActionResponsePart::from_text(
                      StatusCode::NOT_FOUND,
                      "No matching routes found".into(),
-@@ -652,7 +873,9 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -641,7 +860,9 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          let sender_closed_fut = state.environment.provider.http_response_closed()?;
          let sender_closed =
              Box::pin(futures::stream::once(sender_closed_fut).filter_map(|_| async move { None }));
@@ -5319,7 +5317,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
          state
              .environment
              .provider
-@@ -693,45 +916,113 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -682,45 +903,113 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
  
      #[fastrace::trace]
      pub async fn run_action(
@@ -5444,7 +5442,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
              Ok(Ok(..)) => (),
              Ok(Err(e)) => {
                  result = Ok(Err(e));
-@@ -740,17 +1031,77 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -729,17 +1018,77 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
                  result = Err(e);
              },
          }
@@ -5527,7 +5525,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
      }
  
      #[fastrace::trace]
-@@ -759,6 +1110,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -748,6 +1097,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          timeout: &mut Timeout<RT>,
          request_params: ActionRequestParams,
          cancellation: BoxFuture<'_, ()>,
@@ -5535,7 +5533,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
      ) -> anyhow::Result<Result<ConvexValue, JsError>> {
          let handle = isolate.handle();
          scope!(let v8_scope, isolate.scope());
-@@ -767,6 +1119,10 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -756,6 +1106,10 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
              let state = scope.state_mut()?;
              state.environment.provider.initialize(timeout).await?;
          }
@@ -5546,7 +5544,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
          let (path, arguments, _) = request_params.path_and_args.consume();
  
          // Don't allow directly running a UDF within the `_deps` directory. We don't
-@@ -789,7 +1145,13 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -778,7 +1132,13 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          };
  
          let module = match scope
@@ -5561,7 +5559,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
              .await?
          {
              Ok(id) => id,
-@@ -1018,10 +1380,15 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1007,10 +1367,15 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
              // This enforces on database access in the router.
              // We might relax this to e.g. implement a JavaScript router with
              // auth middleware which affected the matched route.
@@ -5579,7 +5577,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
          // If we hit a system error within a syscall, return `Err`, even if JS thinks it
          // returned successfully. The syscall layer uses
          // `scope.terminate_execution()` when we hit a system error, which
-@@ -1043,7 +1410,11 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1032,7 +1397,11 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          let result: Result<(), JsError> = loop {
              // Advance the user's promise as far as it can go by draining the microtask
              // queue.
@@ -5592,7 +5590,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
              pump_message_loop(scope);
              scope.record_heap_stats(&handle)?;
              let request_stream_state = scope.state()?.request_stream_state.as_ref();
-@@ -1172,21 +1543,26 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1161,21 +1530,26 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
                              };
                          },
                          TaskResponse::TaskDone { task_id, variant } => {
@@ -5633,7 +5631,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
                          },
                      };
                  },
-@@ -1204,12 +1580,24 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1193,12 +1567,24 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
              timeout.permit = Some(permit);
              handle.check_terminated()?;
          };
@@ -5661,7 +5659,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
      fn dangling_task_counts(&self) -> BTreeMap<String, usize> {
          dangling_task_counts(self.task_promise_resolvers.values().map(|(_, task)| task))
      }
-@@ -1218,12 +1606,12 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
+@@ -1207,12 +1593,12 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> ActionEnvironment<RT, S> {
          &mut self,
          request: TaskRequestEnum,
          resolver: v8::Global<v8::PromiseResolver>,
@@ -5676,7 +5674,50 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
      }
  }
  
-@@ -1341,7 +1729,7 @@ pub fn dangling_task_counts<'a>(
+@@ -1273,9 +1659,32 @@ pub fn finish_http_action<RT: Runtime, S: ActionInnerProvider<RT>>(
+     execution_time: FunctionExecutionTime,
+     result: anyhow::Result<(Option<HttpActionRoute>, HttpActionResult)>,
+ ) -> anyhow::Result<S::HttpOutcome> {
++    let outcome = prepare_http_action_outcome(
++        &mut provider,
++        dangling_task_counts,
++        http_module_path,
++        request_head,
++        start_unix_timestamp,
++        execution_time,
++        result,
++    )?;
++    Ok(provider.into_http_outcome(outcome))
++}
++
++// Reusable V8 contexts must recheck termination and response ownership after
++// warning finalization, before consuming the provider or retaining the context.
++fn prepare_http_action_outcome<RT: Runtime, S: ActionInnerProvider<RT>>(
++    provider: &mut S,
++    dangling_task_counts: BTreeMap<String, usize>,
++    http_module_path: &ValidatedHttpPath,
++    request_head: HttpActionRequestHead,
++    start_unix_timestamp: UnixTimestamp,
++    execution_time: FunctionExecutionTime,
++    result: anyhow::Result<(Option<HttpActionRoute>, HttpActionResult)>,
++) -> anyhow::Result<HttpActionOutcome> {
+     let user_execution_time = execution_time.elapsed;
+     provider.add_http_response_size_warning()?;
+-    add_warnings_to_log_lines(&mut provider, dangling_task_counts, execution_time)?;
++    add_warnings_to_log_lines(provider, dangling_task_counts, execution_time)?;
+     let (route, result) = result?;
+     let outcome = HttpActionOutcome::new(
+         route,
+@@ -1287,7 +1696,7 @@ pub fn finish_http_action<RT: Runtime, S: ActionInnerProvider<RT>>(
+         http_module_path.npm_version().clone(),
+         user_execution_time,
+     );
+-    Ok(provider.into_http_outcome(outcome))
++    Ok(outcome)
+ }
+ 
+ fn add_warnings_to_log_lines_action<RT: Runtime, S: ActionInnerProvider<RT>>(
+@@ -1367,7 +1776,7 @@ pub fn dangling_task_counts<'a>(
      let mut counts = BTreeMap::new();
      for task in tasks
          .into_iter()
@@ -5685,7 +5726,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
      {
          *counts.entry(task.name_when_dangling()).or_default() += 1;
      }
-@@ -1372,8 +1760,38 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
+@@ -1398,8 +1807,38 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
          self.phase.initialize(timeout).await
      }
  
@@ -5726,7 +5767,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
      }
  
      fn start_task(&mut self, request: TaskRequestEnum) -> anyhow::Result<TaskId> {
-@@ -1465,6 +1883,7 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
+@@ -1491,6 +1930,7 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
                  }
                  if streamer.total_bytes_sent() + b.len() > HTTP_ACTION_RESPONSE_BODY_LIMIT {
                      self.http_response_too_large = true;
@@ -5734,7 +5775,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
                      let e = JsError::from_message(format!(
                          "HttpResponseTooLarge: HTTP actions support responses up to {}",
                          HTTP_ACTION_RESPONSE_BODY_LIMIT.format_size(BINARY)
-@@ -1483,13 +1902,18 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
+@@ -1509,13 +1949,18 @@ impl<RT: Runtime> ActionInnerProvider<RT> for ActionSyscallProvider<RT> {
                      let _ = streamer.send_part(HttpActionResponsePart::BodyChunk(b))?;
                  }
              },
@@ -5760,7 +5801,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
          };
          Ok(())
      }
-@@ -1602,15 +2026,15 @@ impl<RT: Runtime> OpProvider for ActionSyscallProvider<RT> {
+@@ -1628,15 +2073,15 @@ impl<RT: Runtime> OpProvider for ActionSyscallProvider<RT> {
  }
  
  impl<RT: Runtime> SyscallProvider<RT> for ActionSyscallProvider<RT> {
@@ -5779,7 +5820,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
          Ok(result)
      }
  
-@@ -1634,6 +2058,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> JsEnvironment<RT> for ActionEnviro
+@@ -1660,6 +2105,7 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> JsEnvironment<RT> for ActionEnviro
          resolver: Self::AsyncResolver,
      ) -> anyhow::Result<()> {
          self.start_task(TaskRequestEnum::AsyncSyscall { name, args }, resolver)
@@ -5787,7 +5828,7 @@ index 3964bebdd22b4d2506c3b86d83797bd67212943e..c28a78d92db6af7ed6edff096ee8bec4
      }
  
      fn start_async_op(
-@@ -1642,6 +2067,47 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> JsEnvironment<RT> for ActionEnviro
+@@ -1668,6 +2114,47 @@ impl<RT: Runtime, S: ActionInnerProvider<RT>> JsEnvironment<RT> for ActionEnviro
          resolver: Self::AsyncResolver,
      ) -> anyhow::Result<()> {
          self.start_task(TaskRequestEnum::AsyncOp(request), resolver)
@@ -8029,7 +8070,7 @@ index 0000000000000000000000000000000000000000..3ea3bc07c92d5fdf30f344ed29899ee1
 +        .expect("context-reuse worker test panicked")
 +}
 diff --git a/crates/isolate/src/environment/udf/mod.rs b/crates/isolate/src/environment/udf/mod.rs
-index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577bae06f06 100644
+index 1e26d925fda718ac444b3ea0ccbbbce705833cee..52ba57c197dadbce861bad9310cb6d2f27689963 100644
 --- a/crates/isolate/src/environment/udf/mod.rs
 +++ b/crates/isolate/src/environment/udf/mod.rs
 @@ -1,4 +1,3 @@
@@ -8117,10 +8158,10 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
      deployment: DeploymentMetadata,
      client_id: String,
      udf_server_version: Option<semver::Version>,
-@@ -301,14 +302,18 @@ impl<RT: Runtime> OpProvider for DatabaseUdfSyscallProvider<RT> {
+@@ -308,7 +309,9 @@ impl<RT: Runtime> OpProvider for DatabaseUdfSyscallProvider<RT> {
              // start of execution and doesn't observe elapsed time.
              UdfType::Query => self.phase.performance_now_fixed(),
-             UdfType::Mutation => self.phase.performance_now_incrementing(),
+             UdfType::Mutation | UdfType::Init => self.phase.performance_now_incrementing(),
 -            _ => anyhow::bail!("Expected a query or mutation"),
 +            UdfType::Action | UdfType::HttpAction => {
 +                anyhow::bail!("Expected a query or mutation")
@@ -8128,9 +8169,10 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          }
      }
  
-     fn performance_time_origin(&mut self) -> anyhow::Result<UnixTimestamp> {
-         match self.udf_type {
-             UdfType::Query | UdfType::Mutation => self.phase.performance_time_origin(),
+@@ -317,7 +320,9 @@ impl<RT: Runtime> OpProvider for DatabaseUdfSyscallProvider<RT> {
+             UdfType::Query | UdfType::Mutation | UdfType::Init => {
+                 self.phase.performance_time_origin()
+             },
 -            _ => anyhow::bail!("Expected a query or mutation"),
 +            UdfType::Action | UdfType::HttpAction => {
 +                anyhow::bail!("Expected a query or mutation")
@@ -8138,7 +8180,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          }
      }
  
-@@ -412,6 +417,10 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
+@@ -424,6 +429,10 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
          &self.path
      }
  
@@ -8149,7 +8191,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
      fn udf_type(&self) -> UdfType {
          self.udf_type
      }
-@@ -508,7 +517,7 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
+@@ -520,7 +529,7 @@ impl<RT: Runtime> DatabaseUdfInnerProvider<RT> for DatabaseUdfSyscallProvider<RT
      ) -> anyhow::Result<Option<ContextReadSet>> {
          let read_set = self.phase.finish_snoop()?;
          Ok(if should_capture {
@@ -8158,7 +8200,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          } else {
              None
          })
-@@ -519,8 +528,47 @@ type UdfRecursiveExecutor<RT> = RecursiveExecutor<
+@@ -531,8 +540,47 @@ type UdfRecursiveExecutor<RT> = RecursiveExecutor<
      anyhow::Result<(
          DatabaseUdfEnvironment<RT>,
          anyhow::Result<Result<PendingValue, JsError>>,
@@ -8206,7 +8248,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
  struct RunUdf<'a, 'b, RT: Runtime> {
      rt: &'a RT,
      v8_scope: &'a mut v8::Isolate,
-@@ -528,6 +576,7 @@ struct RunUdf<'a, 'b, RT: Runtime> {
+@@ -540,6 +588,7 @@ struct RunUdf<'a, 'b, RT: Runtime> {
      context_cache: &'a mut ContextCache,
      execution_handle: &'a ExecutionHandle,
      executor: &'a UdfRecursiveExecutor<RT>,
@@ -8214,7 +8256,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
  }
  
  impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
-@@ -545,9 +594,10 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -557,9 +606,10 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
              client_id,
              rng_seed,
          );
@@ -8228,7 +8270,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          // N.B.: `run_nested` calls the corresponding `pop_context`.
          // This may not happen in case of a system error, but in that case we
          // are going to throw away the entire context stack anyway.
-@@ -557,25 +607,28 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -569,25 +619,28 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
          let mut isolate_clean = false;
          // User code is going to run again; regain the concurrency permit.
          let mut unpause_guard = self.paused_timeout.regain().await?;
@@ -8275,7 +8317,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          let outcome = NestedUdfOutcome {
              observed_identity: nested_provider.syscall_provider.phase.observed_identity(),
              observed_rng: nested_provider.syscall_provider.phase.observed_rng(),
-@@ -586,10 +639,15 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
+@@ -598,10 +651,15 @@ impl<'a, 'b, RT: Runtime> UdfCallback<RT> for RunUdf<'a, 'b, RT> {
              result: result?,
              syscall_trace: nested_provider.syscall_provider.syscall_trace,
          };
@@ -8295,7 +8337,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
      }
  }
  
-@@ -619,6 +677,7 @@ pub trait DatabaseUdfInnerProvider<RT: Runtime>:
+@@ -631,6 +689,7 @@ pub trait DatabaseUdfInnerProvider<RT: Runtime>:
  
      fn rt(&self) -> &RT;
      fn path(&self) -> &ResolvedComponentFunctionPath;
@@ -8303,7 +8345,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
      fn udf_type(&self) -> UdfType;
      fn reactor_depth(&self) -> usize;
      async fn initialize(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()>;
-@@ -671,7 +730,10 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -683,7 +742,10 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
              module_loader,
              deployment,
          } = environment_data;
@@ -8315,7 +8357,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          let (path, arguments, udf_server_version) = path_and_args.consume();
          let component = path.component;
          let identity = transaction.inert_identity();
-@@ -681,6 +743,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
+@@ -693,6 +755,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
                      rt: rt.clone(),
                      udf_type,
                      path,
@@ -8323,7 +8365,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
                      udf_server_version: udf_server_version.clone(),
  
                      phase: UdfPhase::new(
-@@ -736,7 +799,7 @@ where
+@@ -748,7 +811,7 @@ where
          context_cache: &mut ContextCache,
          permit: ConcurrencyPermit,
          isolate_clean: &mut bool,
@@ -8332,7 +8374,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          args: DatabaseUdfArgs,
          function_started: Option<oneshot::Sender<()>>,
          udf_callback: Option<IsolateClient<RT>>,
-@@ -751,7 +814,7 @@ where
+@@ -763,7 +826,7 @@ where
              // reject the function for capacity reasons.
              _ = tx.send(());
          }
@@ -8341,7 +8383,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
              .run_until(Self::run_nested(
                  &executor,
                  &args,
-@@ -761,7 +824,7 @@ where
+@@ -773,7 +836,7 @@ where
                  state,
                  &mut timeout,
                  isolate_clean,
@@ -8350,7 +8392,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
                  udf_callback,
              ))
              .await?;
-@@ -777,10 +840,20 @@ where
+@@ -789,10 +852,20 @@ where
              Err(e) => result = Err(e),
          }
          let result = result?;
@@ -8373,7 +8415,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
      }
  
      /// Runs a query or mutation, possibly nested via `runQuery`/`runMutation`.
-@@ -793,17 +866,26 @@ where
+@@ -805,17 +878,26 @@ where
          mut request_state: RequestState<RT, Self>,
          timeout: &mut Timeout<RT>,
          isolate_clean: &mut bool,
@@ -8404,7 +8446,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
              let v8_context = v8::Local::new(handle_scope, context);
              context_scope = v8::ContextScope::new(handle_scope, v8_context);
              (
-@@ -829,6 +911,7 @@ where
+@@ -841,6 +923,7 @@ where
                  None,
              )
          };
@@ -8412,7 +8454,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          let mut result = {
              let v8_scope = isolate_context.scope();
              let module = {
-@@ -849,11 +932,17 @@ where
+@@ -861,11 +944,17 @@ where
                  .await;
                  if snoop {
                      let mut scope = RequestScope::<RT, Self>::enter(v8_scope);
@@ -8435,7 +8477,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
                          .await?;
                  }
                  initialize_result
-@@ -866,7 +955,7 @@ where
+@@ -878,7 +967,7 @@ where
                          &mut *v8_scope,
                          context_cache,
                          timeout,
@@ -8444,7 +8486,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
                          args,
                          module,
                          udf_callback,
-@@ -882,9 +971,32 @@ where
+@@ -894,9 +983,32 @@ where
          // to ensure the microtask queue is empty. Otherwise, JS from this request may
          // leak to a subsequent one on isolate reuse.
          isolate_context.checkpoint();
@@ -8477,7 +8519,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          let this = request_state.environment;
          // Override the returned result if we hit a termination error.
          match execution_handle.pop_context(request_state.context_id)? {
-@@ -892,29 +1004,50 @@ where
+@@ -904,29 +1016,50 @@ where
              Err(e) => result = Ok(Err(e)),
          }
  
@@ -8539,7 +8581,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
      }
  
      #[fastrace::trace(properties = {"reusable_context": "{reusable_context}", "is_reused": "{is_reused}"})]
-@@ -937,10 +1070,14 @@ where
+@@ -949,10 +1082,14 @@ where
                  .await?;
          }
  
@@ -8556,7 +8598,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          };
  
          if reusable_context {
-@@ -963,15 +1100,15 @@ where
+@@ -975,15 +1112,15 @@ where
              return Ok(Err(JsError::from_message(message)));
          };
  
@@ -8581,7 +8623,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
      }
  
      #[convex_macro::instrument_future]
-@@ -982,7 +1119,7 @@ where
+@@ -994,7 +1131,7 @@ where
          v8_scope: &mut v8::PinScope<'_, '_>,
          context_cache: &mut ContextCache,
          timeout: &mut Timeout<RT>,
@@ -8590,7 +8632,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          args: &DatabaseUdfArgs,
          module: v8::Local<'_, v8::Module>,
          udf_callback: Option<IsolateClient<RT>>,
-@@ -1086,17 +1223,24 @@ where
+@@ -1098,17 +1235,24 @@ where
              .ok_or_else(|| anyhow!("Couldn't find invoke function in {udf_path:?}"))?
              .try_into()?;
  
@@ -8622,7 +8664,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          // If we hit a system error within a syscall, return `Err`, even if JS thinks it
          // returned successfully. The syscall layer uses
          // `scope.terminate_execution()` when we hit a system error, which
-@@ -1109,11 +1253,14 @@ where
+@@ -1121,11 +1265,14 @@ where
              Ok(None) => anyhow::bail!("Successful invocation returned None"),
              Err(e) => return Ok(Err(e)),
          };
@@ -8639,7 +8681,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
              pump_message_loop(&scope);
              scope.record_heap_stats(handle)?;
              handle.check_terminated()?;
-@@ -1197,6 +1344,7 @@ where
+@@ -1209,6 +1356,7 @@ where
                                  context_cache,
                                  execution_handle: handle,
                                  executor,
@@ -8647,7 +8689,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
                              };
                              let udf_callback = if let Some(callback) = &udf_callback {
                                  Either::Left(callback)
-@@ -1205,7 +1353,7 @@ where
+@@ -1217,7 +1365,7 @@ where
                              };
                              select! {
                                  biased;
@@ -8656,7 +8698,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
                                      log_isolate_request_cancelled();
                                      anyhow::bail!("Cancelled");
                                  },
-@@ -1241,7 +1389,7 @@ where
+@@ -1253,7 +1401,7 @@ where
                                  .into(),
                              )?;
                          },
@@ -8665,7 +8707,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
                      },
                  };
                  resolve_promise(result_scope, resolver, result_v8)?;
-@@ -1249,6 +1397,7 @@ where
+@@ -1261,6 +1409,7 @@ where
              handle.check_terminated()?;
          }
  
@@ -8673,7 +8715,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
          // Check to see if the user's promise is blocked.
          let result = match promise.state() {
              v8::PromiseState::Pending => Err(JsError::from_message(
-@@ -1294,23 +1443,53 @@ where
+@@ -1306,23 +1455,53 @@ where
      async fn take_and_validate_reused_context(
          &mut self,
          context_cache: &mut ContextCache,
@@ -8741,7 +8783,7 @@ index e5ae67ef7cc59787361203ba371907e73a3c175f..c77b44367788f0bf68756c01a79fb577
      }
  }
  
-@@ -1569,71 +1748,6 @@ pub fn add_warnings_to_log_lines(
+@@ -1581,71 +1760,6 @@ pub fn add_warnings_to_log_lines(
  impl<RT: Runtime> ValidateContext for DatabaseUdfSyscallProvider<RT> {
      #[fastrace::trace]
      async fn validate_reused_context(&mut self, read_set: &ContextReadSet) -> anyhow::Result<bool> {
@@ -10801,7 +10843,7 @@ index 29888504de4dbffac88144739894cfbecc68eb90..72e01f3bcdfd37a52d6b728d6b8f4ba9
 +    }
 +}
 diff --git a/crates/local_backend/src/lib.rs b/crates/local_backend/src/lib.rs
-index 223c5ad42e424872406bc48195e8a01e394786db..6a0457c2a33ff05643e65811f746df032fc343e1 100644
+index f204e7fe8d3af41e2674094f41365ab17d11bfd4..66b8c532fa54f4de7a3600ea293a6eca66a57737 100644
 --- a/crates/local_backend/src/lib.rs
 +++ b/crates/local_backend/src/lib.rs
 @@ -240,7 +240,7 @@ pub async fn make_app(
@@ -10822,7 +10864,7 @@ index 223c5ad42e424872406bc48195e8a01e394786db..6a0457c2a33ff05643e65811f746df03
  
      let application = Application::new(
 diff --git a/crates/model/src/modules/module_versions.rs b/crates/model/src/modules/module_versions.rs
-index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c84451a627f55 100644
+index b51709ccdfdad81e56a88329b696be85c5834bba..ddeb7817d157949fccda6a4cae7f2299bf281971 100644
 --- a/crates/model/src/modules/module_versions.rs
 +++ b/crates/model/src/modules/module_versions.rs
 @@ -5,6 +5,7 @@ use std::{
@@ -10833,7 +10875,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c8445
  use async_lru::async_lru::SizedValue;
  use common::{
      http::RoutedHttpPath,
-@@ -89,6 +90,212 @@ impl SizedValue for FullModuleSource {
+@@ -89,6 +90,213 @@ impl SizedValue for FullModuleSource {
      }
  }
  
@@ -10885,6 +10927,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c8445
 +            UdfType::Mutation => self.mutations,
 +            UdfType::Action => self.actions,
 +            UdfType::HttpAction => self.http_actions,
++            UdfType::Init => false,
 +        }
 +    }
 +}
@@ -11019,7 +11062,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c8445
 +
 +    pub fn for_type(&self, udf_type: UdfType) -> Option<&CanonicalizedModulePath> {
 +        match (self, udf_type) {
-+            (_, UdfType::HttpAction) => None,
++            (_, UdfType::HttpAction | UdfType::Init) => None,
 +            (Self::Legacy(path), UdfType::Query | UdfType::Mutation | UdfType::Action) => {
 +                Some(path)
 +            },
@@ -11046,7 +11089,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c8445
  #[derive(Debug, Clone, PartialEq, Eq, Default)]
  pub struct AnalyzedModule {
      pub functions: WithHeapSize<Vec<AnalyzedFunction>>,
-@@ -96,12 +303,15 @@ pub struct AnalyzedModule {
+@@ -96,12 +304,15 @@ pub struct AnalyzedModule {
      pub cron_specs: Option<WithHeapSize<BTreeMap<CronIdentifier, CronSpec>>>,
      /// Index of the module's original source in the source map.
      pub source_index: Option<u32>,
@@ -11068,7 +11111,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c8445
  }
  
  impl HeapSize for AnalyzedModule {
-@@ -110,6 +320,7 @@ impl HeapSize for AnalyzedModule {
+@@ -110,6 +321,7 @@ impl HeapSize for AnalyzedModule {
              + self.http_routes.heap_size()
              + self.cron_specs.heap_size()
              + self.source_index.heap_size()
@@ -11076,7 +11119,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c8445
      }
  }
  
-@@ -120,6 +331,15 @@ pub struct SerializedAnalyzedModule {
+@@ -120,6 +332,15 @@ pub struct SerializedAnalyzedModule {
      http_routes: Option<Vec<SerializedAnalyzedHttpRoute>>,
      cron_specs: Option<Vec<SerializedNamedCronSpec>>,
      source_mapped: Option<SerializedMappedModule>,
@@ -11092,7 +11135,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c8445
      #[serde(default)]
      #[serde(skip_serializing_if = "std::ops::Not::not")]
      reuse_context: bool,
-@@ -129,6 +349,9 @@ impl TryFrom<AnalyzedModule> for SerializedAnalyzedModule {
+@@ -129,6 +350,9 @@ impl TryFrom<AnalyzedModule> for SerializedAnalyzedModule {
      type Error = anyhow::Error;
  
      fn try_from(m: AnalyzedModule) -> anyhow::Result<Self> {
@@ -11102,7 +11145,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c8445
          let source_mapped = m
              .source_index
              .as_ref()
-@@ -149,7 +372,9 @@ impl TryFrom<AnalyzedModule> for SerializedAnalyzedModule {
+@@ -149,7 +373,9 @@ impl TryFrom<AnalyzedModule> for SerializedAnalyzedModule {
                  .map(|specs| specs.into_iter().map(TryFrom::try_from).try_collect())
                  .transpose()?,
              source_mapped,
@@ -11113,7 +11156,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c8445
          })
      }
  }
-@@ -158,6 +383,16 @@ impl TryFrom<SerializedAnalyzedModule> for AnalyzedModule {
+@@ -158,6 +384,16 @@ impl TryFrom<SerializedAnalyzedModule> for AnalyzedModule {
      type Error = anyhow::Error;
  
      fn try_from(m: SerializedAnalyzedModule) -> anyhow::Result<Self> {
@@ -11130,7 +11173,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c8445
          Ok(Self {
              functions: m
                  .functions
-@@ -178,7 +413,8 @@ impl TryFrom<SerializedAnalyzedModule> for AnalyzedModule {
+@@ -178,7 +414,8 @@ impl TryFrom<SerializedAnalyzedModule> for AnalyzedModule {
              source_index: m
                  .source_mapped
                  .and_then(|mapped_module| mapped_module.source_index),
@@ -11140,7 +11183,7 @@ index b51709ccdfdad81e56a88329b696be85c5834bba..38ca586b4e1a1e9efe790768959c8445
          })
      }
  }
-@@ -670,4 +906,187 @@ mod tests {
+@@ -670,4 +907,187 @@ mod tests {
          }
      }
  
@@ -11343,7 +11386,7 @@ index 2c722b8c2ec18ff6f0d377c2c3a7e1cb517a152e..5af7b8613dff18af963377a940c60afd
              result.insert(path, module);
          }
 diff --git a/crates/pb/protos/common.proto b/crates/pb/protos/common.proto
-index 6e47db9a428a58826b188daa89d674297b32bac0..438987f77a4936ba633eae2bce8d231c415aa6dc 100644
+index 4b449b7007e676cf917af213e9b7be3811f0e4bb..78e386d10346f67309ac5b8d8d84f1c2385898c9 100644
 --- a/crates/pb/protos/common.proto
 +++ b/crates/pb/protos/common.proto
 @@ -4,13 +4,38 @@ package common;
@@ -11589,7 +11632,7 @@ index 8309e206817ade15d508f8df79fc0dc242c4431d..4bbcc9fd9305b84d6aef28883965ae3d
      match &outcome {
          FunctionOutcome::Query(UdfOutcome { result, .. }) => result.is_ok(),
 diff --git a/crates/udf/src/validation.rs b/crates/udf/src/validation.rs
-index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22b6933062 100644
+index cc461aa596dff9bbe3d91a2d2ccdd7b4a1959c4e..cc7a2144d0d9868a99d13521bf6f1100de1571bd 100644
 --- a/crates/udf/src/validation.rs
 +++ b/crates/udf/src/validation.rs
 @@ -55,7 +55,10 @@ use model::{
@@ -11624,7 +11667,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
      ActionOutcome,
      SyscallTrace,
      UdfOutcome,
-@@ -447,15 +455,18 @@ impl VisibilityInfo {
+@@ -449,15 +457,18 @@ impl VisibilityInfo {
  /// - Checking the args size.
  /// - Checking that the args pass validation.
  ///
@@ -11646,7 +11689,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
  }
  
  impl ValidatedPathAndArgs {
-@@ -538,7 +549,8 @@ impl ValidatedPathAndArgs {
+@@ -540,7 +551,8 @@ impl ValidatedPathAndArgs {
                      path,
                      args,
                      npm_version: None,
@@ -11656,7 +11699,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
                  },
                  ReturnsValidator::Unvalidated,
                  visibility_info,
-@@ -626,7 +638,8 @@ impl ValidatedPathAndArgs {
+@@ -628,7 +640,8 @@ impl ValidatedPathAndArgs {
              pending_args_policy,
              analyzed_function,
              udf_version,
@@ -11666,7 +11709,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
          )? {
              Ok((validated_udf_path_and_args, visibility_info)) => Ok(Ok((
                  validated_udf_path_and_args,
-@@ -646,7 +659,8 @@ impl ValidatedPathAndArgs {
+@@ -648,7 +661,8 @@ impl ValidatedPathAndArgs {
          pending_args_policy: PendingArgsPolicy,
          analyzed_function: AnalyzedFunction,
          version: Version,
@@ -11676,7 +11719,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
      ) -> anyhow::Result<Result<(ValidatedPathAndArgs, VisibilityInfo), JsError>> {
          let visibility_info = VisibilityInfo {
              visibility: analyzed_function.visibility.clone(),
-@@ -718,12 +732,17 @@ impl ValidatedPathAndArgs {
+@@ -720,12 +734,17 @@ impl ValidatedPathAndArgs {
              ))));
          }
  
@@ -11695,7 +11738,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
              },
              visibility_info,
          )))
-@@ -759,6 +778,9 @@ impl ValidatedPathAndArgs {
+@@ -761,6 +780,9 @@ impl ValidatedPathAndArgs {
              component_path,
              component_id,
              reuse_context,
@@ -11705,7 +11748,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
          }: pb::common::ValidatedPathAndArgs,
      ) -> anyhow::Result<Self> {
          let args =
-@@ -768,20 +790,383 @@ impl ValidatedPathAndArgs {
+@@ -770,20 +792,383 @@ impl ValidatedPathAndArgs {
              .context("Missing component_path in proto")?
              .try_into()
              .context("Invalid component path in proto")?;
@@ -12093,7 +12136,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
      }
  }
  
-@@ -793,9 +1178,28 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
+@@ -795,9 +1180,28 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
              path,
              args,
              npm_version,
@@ -12123,7 +12166,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
          let args = args.get().as_bytes().to_vec();
          let component_path = Some(path.component_path.into());
          Ok(Self {
-@@ -804,20 +1208,41 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
+@@ -806,20 +1210,41 @@ impl TryFrom<ValidatedPathAndArgs> for pb::common::ValidatedPathAndArgs {
              npm_version: npm_version.map(|v| v.to_string()),
              component_path,
              component_id: path.component.serialize_to_string(),
@@ -12169,7 +12212,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
  }
  
  impl ValidatedHttpPath {
-@@ -851,14 +1276,32 @@ impl ValidatedHttpPath {
+@@ -853,14 +1278,32 @@ impl ValidatedHttpPath {
              Ok(udf_version) => udf_version,
              Err(e) => return Ok(Err(e)),
          };
@@ -12207,7 +12250,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
          }))
      }
  
-@@ -870,13 +1313,20 @@ impl ValidatedHttpPath {
+@@ -872,13 +1315,20 @@ impl ValidatedHttpPath {
          &self.path
      }
  
@@ -12229,7 +12272,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
          }: pb::common::ValidatedHttpPath,
      ) -> anyhow::Result<Self> {
          let component = ComponentId::deserialize_from_string(component_id.as_deref())?;
-@@ -884,14 +1334,25 @@ impl ValidatedHttpPath {
+@@ -886,14 +1336,25 @@ impl ValidatedHttpPath {
              .context("Missing component_path in proto")?
              .try_into()
              .context("Invalid component path in proto")?;
@@ -12257,7 +12300,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
          })
      }
  }
-@@ -903,7 +1364,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+@@ -905,7 +1366,7 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
          ValidatedHttpPath {
              path,
              npm_version,
@@ -12266,7 +12309,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
          }: ValidatedHttpPath,
      ) -> anyhow::Result<Self> {
          let component_path = Some(path.component_path.into());
-@@ -912,7 +1373,10 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
+@@ -914,7 +1375,10 @@ impl TryFrom<ValidatedHttpPath> for pb::common::ValidatedHttpPath {
              npm_version: npm_version.map(|v| v.to_string()),
              component_path,
              component_id: path.component.serialize_to_string(),
@@ -12278,7 +12321,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
          })
      }
  }
-@@ -1045,6 +1509,41 @@ impl ValidatedUdfOutcome {
+@@ -1047,6 +1511,41 @@ impl ValidatedUdfOutcome {
      }
  }
  
@@ -12320,7 +12363,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
  #[derive(Debug, Clone)]
  pub struct ValidatedActionOutcome {
      pub path: CanonicalizedComponentFunctionPath,
-@@ -1064,11 +1563,14 @@ pub struct ValidatedActionOutcome {
+@@ -1066,11 +1565,14 @@ pub struct ValidatedActionOutcome {
  
  impl ValidatedActionOutcome {
      pub fn new(
@@ -12337,7 +12380,7 @@ index 7082eb218e0c453bb149e2e7af7de04768ca1eb7..bc78a07a5ea7ad6455fc9b99171b0a22
              path: outcome.path,
              arguments: outcome.arguments,
              identity: outcome.identity,
-@@ -1078,34 +1580,7 @@ impl ValidatedActionOutcome {
+@@ -1080,34 +1582,7 @@ impl ValidatedActionOutcome {
              udf_server_version: outcome.udf_server_version,
              mutation_queue_length: None,
              user_execution_time: outcome.user_execution_time,

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 29 Jul 2026 02:38:40 +0800
-Subject: [PATCH 11/32] runtime: add backend memory resilience
+Subject: [PATCH 10/30] runtime: add backend memory resilience
 
 Expose process, allocator, cgroup, Node, cache, and control-plane memory ownership so operators can account for backend RSS and telemetry coverage. Report glibc arena count separately and preserve the distinction between logical allocator free space and resident memory.
 
@@ -39,10 +39,10 @@ A long-running multithreaded self-hosted backend under a 30 GiB cgroup limit rea
  create mode 100644 patches/backend_memory_resilience/README.md
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 01e70f852a52db81dbb7a088952c59224ea883db..c1e2ec8b8b60720fa7fd87a6aee8d2bf9a778c82 100644
+index a13b14dd34a6650a7058bcf0246265638850205d..53949e975aabd14b6ea486a695d39c8a4a99790b 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -6702,6 +6702,7 @@ dependencies = [
+@@ -6771,6 +6771,7 @@ dependencies = [
   "indexing",
   "jsonschema",
   "keybroker",
@@ -347,7 +347,7 @@ index 7e748e186c71f2142a3829b8b3ef04b1a159d87d..3bea8fb081bf812096dbebe3ad8708dd
          };
          let (started_tx, mut started_rx) = mpsc::unbounded_channel();
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 453fa00921c58d9ee9721318fec5e7d8eeba3276..e0920a99f680261fccf2391df763d1329f84de8a 100644
+index 7d77696e3eb7fac7f9d60d8542f403ba33cd4458..bb6efed222581ae7a5d59be3e2fca1b535f776c1 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -69,6 +69,12 @@ fn validate_usize_strict_nonzero(name: &str, value: usize) -> anyhow::Result<usi
@@ -542,7 +542,7 @@ index 453fa00921c58d9ee9721318fec5e7d8eeba3276..e0920a99f680261fccf2391df763d132
  /// Ideally, we should have no timeout here but we are relying on defense in
  /// depth in case somehow the upstream get stuck. Use very high timeout here.
  ///
-@@ -965,7 +1143,7 @@ pub static WRITE_LOG_MIN_RETENTION_SECS: LazyLock<Duration> =
+@@ -971,7 +1149,7 @@ pub static WRITE_LOG_MIN_RETENTION_SECS: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("WRITE_LOG_MIN_RETENTION_SECS", 30)));
  
  /// The maximum time to retain the WriteLog, note that the WriteLog might be
@@ -551,7 +551,7 @@ index 453fa00921c58d9ee9721318fec5e7d8eeba3276..e0920a99f680261fccf2391df763d132
  pub static WRITE_LOG_MAX_RETENTION_SECS: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("WRITE_LOG_MAX_RETENTION_SECS", 300)));
  
-@@ -2204,8 +2382,8 @@ pub static SUBSCRIPTIONS_WORKER_QUEUE_SIZE: LazyLock<usize> =
+@@ -2241,8 +2419,8 @@ pub static SUBSCRIPTIONS_WORKER_QUEUE_SIZE: LazyLock<usize> =
      LazyLock::new(|| env_config("SUBSCRIPTIONS_WORKER_QUEUE_SIZE", 10000));
  
  /// The number of SubscriptionManager instances to run per SubscriptionsWorker.
@@ -562,7 +562,7 @@ index 453fa00921c58d9ee9721318fec5e7d8eeba3276..e0920a99f680261fccf2391df763d132
  pub static NUM_SUBSCRIPTION_MANAGERS: LazyLock<usize> =
      LazyLock::new(|| env_config("NUM_SUBSCRIPTION_MANAGERS", 1));
  
-@@ -2371,4 +2549,12 @@ mod strict_capacity_tests {
+@@ -2416,4 +2594,12 @@ mod strict_capacity_tests {
              validate_usize_strict_nonzero("CAP", tokio::sync::Semaphore::MAX_PERMITS + 1).is_err()
          );
      }
@@ -660,7 +660,7 @@ index dcd71ff3444b026f9d444f9c08bad1eb185b8ec5..ffa17357bdc3b75d81d1bf0d0a39a162
  metrics = { workspace = true }
  model = { workspace = true }
 diff --git a/crates/local_backend/src/lib.rs b/crates/local_backend/src/lib.rs
-index a0482cf76d346ce73ccfb1dc30c7774449aafd1f..223c5ad42e424872406bc48195e8a01e394786db 100644
+index 5d61601ab26efe986f4f5c2b2b31768522369b4a..f204e7fe8d3af41e2674094f41365ab17d11bfd4 100644
 --- a/crates/local_backend/src/lib.rs
 +++ b/crates/local_backend/src/lib.rs
 @@ -35,6 +35,7 @@ use common::{
@@ -673,7 +673,7 @@ index a0482cf76d346ce73ccfb1dc30c7774449aafd1f..223c5ad42e424872406bc48195e8a01e
          new_rate_limiter,
 @@ -103,6 +104,8 @@ pub mod environment_variables;
  pub mod http_actions;
- pub mod log_sinks;
+ pub mod integrations;
  pub mod logs;
 +#[cfg(target_os = "linux")]
 +pub mod memory_metrics;
@@ -2707,7 +2707,7 @@ index 499638cebc7a68ef03ad8a629bec60d0df001b38..81f4b3d4c18dc45efe63456ac9c19ea1
          NoopRouteMapper,
      );
 diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
-index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233d2ffae77 100644
+index 581a6ae8ef1e303ce43301949fe401de0d6d73de..703d2c2f27bcf14bc602b7ba7a55d68a61ad0d3b 100644
 --- a/crates/node_executor/src/local.rs
 +++ b/crates/node_executor/src/local.rs
 @@ -26,7 +26,18 @@ use std::{
@@ -3088,7 +3088,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
                      registered_stack_roots: AtomicU64::new(0),
                      server_handle: Mutex::new(server_handle),
                      client,
-@@ -838,7 +1075,11 @@ impl InnerLocalNodeExecutor {
+@@ -840,7 +1077,11 @@ impl InnerLocalNodeExecutor {
          Self::check_node_version(node_path).await?;
  
          let mut cmd = TokioCommand::new(node_path);
@@ -3101,7 +3101,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
              .arg("--ipc-path")
              .arg(socket_path)
              .arg("--tempdir")
-@@ -864,24 +1105,58 @@ impl InnerLocalNodeExecutor {
+@@ -866,24 +1107,58 @@ impl InnerLocalNodeExecutor {
  
  impl LocalNodeExecutor {
      pub async fn new(node_process_timeout: Duration) -> anyhow::Result<Self> {
@@ -3167,7 +3167,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
  
          Ok(executor)
      }
-@@ -889,16 +1164,13 @@ impl LocalNodeExecutor {
+@@ -891,16 +1166,13 @@ impl LocalNodeExecutor {
      async fn acquire_inner(
          &self,
      ) -> anyhow::Result<(Arc<InnerLocalNodeExecutor>, ActiveRequestGuard, bool)> {
@@ -3191,7 +3191,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
              }
          }
  
-@@ -906,17 +1178,23 @@ impl LocalNodeExecutor {
+@@ -908,17 +1180,23 @@ impl LocalNodeExecutor {
          // work separately so late failures from the retired generation can
          // still inspect the generation slot without waiting for its replacement.
          let _startup_guard = self.startup_lock.lock().await;
@@ -3220,7 +3220,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
              state.next_generation = state
                  .next_generation
                  .checked_add(1)
-@@ -967,14 +1245,20 @@ impl LocalNodeExecutor {
+@@ -969,14 +1247,20 @@ impl LocalNodeExecutor {
              anyhow::bail!("Local Node executor is shutting down");
          }
          assert!(state.inner.is_none());
@@ -3242,7 +3242,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
          }
          crate::metrics::log_local_node_generation_start();
          let startup_elapsed = replacement_started.elapsed();
-@@ -994,6 +1278,29 @@ impl LocalNodeExecutor {
+@@ -996,6 +1280,29 @@ impl LocalNodeExecutor {
          Ok((replacement, request_guard, true))
      }
  
@@ -3272,7 +3272,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
      #[try_stream(ok = NodeExecutorStreamPart, error = anyhow::Error)]
      async fn response_stream(mut response: reqwest::Response, deadline: tokio::time::Instant) {
          anyhow::ensure!(
-@@ -1056,14 +1363,19 @@ impl LocalNodeExecutor {
+@@ -1058,14 +1365,19 @@ impl LocalNodeExecutor {
              {
                  // A late result from an old generation cannot retire its replacement.
                  state.inner.take();
@@ -3293,7 +3293,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
                  }
                  crate::metrics::log_local_node_generation_retirement(reason.as_str());
                  crate::metrics::log_local_node_retirement_diagnostics(
-@@ -1087,6 +1399,8 @@ impl LocalNodeExecutor {
+@@ -1089,6 +1401,8 @@ impl LocalNodeExecutor {
                              expected.retained_source_packages.load(Ordering::Relaxed),
                          last_observed_retained_external_packages =
                              expected.retained_external_packages.load(Ordering::Relaxed),
@@ -3302,7 +3302,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
                          last_observed_registered_stack_roots =
                              expected.registered_stack_roots.load(Ordering::Relaxed),
                          "Retiring local Node executor generation"
-@@ -1106,6 +1420,8 @@ impl LocalNodeExecutor {
+@@ -1108,6 +1422,8 @@ impl LocalNodeExecutor {
                              expected.retained_source_packages.load(Ordering::Relaxed),
                          last_observed_retained_external_packages =
                              expected.retained_external_packages.load(Ordering::Relaxed),
@@ -3311,7 +3311,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
                          last_observed_registered_stack_roots =
                              expected.registered_stack_roots.load(Ordering::Relaxed),
                          "Retiring local Node executor generation"
-@@ -1124,6 +1440,7 @@ impl LocalNodeExecutor {
+@@ -1126,6 +1442,7 @@ impl LocalNodeExecutor {
          // so a blocked event loop does not continue consuming a core until each
          // old request reaches its ten-minute timeout. The spawned task remains
          // the child owner if the request that initiated retirement is canceled.
@@ -3319,7 +3319,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
          let expected = expected.clone();
          let generation = expected.generation;
          let termination = tokio::spawn(async move {
-@@ -1153,6 +1470,22 @@ impl LocalNodeExecutor {
+@@ -1155,6 +1472,22 @@ impl LocalNodeExecutor {
                      );
                  },
              }
@@ -3342,7 +3342,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
              result
          })
          .await;
-@@ -1171,6 +1504,58 @@ impl LocalNodeExecutor {
+@@ -1173,6 +1506,58 @@ impl LocalNodeExecutor {
          Ok(true)
      }
  
@@ -3401,7 +3401,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
      fn spawn_watchdog(&self, inner: &Arc<InnerLocalNodeExecutor>) {
          let state = Arc::downgrade(&self.state);
          let expected = Arc::downgrade(inner);
-@@ -1188,6 +1573,7 @@ impl LocalNodeExecutor {
+@@ -1190,6 +1575,7 @@ impl LocalNodeExecutor {
          let mut consecutive_misses = 0;
          let mut previous_package_stats = NodePackageCacheStats::default();
          let mut previous_stack_stats = NodeStackTraceStats::default();
@@ -3409,7 +3409,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
          loop {
              tokio::time::sleep(config.watchdog_interval).await;
              let Some(state) = state.upgrade() else {
-@@ -1207,11 +1593,21 @@ impl LocalNodeExecutor {
+@@ -1209,11 +1595,21 @@ impl LocalNodeExecutor {
              }
  
              let health_check_started = Instant::now();
@@ -3436,7 +3436,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
              let success = health.as_ref().is_some_and(|health| {
                  health.status == "ok"
                      && health
-@@ -1232,9 +1628,21 @@ impl LocalNodeExecutor {
+@@ -1234,9 +1630,21 @@ impl LocalNodeExecutor {
                  return;
              }
              crate::metrics::log_local_node_health_check(health_check_elapsed, "watchdog", success);
@@ -3460,7 +3460,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
                  consecutive_misses = 0;
                  crate::metrics::set_local_node_consecutive_health_misses(0);
                  if expected.runtime_stats_supported {
-@@ -1245,14 +1653,42 @@ impl LocalNodeExecutor {
+@@ -1247,14 +1655,42 @@ impl LocalNodeExecutor {
                          &mut previous_stack_stats,
                      );
                  }
@@ -3509,7 +3509,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
                  if Self::retire_inner_state(
                      &state,
                      &expected,
-@@ -1293,10 +1729,14 @@ impl LocalNodeExecutor {
+@@ -1295,10 +1731,14 @@ impl LocalNodeExecutor {
          inner
              .retained_external_packages
              .store(package.retained_external_packages, Ordering::Relaxed);
@@ -3524,7 +3524,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
              package.retained_source_packages,
              package.retained_source_bytes,
              package.active_source_owners,
-@@ -1648,6 +2088,13 @@ mod tests {
+@@ -1650,6 +2090,13 @@ mod tests {
              health_check_timeout: Duration::from_millis(10),
              watchdog_interval: Duration::from_millis(10),
              watchdog_failure_threshold: 2,
@@ -3538,7 +3538,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
          }
      }
  
-@@ -1712,6 +2159,152 @@ mod tests {
+@@ -1714,6 +2161,152 @@ mod tests {
              }))
              .is_err()
          );
@@ -3691,7 +3691,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
      }
  
      #[tokio::test]
-@@ -1755,13 +2348,23 @@ done
+@@ -1757,13 +2350,23 @@ done
              .kill_on_drop(true)
              .spawn()
              .unwrap();
@@ -3715,7 +3715,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
              registered_stack_roots: AtomicU64::new(0),
              server_handle: Mutex::new(ManagedChild::new(generation, server_handle, source_dir)),
              client,
-@@ -1914,6 +2517,7 @@ done
+@@ -1916,6 +2519,7 @@ done
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              next_generation: inner.generation,
              inner: Some(inner),
@@ -3723,7 +3723,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
              replacement_for_generation: None,
          }));
          let executor = LocalNodeExecutor {
-@@ -1925,12 +2529,117 @@ done
+@@ -1927,12 +2531,117 @@ done
          (executor, state)
      }
  
@@ -3841,7 +3841,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
              replacement_for_generation: None,
              next_generation: 2,
          }));
-@@ -1984,6 +2693,7 @@ done
+@@ -1986,6 +2695,7 @@ done
          let generation = test_inner(1).await;
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(generation.clone()),
@@ -3849,7 +3849,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
              replacement_for_generation: None,
              next_generation: 1,
          }));
-@@ -2016,11 +2726,7 @@ done
+@@ -2018,11 +2728,7 @@ done
      #[tokio::test]
      async fn retirement_reaps_child_after_retiring_caller_is_canceled() {
          let generation = test_inner(1).await;
@@ -3862,7 +3862,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
  
          // Hold the child lock so the detached termination owner cannot finish
          // before the task that initiated retirement is canceled.
-@@ -2042,11 +2748,18 @@ done
+@@ -2044,11 +2750,18 @@ done
          })
          .await
          .unwrap();
@@ -3881,7 +3881,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
              loop {
                  if generation.server_handle.lock().await.child.is_none() {
                      break;
-@@ -2056,6 +2769,7 @@ done
+@@ -2058,6 +2771,7 @@ done
          })
          .await
          .unwrap();
@@ -3889,7 +3889,7 @@ index 2a0fb0db53e10057dd967061e616296d6d76fc1d..fda4ba8824eafbe96632b46638c6b233
      }
  
      #[tokio::test]
-@@ -2096,6 +2810,7 @@ done
+@@ -2098,6 +2812,7 @@ done
          let generation = test_inner_with_client(1, client).await;
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(generation.clone()),

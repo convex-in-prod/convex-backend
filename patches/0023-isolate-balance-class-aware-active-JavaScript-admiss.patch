@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Tue, 25 Aug 2026 16:02:20 +0800
-Subject: [PATCH 25/32] isolate: balance class-aware active-JavaScript
+Subject: [PATCH 23/30] isolate: balance class-aware active-JavaScript
  admission
 
 Propagate the backend-owned service class from an admitted degradable query leader into its isolate request and suspended permit. Keep dependency work first, preserve resumptions ahead of new starts within each class, and make protected and degradable floors non-preemptive while allowing unused capacity to be borrowed.
@@ -12,7 +12,7 @@ Give typed configuration work a fair queue within the protected JavaScript group
 
 Accept a closed per-call HTTP mutation priority hint, propagate it through request execution metadata, and give high mutations at most two turns before eligible ordinary application demand. Preserve dependency and configuration barriers, existing capacity bounds, cancellation ownership and closed metric labels. Publish the protocol capability and checked OpenAPI contract.
 ---
- .../src/application_function_runner/mod.rs    |  43 +-
+ .../src/application_function_runner/mod.rs    |  40 +-
  crates/application/src/cache/mod.rs           |   8 +-
  crates/common/src/execution_context.rs        |  43 +-
  crates/common/src/knobs.rs                    |  60 +-
@@ -43,14 +43,14 @@ Accept a closed per-call HTTP mutation priority hint, propagate it through reque
  .../deployment_operations.md                  |  15 +-
  patches/scheduled_action_admission/README.md  |   2 +-
  self-hosted/advanced/knobs.md                 |  76 +-
- 31 files changed, 3233 insertions(+), 614 deletions(-)
+ 31 files changed, 3235 insertions(+), 609 deletions(-)
  create mode 100644 patches/isolate_queue_control/isolate_delay_queue_design_reference.md
 
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 0ea3057360a94fc7ea8a477fcfaaea7e99d47273..5b87a34336c11692166d9a2da37fbe9f12d9cc6e 100644
+index b678f0abcea50001c9f89f54e169ecaf0b660f8c..2b39436f9fb999e50c5aa6b8d1e1495c3332b58d 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
-@@ -369,6 +369,12 @@ fn node_action_gate_dependency(
+@@ -370,6 +370,12 @@ fn node_action_gate_dependency(
      scheduler_dependency.unblocks_ancestor() || !caller.is_root()
  }
  
@@ -63,7 +63,7 @@ index 0ea3057360a94fc7ea8a477fcfaaea7e99d47273..5b87a34336c11692166d9a2da37fbe9f
  impl<RT: Runtime> FunctionRouter<RT> {
      pub(crate) async fn acquire_permit(
          &self,
-@@ -400,13 +406,28 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -401,13 +407,28 @@ impl<RT: Runtime> FunctionRouter<RT> {
          tx: Transaction<RT>,
          permit: RequestGuard<'_, RT>,
          path_and_args: ValidatedPathAndArgs,
@@ -95,20 +95,17 @@ index 0ea3057360a94fc7ea8a477fcfaaea7e99d47273..5b87a34336c11692166d9a2da37fbe9f
          anyhow::ensure!(
              permit.limiter.udf_type == udf_type,
              "Running a {udf_type} with a {} permit",
-@@ -421,11 +442,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
-                 udf_type,
-                 context,
-                 None,
--                Some(match udf_type {
--                    UdfType::Query => FunctionMetadata::Query { journal, path_and_args, active_javascript_class },
--                    UdfType::Mutation => FunctionMetadata::Mutation { journal, path_and_args },
--                    _ => anyhow::bail!("Invalid database UDF type"),
--                }),
+@@ -434,6 +455,9 @@ impl<RT: Runtime> FunctionRouter<RT> {
+                     },
+                     _ => anyhow::bail!("Invalid database UDF type"),
+                 }),
++=======
 +                Some(function_metadata),
++>>>>>>> 44c2402e4 (isolate: balance class-aware active-JavaScript admission)
                  None,
                  None,
                  scheduler_dependency,
-@@ -722,7 +739,9 @@ impl<RT: Runtime> Limiter<RT> {
+@@ -730,7 +754,9 @@ impl<RT: Runtime> Limiter<RT> {
              } => match x {},
              _ = async {
                  match deadline {
@@ -119,7 +116,7 @@ index 0ea3057360a94fc7ea8a477fcfaaea7e99d47273..5b87a34336c11692166d9a2da37fbe9f
                      None => future::pending().await,
                  }
              } => {
-@@ -1196,11 +1215,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1216,11 +1242,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          tx,
                          permit,
                          path_and_args,
@@ -132,7 +129,7 @@ index 0ea3057360a94fc7ea8a477fcfaaea7e99d47273..5b87a34336c11692166d9a2da37fbe9f
                      )
                      .await?
              },
-@@ -1760,11 +1778,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1782,11 +1807,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  tx,
                  permit,
                  path_and_args,
@@ -289,10 +286,10 @@ index 6b5fe119ff393ef897047d39c0c21ec3182962bd..fe8cf9e29f8d4daf279d9f1f059f903c
 +    }
 +}
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index 9756448062ec67a093900d73a72bf42448b9f217..07875f2ff2858b22409e9c063c7032f7bcb4ce0a 100644
+index 07046e24c44881efba8fb0d0b665924ffca5b7c1..89a36f985a6d354922d9f1eeeb837a245e351783 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
-@@ -1563,8 +1563,9 @@ pub static ISOLATE_ANALYZE_USER_TIMEOUT: LazyLock<Duration> =
+@@ -1569,8 +1569,9 @@ pub static ISOLATE_ANALYZE_USER_TIMEOUT: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_ANALYZE_USER_TIMEOUT_SECONDS", 4)));
  
  /// Shared isolate queue capacity. The default policy uses generic CoDel. The
@@ -304,7 +301,7 @@ index 9756448062ec67a093900d73a72bf42448b9f217..07875f2ff2858b22409e9c063c7032f7
  /// `ISOLATE_DEPENDENCY_WORKER_RESERVE`. Larger values retain more UDF arguments
  /// and can increase overload latency.
  pub static ISOLATE_QUEUE_SIZE: LazyLock<usize> =
-@@ -1589,6 +1590,13 @@ pub static ISOLATE_DEPENDENCY_WORKER_RESERVE: LazyLock<usize> =
+@@ -1595,6 +1596,13 @@ pub static ISOLATE_DEPENDENCY_WORKER_RESERVE: LazyLock<usize> =
  pub static MAX_ISOLATE_ACTION_WORKERS: LazyLock<usize> =
      LazyLock::new(|| env_config_usize_strict("MAX_ISOLATE_ACTION_WORKERS", 0));
  
@@ -318,7 +315,7 @@ index 9756448062ec67a093900d73a72bf42448b9f217..07875f2ff2858b22409e9c063c7032f7
  /// Enables the isolate scheduler's lane-aware queue delay controller. Disabled
  /// by default so the isolate scheduler retains the generic CoDel queue policy.
  pub static ISOLATE_QUEUE_DELAY_CONTROL_ENABLED: LazyLock<bool> =
-@@ -1605,9 +1613,9 @@ pub static ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS: LazyLock<Duration> = LazyLock::n
+@@ -1611,9 +1619,9 @@ pub static ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS: LazyLock<Duration> = LazyLock::n
      env_config_duration_millis_strict("ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS", 1000)
  });
  
@@ -331,7 +328,7 @@ index 9756448062ec67a093900d73a72bf42448b9f217..07875f2ff2858b22409e9c063c7032f7
  pub static ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS: LazyLock<Duration> = LazyLock::new(|| {
      let name = "ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS";
      let Some(millis) = env_config_optional_usize_strict(name) else {
-@@ -1634,8 +1642,8 @@ pub static ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS: LazyLock<Duration> =
+@@ -1640,8 +1648,8 @@ pub static ISOLATE_QUEUE_HARD_MAX_AGE_MILLIS: LazyLock<Duration> =
  pub static ISOLATE_CONTROL_PLANE_LANE_ENABLED: LazyLock<bool> =
      LazyLock::new(|| env_config_bool_strict("ISOLATE_CONTROL_PLANE_LANE_ENABLED", false));
  
@@ -342,7 +339,7 @@ index 9756448062ec67a093900d73a72bf42448b9f217..07875f2ff2858b22409e9c063c7032f7
  pub static ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY: LazyLock<usize> =
      LazyLock::new(|| env_config_usize_strict("ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY", 16));
  
-@@ -1645,13 +1653,6 @@ pub static ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS: LazyLock<Duration> = LazyL
+@@ -1651,13 +1659,6 @@ pub static ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS: LazyLock<Duration> = LazyL
      env_config_duration_millis_strict("ISOLATE_CONTROL_PLANE_HARD_MAX_AGE_MILLIS", 30000)
  });
  
@@ -356,7 +353,7 @@ index 9756448062ec67a093900d73a72bf42448b9f217..07875f2ff2858b22409e9c063c7032f7
  /// The size of the pending commits in the committer queue. This is a FIFO
  /// queue, so if the queue is too large, we run into a risk of all requests
  /// waiting too long and no requests going through during overload. The size of
-@@ -1868,7 +1869,7 @@ pub fn validate_active_javascript_class_minimums(
+@@ -1874,7 +1875,7 @@ pub fn validate_active_javascript_class_minimums(
      );
      if protected_active_minimum > 0 {
          anyhow::ensure!(
@@ -365,7 +362,7 @@ index 9756448062ec67a093900d73a72bf42448b9f217..07875f2ff2858b22409e9c063c7032f7
              "active-JavaScript class minimums require finite FUNRUN_ISOLATE_ACTIVE_THREADS"
          );
          let combined_minimum = protected_active_minimum
-@@ -2278,20 +2279,21 @@ pub static TICKETMASTER_CLUSTER_NAME: LazyLock<String> =
+@@ -2290,20 +2291,21 @@ pub static TICKETMASTER_CLUSTER_NAME: LazyLock<String> =
  pub static PROBER_PROBE_TIMEOUT: LazyLock<Duration> =
      LazyLock::new(|| Duration::from_secs(env_config("PROBER_PROBE_TIMEOUT", 5)));
  
@@ -395,7 +392,7 @@ index 9756448062ec67a093900d73a72bf42448b9f217..07875f2ff2858b22409e9c063c7032f7
  pub static FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN: LazyLock<usize> =
      LazyLock::new(|| env_config_usize_strict("FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN", 0));
  
-@@ -3060,11 +3062,23 @@ mod strict_capacity_tests {
+@@ -3093,11 +3095,23 @@ mod strict_capacity_tests {
          assert!(validate_active_javascript_class_minimums(28, 0, 0, None).is_ok());
          assert!(validate_active_javascript_class_minimums(28, 0, 14, Some(32)).is_err());
          assert!(validate_active_javascript_class_minimums(0, 4, 14, Some(32)).is_err());
@@ -420,10 +417,10 @@ index 9756448062ec67a093900d73a72bf42448b9f217..07875f2ff2858b22409e9c063c7032f7
      fn local_node_pool_policies_are_strict_and_bounded() {
          let policies = parse_local_node_executor_pool_policies(
 diff --git a/crates/common/src/types/functions.rs b/crates/common/src/types/functions.rs
-index 2f992977639db82f13c0923d1d7e1cbaac7f8b53..70697266e7e3224231b5de994e7182cae2f4e982 100644
+index 149b3b300226b58a3914cc7557428cc6f1e76485..3008d2f47a76f95974c9bc906f822227a78934d3 100644
 --- a/crates/common/src/types/functions.rs
 +++ b/crates/common/src/types/functions.rs
-@@ -149,32 +149,62 @@ pub enum SchedulerDependencyClass {
+@@ -156,32 +156,62 @@ pub enum SchedulerDependencyClass {
  
  impl SchedulerDependencyClass {
      pub fn unblocks_ancestor(&self) -> bool {
@@ -511,10 +508,10 @@ index 541742f7d1330348985033b38126ec6bab1f9d90..e95c5fa733a6a9eb6d9164970560f728
      SchedulerDependencyClass,
      UdfIdentifier,
 diff --git a/crates/function_runner/src/in_process_function_runner.rs b/crates/function_runner/src/in_process_function_runner.rs
-index 0087456d1b04ffbff86398d11b254f1fcbe86669..3482b06359bbf2514924346c653211633009f9a0 100644
+index 00823295d5b831cf72e1f5ba178a3f1d8eda113f..3f9e53e70774a39be3efb06ea051200f943ab182 100644
 --- a/crates/function_runner/src/in_process_function_runner.rs
 +++ b/crates/function_runner/src/in_process_function_runner.rs
-@@ -196,6 +196,7 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
+@@ -198,6 +198,7 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
                  *FUNRUN_ISOLATE_ACTIVE_THREADS,
                  *FUNRUN_ISOLATE_PROTECTED_ACTIVE_THREADS_MIN,
                  *FUNRUN_ISOLATE_DEGRADABLE_ACTIVE_THREADS_MIN,
@@ -523,12 +520,12 @@ index 0087456d1b04ffbff86398d11b254f1fcbe86669..3482b06359bbf2514924346c65321163
          } else {
              ConcurrencyLimiter::unlimited()
 diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
-index 2b5c28dfe7acf6a87d5b53321902f56da6368be5..8027bdd74e49368670169e90911af933a942bfa3 100644
+index e0dcb6e03041dc68236a97624548d117f9a25da9..b4fcea7c35a08857dce7ecca7560a533cb845052 100644
 --- a/crates/function_runner/src/server.rs
 +++ b/crates/function_runner/src/server.rs
-@@ -402,7 +402,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
- 
-         match udf_type {
+@@ -418,7 +418,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                         anyhow::bail!("Function metadata does not match {udf_type}")
+ =======
              UdfType::Query | UdfType::Mutation => {
 -                anyhow::ensure!(function_execution_start.is_none(), "Database functions cannot have an action execution start barrier");
 +                anyhow::ensure!(
@@ -538,7 +535,7 @@ index 2b5c28dfe7acf6a87d5b53321902f56da6368be5..8027bdd74e49368670169e90911af933
                  let function_metadata =
                      function_metadata.context("Missing function metadata for query or mutation")?;
                  let (path_and_args, journal, active_javascript_class) = match udf_type {
-@@ -423,7 +426,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -439,7 +442,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                          } => (
                              path_and_args,
                              journal,
@@ -597,7 +594,7 @@ index 4caf76f4d985ceaf9f1d64b782157f3800b4bcc1..16ae4516b084c91ace838eda14e2ef28
 +Protected-group occupancy includes ordinary protected, high mutation, and control-plane
 +permits, including unclaimed grants. Wasm admission uses its own CPU metrics.
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a2d57f990 100644
+index 1a90a514a74e600c4f87495d99ee34756f80c671..5f63df099ccde12b48f5ae47b5781f1143c6115a 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
 @@ -326,7 +326,6 @@ impl AnalyzeResponseSender {
@@ -768,7 +765,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          let request = Self {
              deployment_job: common::query_analysis_admission::DEPLOYMENT_ANALYSIS_JOB
                  .try_with(Clone::clone)
-@@ -1409,6 +1416,7 @@ pub enum RequestType<RT: Runtime> {
+@@ -1412,6 +1419,7 @@ pub enum RequestType<RT: Runtime> {
          reusable_udf_type: Option<UdfType>,
          context_module: Option<CanonicalizedComponentModulePath>,
          fail_worker: bool,
@@ -776,7 +773,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          started: mpsc::UnboundedSender<usize>,
          completion: oneshot::Receiver<()>,
          response: oneshot::Sender<anyhow::Result<()>>,
-@@ -1724,7 +1732,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1727,7 +1735,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              max_independent_actions_per_function <= max_independent_actions,
              "MAX_ISOLATE_ACTION_WORKERS_PER_FUNCTION must not exceed MAX_ISOLATE_ACTION_WORKERS"
          );
@@ -785,7 +782,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              *ISOLATE_QUEUE_DELAY_TARGET_MILLIS,
              *ISOLATE_QUEUE_DELAY_INTERVAL_MILLIS,
              *ISOLATE_QUEUE_DELAY_SHED_THRESHOLD_MILLIS,
-@@ -1733,6 +1741,15 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1736,6 +1744,15 @@ impl<RT: Runtime> IsolateClient<RT> {
              *ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY,
          )?;
          let control_plane_lane_enabled = *ISOLATE_CONTROL_PLANE_LANE_ENABLED;
@@ -801,7 +798,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          validate_control_plane_lane_config(
              control_plane_lane_enabled,
              *ISOLATE_CONTROL_PLANE_QUEUE_CAPACITY,
-@@ -1742,6 +1759,9 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1745,6 +1762,9 @@ impl<RT: Runtime> IsolateClient<RT> {
              *ISOLATE_QUEUE_DELAY_CONTROL_ENABLED,
              *ANALYZE_CONCURRENCY,
          )?;
@@ -811,7 +808,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          let delay_control_config = (*ISOLATE_QUEUE_DELAY_CONTROL_ENABLED).then_some(queue_config);
          let heap_per_worker = ISOLATE_MAX_USER_HEAP_SIZE
              .checked_add(*ISOLATE_MAX_HEAP_EXTRA_SIZE)
-@@ -1808,6 +1828,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1811,6 +1831,7 @@ impl<RT: Runtime> IsolateClient<RT> {
                  max_percent_per_client,
                  _active_workers,
                  control_plane_lane_enabled,
@@ -819,7 +816,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              );
              scheduler.run(receiver, internal_receiver).await
          });
-@@ -2534,8 +2555,10 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -2537,8 +2558,10 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      /// if at least one request is active for that client.
      in_progress_counts_by_client: HashMap<String, ActiveRequestCounts>,
      in_progress_counts: ActiveRequestCounts,
@@ -832,7 +829,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
      pending_permit_counts_by_client: HashMap<String, ActiveRequestCounts>,
      pending_permit_counts: ActiveRequestCounts,
      /// Externally visible active-worker accounting. The worker request owns the
-@@ -2545,10 +2568,12 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
+@@ -2548,10 +2571,12 @@ pub struct SharedIsolateScheduler<RT: Runtime, W: IsolateWorker<RT>> {
      max_workers: usize,
      /// Shared capacity available to every request class.
      base_worker_capacity: usize,
@@ -846,7 +843,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
      independent_actions_by_function: HashMap<IndependentActionKey, usize>,
      handles: Arc<Mutex<Vec<IsolateWorkerHandle>>>,
      max_workers_per_client: usize,
-@@ -2573,10 +2598,10 @@ struct IdleWorkerState {
+@@ -2576,10 +2601,10 @@ struct IdleWorkerState {
      info: IdleWorkerInfo,
  }
  struct ActiveWorkerState {
@@ -858,7 +855,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
  }
  
  struct WorkerSelection {
-@@ -2599,7 +2624,16 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2602,7 +2627,16 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          max_percent_per_client: usize,
          active_workers: Arc<AtomicUsize>,
          control_plane_lane_enabled: bool,
@@ -875,7 +872,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          let dependency_reserve = max_workers - base_worker_capacity;
          let max_workers_per_client =
              per_client_worker_capacity(max_workers, max_percent_per_client);
-@@ -2624,6 +2658,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2627,6 +2661,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              available_workers: HashMap::new(),
              max_workers,
              base_worker_capacity,
@@ -883,7 +880,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              max_independent_actions,
              max_independent_actions_per_function,
              independent_actions_by_function: HashMap::new(),
-@@ -2693,6 +2728,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2696,6 +2731,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              active_counts,
              max_workers: self.max_workers,
              base_worker_capacity: self.base_worker_capacity,
@@ -891,7 +888,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              max_independent_actions: self.max_independent_actions,
              max_independent_actions_per_function: self.max_independent_actions_per_function,
              independent_actions_by_function: self.independent_actions_by_function.clone(),
-@@ -2726,7 +2762,16 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2729,7 +2765,16 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
  
      fn reserve_pending_permit(&mut self, request: &Request<RT>) {
          let properties = request.scheduling_properties(self.control_plane_lane_enabled);
@@ -909,7 +906,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          self.reserve_action_function(request.independent_action_key());
          self.pending_permit_counts.increment(properties);
          self.pending_permit_counts_by_client
-@@ -2779,14 +2824,15 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2782,14 +2827,15 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
          let mut external_expired_receiver = receiver.expired_receiver();
          let scheduler_state = Arc::new(Mutex::new(self.state_snapshot()));
          let control_plane_lane_enabled = self.control_plane_lane_enabled;
@@ -928,7 +925,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              async move {
                  let output = receiver
                      .recv_next_selecting(|request| {
-@@ -2801,9 +2847,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2804,9 +2850,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          // wave from one class can be removed from the queue and
                          // hide demand from the other class behind permit waits.
                          eligibility.active_javascript_class_pending = pending_classes.lock()
@@ -940,7 +937,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
                              )];
                          eligibility
                      })
-@@ -2921,22 +2966,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2924,22 +2969,10 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          },
                      }
                  },
@@ -967,7 +964,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
                  pending = pending_external_permits.next(), if has_pending_external => {
                      let Some(PendingExternalPermit {
                          request,
-@@ -2948,9 +2981,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2951,9 +2984,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      self.release_pending_permit(&request);
                      let properties =
                          request.scheduling_properties(self.control_plane_lane_enabled);
@@ -979,7 +976,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
                      );
                      let was_pending = mem::replace(
                          &mut pending_external_classes.lock()[class_index],
-@@ -2981,6 +3013,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -2984,6 +3016,22 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          },
                      }
                  },
@@ -1002,7 +999,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
                  output = external_request_stream.next(), if external_request_stream_open => {
                      let Some(IsolateQueueOutput {
                          item: request,
-@@ -3008,9 +3056,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3011,9 +3059,8 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      }
                      let permit_deadline = permit_deadline
                          .expect("non-rejected external request must retain its queue deadline");
@@ -1014,7 +1011,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
                      );
                      let mut pending_classes = pending_external_classes.lock();
                      assert!(
-@@ -3043,11 +3090,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3046,11 +3093,11 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                          &request.client_id,
                          request.independent_action_key().as_ref(),
                      );
@@ -1031,7 +1028,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
                      eligibility
                  }), if external_expiration_receiver_open => {
                      match expired {
-@@ -3114,18 +3161,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3117,18 +3164,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              cached_contexts,
              miss_placement,
              non_reusing_action_placement,
@@ -1051,7 +1048,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          let (done_sender, done_receiver) = oneshot::channel();
          let client_id = request.client_id.clone();
          let action_key = request.independent_action_key();
-@@ -3246,30 +3282,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3249,30 +3285,17 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
      }
  
      /// Find a worker for the request's client.
@@ -1088,7 +1085,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          let reusable_context_kind = request.reusable_context_kind();
          // Try to find an existing worker for this client.
          if let Some((client_id, mut workers)) = self.available_workers.remove_entry(client_id) {
-@@ -3353,13 +3376,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3356,13 +3379,13 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              if !workers.is_empty() {
                  self.available_workers.insert(client_id, workers);
              }
@@ -1104,7 +1101,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          }
          // If we've recently started up and haven't yet created `max_workers` threads,
          // create a new worker instead of "stealing" some other client's worker.
-@@ -3380,14 +3403,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3383,14 +3406,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                  self.worker.config().name,
                  self.worker_senders.len() - 1
              );
@@ -1121,7 +1118,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          }
          // No existing worker for this client and we've already started the max number
          // of workers -- just grab the least recently used worker. This worker is least
-@@ -3402,10 +3425,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3405,10 +3428,7 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
                      .last_used_ts
              })
          else {
@@ -1133,7 +1130,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          };
          let worker = workers
              .pop_back()
-@@ -3419,14 +3439,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
+@@ -3422,14 +3442,14 @@ impl<RT: Runtime, W: IsolateWorker<RT>> SharedIsolateScheduler<RT, W> {
              let key = key.clone();
              self.available_workers.remove(&key);
          }
@@ -1150,7 +1147,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
      }
  
      fn aggregate_heap_stats(&self) -> IsolateHeapStats {
-@@ -3695,7 +3715,9 @@ mod tests {
+@@ -3698,7 +3718,9 @@ mod tests {
          },
          types::{
              ActiveJavascriptClass,
@@ -1160,7 +1157,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              SchedulerDependencyClass,
              UdfType,
          },
-@@ -3728,7 +3750,6 @@ mod tests {
+@@ -3731,7 +3753,6 @@ mod tests {
          per_client_worker_capacity,
          validate_control_plane_lane_config,
          wait_for_external_permit,
@@ -1168,7 +1165,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          ActiveRequestCounts,
          AnalysisModuleSnapshot,
          AnalyzeResponseSender,
-@@ -3738,6 +3759,7 @@ mod tests {
+@@ -3741,6 +3762,7 @@ mod tests {
          ExternalPermitWaitOutcome,
          IdleWorkerInfo,
          IdleWorkerState,
@@ -1176,7 +1173,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          IsolateClient,
          IsolateConfig,
          IsolateWorker,
-@@ -3762,12 +3784,10 @@ mod tests {
+@@ -3765,12 +3787,10 @@ mod tests {
          isolate::Isolate,
          isolate_queue::{
              IsolateQueueConfig,
@@ -1189,7 +1186,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              SchedulerContextAffinityOutcome,
          },
          ConcurrencyLimiter,
-@@ -3879,6 +3899,7 @@ mod tests {
+@@ -3882,6 +3902,7 @@ mod tests {
                          reusable_udf_type: _,
                          context_module: _,
                          fail_worker,
@@ -1197,7 +1194,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
                          started,
                          completion,
                          response,
-@@ -4013,6 +4034,19 @@ mod tests {
+@@ -4016,6 +4037,19 @@ mod tests {
          response: oneshot::Receiver<anyhow::Result<()>>,
      }
  
@@ -1217,7 +1214,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
      struct InFlightTestRequest {
          completion: oneshot::Sender<()>,
          response: oneshot::Receiver<anyhow::Result<()>>,
-@@ -4070,6 +4104,7 @@ mod tests {
+@@ -4073,6 +4107,7 @@ mod tests {
              reusable_udf_type: None,
              context_module: None,
              fail_worker: matches!(kind, TestRequestKind::WorkerFailure),
@@ -1225,7 +1222,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              started,
              completion: completion_receiver,
              response: response_sender,
-@@ -4286,6 +4321,7 @@ mod tests {
+@@ -4289,6 +4324,7 @@ mod tests {
                  max_percent_per_client,
                  active_workers.clone(),
                  control_plane_lane_enabled,
@@ -1233,7 +1230,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              );
              Self {
                  sender,
-@@ -4455,6 +4491,7 @@ mod tests {
+@@ -4458,6 +4494,7 @@ mod tests {
              active_counts: global_active,
              max_workers: 6,
              base_worker_capacity: 5,
@@ -1241,7 +1238,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              max_independent_actions: 3,
              max_independent_actions_per_function: 3,
              independent_actions_by_function: HashMap::new(),
-@@ -4681,6 +4718,10 @@ mod tests {
+@@ -4684,6 +4721,10 @@ mod tests {
              let request = Request::new("deployment".to_string(), inner, EncodedSpan::empty());
              assert!(request.is_response_closed());
              let enabled = request.scheduling_properties(true);
@@ -1252,7 +1249,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              assert_eq!(enabled.queue_lane(), IsolateQueueLane::ControlPlane);
              assert_eq!(enabled.as_label(), "control_plane");
              assert!(!enabled.can_block_on_descendant);
-@@ -4720,6 +4761,16 @@ mod tests {
+@@ -4723,6 +4764,16 @@ mod tests {
              )
          };
          assert!(valid().is_ok());
@@ -1269,7 +1266,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          assert!(validate_control_plane_lane_config(
              false,
              1,
-@@ -4825,6 +4876,7 @@ mod tests {
+@@ -4828,6 +4879,7 @@ mod tests {
          let active = ActiveRequestCounts {
              total: 5,
              independent_actions: 3,
@@ -1277,7 +1274,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          };
          let state = snapshot(active, active);
          let control_plane = RequestSchedulingProperties {
-@@ -4850,6 +4902,7 @@ mod tests {
+@@ -4853,6 +4905,7 @@ mod tests {
          let active = ActiveRequestCounts {
              total: 5,
              independent_actions: 0,
@@ -1285,7 +1282,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          };
          let state = snapshot(active, active);
          assert!(!state.can_start_request(properties(false, false, false), "deployment", None));
-@@ -4862,6 +4915,7 @@ mod tests {
+@@ -4865,6 +4918,7 @@ mod tests {
          let active = ActiveRequestCounts {
              total: 4,
              independent_actions: 0,
@@ -1293,7 +1290,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          };
          let state = snapshot(active, active);
          assert!(state.can_start_request(properties(false, false, false), "deployment", None));
-@@ -4874,6 +4928,7 @@ mod tests {
+@@ -4877,6 +4931,7 @@ mod tests {
          let active = ActiveRequestCounts {
              total: 6,
              independent_actions: 0,
@@ -1301,7 +1298,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          };
          let state = snapshot(active, active);
          assert!(!state.can_start_request(properties(false, false, false), "deployment", None));
-@@ -4881,22 +4936,32 @@ mod tests {
+@@ -4884,22 +4939,32 @@ mod tests {
      }
  
      #[test]
@@ -1350,7 +1347,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
      }
  
      #[test]
-@@ -4927,10 +4992,12 @@ mod tests {
+@@ -4930,10 +4995,12 @@ mod tests {
          let global = ActiveRequestCounts {
              total: 4,
              independent_actions: 0,
@@ -1363,7 +1360,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          };
          let mut state = snapshot(global, client);
          state.base_workers_per_client = 2;
-@@ -4942,6 +5009,7 @@ mod tests {
+@@ -4945,6 +5012,7 @@ mod tests {
          let client_at_total = ActiveRequestCounts {
              total: 3,
              independent_actions: 0,
@@ -1371,7 +1368,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          };
          let mut state = snapshot(global, client_at_total);
          state.base_workers_per_client = 2;
-@@ -4977,6 +5045,7 @@ mod tests {
+@@ -4980,6 +5048,7 @@ mod tests {
                  100,
                  Arc::new(AtomicUsize::new(0)),
                  false,
@@ -1379,7 +1376,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              );
              let (worker_sender, _worker_receiver) = mpsc::channel(1);
              scheduler.worker_senders.push(worker_sender);
-@@ -5022,9 +5091,7 @@ mod tests {
+@@ -5025,9 +5094,7 @@ mod tests {
              *context_module = Some(module.clone());
              let context_kind = request.reusable_context_kind().unwrap();
  
@@ -1390,7 +1387,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              assert_eq!(selection.worker_id, 0);
              assert_eq!(
                  selection.context_affinity,
-@@ -5059,9 +5126,7 @@ mod tests {
+@@ -5062,9 +5129,7 @@ mod tests {
                      },
                  ]),
              );
@@ -1401,7 +1398,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              assert_eq!(selection.worker_id, 1);
              assert_eq!(
                  selection.context_affinity,
-@@ -5166,9 +5231,7 @@ mod tests {
+@@ -5169,9 +5234,7 @@ mod tests {
                              SchedulerDependencyClass::UnblocksAncestor,
                          );
                      }
@@ -1412,7 +1409,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
                      let is_action = matches!(kind, TestRequestKind::Action);
                      let expected_worker = if is_action { action_worker } else { 0 };
                      assert_eq!(selection.worker_id, expected_worker);
-@@ -5219,9 +5282,7 @@ mod tests {
+@@ -5222,9 +5285,7 @@ mod tests {
                          };
                          *reusable_udf_type = Some(UdfType::Query);
                          *context_module = Some(module);
@@ -1423,7 +1420,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
                          assert_eq!(query.worker_id, 0);
                          assert_eq!(
                              query.context_affinity,
-@@ -5241,6 +5302,7 @@ mod tests {
+@@ -5244,6 +5305,7 @@ mod tests {
          let active = ActiveRequestCounts {
              total: 3,
              independent_actions: 3,
@@ -1431,7 +1428,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          };
          let state = snapshot(active, active);
          assert!(!state.can_start_request(properties(false, true, true), "deployment", None));
-@@ -5249,7 +5311,7 @@ mod tests {
+@@ -5252,7 +5314,7 @@ mod tests {
      }
  
      #[test]
@@ -1440,7 +1437,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          let tokio = ProdRuntime::init_tokio().unwrap();
          let rt = SchedulerTestRuntime::new(ProdRuntime::new(&tokio));
          let mut harness = SchedulerHarness::new(rt, 8, 7, 6, 100, 8);
-@@ -5257,21 +5319,315 @@ mod tests {
+@@ -5260,21 +5322,315 @@ mod tests {
          scheduler.max_independent_actions_per_function = 1;
          let mut first = test_request(1, TestRequestKind::Action, harness.started_sender.clone());
          let key = first.request.independent_action_key().unwrap();
@@ -1764,7 +1761,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
      #[test]
      fn zero_workers_are_rejected_at_construction() {
          let tokio = ProdRuntime::init_tokio().expect("failed to create Tokio runtime");
-@@ -5583,13 +5939,106 @@ mod tests {
+@@ -5586,13 +5942,106 @@ mod tests {
          });
      }
  
@@ -1872,7 +1869,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
              let protected_held = limiter
                  .acquire_with_class(
                      Arc::new("protected-held".to_owned()),
-@@ -5641,13 +6090,177 @@ mod tests {
+@@ -5644,13 +6093,177 @@ mod tests {
          });
      }
  
@@ -2051,7 +2048,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          let PendingTestRequest {
              request: global_pending,
              ..
-@@ -5656,6 +6269,14 @@ mod tests {
+@@ -5659,6 +6272,14 @@ mod tests {
              TestRequestKind::Degradable,
              global_harness.started_sender.clone(),
          );
@@ -2066,7 +2063,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          let global_scheduler = &mut global_harness
              .pending_scheduler
              .as_mut()
-@@ -5664,22 +6285,56 @@ mod tests {
+@@ -5667,22 +6288,56 @@ mod tests {
          global_scheduler.reserve_pending_permit(&global_pending);
          let global_state = global_scheduler.state_snapshot();
          let candidate = properties(false, false, false);
@@ -2125,7 +2122,7 @@ index 70cb159994ec30197b561bc6b7effb47b2523323..ba2652249def6e2240510c6cb57d741a
          let client_scheduler = &mut client_harness
              .pending_scheduler
              .as_mut()
-@@ -5690,8 +6345,28 @@ mod tests {
+@@ -5693,8 +6348,28 @@ mod tests {
          let client_eligibility =
              client_state.request_eligibility(candidate, &client_pending.client_id, None);
          assert!(!client_eligibility.physical_total);
@@ -4151,7 +4148,7 @@ index e936519b2046b4d5dd75217deba29fc8e8f0f123..9c3941b9aa5132f56667cb0b94fe10b7
 +    }
 +}
 diff --git a/crates/local_backend/src/router.rs b/crates/local_backend/src/router.rs
-index 725462f38090326699cf864e1473a26341c90395..480d7f1fa545594719382a1f58bed111a80793b8 100644
+index a7439c088ffde9736c84844ca96e58890b71bcaa..26bffdc3fe41445e44d2046ce29812d374d0fc0b 100644
 --- a/crates/local_backend/src/router.rs
 +++ b/crates/local_backend/src/router.rs
 @@ -653,3 +653,28 @@ pub fn cors() -> CorsLayer {
@@ -4184,7 +4181,7 @@ index 725462f38090326699cf864e1473a26341c90395..480d7f1fa545594719382a1f58bed111
 +    }
 +}
 diff --git a/crates/pb/protos/common.proto b/crates/pb/protos/common.proto
-index 438987f77a4936ba633eae2bce8d231c415aa6dc..8c9eac55d0442757927ee5eb7c0456e4699e8daa 100644
+index 78e386d10346f67309ac5b8d8d84f1c2385898c9..80b02ace3b79c0639c4983c8a4145669dfe55a21 100644
 --- a/crates/pb/protos/common.proto
 +++ b/crates/pb/protos/common.proto
 @@ -136,6 +136,7 @@ message ExecutionContext {
@@ -4264,7 +4261,7 @@ index 4a7bd1f4fcaa31b34f552eee613f9b48724195e4..959b994e2e5a8c2f4038002e6891436e
 \ No newline at end of file
 +}
 diff --git a/patches/README.md b/patches/README.md
-index 3cf5de15d5c0569a06a1d1fecabe3aa02f29429f..13f7dd07abf3c6f9b20235ecd92f2cc176651f83 100644
+index 462e1c6f167601b8724704e00a22ac39ceccad9e..3ea64e41f4fcb94664ae91e596600df871c9c218 100644
 --- a/patches/README.md
 +++ b/patches/README.md
 @@ -6,9 +6,11 @@ a patch, preserve its prerequisites, and verify the effective configuration and
@@ -4282,7 +4279,7 @@ index 3cf5de15d5c0569a06a1d1fecabe3aa02f29429f..13f7dd07abf3c6f9b20235ecd92f2cc1
  extension are one queue-control patch. The matching degradable-query client half is maintained in
  `convex-js`; it shares the protocol and adoption essay but is not another commit in this backend
  chain. Non-committing codegen analysis likewise has a matching CLI commit, with the combined
-@@ -210,10 +212,11 @@ requires explicit client negotiation, and its preparation is process-local.
+@@ -194,10 +196,11 @@ requires explicit client negotiation, and its preparation is process-local.
  ### [Dependency capacity](dependency_capacity/README.md)
  
  - Purpose: propagate ancestor-unblocking ownership and allow only dependencies to use bounded
@@ -4296,7 +4293,7 @@ index 3cf5de15d5c0569a06a1d1fecabe3aa02f29429f..13f7dd07abf3c6f9b20235ecd92f2cc1
  - Rollback: restore the prior image and capacity settings together; removing it restores the
    action/descendant capacity inversion.
  
-@@ -294,7 +297,8 @@ requires explicit client negotiation, and its preparation is process-local.
+@@ -278,7 +281,8 @@ requires explicit client negotiation, and its preparation is process-local.
    subscriptions stay mounted.
  - Activation: backend admission is inert while
    `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS` is unset. Clients must explicitly send the
@@ -4306,7 +4303,7 @@ index 3cf5de15d5c0569a06a1d1fecabe3aa02f29429f..13f7dd07abf3c6f9b20235ecd92f2cc1
    Optional protected and degradable active-JavaScript minimums provide work-conserving execution
    progress when the leader cap exceeds active-JavaScript capacity.
  - Rollback: remove the application opt-in first, then unset the backend cap. The protocol fields can
-@@ -302,7 +306,8 @@ requires explicit client negotiation, and its preparation is process-local.
+@@ -286,7 +290,8 @@ requires explicit client negotiation, and its preparation is process-local.
  
  ## Detailed design references
  

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Fri, 24 Jul 2026 17:19:25 +0800
-Subject: [PATCH 16/32] scheduler: admit durable actions before claim
+Subject: [PATCH 15/30] scheduler: admit durable actions before claim
 
 Prepare scheduled and registered-cron actions while their durable jobs remain Pending. Add a two-way execution-start barrier so V8 owns normal queue, active-permit, and selected-worker capacity, and Node completes application-side preparation, before a fresh exact-state transaction commits Pending to InProgress.
 
@@ -9,10 +9,10 @@ Keep polling the prepared execution while the claim is in flight so a known-lost
 
 Add bounded admission and claim metrics, focused barrier coverage, patch-train integration notes, rollout guidance, and rejected-alternative analysis.
 ---
- .../application_function_runner/metrics.rs    |  42 ++
+ .../application_function_runner/metrics.rs    |  45 ++
  .../src/application_function_runner/mod.rs    | 161 ++++++-
- crates/application/src/cron_jobs/mod.rs       |  63 ++-
- crates/application/src/scheduled_jobs/mod.rs  |  79 +--
+ crates/application/src/cron_jobs/mod.rs       |  57 ++-
+ crates/application/src/scheduled_jobs/mod.rs  |  73 ++-
  .../src/in_process_function_runner.rs         |   3 +
  crates/function_runner/src/lib.rs             |   2 +
  crates/function_runner/src/server.rs          | 120 +++++
@@ -23,22 +23,26 @@ Add bounded admission and claim metrics, focused barrier coverage, patch-train i
  patches/dependency_capacity/README.md         |   5 +
  patches/isolate_queue_control/README.md       |  21 +-
  patches/scheduled_action_admission/README.md  | 455 ++++++++++++++++++
- 14 files changed, 1052 insertions(+), 132 deletions(-)
+ 14 files changed, 1055 insertions(+), 120 deletions(-)
  create mode 100644 patches/scheduled_action_admission/README.md
 
 diff --git a/crates/application/src/application_function_runner/metrics.rs b/crates/application/src/application_function_runner/metrics.rs
-index 50807602a929157d507cfa672cb1f9392ca4ff83..a12751241e6e7a96ae01f37271d043c7f44a71bc 100644
+index 5cbe3538a4e2d8231a13559a4a92d64a17cd4c63..ccc8a68b682673d5604a4c0f05b4ef573b8f4258 100644
 --- a/crates/application/src/application_function_runner/metrics.rs
 +++ b/crates/application/src/application_function_runner/metrics.rs
-@@ -8,6 +8,7 @@ use metrics::{
+@@ -8,7 +8,11 @@ use metrics::{
      log_distribution_with_labels,
      register_convex_counter,
      register_convex_histogram,
++<<<<<<< HEAD
+     IntoLabel,
++=======
 +    CancelableTimer,
++>>>>>>> 6b9627540 (scheduler: admit durable actions before claim)
      StaticMetricLabel,
      StatusTimer,
      STATUS_LABEL,
-@@ -21,6 +22,47 @@ pub enum UdfExecutorResult {
+@@ -22,6 +26,47 @@ pub enum UdfExecutorResult {
      SystemError(&'static str),
  }
  
@@ -87,7 +91,7 @@ index 50807602a929157d507cfa672cb1f9392ca4ff83..a12751241e6e7a96ae01f37271d043c7
      UDF_EXECUTOR_RESULT_TOTAL,
      "Number of queries against the module cache",
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b58c9319a9 100644
+index e998691152d94460c5095f550ca18563c1b1952c..7a9bb576a5c2db15c69c189fedf005760761b6e9 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
 @@ -106,6 +106,8 @@ use file_storage::{
@@ -110,7 +114,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
      function_waiter_timer,
      log_occ_retries,
      log_outstanding_functions,
-@@ -386,6 +391,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -394,6 +399,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                      _ => anyhow::bail!("Invalid database UDF type"),
                  }),
                  None,
@@ -118,7 +122,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
                  scheduler_dependency,
              )
              .await?;
-@@ -403,7 +409,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -411,7 +417,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          log_line_sender: mpsc::UnboundedSender<LogLine>,
          context: ExecutionContext,
          permit_timeout: PermitTimeout,
@@ -127,7 +131,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let permit = self
-@@ -426,6 +432,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -434,6 +440,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                      return_validation,
                  }),
                  None,
@@ -135,7 +139,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
                  scheduler_dependency,
              )
              .await?;
-@@ -458,6 +465,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -466,6 +473,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  Some(log_line_sender),
                  None,
                  Some(http_action_metadata),
@@ -143,7 +147,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
                  SchedulerDependencyClass::Independent,
              )
              .await?;
-@@ -481,6 +489,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -489,6 +497,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
          function_metadata: Option<FunctionMetadata>,
          http_action_metadata: Option<HttpActionMetadata>,
@@ -151,7 +155,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
          // Read in this transaction so preference changes invalidate cached queries.
-@@ -532,6 +541,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -540,6 +549,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  self.default_system_env_vars.clone(),
                  in_memory_index_last_modified,
                  context,
@@ -159,7 +163,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
                  scheduler_dependency,
              ),
              diagnostic.as_ref().map(RuntimeDiagnostic::task),
-@@ -1651,7 +1661,140 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1673,7 +1683,140 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          usage_tracking: FunctionUsageTracker,
          context: ExecutionContext,
          permit_timeout: PermitTimeout,
@@ -301,7 +305,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
          let mut diagnostic =
-@@ -1665,6 +1808,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1687,6 +1830,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  usage_tracking,
                  context,
                  permit_timeout,
@@ -309,7 +313,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
                  scheduler_dependency,
              ),
              diagnostic.as_ref().map(RuntimeDiagnostic::task),
-@@ -1707,7 +1851,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1729,7 +1873,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          usage_tracking: FunctionUsageTracker,
          context: ExecutionContext,
          permit_timeout: PermitTimeout,
@@ -318,7 +322,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionCompletion> {
          if path.is_system() && !(identity.is_admin() || identity.is_system()) {
-@@ -1736,6 +1880,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1758,6 +1902,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  (path_and_args, returns_validator)
              },
              Err(js_error) => {
@@ -328,7 +332,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
                  return Ok(ActionCompletion {
                      outcome: ValidatedActionOutcome::from_error(
                          js_error,
-@@ -1788,6 +1935,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1810,6 +1957,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          log_line_sender,
                          context.clone(),
                          permit_timeout,
@@ -336,7 +340,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
                          scheduler_dependency,
                      )
                      .boxed();
-@@ -1915,6 +2063,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1937,6 +2085,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                      encoded_parent_trace: EncodedSpan::from_parent().0,
                  };
  
@@ -347,7 +351,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
                  let node_outcome_future = self
                      .node_actions
                      .execute(request, log_line_sender, source_maps_callback)
-@@ -1979,6 +2131,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2001,6 +2153,9 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  })
              },
              ModuleEnvironment::Invalid => {
@@ -358,7 +362,7 @@ index 2441510da11b0069e8ccb53321687418f4f4c99a..51fa191ac280f95f4d60f32f605da5b5
              },
          };
 diff --git a/crates/application/src/cron_jobs/mod.rs b/crates/application/src/cron_jobs/mod.rs
-index a0ae7fe9f9b8ff8b3933adaf6b91bea921b9027b..16941209a19176c527948a2c62a8908e988da440 100644
+index 3aeb5951a810a7047d0f672265b43fbe6f98d934..fc1b21396e51d2d922935b18116a539035f81242 100644
 --- a/crates/application/src/cron_jobs/mod.rs
 +++ b/crates/application/src/cron_jobs/mod.rs
 @@ -91,6 +91,7 @@ use value::{
@@ -369,7 +373,7 @@ index a0ae7fe9f9b8ff8b3933adaf6b91bea921b9027b..16941209a19176c527948a2c62a8908e
          PermitTimeout,
      },
      function_log::FunctionExecutionLog,
-@@ -683,7 +684,8 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -682,7 +683,8 @@ impl<RT: Runtime> CronJobContext<RT> {
          let identity = tx.identity().clone();
          let (_, component_path) = self.get_job_component(&mut tx, job.id).await?;
          let caller = FunctionCaller::Cron;
@@ -379,7 +383,7 @@ index a0ae7fe9f9b8ff8b3933adaf6b91bea921b9027b..16941209a19176c527948a2c62a8908e
              CronJobState::Pending => {
                  // Create a new request & execution ID
                  let request_id = RequestId::new();
-@@ -693,27 +695,37 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -692,25 +694,41 @@ impl<RT: Runtime> CronJobContext<RT> {
                  );
                  sentry::configure_scope(|scope| context.add_sentry_tags(scope));
  
@@ -410,12 +414,10 @@ index a0ae7fe9f9b8ff8b3933adaf6b91bea921b9027b..16941209a19176c527948a2c62a8908e
 +                        .await?;
 +                    Ok(Some(updated_job))
                  };
--                CronModel::new(&mut tx, component)
--                    .update_job_state(updated_job.cron_next_run())
--                    .await?;
--                self.database
--                    .commit_with_write_source(tx, "cron_in_progress")
--                    .await?;
+                 CronModel::new(&mut tx, component)
+                     .update_job_state(updated_job.cron_next_run())
+                     .await?;
+                 self.database.commit(tx, "cron_in_progress").await?;
  
 -                // Execute the action
 +                // Reserve the runtime before making the at-most-once claim visible.
@@ -431,7 +433,7 @@ index a0ae7fe9f9b8ff8b3933adaf6b91bea921b9027b..16941209a19176c527948a2c62a8908e
                          PublicFunctionPath::Component(path),
                          job.cron_spec.udf_args.clone(),
                          identity.clone(),
-@@ -722,8 +734,14 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -719,8 +737,14 @@ impl<RT: Runtime> CronJobContext<RT> {
                          context.clone(),
                          PermitTimeout::WaitIndefinitely,
                          SchedulerDependencyClass::Independent,
@@ -447,7 +449,7 @@ index a0ae7fe9f9b8ff8b3933adaf6b91bea921b9027b..16941209a19176c527948a2c62a8908e
                  let execution_time_f64 = completion.execution_time.as_secs_f64();
                  let truncated_log_lines = self.truncate_log_lines(completion.log_lines.clone());
  
-@@ -763,9 +781,16 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -760,9 +784,16 @@ impl<RT: Runtime> CronJobContext<RT> {
                      .await;
              },
              CronJobState::InProgress {
@@ -466,7 +468,7 @@ index a0ae7fe9f9b8ff8b3933adaf6b91bea921b9027b..16941209a19176c527948a2c62a8908e
                  // This case can happen if there is a system error while executing
                  // the action or if backend exits after executing the action but
                  // before updating the state. Since we execute actions at most once,
-@@ -806,7 +831,7 @@ impl<RT: Runtime> CronJobContext<RT> {
+@@ -801,7 +832,7 @@ impl<RT: Runtime> CronJobContext<RT> {
  
                  let path = CanonicalizedComponentFunctionPath {
                      component: component_path,
@@ -476,7 +478,7 @@ index a0ae7fe9f9b8ff8b3933adaf6b91bea921b9027b..16941209a19176c527948a2c62a8908e
                  let mut err = err.into();
                  self.function_log
 diff --git a/crates/application/src/scheduled_jobs/mod.rs b/crates/application/src/scheduled_jobs/mod.rs
-index ae5686dfd27cfe95b7123ab667273ce8709f1c04..3bbb7fdbffc6a9af5aff28956af1fbc26e985068 100644
+index 027e0e3317876bfcd7683d95caaaaa338d753e16..d0ada370ae78afd0e7980aabd61384421489fb52 100644
 --- a/crates/application/src/scheduled_jobs/mod.rs
 +++ b/crates/application/src/scheduled_jobs/mod.rs
 @@ -121,6 +121,7 @@ use value::{
@@ -505,7 +507,7 @@ index ae5686dfd27cfe95b7123ab667273ce8709f1c04..3bbb7fdbffc6a9af5aff28956af1fbc2
              ScheduledJobState::Pending => {
                  // Create a new request & execution ID
                  let request_id = RequestId::new();
-@@ -1039,24 +1033,38 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+@@ -1039,22 +1033,42 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                  );
                  sentry::configure_scope(|scope| context.add_sentry_tags(scope));
  
@@ -537,12 +539,10 @@ index ae5686dfd27cfe95b7123ab667273ce8709f1c04..3bbb7fdbffc6a9af5aff28956af1fbc2
 +                        .await?;
 +                    Ok(Some(updated_job))
                  };
--                SchedulerModel::new(&mut tx, namespace)
--                    .replace(job_id, updated_job.clone())
--                    .await?;
--                self.database
--                    .commit_with_write_source(tx, "scheduled_job_progress")
--                    .await?;
+                 SchedulerModel::new(&mut tx, namespace)
+                     .replace(job_id, updated_job.clone())
+                     .await?;
+                 self.database.commit(tx, "scheduled_job_progress").await?;
  
 -                // Execute the action
 +                // The action holds its environment-specific admission while `claim`
@@ -558,7 +558,7 @@ index ae5686dfd27cfe95b7123ab667273ce8709f1c04..3bbb7fdbffc6a9af5aff28956af1fbc2
                          PublicFunctionPath::Component(path),
                          job.udf_args()?,
                          identity,
-@@ -1065,8 +1073,15 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+@@ -1063,8 +1077,15 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                          context.clone(),
                          PermitTimeout::WaitIndefinitely,
                          SchedulerDependencyClass::Independent,
@@ -575,7 +575,7 @@ index ae5686dfd27cfe95b7123ab667273ce8709f1c04..3bbb7fdbffc6a9af5aff28956af1fbc2
                  let state = match &completion.outcome.result {
                      Ok(_) => ScheduledJobState::Success,
                      Err(e) => ScheduledJobState::Failed(e.to_string()),
-@@ -1091,9 +1106,17 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+@@ -1089,9 +1110,17 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                      .await;
              },
              ScheduledJobState::InProgress {
@@ -595,7 +595,7 @@ index ae5686dfd27cfe95b7123ab667273ce8709f1c04..3bbb7fdbffc6a9af5aff28956af1fbc2
                  // This case can happen if there is a system error while executing
                  // the action or if backend exits after executing the action but
                  // before updating the state. Since we execute actions at most once,
-@@ -1168,8 +1191,8 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+@@ -1166,8 +1195,8 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
              .then_some((tx, metadata)))
      }
  
@@ -607,10 +607,10 @@ index ae5686dfd27cfe95b7123ab667273ce8709f1c04..3bbb7fdbffc6a9af5aff28956af1fbc2
          &self,
          job_id: ResolvedDocumentId,
 diff --git a/crates/function_runner/src/in_process_function_runner.rs b/crates/function_runner/src/in_process_function_runner.rs
-index aa3a0ffc33e5f644e23e9eef460182b901431126..0087456d1b04ffbff86398d11b254f1fcbe86669 100644
+index 849bf16c45dd2f3fb0b77f618cd6a39959782d4d..00823295d5b831cf72e1f5ba178a3f1d8eda113f 100644
 --- a/crates/function_runner/src/in_process_function_runner.rs
 +++ b/crates/function_runner/src/in_process_function_runner.rs
-@@ -110,6 +110,7 @@ use crate::{
+@@ -112,6 +112,7 @@ use crate::{
      server::{
          validate_run_function_result,
          DeploymentStorage,
@@ -618,7 +618,7 @@ index aa3a0ffc33e5f644e23e9eef460182b901431126..0087456d1b04ffbff86398d11b254f1f
          FunctionMetadata,
          FunctionRunnerCore,
          HttpActionMetadata,
-@@ -299,6 +300,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
+@@ -301,6 +302,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
          default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
          in_memory_index_last_modified: BTreeMap<IndexId, Timestamp>,
          context: ExecutionContext,
@@ -626,7 +626,7 @@ index aa3a0ffc33e5f644e23e9eef460182b901431126..0087456d1b04ffbff86398d11b254f1f
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(
          Option<FunctionFinalTransaction>,
-@@ -341,6 +343,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
+@@ -348,6 +350,7 @@ impl<RT: Runtime> FunctionRunner<RT> for InProcessFunctionRunner<RT> {
              fetch_client: self.fetch_client.clone(),
              log_line_sender,
              function_started_sender: None,
@@ -655,7 +655,7 @@ index e352f03e50c6d508a3cc65b58c6b0687e4bc201b..e0f00d9da669a5da6091f56c4e1c96c2
      ) -> anyhow::Result<(
          Option<FunctionFinalTransaction>,
 diff --git a/crates/function_runner/src/server.rs b/crates/function_runner/src/server.rs
-index 2a3b551a621aea16bd4357023b152a9433d6c9fe..59337e71dbe13ec4927d9ab00fff8d69d4dd7c59 100644
+index d28c6a98a94562a3b42cee9fa14fe0c37aeda499..03fd3425e4b320e0971a48160c5260e3400838b5 100644
 --- a/crates/function_runner/src/server.rs
 +++ b/crates/function_runner/src/server.rs
 @@ -125,6 +125,68 @@ use crate::{
@@ -743,15 +743,15 @@ index 2a3b551a621aea16bd4357023b152a9433d6c9fe..59337e71dbe13ec4927d9ab00fff8d69
              udf_type,
              identity,
              existing_writes,
-@@ -395,6 +459,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
- 
-         match udf_type {
+@@ -411,6 +475,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+                         anyhow::bail!("Function metadata does not match {udf_type}")
+ =======
              UdfType::Query | UdfType::Mutation => {
 +                anyhow::ensure!(function_execution_start.is_none(), "Database functions cannot have an action execution start barrier");
                  let function_metadata =
                      function_metadata.context("Missing function metadata for query or mutation")?;
                  let (path_and_args, journal, active_javascript_class) = match udf_type {
-@@ -475,6 +540,8 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -492,6 +557,8 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                      };
                  let log_line_sender =
                      log_line_sender.context("Missing log line sender for action")?;
@@ -760,7 +760,7 @@ index 2a3b551a621aea16bd4357023b152a9433d6c9fe..59337e71dbe13ec4927d9ab00fff8d69
                  let outcome = self
                      .isolate_client
                      .execute_action(
-@@ -488,6 +555,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -505,6 +572,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                          environment_data,
                          deployment_name,
                          function_started_sender,
@@ -768,7 +768,7 @@ index 2a3b551a621aea16bd4357023b152a9433d6c9fe..59337e71dbe13ec4927d9ab00fff8d69
                          scheduler_dependency,
                      )
                      .await?;
-@@ -498,6 +566,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -515,6 +583,10 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                  ))
              },
              UdfType::HttpAction => {
@@ -779,7 +779,7 @@ index 2a3b551a621aea16bd4357023b152a9433d6c9fe..59337e71dbe13ec4927d9ab00fff8d69
                  anyhow::ensure!(
                      scheduler_dependency == SchedulerDependencyClass::Independent,
                      "HTTP actions cannot be dependency-unblocking scheduler requests"
-@@ -665,3 +737,51 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
+@@ -682,3 +754,51 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
              .await
      }
  }
@@ -832,10 +832,10 @@ index 2a3b551a621aea16bd4357023b152a9433d6c9fe..59337e71dbe13ec4927d9ab00fff8d69
 +    }
 +}
 diff --git a/crates/isolate/src/client.rs b/crates/isolate/src/client.rs
-index b70a44302b8e3e286a9b89ed65a63b1fca8ee29d..b06922e60b2f7a4909f4f8d64bb9b814b0c0a69c 100644
+index fe011b80fc907270d3fa446a6df1596f5a5c1077..02e351e997b91ff0bb6ab23a3425418b7a9d0499 100644
 --- a/crates/isolate/src/client.rs
 +++ b/crates/isolate/src/client.rs
-@@ -1344,6 +1344,7 @@ pub enum RequestType<RT: Runtime> {
+@@ -1347,6 +1347,7 @@ pub enum RequestType<RT: Runtime> {
          fetch_client: Arc<dyn FetchClient>,
          log_line_sender: mpsc::UnboundedSender<LogLine>,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -843,7 +843,7 @@ index b70a44302b8e3e286a9b89ed65a63b1fca8ee29d..b06922e60b2f7a4909f4f8d64bb9b814
      },
      HttpAction {
          request: HttpActionRequest<RT>,
-@@ -1920,6 +1921,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1923,6 +1924,7 @@ impl<RT: Runtime> IsolateClient<RT> {
          environment_data: EnvironmentData<RT>,
          instance_name: String,
          function_started_sender: Option<oneshot::Sender<()>>,
@@ -851,7 +851,7 @@ index b70a44302b8e3e286a9b89ed65a63b1fca8ee29d..b06922e60b2f7a4909f4f8d64bb9b814
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<ActionOutcome> {
          let (tx, rx) = oneshot::channel();
-@@ -1943,6 +1945,7 @@ impl<RT: Runtime> IsolateClient<RT> {
+@@ -1946,6 +1948,7 @@ impl<RT: Runtime> IsolateClient<RT> {
              fetch_client,
              log_line_sender,
              function_started_sender,
