@@ -11,6 +11,60 @@ Build the backend from scratch by running:
 docker build -t convex-backend -f self-hosted/docker-build/Dockerfile.backend .
 ```
 
+## Hosted CI builds
+
+The manual
+[Build patched backend image](../../.github/workflows/build_patched_backend.yml)
+workflow builds an optimized Linux amd64 image on `ubuntu-24.04`, runs Wasm Rust
+regressions, checks its capabilities and SQLite startup, and publishes
+`ghcr.io/<owner>/<repository>:backend-build-<run-id>-<attempt>`. Before pushing,
+it creates the matching Git tag so the exact source remains reachable after
+rebasing the patch train. Tags are never moved; a failed image push can leave a
+source tag without an image. Rerunning uses a new attempt number.
+
+The image includes the Wasm runtime gate and source-package authority helper.
+The job summary supplies the source tag and image digest for downstream
+Dockerfiles. No registry account beyond GitHub is required; the workflow uses
+`GITHUB_TOKEN` with contents and package write permission. Pin consumers to the
+digest to identify the exact build, including its system dependencies.
+
+The builder has a 12 GiB memory limit with no additional swap, two Cargo jobs,
+and serialized backend LLVM optimization. It removes unused host SDKs and
+reports available disk before and during compilation. This uses reclaimed runner
+space; fitting within a strict 14 GB disk quota is not guaranteed. A cold build
+must also finish within GitHub's six-hour job limit.
+
+Before publication, the same job builds the `rust-tests` Docker target. It runs
+the isolate library's Wasm, module-registry and host-error-attribution tests,
+then repeats preparation and module-cache tests with one worker and with
+CPU-derived parallelism. The initial run uses four workers. Libtest runs tests
+serially because they share process-wide runtime state; concurrency within a
+test remains enabled. Ignored tests requiring external compiler fixtures and
+the rest of the backend workspace are not part of this suite.
+
+Tests reuse the builder, installed tools, JavaScript dependencies and Cargo,
+download and sccache mounts. They use the test profile without debug symbols or
+incremental compilation. Test-only features and panic unwinding mean release
+Rust artifacts are not all reusable; this adds compilation time and disk use.
+The test step always executes, including on an unchanged source revision, and
+failure prevents image publication. Test binaries stay in the builder cache.
+
+Build layers are cached in GHCR at `buildcache-amd64`. A separate Actions cache
+preserves up to 2 GiB of sccache output across runners. Cargo target and
+download cache mounts remain local to each runner, so source changes still
+require dependency downloads, build-script execution and linking. Exact cached
+build layers can skip those steps. The cache extraction temporarily needs
+additional disk space, and old Actions cache entries are subject to GitHub's
+eviction.
+
+The workflow sets `CARGO_CHEF_COOK=false`: a fresh runner cannot recover the
+target mount from registry layers, and cooking dependencies without the final
+feature set adds work before the sccache-enabled build. The default remains
+`true` for persistent local builders. Consumers pull only the runtime image;
+they do not download build caches.
+
+## Local build options
+
 The backend build uses Cargo's `release` profile by default. Select another
 built-in or custom workspace profile with `CARGO_BUILD_PROFILE`:
 
