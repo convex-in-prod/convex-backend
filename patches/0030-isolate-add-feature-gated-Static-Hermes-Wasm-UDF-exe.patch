@@ -174,19 +174,22 @@ refresh, configuration invalidation, and reclamation planning with tests.
  Cargo.toml                                    |    14 +-
  crates/application/Cargo.toml                 |     8 +-
  .../application_function_runner/metrics.rs    |     5 +-
- .../src/application_function_runner/mod.rs    |   127 +-
+ .../src/application_function_runner/mod.rs    |   138 +-
  .../query_shadow.rs                           |  1763 ++
  .../tests/static_hermes_wasmtime_gate.rs      | 13125 ++++++++++
  crates/application/src/audit_logging.rs       |    29 +-
  .../source_package_preactivation_authority.rs |   454 +
  crates/application/src/cache/mod.rs           |    24 +-
- crates/application/src/deploy_config.rs       |  1813 +-
+ crates/application/src/cron_jobs/mod.rs       |     9 +-
+ crates/application/src/deploy_config.rs       |  1837 +-
  crates/application/src/external_deps.rs       |    91 +
  crates/application/src/function_log.rs        |  4829 +++-
  crates/application/src/lib.rs                 |   235 +-
  crates/application/src/metrics.rs             |    13 +
- crates/application/src/scheduled_jobs/mod.rs  |    15 +
- .../src/system_table_cleanup/mod.rs           |    11 +
+ crates/application/src/scheduled_jobs/mod.rs  |    22 +-
+ crates/application/src/schema_worker/mod.rs   |     2 +-
+ crates/application/src/schema_worker/tests.rs |    16 +-
+ .../src/system_table_cleanup/mod.rs           |    13 +-
  crates/authentication/src/application_auth.rs |     4 +-
  crates/common/Cargo.toml                      |     1 +
  crates/common/src/auth.rs                     |     3 +-
@@ -250,8 +253,8 @@ refresh, configuration invalidation, and reclamation planning with tests.
  crates/isolate/src/environment/action/mod.rs  |     1 +
  crates/isolate/src/environment/analyze.rs     |   179 +-
  crates/isolate/src/environment/mod.rs         |     5 +
- .../src/environment/udf/async_syscall.rs      |  1714 +-
- .../environment/udf/context_reuse_tests.rs    |   512 +-
+ .../src/environment/udf/async_syscall.rs      |  1669 +-
+ .../environment/udf/context_reuse_tests.rs    |   518 +-
  .../environment/udf/generated_wasm_memory.rs  |  7835 ++++++
  .../udf/generated_wasm_memory/forecast.rs     |   213 +
  .../udf/generated_wasm_memory/initialized.rs  |   338 +
@@ -449,7 +452,7 @@ refresh, configuration invalidation, and reclamation planning with tests.
  self-hosted/docker-build/README.md            |    84 +
  self-hosted/docker-build/run_backend.sh       |     3 +-
  self-hosted/docker/docker-compose.yml         |     1 +
- 280 files changed, 187699 insertions(+), 8470 deletions(-)
+ 283 files changed, 187717 insertions(+), 8484 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/query_shadow.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
  create mode 100644 crates/application/src/bin/source_package_preactivation_authority.rs
@@ -20148,7 +20151,7 @@ index 1fe4f7228a10d4d5ab1d518cd85f2b8282614306..9405a85d4752f81e8dc4704fa3aae016
      StatusTimer,
      STATUS_LABEL,
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490eb7d893cb 100644
+index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..3db0c2371604a8178878eae631c478048bf1da06 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
 @@ -116,6 +116,8 @@ use function_runner::{
@@ -20186,12 +20189,24 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          let (udf_type, function_metadata) = match function_kind {
              DatabaseFunctionKind::Query(active_javascript_class) => (
-@@ -455,12 +460,10 @@ impl<RT: Runtime> FunctionRouter<RT> {
-                     },
-                     _ => anyhow::bail!("Invalid database UDF type"),
-                 }),
+@@ -443,24 +448,11 @@ impl<RT: Runtime> FunctionRouter<RT> {
+                 udf_type,
+                 context,
+                 None,
+-                Some(match udf_type {
+-                    UdfType::Query => FunctionMetadata::Query {
+-                        journal,
+-                        path_and_args,
+-                        active_javascript_class,
+-                    },
+-                    UdfType::Mutation => FunctionMetadata::Mutation {
+-                        journal,
+-                        path_and_args,
+-                    },
+-                    _ => anyhow::bail!("Invalid database UDF type"),
+-                }),
 -=======
--                Some(function_metadata),
+                 Some(function_metadata),
 ->>>>>>> 44c2402e4 (isolate: balance class-aware active-JavaScript admission)
                  None,
                  None,
@@ -20200,7 +20215,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
              )
              .await?;
          let tx = tx.with_context(|| format!("Missing transaction in response for {udf_type}"))?;
-@@ -502,6 +505,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -502,6 +494,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  None,
                  function_execution_start,
                  scheduler_dependency,
@@ -20208,7 +20223,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
              )
              .await?;
  
-@@ -535,6 +539,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -535,6 +528,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  Some(http_action_metadata),
                  None,
                  SchedulerDependencyClass::Independent,
@@ -20216,7 +20231,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
              )
              .await?;
  
-@@ -545,8 +550,6 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -545,8 +539,6 @@ impl<RT: Runtime> FunctionRouter<RT> {
          Ok(outcome)
      }
  
@@ -20225,7 +20240,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
      #[fastrace::trace]
      async fn function_runner_execute(
          &self,
-@@ -559,6 +562,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -559,6 +551,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          http_action_metadata: Option<HttpActionMetadata>,
          function_execution_start: Option<FunctionExecutionStartGate>,
          scheduler_dependency: SchedulerDependencyClass,
@@ -20233,7 +20248,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
      ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
          // Read in this transaction so preference changes invalidate cached queries.
          let udf_runtime = BackendInfoModel::new(&mut tx)
-@@ -586,6 +590,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -586,6 +579,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          let timer = function_run_timer(udf_type);
          let execution = isolate::execution_observation::observe(
              self.function_runner.run_function(
@@ -20241,7 +20256,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
                  udf_type,
                  udf_runtime,
                  tx.identity().clone(),
-@@ -621,7 +626,15 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -621,7 +615,15 @@ impl<RT: Runtime> FunctionRouter<RT> {
              // have both been checked.
              diagnostic.outcome = AttemptOutcome::SystemError;
          }
@@ -20258,7 +20273,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
          timer.finish();
          drop(permit);
  
-@@ -838,6 +851,11 @@ pub struct RequestGuard<'a, RT: Runtime> {
+@@ -838,6 +840,11 @@ pub struct RequestGuard<'a, RT: Runtime> {
      permit: Option<DependencyOverflowPermit>,
  }
  
@@ -20270,7 +20285,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
  impl<RT: Runtime> RequestGuard<'_, RT> {
      async fn acquire_permit(&mut self, is_dependency: bool) -> anyhow::Result<()> {
          let timer = function_waiter_timer(self.limiter.udf_type);
-@@ -1024,6 +1042,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
+@@ -1024,6 +1031,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
      key_broker: KeyBroker,
  
      isolate_functions: FunctionRouter<RT>,
@@ -20278,7 +20293,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
      // Used for analyze, schema, etc.
      node_actions: NodeActions<RT>,
  
-@@ -1067,6 +1086,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1067,6 +1075,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              default_system_env_vars.clone(),
              function_log.clone(),
          );
@@ -20286,7 +20301,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
          // Construct this gate once per application runner. The cache manager
          // and isolate analysis must receive clones of the same semaphore or
          // their loads become additive again.
-@@ -1118,6 +1138,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1118,6 +1127,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              database,
              key_broker,
              isolate_functions,
@@ -20294,7 +20309,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
              node_actions,
              source_map_cache,
              modules_storage,
-@@ -1134,6 +1155,56 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1134,6 +1144,56 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          }
      }
  
@@ -20351,7 +20366,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
      fn node_pool_action_limiter(
          &self,
          pool: Option<&NodeExecutorPoolName>,
-@@ -1233,12 +1304,15 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1233,12 +1293,15 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          let (mut tx, outcome) = match validate_result {
              Ok(path_and_args) => {
                  // Preserve the caller's uncommitted module writes in this transaction.
@@ -20368,7 +20383,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
                          tx,
                          permit,
                          path_and_args,
-@@ -1246,6 +1320,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1246,6 +1309,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          QueryJournal::new(),
                          context.clone(),
                          SchedulerDependencyClass::Independent,
@@ -20376,7 +20391,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
                      )
                      .await?
              },
-@@ -1552,6 +1627,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1552,6 +1616,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                      return Ok(Err(MutationError {
                          error: error.to_owned(),
                          log_lines,
@@ -20384,7 +20399,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
                      }));
                  },
              };
-@@ -1592,6 +1668,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1592,6 +1657,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          Err(MutationError {
                              error: js_error,
                              log_lines,
@@ -20392,7 +20407,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
                          })
                      } else {
                          if let Some(occ_info) = e.occ_info()
-@@ -1702,11 +1779,22 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1702,11 +1768,22 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
      pub async fn acquire_mutation_permit(
          &self,
          scheduler_dependency: SchedulerDependencyClass,
@@ -20418,7 +20433,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
      }
  
      /// Attempts to run a mutation once using the given transaction.
-@@ -1717,7 +1805,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1717,7 +1794,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
      pub async fn run_mutation_no_udf_log(
          &self,
          tx: Transaction<RT>,
@@ -20427,7 +20442,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
          path: PublicFunctionPath,
          arguments: SerializedArgs,
          allowed_visibility: AllowedVisibility,
-@@ -1761,7 +1849,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1761,7 +1838,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
      async fn run_mutation_inner(
          &self,
          mut tx: Transaction<RT>,
@@ -20436,7 +20451,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
          path: PublicFunctionPath,
          arguments: SerializedArgs,
          allowed_visibility: AllowedVisibility,
-@@ -1769,7 +1857,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1769,7 +1846,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          mutation_queue_length: Option<usize>,
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Transaction<RT>, ValidatedUdfOutcome)> {
@@ -20448,7 +20463,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
          self.database.check_write_throughput_limit()?;
          if path.is_system() && !(tx.identity().is_admin() || tx.identity().is_system()) {
              anyhow::bail!(unauthorized_error("mutation"));
-@@ -1803,7 +1894,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1803,7 +1883,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          let path = path_and_args.path().clone();
          let (mut tx, outcome) = self
              .isolate_functions
@@ -20457,7 +20472,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
                  tx,
                  permit,
                  path_and_args,
-@@ -1811,6 +1902,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1811,6 +1891,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  QueryJournal::new(),
                  context.clone(),
                  scheduler_dependency,
@@ -20465,7 +20480,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
              )
              .await?;
          let mutation_outcome = match outcome {
-@@ -2515,8 +2607,6 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2515,8 +2596,6 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          }
      }
  
@@ -20474,7 +20489,7 @@ index 2b39436f9fb999e50c5aa6b8d1e1495c3332b58d..96b773cce6aeca5364e6be9ba39d490e
      #[fastrace::trace]
      pub async fn build_deps(
          &self,
-@@ -3643,4 +3733,7 @@ mod tests {
+@@ -3643,4 +3722,7 @@ mod tests {
              Ok(())
          })
      }
@@ -22253,7 +22268,7 @@ index 0000000000000000000000000000000000000000..5509805bb061fa1a550b4556397b4876
 +}
 diff --git a/crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs b/crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea72e4d731a
+index 0000000000000000000000000000000000000000..c4986d24dcded6fe2de993fbe6967ecb6f9eb19d
 --- /dev/null
 +++ b/crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
 @@ -0,0 +1,13125 @@
@@ -24556,7 +24571,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(tx, "static_hermes_gate_test_module")
++        .commit(tx, "static_hermes_gate_test_module")
 +        .await?;
 +    Ok(())
 +}
@@ -24584,7 +24599,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(tx, "static_hermes_gate_test_setup")
++        .commit(tx, "static_hermes_gate_test_setup")
 +        .await?;
 +    Ok((table, id.developer_id))
 +}
@@ -24618,7 +24633,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +            .await?;
 +    }
 +    database
-+        .commit_with_write_source(tx, "static_hermes_gate_query_test_setup")
++        .commit(tx, "static_hermes_gate_query_test_setup")
 +        .await?;
 +    Ok(table)
 +}
@@ -24782,7 +24797,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(tx, "static_hermes_gate_test_conflict")
++        .commit(tx, "static_hermes_gate_test_conflict")
 +        .await?;
 +    Ok(())
 +}
@@ -25643,7 +25658,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(tx, "static_hermes_normal_route_object_fixture_restore")
++        .commit(tx, "static_hermes_normal_route_object_fixture_restore")
 +        .await?;
 +    Ok(())
 +}
@@ -25805,7 +25820,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +        }
 +    }
 +    database
-+        .commit_with_write_source(tx, "static_hermes_normal_route_collect_delete_seed")
++        .commit(tx, "static_hermes_normal_route_collect_delete_seed")
 +        .await?;
 +    anyhow::ensure!(
 +        document_ids.len() == result_fields.len() * synthetic_rows.len(),
@@ -28257,7 +28272,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +        },
 +    };
 +    database
-+        .commit_with_write_source(tx, "static_hermes_normal_route_test_setup")
++        .commit(tx, "static_hermes_normal_route_test_setup")
 +        .await?;
 +    Ok(fixture)
 +}
@@ -28552,7 +28567,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +        None => None,
 +    };
 +    database
-+        .commit_with_write_source(tx, "static_hermes_normal_route_sequence_test_setup")
++        .commit(tx, "static_hermes_normal_route_sequence_test_setup")
 +        .await?;
 +    match &expectation.sequence.expected_committed_state {
 +        NormalRouteSequenceExpectedCommittedState::ApplicationProbePatch { .. } => {
@@ -28677,7 +28692,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(tx, "static_hermes_normal_route_test_invalidation")
++        .commit(tx, "static_hermes_normal_route_test_invalidation")
 +        .await?;
 +    Ok(())
 +}
@@ -29527,7 +29542,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +    let mut setup_tx = database.begin_system().await?;
 +    materialize_normal_route_schema(&mut setup_tx, &schema).await?;
 +    database
-+        .commit_with_write_source(
++        .commit(
 +            setup_tx,
 +            "normal_route_schema_table_materialization_test_setup",
 +        )
@@ -29595,7 +29610,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +    let mut tx = database.begin_system().await?;
 +    let fixture = install_normal_route_file_storage_fixture(&mut tx, &storage, &setup).await?;
 +    database
-+        .commit_with_write_source(tx, "normal_route_file_storage_test_setup")
++        .commit(tx, "normal_route_file_storage_test_setup")
 +        .await?;
 +    assert_eq!(
 +        fixture.invocation_arguments,
@@ -29722,7 +29737,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +    );
 +    let sampling_bps = match udf_type {
 +        UdfType::Query => *APPLICATION_STATIC_HERMES_QUERY_SHADOW_BPS,
-+        UdfType::Mutation => *APPLICATION_STATIC_HERMES_MUTATION_SHADOW_BPS,
++        UdfType::Mutation | UdfType::Init => *APPLICATION_STATIC_HERMES_MUTATION_SHADOW_BPS,
 +        UdfType::Action | UdfType::HttpAction => {
 +            anyhow::bail!("shadow test selected an unsupported UDF type")
 +        },
@@ -30056,7 +30071,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +                    .result
 +                    .map_err(|error| anyhow::anyhow!("normal registry route failed: {error}"))?;
 +                let commit_ts = database
-+                    .commit_with_write_source(
++                    .commit(
 +                        transaction,
 +                        "static_hermes_normal_route_test_mutation",
 +                    )
@@ -30109,7 +30124,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(
++        .commit(
 +            transaction,
 +            "static_hermes_normal_route_test_provenance_mismatch",
 +        )
@@ -30432,7 +30447,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +            )
 +            .await?;
 +        database
-+            .commit_with_write_source(tx, "mixed_engine_setup")
++            .commit(tx, "mixed_engine_setup")
 +            .await?;
 +        let runner = new_runner(
 +            rt,
@@ -30670,7 +30685,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +                    )
 +                    .await?;
 +                database
-+                    .commit_with_write_source(tx, "fallback_fixture")
++                    .commit(tx, "fallback_fixture")
 +                    .await?;
 +                let runner = new_runner(
 +                    rt,
@@ -30809,7 +30824,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +                        );
 +                        if udf_type == UdfType::Mutation {
 +                            database
-+                                .commit_with_write_source(tx, "fallback_result")
++                                .commit(tx, "fallback_result")
 +                                .await?;
 +                            assert_eq!(
 +                                table_count(&database, &table).await?,
@@ -32959,7 +32974,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +        },
 +        Ok(result) if udf_type == UdfType::Mutation => {
 +            let commit_ts = database
-+                .commit_with_write_source(transaction, "static_hermes_paired_lane_mutation")
++                .commit(transaction, "static_hermes_paired_lane_mutation")
 +                .await?;
 +            NormalRoutePairedLaneOutcome::Returned {
 +                value: result.resolve_commit_ts(i64::from(commit_ts))?.json_value(),
@@ -35023,7 +35038,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +            "V8 mutation did not produce a write set"
 +        );
 +        database
-+            .commit_with_write_source(transaction, "static_hermes_cancelled_shadow_v8_commit")
++            .commit(transaction, "static_hermes_cancelled_shadow_v8_commit")
 +            .await?;
 +        let (committed_state, document_markers) =
 +            normal_route_paired_lane_post_state(&database, BTreeMap::new()).await?;
@@ -35164,7 +35179,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +        let expected_write_commits =
 +            initial_write_commits + 1 + usize::from(!recovery_transaction.is_readonly());
 +        database
-+            .commit_with_write_source(
++            .commit(
 +                recovery_transaction,
 +                "static_hermes_cancelled_shadow_recovery_commit",
 +            )
@@ -35212,7 +35227,7 @@ index 0000000000000000000000000000000000000000..90c62583e3ffea0b9912528116f99ea7
 +    );
 +    assert_eq!(database.write_commits_since_load(), initial_write_commits);
 +    database
-+        .commit_with_write_source(
++        .commit(
 +            transaction,
 +            "static_hermes_production_mutation_shadow_v8_commit",
 +        )
@@ -36012,8 +36027,30 @@ index 6e50182e16c3e20dced8d6e9fba08a685087f724..c4f531496bf5abb51c590f9b643cb120
          }
      }
  
+diff --git a/crates/application/src/cron_jobs/mod.rs b/crates/application/src/cron_jobs/mod.rs
+index fc1b21396e51d2d922935b18116a539035f81242..69bba1a7caba7d67d20c7d9a7c3f8ed69280275b 100644
+--- a/crates/application/src/cron_jobs/mod.rs
++++ b/crates/application/src/cron_jobs/mod.rs
+@@ -711,16 +711,9 @@ impl<RT: Runtime> CronJobContext<RT> {
+                     CronModel::new(&mut tx, component)
+                         .update_job_state(updated_job.cron_next_run())
+                         .await?;
+-                    self.database
+-                        .commit_with_write_source(tx, "cron_in_progress")
+-                        .await?;
++                    self.database.commit(tx, "cron_in_progress").await?;
+                     Ok(Some(updated_job))
+                 };
+-                CronModel::new(&mut tx, component)
+-                    .update_job_state(updated_job.cron_next_run())
+-                    .await?;
+-                self.database.commit(tx, "cron_in_progress").await?;
+-
+                 // Reserve the runtime before making the at-most-once claim visible.
+                 let path = CanonicalizedComponentFunctionPath {
+                     component: component_path,
 diff --git a/crates/application/src/deploy_config.rs b/crates/application/src/deploy_config.rs
-index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f6fb348c7 100644
+index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..db482d4bc25f8f7a13aa089419cdecc1be4fb309 100644
 --- a/crates/application/src/deploy_config.rs
 +++ b/crates/application/src/deploy_config.rs
 @@ -59,6 +59,7 @@ use common::{
@@ -37193,6 +37230,22 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
              external_deps_package_id: None,
              package_size: Default::default(),
              node_version: None,
+@@ -2882,13 +3396,13 @@ mod deployment_receipt_tests {
+             SourcePackageModel::new(&mut native, TableNamespace::Global)
+                 .put(package)
+                 .await?;
+-            db.commit_with_write_source(native, "native_selection_test")
++            db.commit(native, "native_selection_test")
+                 .await?;
+             SourcePackageModel::new(&mut stale, TableNamespace::Global)
+                 .put(source())
+                 .await?;
+             assert!(db
+-                .commit_with_write_source(stale, "stale_native_selection_test")
++                .commit(stale, "stale_native_selection_test")
+                 .await
+                 .unwrap_err()
+                 .is_occ());
 @@ -2913,6 +3427,75 @@ mod deployment_receipt_tests {
          })
      }
@@ -37237,7 +37290,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +                                SourcePackageModel::new(&mut competing, TableNamespace::Global)
 +                                    .put(source())
 +                                    .await?;
-+                                db.commit_with_write_source(competing, "test_competing_source")
++                                db.commit(competing, "test_competing_source")
 +                                    .await?;
 +                            }
 +                            Ok((id, publication))
@@ -37269,7 +37322,29 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
      #[test]
      fn empty_source_activations_serialize_and_advance_the_generation() -> anyhow::Result<()> {
          let tokio = ProdRuntime::init_tokio()?;
-@@ -3010,8 +3593,10 @@ mod deployment_receipt_tests {
+@@ -2937,10 +3520,10 @@ mod deployment_receipt_tests {
+             let first_id = SourcePackageModel::new(&mut newer, TableNamespace::Global)
+                 .put(source())
+                 .await?;
+-            db.commit_with_write_source(newer, "test_newer_source")
++            db.commit(newer, "test_newer_source")
+                 .await?;
+             assert!(db
+-                .commit_with_write_source(older, "test_older_source")
++                .commit(older, "test_older_source")
+                 .await
+                 .unwrap_err()
+                 .is_occ());
+@@ -2957,7 +3540,7 @@ mod deployment_receipt_tests {
+                 .put(source())
+                 .await?;
+             assert_ne!(first_id, second_id);
+-            db.commit_with_write_source(retry, "test_source_retry")
++            db.commit(retry, "test_source_retry")
+                 .await?;
+             let mut tx = db.begin_system().await?;
+             let latest = SourcePackageModel::new(&mut tx, TableNamespace::Global)
+@@ -3010,21 +3593,23 @@ mod deployment_receipt_tests {
                  system_env_var_overrides: BTreeMap::new(),
              }));
              assert!(operation.validate(&mut tx).await?.is_none());
@@ -37282,6 +37357,34 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
                  &SerializedFinishPushDiff::try_from(FinishPushDiff::default())?,
              )?;
              DeploymentReceiptModel::new(&mut tx)
+                 .record(committed_receipt)
+                 .await?;
+             let committed = db
+-                .commit_with_write_source(tx, "test_finish_receipt")
++                .commit(tx, "test_finish_receipt")
+                 .await?;
+             let mut newer = db.begin_system().await?;
+             SourcePackageModel::new(&mut newer, TableNamespace::Global)
+                 .put(source())
+                 .await?;
+-            db.commit_with_write_source(newer, "test_activation_after_receipt")
++            db.commit(newer, "test_activation_after_receipt")
+                 .await?;
+             let mut tx = db.begin_system().await?;
+             // Historical replay wins over the now-stale preparation. It must
+@@ -3073,10 +3658,10 @@ mod deployment_receipt_tests {
+                     "https://changed.example.invalid".to_owned(),
+                 )
+                 .await?;
+-            db.commit_with_write_source(update, "test_canonical_url_change")
++            db.commit(update, "test_canonical_url_change")
+                 .await?;
+             assert!(db
+-                .commit_with_write_source(activation, "test_stale_environment_activation")
++                .commit(activation, "test_stale_environment_activation")
+                 .await
+                 .unwrap_err()
+                 .is_occ());
 @@ -3106,6 +3691,9 @@ mod deployment_receipt_tests {
              let db = deployment_test_database(rt.clone(), persistence.clone()).await?;
              model::initialize_application_system_tables(&db).await?;
@@ -37292,7 +37395,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
              let prepared = PreparedPush {
                  packages: BTreeMap::new(),
                  external_deps_storage_key: None,
-@@ -3124,7 +3712,12 @@ mod deployment_receipt_tests {
+@@ -3124,24 +3712,51 @@ mod deployment_receipt_tests {
                      .put(source())
                      .await?;
                  DeploymentReceiptModel::new(tx)
@@ -37306,7 +37409,13 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
                      .await?;
              }
              let committed = db
-@@ -3136,12 +3729,34 @@ mod deployment_receipt_tests {
+-                .commit_with_write_source(first, "test_deployment_receipt")
++                .commit(first, "test_deployment_receipt")
+                 .await?;
+             let conflict = db
+-                .commit_with_write_source(competing, "test_competing_deployment")
++                .commit(competing, "test_competing_deployment")
+                 .await
                  .unwrap_err();
              assert!(conflict.is_occ());
              let mut tx = db.begin_system().await?;
@@ -37366,7 +37475,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +            let newer_source = SourcePackageModel::new(&mut newer, TableNamespace::Global)
 +                .put(source())
 +                .await?;
-+            db.commit_with_write_source(newer, "test_newer_activation_after_restart")
++            db.commit(newer, "test_newer_activation_after_restart")
 +                .await?;
 +            let mut tx = db.begin_system().await?;
 +            let operation = FinishPushOperation {
@@ -37392,7 +37501,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
              Ok(())
          })
      }
-@@ -3187,6 +3838,23 @@ mod deployment_receipt_tests {
+@@ -3187,20 +3838,688 @@ mod deployment_receipt_tests {
                  .await
                  .is_err());
              drop(tx);
@@ -37411,12 +37520,15 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +                    }))?,
 +                )
 +                .await?;
-+            db.commit_with_write_source(tx, "test_expired_legacy_receipt")
++            db.commit(tx, "test_expired_legacy_receipt")
 +                .await?;
              for index in 0..16 {
                  let mut tx = db.begin_system().await?;
                  DeploymentReceiptModel::new(&mut tx)
-@@ -3196,11 +3864,662 @@ mod deployment_receipt_tests {
+                     .record(receipt(&format!("operation-{index}"), now + 600))
+                     .await?;
+-                db.commit_with_write_source(tx, "test_receipt_capacity")
++                db.commit(tx, "test_receipt_capacity")
                      .await?;
              }
              let mut tx = db.begin_system().await?;
@@ -37456,7 +37568,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +                    .patch(id, value::obj!("expiresUnixSeconds" => now - 1)?.into())
 +                    .await?;
 +            }
-+            db.commit_with_write_source(tx, "test_expire_receipt_capacity")
++            db.commit(tx, "test_expire_receipt_capacity")
 +                .await?;
 +            let mut first = db.begin_system().await?;
 +            let mut competing = db.begin_system().await?;
@@ -37466,10 +37578,10 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +            DeploymentReceiptModel::new(&mut competing)
 +                .record(receipt("competing-replacement", now + 600))
 +                .await?;
-+            db.commit_with_write_source(first, "test_reclaim_receipt")
++            db.commit(first, "test_reclaim_receipt")
 +                .await?;
 +            assert!(db
-+                .commit_with_write_source(competing, "test_competing_receipt_reclamation")
++                .commit(competing, "test_competing_receipt_reclamation")
 +                .await
 +                .unwrap_err()
 +                .is_occ());
@@ -37477,7 +37589,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +            DeploymentReceiptModel::new(&mut retry)
 +                .record(receipt("competing-replacement", now + 600))
 +                .await?;
-+            db.commit_with_write_source(retry, "test_reclaim_next_receipt")
++            db.commit(retry, "test_reclaim_next_receipt")
 +                .await?;
 +            let mut tx = db.begin_system().await?;
 +            for id in ["replacement", "competing-replacement"] {
@@ -37524,7 +37636,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +                    }))?,
 +                )
 +                .await?;
-+            db.commit_with_write_source(tx, "test_malformed_receipt")
++            db.commit(tx, "test_malformed_receipt")
 +                .await?;
 +            let mut tx = db.begin_system().await?;
 +            let valid = SerializedFinishPushDiff::try_from(FinishPushDiff::default())?;
@@ -37536,7 +37648,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +                    &valid,
 +                )?)
 +                .await?;
-+            db.commit_with_write_source(tx, "test_unrelated_valid_receipt")
++            db.commit(tx, "test_unrelated_valid_receipt")
 +                .await?;
 +            let mut tx = db.begin_system().await?;
 +            let mut operation = FinishPushOperation {
@@ -37563,7 +37675,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +                    "_deployment_receipts.by_operation".parse()?,
 +                )
 +                .await?;
-+            db.commit_with_write_source(tx, "test_receipt_index_upgrade")
++            db.commit(tx, "test_receipt_index_upgrade")
 +                .await?;
 +            let mut tx = db.begin_system().await?;
 +            operation.operation_id = "valid".to_owned();
@@ -37616,7 +37728,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +                .put(original.clone())
 +                .await?;
 +            database
-+                .commit_with_write_source(tx, "test_original_dependencies")
++                .commit(tx, "test_original_dependencies")
 +                .await?;
 +            let selection = ExternalDepsPackageSelection {
 +                id,
@@ -37631,7 +37743,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +                .put(replacement.clone())
 +                .await?;
 +            database
-+                .commit_with_write_source(tx, "test_replacement_dependencies")
++                .commit(tx, "test_replacement_dependencies")
 +                .await?;
 +            let mut tx = database.begin_system().await?;
 +            let mut model = ExternalPackagesModel::new(&mut tx);
@@ -37651,7 +37763,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +                let mut tx = database.begin_system().await?;
 +                ExternalPackagesModel::new(&mut tx).put(other).await?;
 +                database
-+                    .commit_with_write_source(tx, "test_dependency_cache_churn")
++                    .commit(tx, "test_dependency_cache_churn")
 +                    .await?;
 +            }
 +            let mut tx = database.begin_system().await?;
@@ -37748,7 +37860,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +        SourcePackageModel::new(&mut tx, TableNamespace::Global)
 +            .put(source_package)
 +            .await?;
-+        database.commit_with_write_source(tx, write_source).await?;
++        database.commit(tx, write_source).await?;
 +        Ok(())
 +    }
 +
@@ -37789,7 +37901,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +            .put(source_package)
 +            .await?;
 +        database
-+            .commit_with_write_source(tx, "source_keyed_paired_finish_push")
++            .commit(tx, "source_keyed_paired_finish_push")
 +            .await?;
 +        Ok(())
 +    }
@@ -38019,7 +38131,7 @@ index b34a79432b3b2b201397aa2f4c06b8a61db9ba84..cea559c2f7fddf50aacd16735bc43e6f
 +            )
 +            .await?;
 +            let stale_commit_error = foreign_first_database
-+                .commit_with_write_source(stale_paired_tx, "source_keyed_paired_finish_push")
++                .commit(stale_paired_tx, "source_keyed_paired_finish_push")
 +                .await
 +                .err()
 +                .context("the transaction-visible expected-prior read did not fence its commit")?;
@@ -43573,7 +43685,7 @@ index a6cd90321ab904259ec32e6b6044848da18f934d..0f47bf2c1e4b6c1cf84989e67f70b95d
      let cache_label = if is_cache_hit { "hit" } else { "miss" };
  
 diff --git a/crates/application/src/scheduled_jobs/mod.rs b/crates/application/src/scheduled_jobs/mod.rs
-index d0ada370ae78afd0e7980aabd61384421489fb52..4e301728d6c256aeefbfc805907a3a09fc690a42 100644
+index d0ada370ae78afd0e7980aabd61384421489fb52..ae0f8133d5042cb1177dcf2b98388caf684033fd 100644
 --- a/crates/application/src/scheduled_jobs/mod.rs
 +++ b/crates/application/src/scheduled_jobs/mod.rs
 @@ -171,6 +171,21 @@ pub struct ScheduledJobRunner {
@@ -43598,8 +43710,105 @@ index d0ada370ae78afd0e7980aabd61384421489fb52..4e301728d6c256aeefbfc805907a3a09
      pub fn start<RT: Runtime>(
          rt: RT,
          deployment_name: String,
+@@ -1052,15 +1067,10 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
+                         .replace(job_id, updated_job.clone())
+                         .await?;
+                     self.database
+-                        .commit_with_write_source(tx, "scheduled_job_progress")
++                        .commit(tx, "scheduled_job_progress")
+                         .await?;
+                     Ok(Some(updated_job))
+                 };
+-                SchedulerModel::new(&mut tx, namespace)
+-                    .replace(job_id, updated_job.clone())
+-                    .await?;
+-                self.database.commit(tx, "scheduled_job_progress").await?;
+-
+                 // The action holds its environment-specific admission while `claim`
+                 // verifies Pending and commits InProgress. For V8 this includes an
+                 // eligible worker and active execution permit. User code cannot start
+diff --git a/crates/application/src/schema_worker/mod.rs b/crates/application/src/schema_worker/mod.rs
+index 727cbc3306b07f7825fdc54739f33f12d3b5fc38..b307094b0d9a3c72860e7c862ac12d98ab44d513 100644
+--- a/crates/application/src/schema_worker/mod.rs
++++ b/crates/application/src/schema_worker/mod.rs
+@@ -473,7 +473,7 @@ impl<RT: Runtime> SchemaWorker<RT> {
+                 .await?;
+             if deleted > 0 {
+                 self.database
+-                    .commit_with_write_source(tx, "schema_validation_attempt_cleanup")
++                    .commit(tx, "schema_validation_attempt_cleanup")
+                     .await?;
+             }
+         }
+diff --git a/crates/application/src/schema_worker/tests.rs b/crates/application/src/schema_worker/tests.rs
+index 366652146e35e13fca0761944e40d06eb771ed97..501e82cf79e87cb4692eb88fd1c2ad0104913e55 100644
+--- a/crates/application/src/schema_worker/tests.rs
++++ b/crates/application/src/schema_worker/tests.rs
+@@ -104,7 +104,7 @@ async fn submit_active_and_pending_schema(
+         .await?;
+     assert_eq!(pending_state, SchemaState::Pending);
+     database
+-        .commit_with_write_source(tx, "test_schema_setup")
++        .commit(tx, "test_schema_setup")
+         .await?;
+     Ok(pending_id)
+ }
+@@ -119,7 +119,7 @@ async fn pending_schema_with_attempt(
+         .start_table_validation(schema_id, table_name.clone(), None, Some(10))
+         .await?;
+     database
+-        .commit_with_write_source(tx, "test_validation_setup")
++        .commit(tx, "test_validation_setup")
+         .await?;
+     Ok((schema_id, validation_id))
+ }
+@@ -166,7 +166,7 @@ fn schema_failure_write_commits_after_progress_checkpoint() -> anyhow::Result<()
+                     .await?
+             );
+             database
+-                .commit_with_write_source(application_tx, "test_schema_failing_write")
++                .commit(application_tx, "test_schema_failing_write")
+                 .await?;
+ 
+             let mut verify_tx = database.begin_system().await?;
+@@ -233,11 +233,11 @@ fn stale_progress_checkpoint_loses_to_schema_failure() -> anyhow::Result<()> {
+                 .insert(table_name, ConvexObject::empty())
+                 .await?;
+             database
+-                .commit_with_write_source(application_tx, "test_schema_failing_write")
++                .commit(application_tx, "test_schema_failing_write")
+                 .await?;
+ 
+             let error = database
+-                .commit_with_write_source(stale_checkpoint, "test_stale_schema_checkpoint")
++                .commit(stale_checkpoint, "test_stale_schema_checkpoint")
+                 .await
+                 .expect_err("a checkpoint based on Pending must lose to Failed");
+             assert!(error.is_occ(), "expected OCC, got {error:#}");
+@@ -298,7 +298,7 @@ fn staged_checkpoint_tracks_schema_ownership() -> anyhow::Result<()> {
+                     .unwrap()
+                     .id();
+                 database
+-                    .commit_with_write_source(tx, "test_staged_setup")
++                    .commit(tx, "test_staged_setup")
+                     .await?;
+ 
+                 let worker = SchemaWorker {
+@@ -340,10 +340,10 @@ fn staged_checkpoint_tracks_schema_ownership() -> anyhow::Result<()> {
+                     .mark_active(next_id)
+                     .await?;
+                 database
+-                    .commit_with_write_source(replacement, "test_replace_staged_schema")
++                    .commit(replacement, "test_replace_staged_schema")
+                     .await?;
+                 let error = database
+-                    .commit_with_write_source(stale_checkpoint, "test_stale_staged_checkpoint")
++                    .commit(stale_checkpoint, "test_stale_staged_checkpoint")
+                     .await
+                     .expect_err("overwriting the owner must fence a staged checkpoint");
+                 assert!(error.is_occ(), "expected OCC, got {error:#}");
 diff --git a/crates/application/src/system_table_cleanup/mod.rs b/crates/application/src/system_table_cleanup/mod.rs
-index 20e88dcd78b8bff344820299966cc43847ca1aea..dd2f6639914a7c96612133a87c9d03115e0eeaa5 100644
+index 20e88dcd78b8bff344820299966cc43847ca1aea..17ea6c8f86c5f63cc83543d96ada2c3a8e9b6410 100644
 --- a/crates/application/src/system_table_cleanup/mod.rs
 +++ b/crates/application/src/system_table_cleanup/mod.rs
 @@ -568,6 +568,7 @@ mod tests {
@@ -43628,6 +43837,15 @@ index 20e88dcd78b8bff344820299966cc43847ca1aea..dd2f6639914a7c96612133a87c9d0311
                  external_deps_package_id: None,
                  package_size: PackageSize::default(),
                  node_version: None,
+@@ -627,7 +631,7 @@ mod tests {
+             })
+             .await?;
+         database
+-            .commit_with_write_source(tx, "source_package_cleanup_test_setup")
++            .commit(tx, "source_package_cleanup_test_setup")
+             .await?;
+         Ok(source_package_id)
+     }
 @@ -645,6 +649,7 @@ mod tests {
                  &database,
                  "source-package-cleanup-old",
@@ -60605,7 +60823,7 @@ index 43cc0957aa6c84fe1058d8582357ef7ef1b8e26b..b36167f6aea57c07542d7e59ace1b0d1
      fn unix_timestamp(&mut self) -> anyhow::Result<UnixTimestamp>;
      fn performance_now(&mut self) -> anyhow::Result<Duration>;
 diff --git a/crates/isolate/src/environment/udf/async_syscall.rs b/crates/isolate/src/environment/udf/async_syscall.rs
-index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586f3c62b72 100644
+index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..5ea9ca82675ae5bd3e314f4f0233ade843464752 100644
 --- a/crates/isolate/src/environment/udf/async_syscall.rs
 +++ b/crates/isolate/src/environment/udf/async_syscall.rs
 @@ -17,7 +17,11 @@ use common::{
@@ -60831,10 +61049,10 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
 +        match self {
 +            Self::Get(_) => LogicalHostOperation::DatabaseGet,
 +            Self::QueryStreamNext(_) => LogicalHostOperation::DatabaseQueryStreamNext,
-         }
-     }
- }
- 
++        }
++    }
++}
++
 +pub struct AsyncSyscallResult {
 +    pub(super) result: anyhow::Result<AsyncSyscallValue>,
 +    pub(super) host_operation_error: Option<HostOperationErrorV1>,
@@ -61195,8 +61413,8 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
 +        Self {
 +            result: result.map(|value| AsyncSyscallValue::Json(value.get().to_owned())),
 +            host_operation_error: None,
-+        }
-+    }
+         }
+     }
 +
 +    fn with_host_operation_error(
 +        result: anyhow::Result<Box<RawValue>>,
@@ -61235,8 +61453,8 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
 +        operation,
 +        document_id,
 +    })
-+}
-+
+ }
+ 
  impl AsyncSyscallBatch {
      pub fn new(name: String, args: JsonValue) -> Self {
          match &*name {
@@ -61462,27 +61680,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
          &mut self,
          storage_id: FileStorageId,
      ) -> anyhow::Result<Option<FileStorageEntry>> {
-@@ -555,14 +1216,11 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
-         &mut self,
-         storage_ids: &BTreeMap<BatchKey, FileStorageId>,
-     ) -> anyhow::Result<BTreeMap<BatchKey, anyhow::Result<Option<(Bytes, Option<String>)>>>> {
--        match self.udf_type {
--            UdfType::Mutation | UdfType::Init => {},
--            UdfType::Query | UdfType::Action | UdfType::HttpAction => {
--                anyhow::bail!(ErrorMetadata::bad_request(
--                    "StorageGetNotSupported",
--                    "Getting files from storage is only supported in mutations and actions",
--                ));
--            },
-+        if self.udf_type != UdfType::Mutation {
-+            anyhow::bail!(ErrorMetadata::bad_request(
-+                "StorageGetNotSupported",
-+                "Getting files from storage is only supported in mutations and actions",
-+            ));
-         }
-         let component = self.phase.component()?;
-         let tx = self.phase.tx()?;
-@@ -635,14 +1293,12 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
+@@ -635,14 +1296,12 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
          args: PendingValue,
          transaction_limits: Option<TransactionLimits>,
          udf_callback: impl UdfCallback<RT>,
@@ -61502,7 +61700,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
              // Queries can call other queries, but not snapshot queries.
              (UdfType::Query, NestedUdfType::Query) => (),
              // Mutations can call queries (including snapshot queries) or mutations.
-@@ -666,6 +1322,7 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
+@@ -666,6 +1325,7 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
          let execution_type = nested_udf_type.execution_type();
          let pending_args_policy = match self.udf_type {
              UdfType::Mutation => PendingArgsPolicy::Allow,
@@ -61510,7 +61708,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
              _ => PendingArgsPolicy::Reject,
          };
          let path_and_args_result = ValidatedPathAndArgs::new_with_returns_validator(
-@@ -736,8 +1393,16 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
+@@ -736,8 +1396,16 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
                          file_storage: self.file_storage.clone(),
                          module_loader: self.phase.module_loader().clone(),
                          deployment: self.deployment.clone(),
@@ -61527,7 +61725,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
                  },
                  rng_seed,
                  new_reactor_depth,
-@@ -779,6 +1444,8 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
+@@ -779,6 +1447,8 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
              observed_identity,
              observed_rng,
              observed_time,
@@ -61536,7 +61734,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
              syscall_trace,
              audit_log_lines,
              log_lines,
-@@ -805,6 +1472,7 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
+@@ -805,6 +1475,7 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
          }
  
          self.syscall_trace.merge(&syscall_trace);
@@ -61544,7 +61742,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
  
          if share_query_journal && result.is_ok() && journal.end_cursor.is_some() {
              anyhow::ensure!(
-@@ -827,7 +1495,15 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
+@@ -827,7 +1498,15 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
          }
  
          // TODO: How do we want to propagate stack traces between component calls?
@@ -61561,7 +61759,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
          let tx = self.phase.tx()?;
          let table_mapping = tx.table_mapping().namespace(called_component_id.into());
          if let Some(e) = returns_validator.check_pending_output(
-@@ -837,7 +1513,10 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
+@@ -837,7 +1516,10 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
          )? {
              anyhow::bail!(ErrorMetadata::bad_request("InvalidReturnValue", e.message));
          }
@@ -61573,7 +61771,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      }
  
      async fn create_function_handle(
-@@ -876,7 +1555,32 @@ pub(super) async fn run_async_syscall_batch<RT: Runtime>(
+@@ -876,7 +1558,32 @@ pub(super) async fn run_async_syscall_batch<RT: Runtime>(
      provider: &mut DatabaseUdfSyscallProvider<RT>,
      batch: AsyncSyscallBatch,
      udf_callback: impl UdfCallback<RT>,
@@ -61607,7 +61805,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      let start = provider.phase.rt.monotonic_now();
      let batch_name = batch.name().to_string();
      let timer = async_syscall_timer(&batch_name);
-@@ -884,71 +1588,245 @@ pub(super) async fn run_async_syscall_batch<RT: Runtime>(
+@@ -884,71 +1591,248 @@ pub(super) async fn run_async_syscall_batch<RT: Runtime>(
      // inner errors are for individual batch items that may be system or developer
      // errors.
      let results = match batch {
@@ -61787,6 +61985,9 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
 +                "1.0/signJwt" => AsyncSyscallResult::from_json(
 +                    Box::pin(sign_deployment_jwt(provider, args)).await,
 +                ),
++                "1.0/getDeploymentJwks" => {
++                    AsyncSyscallResult::from_json(deployment_jwks(provider))
++                },
                  // Storage
 -                "1.0/storageDelete" => Box::pin(storage_delete(provider, args)).await,
 -                "1.0/storageGetMetadata" => Box::pin(storage_get_metadata(provider, args)).await,
@@ -61889,7 +62090,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
  }
  
  /// Returns the remaining headroom for this transaction before hitting
-@@ -1005,18 +1883,10 @@ fn tx_metrics<RT: Runtime>(
+@@ -1005,18 +1889,10 @@ fn tx_metrics<RT: Runtime>(
  fn function_metadata<RT: Runtime>(
      provider: &mut DatabaseUdfSyscallProvider<RT>,
  ) -> anyhow::Result<Box<RawValue>> {
@@ -61912,50 +62113,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
  }
  
  /// Returns metadata about the deployment this function is running on.
-@@ -1044,15 +1914,13 @@ async fn deployment_metadata<RT: Runtime>(
- fn request_metadata<RT: Runtime>(
-     provider: &mut DatabaseUdfSyscallProvider<RT>,
- ) -> anyhow::Result<Box<RawValue>> {
--    match provider.udf_type {
--        UdfType::Mutation | UdfType::Init => {},
--        UdfType::Query | UdfType::Action | UdfType::HttpAction => {
--            anyhow::bail!(ErrorMetadata::bad_request(
--                "RequestMetadataNotAllowed",
--                format!("Cannot get request metadata in a {}", provider.udf_type)
--            ));
--        },
--    }
-+    anyhow::ensure!(
-+        provider.udf_type == UdfType::Mutation,
-+        ErrorMetadata::bad_request(
-+            "RequestMetadataNotAllowed",
-+            format!("Cannot get request metadata in a {}", provider.udf_type)
-+        )
-+    );
-     // Expose the raw auth JWT the request was authenticated with, if any. Only
-     // `User` identities carry a JWT (an OIDC or custom JWT); admin keys and
-     // logged-out requests have no token.
-@@ -1163,14 +2031,11 @@ async fn sign_deployment_jwt<RT: Runtime>(
-     provider: &mut DatabaseUdfSyscallProvider<RT>,
-     args: JsonValue,
- ) -> anyhow::Result<Box<RawValue>> {
--    match provider.udf_type {
--        UdfType::Mutation | UdfType::Init => {},
--        UdfType::Query | UdfType::Action | UdfType::HttpAction => {
--            anyhow::bail!(ErrorMetadata::bad_request(
--                "JwtSignInQuery",
--                "ctx.auth.signJwt() can't be called from a query. Call it from a mutation.",
--            ));
--        },
-+    if provider.udf_type != UdfType::Mutation {
-+        anyhow::bail!(ErrorMetadata::bad_request(
-+            "JwtSignInQuery",
-+            "ctx.auth.signJwt() can't be called from a query. Call it from a mutation.",
-+        ));
-     }
-     let default_system_env_vars = provider.phase.default_system_env_vars().clone();
-     let component = provider.phase.component()?;
-@@ -1179,7 +2044,11 @@ async fn sign_deployment_jwt<RT: Runtime>(
+@@ -1179,7 +2055,11 @@ async fn sign_deployment_jwt<RT: Runtime>(
      let signer = tx
          .get_component_path(component)
          .context("Calling component not found")?;
@@ -61968,25 +62126,21 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      let token = udf::deployment_jwt::mint(
          keys,
          &origin,
-@@ -1190,17 +2059,6 @@ async fn sign_deployment_jwt<RT: Runtime>(
-     Ok(serde_json::value::to_raw_value(&token)?)
+@@ -1197,7 +2077,12 @@ async fn sign_deployment_jwt<RT: Runtime>(
+ fn deployment_jwks<RT: Runtime>(
+     provider: &mut DatabaseUdfSyscallProvider<RT>,
+ ) -> anyhow::Result<Box<RawValue>> {
+-    let jwks = provider.key_broker.deployment_jwt_keys()?.jwks()?;
++    let keys = provider
++        .key_broker
++        .deployment_jwt_keys
++        .as_ref()
++        .context("Function runner caller didn't send the deployment JWT signing key")?;
++    let jwks = keys.jwks()?;
+     Ok(serde_json::value::to_raw_value(&jwks)?)
  }
  
--/// The public keys that verify `ctx.auth.signJwt` tokens, the same JWKS that
--/// `/.well-known/jwks.json` serves. Unlike signing, this is allowed in
--/// queries: the keys are deployment state shared by every caller, not a fresh
--/// value like a token's `iat` and `exp`.
--fn deployment_jwks<RT: Runtime>(
--    provider: &mut DatabaseUdfSyscallProvider<RT>,
--) -> anyhow::Result<Box<RawValue>> {
--    let jwks = provider.key_broker.deployment_jwt_keys()?.jwks()?;
--    Ok(serde_json::value::to_raw_value(&jwks)?)
--}
--
- #[convex_macro::instrument_future]
- async fn storage_generate_upload_url<RT: Runtime>(
-     provider: &mut DatabaseUdfSyscallProvider<RT>,
-@@ -1450,6 +2308,48 @@ async fn schedule<RT: Runtime>(
+@@ -1450,6 +2335,48 @@ async fn schedule<RT: Runtime>(
          args,
      }: ScheduleArgs = with_argument_error("scheduler", || Ok(serde_json::from_value(args)?))?;
  
@@ -62035,7 +62189,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      let path = match function_handle {
          Some(h) => {
              let handle: FunctionHandle = with_argument_error("scheduler", || h.parse())?;
-@@ -1477,13 +2377,10 @@ async fn schedule<RT: Runtime>(
+@@ -1477,13 +2404,10 @@ async fn schedule<RT: Runtime>(
  
      let scheduling_component = provider.phase.component()?;
  
@@ -62052,7 +62206,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
          .await?;
  
      let context = provider.context.clone();
-@@ -1492,7 +2389,7 @@ async fn schedule<RT: Runtime>(
+@@ -1492,7 +2416,7 @@ async fn schedule<RT: Runtime>(
          .schedule(path, udf_args, scheduled_ts, context)
          .await?;
  
@@ -62061,7 +62215,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
  }
  
  #[convex_macro::instrument_future]
-@@ -1617,7 +2514,7 @@ async fn write_deployment_audit_log<RT: Runtime>(
+@@ -1617,7 +2541,7 @@ async fn write_deployment_audit_log<RT: Runtime>(
  async fn insert<RT: Runtime>(
      provider: &mut DatabaseUdfSyscallProvider<RT>,
      args: JsonValue,
@@ -62070,7 +62224,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      #[derive(Deserialize)]
      #[serde(rename_all = "camelCase")]
      struct InsertArgs {
-@@ -1627,30 +2524,29 @@ async fn insert<RT: Runtime>(
+@@ -1627,30 +2551,29 @@ async fn insert<RT: Runtime>(
      let (table, value) = with_argument_error("db.insert", || {
          let args: InsertArgs = serde_json::from_value(args)?;
          let value = PendingValue::from_uncommitted_json(args.value).context(ArgName("value"))?;
@@ -62114,7 +62268,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
  }
  
  #[fastrace::trace]
-@@ -1658,7 +2554,7 @@ async fn insert<RT: Runtime>(
+@@ -1658,7 +2581,7 @@ async fn insert<RT: Runtime>(
  async fn shallow_merge<RT: Runtime>(
      provider: &mut DatabaseUdfSyscallProvider<RT>,
      args: JsonValue,
@@ -62123,7 +62277,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      #[derive(Deserialize)]
      #[serde(rename_all = "camelCase")]
      struct UpdateArgs {
-@@ -1667,21 +2563,29 @@ async fn shallow_merge<RT: Runtime>(
+@@ -1667,21 +2590,29 @@ async fn shallow_merge<RT: Runtime>(
          id: String,
          value: JsonValue,
      }
@@ -62162,7 +62316,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      })?;
  
      system_table_guard(&table_name, false)?;
-@@ -1689,9 +2593,7 @@ async fn shallow_merge<RT: Runtime>(
+@@ -1689,9 +2620,7 @@ async fn shallow_merge<RT: Runtime>(
      let document = UserFacingModel::new(tx, component.into())
          .patch(id, value)
          .await?;
@@ -62173,7 +62327,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
  }
  
  #[fastrace::trace]
-@@ -1699,7 +2601,7 @@ async fn shallow_merge<RT: Runtime>(
+@@ -1699,7 +2628,7 @@ async fn shallow_merge<RT: Runtime>(
  async fn replace<RT: Runtime>(
      provider: &mut DatabaseUdfSyscallProvider<RT>,
      args: JsonValue,
@@ -62182,7 +62336,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      #[derive(Deserialize)]
      #[serde(rename_all = "camelCase")]
      struct ReplaceArgs {
-@@ -1708,23 +2610,34 @@ async fn replace<RT: Runtime>(
+@@ -1708,23 +2637,34 @@ async fn replace<RT: Runtime>(
          id: String,
          value: JsonValue,
      }
@@ -62224,7 +62378,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      })?;
  
      system_table_guard(&table_name, false)?;
-@@ -1732,9 +2645,7 @@ async fn replace<RT: Runtime>(
+@@ -1732,9 +2672,7 @@ async fn replace<RT: Runtime>(
      let document = UserFacingModel::new(tx, component.into())
          .replace(id, value)
          .await?;
@@ -62235,7 +62389,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
  }
  
  #[fastrace::trace]
-@@ -1742,18 +2653,7 @@ async fn replace<RT: Runtime>(
+@@ -1742,18 +2680,7 @@ async fn replace<RT: Runtime>(
  async fn query_batch<RT: Runtime>(
      provider: &mut DatabaseUdfSyscallProvider<RT>,
      batch_args: Vec<AsyncRead>,
@@ -62255,7 +62409,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      #[derive(Deserialize)]
      #[serde(rename_all = "camelCase")]
      struct QueryStreamNextArgs {
-@@ -1772,14 +2672,14 @@ async fn query_batch<RT: Runtime>(
+@@ -1772,14 +2699,14 @@ async fn query_batch<RT: Runtime>(
                          let args: QueryStreamNextArgs = serde_json::from_value(args)?;
                          Ok(args.query_id)
                      })?;
@@ -62278,7 +62432,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
                      let local_query = match managed_query {
                          ManagedQuery::Pending { query, version } => {
                              let component = provider.phase.component()?;
-@@ -1795,13 +2695,18 @@ async fn query_batch<RT: Runtime>(
+@@ -1795,13 +2722,18 @@ async fn query_batch<RT: Runtime>(
                      };
                      Some((Some(query_id), local_query))
                  },
@@ -62301,7 +62455,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
                      let method_name = if args.is_system {
                          "db.system.get"
                      } else {
-@@ -1855,7 +2760,9 @@ async fn query_batch<RT: Runtime>(
+@@ -1855,7 +2787,9 @@ async fn query_batch<RT: Runtime>(
                      .is_none());
              },
              Ok(None) => {
@@ -62312,7 +62466,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
              },
          }
      }
-@@ -1867,7 +2774,7 @@ async fn query_batch<RT: Runtime>(
+@@ -1867,7 +2801,7 @@ async fn query_batch<RT: Runtime>(
          },
      };
  
@@ -62321,7 +62475,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
          queries_to_fetch
              .iter_mut()
              .map(|(idx, (_, local_query))| (*idx, (local_query, None)))
-@@ -1876,12 +2783,6 @@ async fn query_batch<RT: Runtime>(
+@@ -1876,12 +2810,6 @@ async fn query_batch<RT: Runtime>(
      )
      .await;
  
@@ -62334,7 +62488,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      for (batch_key, (query_id, local_query)) in queries_to_fetch {
          let result: anyhow::Result<_> = try_anyhow!({
              if let Some(query_id) = query_id {
-@@ -1896,18 +2797,20 @@ async fn query_batch<RT: Runtime>(
+@@ -1896,18 +2824,20 @@ async fn query_batch<RT: Runtime>(
              let done = maybe_next.is_none();
              let component = provider.phase.component()?;
              let tx = provider.phase.tx()?;
@@ -62361,7 +62515,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
              }
          });
          results.insert(batch_key, result);
-@@ -1930,27 +2833,33 @@ async fn remove<RT: Runtime>(
+@@ -1930,27 +2860,33 @@ async fn remove<RT: Runtime>(
          id: String,
      }
  
@@ -62404,7 +62558,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
  }
  
  #[convex_macro::instrument_future]
-@@ -1958,7 +2867,7 @@ async fn run_udf<RT: Runtime>(
+@@ -1958,7 +2894,7 @@ async fn run_udf<RT: Runtime>(
      provider: &mut DatabaseUdfSyscallProvider<RT>,
      args: JsonValue,
      udf_callback: impl UdfCallback<RT>,
@@ -62413,7 +62567,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      #[derive(Deserialize)]
      #[serde(rename_all = "camelCase")]
      struct RunUdfArgs {
-@@ -1969,80 +2878,117 @@ async fn run_udf<RT: Runtime>(
+@@ -1969,80 +2905,117 @@ async fn run_udf<RT: Runtime>(
          args: JsonValue,
          transaction_limits: Option<TransactionLimits>,
      }
@@ -62443,16 +62597,15 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
 +        // The legacy query path must reject the unresolved commit token before
 +        // it can become a pending value; mutations may pass it to nested UDFs.
          let args = match caller_udf_type {
--            UdfType::Mutation | UdfType::Init => {
+             UdfType::Mutation | UdfType::Init => {
 -                let args = PendingValue::from_uncommitted_json(args).context(ArgName("args"))?;
 -                if !args.is_object() {
 -                    return Err(anyhow::anyhow!("Value must be an Object").context(ArgName("args")));
 -                }
 -                args
-+            UdfType::Mutation => {
 +                PendingValue::from_uncommitted_json(args).context(ArgName("args"))?
 +            },
-+            UdfType::Query | UdfType::Action | UdfType::HttpAction | UdfType::Init => {
++            UdfType::Query | UdfType::Action | UdfType::HttpAction => {
 +                PendingValue::from(ConvexValue::try_from(args).context(ArgName("args"))?)
 +            },
 +        };
@@ -62596,7 +62749,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
  }
  
  async fn create_function_handle<RT: Runtime>(
-@@ -2111,48 +3057,64 @@ struct QueryPageMetadata {
+@@ -2111,48 +3084,64 @@ struct QueryPageMetadata {
      page_status: Option<QueryPageStatus>,
  }
  
@@ -62693,7 +62846,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      let end_cursor = query.end_cursor();
      let has_end_cursor = end_cursor.is_some();
      let mut page = Vec::with_capacity(page_size);
-@@ -2169,7 +3131,7 @@ async fn read_page_from_query<RT: Runtime>(
+@@ -2169,7 +3158,7 @@ async fn read_page_from_query<RT: Runtime>(
              Some(page_size - page.len())
          };
  
@@ -62702,7 +62855,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
              Ok(Some(v)) => v,
              Ok(None) => {
                  break;
-@@ -2222,7 +3184,7 @@ async fn read_page_from_query<RT: Runtime>(
+@@ -2222,7 +3211,7 @@ async fn read_page_from_query<RT: Runtime>(
  async fn query_page<RT: Runtime>(
      provider: &mut DatabaseUdfSyscallProvider<RT>,
      args: JsonValue,
@@ -62711,7 +62864,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      #[derive(Deserialize)]
      #[serde(rename_all = "camelCase")]
      struct QueryPageArgs {
-@@ -2237,10 +3199,31 @@ async fn query_page<RT: Runtime>(
+@@ -2237,10 +3226,31 @@ async fn query_page<RT: Runtime>(
      }
      let args: QueryPageArgs =
          with_argument_error("queryPage", || Ok(serde_json::from_value(args)?))?;
@@ -62744,7 +62897,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
      let table_filter = provider.table_filter();
  
      let page_size = args.page_size;
-@@ -2287,20 +3270,20 @@ async fn query_page<RT: Runtime>(
+@@ -2287,20 +3297,20 @@ async fn query_page<RT: Runtime>(
          let query = DeveloperQuery::new_bounded(
              tx,
              component.into(),
@@ -62768,7 +62921,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
              .collect::<anyhow::Result<_>>()?;
          (page, metadata)
      };
-@@ -2332,21 +3315,112 @@ async fn query_page<RT: Runtime>(
+@@ -2332,21 +3342,112 @@ async fn query_page<RT: Runtime>(
          provider.next_journal.end_cursor = Some(cursor);
      }
  
@@ -62894,7 +63047,7 @@ index f9b9adc2c20f1e192b42e894c95f7d6047b6d32c..e3a484571dee97a712093da299ef0586
 +    }
  }
 diff --git a/crates/isolate/src/environment/udf/context_reuse_tests.rs b/crates/isolate/src/environment/udf/context_reuse_tests.rs
-index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051988f4c3d 100644
+index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..20f5c44fef4a44d5ebe3b74f84deb39ccdbd6dd6 100644
 --- a/crates/isolate/src/environment/udf/context_reuse_tests.rs
 +++ b/crates/isolate/src/environment/udf/context_reuse_tests.rs
 @@ -14,6 +14,7 @@ use common::{
@@ -62985,6 +63138,15 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
                  external_deps_package_id: None,
                  package_size: PackageSize::default(),
                  node_version: None,
+@@ -190,7 +208,7 @@ impl Fixture {
+             })
+             .await?;
+         database
+-            .commit_with_write_source(tx, "context_reuse_test")
++            .commit(tx, "context_reuse_test")
+             .await?;
+         Ok(Self {
+             contexts: ContextCache::new(),
 @@ -209,6 +227,21 @@ impl Fixture {
      }
  
@@ -63007,7 +63169,7 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
          let mut tx = self.database.begin_system().await?;
          let path = CanonicalizedComponentModulePath {
              component: ComponentId::Root,
-@@ -222,7 +255,7 @@ impl Fixture {
+@@ -222,24 +255,88 @@ impl Fixture {
                  ModuleSource::from(source),
                  self.package,
                  None,
@@ -63016,9 +63178,10 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
                  ModuleEnvironment::Isolate,
                  None,
              )
-@@ -230,16 +263,80 @@ impl Fixture {
+             .await?;
          self.database
-             .commit_with_write_source(tx, "context_reuse_test")
+-            .commit_with_write_source(tx, "context_reuse_test")
++            .commit(tx, "context_reuse_test")
              .await?;
 -        self.modules.0.write().insert(
 -            path.module_path.as_str().to_owned(),
@@ -63094,7 +63257,7 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
 +            .apply(ComponentId::Root, modules, Some(package), analyzed)
 +            .await?;
 +        self.database
-+            .commit_with_write_source(tx, "context_reuse_test")
++            .commit(tx, "context_reuse_test")
 +            .await?;
 +        self.package = package;
 +        Ok(())
@@ -63214,6 +63377,15 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
      }
  }
  
+@@ -727,7 +881,7 @@ fn grouped_action_context_reuses_and_invalidates_with_fresh_request_state() -> a
+                     .create(common::types::EnvironmentVariable {
+                         name: "CONTEXT_REUSE_TEST".parse()?, value: "changed".parse()?,
+                     }, &Default::default()).await?;
+-                fixture.database.commit_with_write_source(tx, "context_reuse_test").await?;
++                fixture.database.commit(tx, "context_reuse_test").await?;
+                 let (value, _) = fixture.run_action("a.js:run", json!(45), ActionOptions::default()).await?;
+                 assert_eq!(value?, json!(["first", 45.0, 2.0, null]));
+ 
 @@ -1350,3 +1504,333 @@ fn grouped_action_worker_publishes_only_after_uncancelled_delivery() -> anyhow::
          .join()
          .expect("context-reuse worker test panicked")
@@ -63230,7 +63402,7 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
 +            let mut tx = fixture.database.begin_system().await?;
 +            let id = UserFacingModel::new(&mut tx, TableNamespace::root_component())
 +                .insert("reuseData".parse()?, value::obj!("marker" => "before")?).await?;
-+            fixture.database.commit_with_write_source(tx, "context_reuse_test").await?;
++            fixture.database.commit(tx, "context_reuse_test").await?;
 +            let source = r#"
 +                let calls = 0;
 +                export const run = { isQuery: true, invokeQuery: async args => {
@@ -63258,7 +63430,7 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
 +            let mut tx = fixture.database.begin_system().await?;
 +            UserFacingModel::new(&mut tx, TableNamespace::root_component())
 +                .replace(id, value::obj!("marker" => "after")?).await?;
-+            let data_ts = fixture.database.commit_with_write_source(tx, "context_reuse_test").await?;
++            let data_ts = fixture.database.commit(tx, "context_reuse_test").await?;
 +            assert!(fixture.database.refresh_token(token, data_ts).await?.is_err());
 +            let invalidated = tokio::time::timeout(Duration::from_secs(5),
 +                subscription.wait_for_invalidation()).await?;
@@ -63278,7 +63450,7 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
 +                component: ComponentId::Root, module_path: "_deps/shared.js".parse()?,
 +            }).await?.context("imported module missing")?;
 +            ModuleModel::new(&mut tx).delete(ComponentId::Root, imported.id()).await?;
-+            let deleted_ts = fixture.database.commit_with_write_source(tx, "context_reuse_test").await?;
++            let deleted_ts = fixture.database.commit(tx, "context_reuse_test").await?;
 +            assert!(fixture.database.refresh_token(token, deleted_ts).await?.is_err());
 +            assert!(fixture.run_with_token("a.js", arg.clone(), true).await.is_err());
 +            fixture.put("_deps/shared.js", source).await?;
@@ -63340,7 +63512,7 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
 +                    .await?;
 +                fixture
 +                    .database
-+                    .commit_with_write_source(tx, "context_reuse_test")
++                    .commit(tx, "context_reuse_test")
 +                    .await?;
 +                let (value, retained) = fixture
 +                    .run_action("a.js:run", json!(false), ActionOptions::default())
@@ -63360,7 +63532,7 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
 +                    .await?;
 +                fixture
 +                    .database
-+                    .commit_with_write_source(tx, "context_reuse_test")
++                    .commit(tx, "context_reuse_test")
 +                    .await?;
 +                let (value, retained) = fixture
 +                    .run_action("a.js:run", json!(false), ActionOptions::default())
@@ -63394,7 +63566,7 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
 +                    .await?;
 +                fixture
 +                    .database
-+                    .commit_with_write_source(tx, "context_reuse_test")
++                    .commit(tx, "context_reuse_test")
 +                    .await?;
 +                let (value, retained) = fixture
 +                    .run_action("a.js:run", json!(false), ActionOptions::default())
@@ -63415,7 +63587,7 @@ index 5b6e236a3417fd0be94537449ec7e09de74d7eb2..bfe288ddd702aaf77482bb9e7b1e1051
 +                    .await?;
 +                fixture
 +                    .database
-+                    .commit_with_write_source(tx, "context_reuse_test")
++                    .commit(tx, "context_reuse_test")
 +                    .await?;
 +                let (value, retained) = fixture
 +                    .run_action("a.js:run", json!(false), ActionOptions::default())
@@ -74218,7 +74390,7 @@ index 0439932994f78316142f7bb0cea718ff0f86e5e5..58dcb83407d902d6d2c294c057d9e5b6
  }
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..19c4866cf8940ea4e7314ecf997df132bb297d98
+index 0000000000000000000000000000000000000000..7eb34235931eb1792057b6e5f6ba9e985ad50604
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate.rs
 @@ -0,0 +1,3168 @@
@@ -76600,7 +76772,7 @@ index 0000000000000000000000000000000000000000..19c4866cf8940ea4e7314ecf997df132
 +        };
 +        let kind = match udf_type {
 +            UdfType::Query => "query",
-+            UdfType::Mutation => "mutation",
++            UdfType::Mutation | UdfType::Init => "mutation",
 +            UdfType::Action | UdfType::HttpAction => {
 +                anyhow::bail!("fixture requires a database UDF")
 +            },
@@ -77392,7 +77564,7 @@ index 0000000000000000000000000000000000000000..19c4866cf8940ea4e7314ecf997df132
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/application_capability_entry_tests.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/application_capability_entry_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..d38ed79d37b9ee315c8859b76f46a96c6178de89
+index 0000000000000000000000000000000000000000..104d13754d35272985fdc2e70ffc9139ad45da06
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/application_capability_entry_tests.rs
 @@ -0,0 +1,1068 @@
@@ -77587,7 +77759,7 @@ index 0000000000000000000000000000000000000000..d38ed79d37b9ee315c8859b76f46a96c
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(transaction, "application_capability_test_setup")
++        .commit(transaction, "application_capability_test_setup")
 +        .await?;
 +    Ok(user.developer_id)
 +}
@@ -78106,7 +78278,7 @@ index 0000000000000000000000000000000000000000..d38ed79d37b9ee315c8859b76f46a96c
 +        }
 +        if invocation.commit {
 +            database
-+                .commit_with_write_source(
++                .commit(
 +                    output.invocation.transaction,
 +                    "application_capability_test_invocation",
 +                )
@@ -78276,7 +78448,7 @@ index 0000000000000000000000000000000000000000..d38ed79d37b9ee315c8859b76f46a96c
 +        .virtual_system_mapping()
 +        .system_resolved_id_to_virtual_developer_id(developer_id)?;
 +    database
-+        .commit_with_write_source(setup, "singleton_query_file_storage_setup")
++        .commit(setup, "singleton_query_file_storage_setup")
 +        .await?;
 +    let request = json!({ "imageId": developer_id.encode() });
 +    let environment_data = EnvironmentData {
@@ -78466,7 +78638,7 @@ index 0000000000000000000000000000000000000000..d38ed79d37b9ee315c8859b76f46a96c
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/artifact_registry_contract_tests.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/artifact_registry_contract_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..4373ddf72c04a9818d92025a1446424217f2b35a
+index 0000000000000000000000000000000000000000..7fda78e9482ba093432276a9e644b2bbf6c0209f
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/artifact_registry_contract_tests.rs
 @@ -0,0 +1,5952 @@
@@ -81490,7 +81662,7 @@ index 0000000000000000000000000000000000000000..4373ddf72c04a9818d92025a14464242
 +        );
 +    }
 +    database
-+        .commit_with_write_source(setup, write_source)
++        .commit(setup, write_source)
 +        .await?;
 +    let request = materialize_real_package_expected_result(request, &document_ids)?;
 +    Ok((database, document_ids, request))
@@ -110911,7 +111083,7 @@ index 0000000000000000000000000000000000000000..d47c6c03e134982e6d5f6356305abc2f
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/process_env_application_tests.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/process_env_application_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..43afdcd5f8e3f57eda5e7cacf0e2c1aff2fbeb73
+index 0000000000000000000000000000000000000000..3c8a7e783fecaeaa5185f9087673428ecf4488b6
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/process_env_application_tests.rs
 @@ -0,0 +1,494 @@
@@ -111186,7 +111358,7 @@ index 0000000000000000000000000000000000000000..43afdcd5f8e3f57eda5e7cacf0e2c1af
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(setup, "process_environment_application_test_setup")
++        .commit(setup, "process_environment_application_test_setup")
 +        .await?;
 +
 +    let metrics = Arc::clone(&test_hooks.metrics);
@@ -111307,7 +111479,7 @@ index 0000000000000000000000000000000000000000..43afdcd5f8e3f57eda5e7cacf0e2c1af
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(update, "process_environment_application_test_update")
++        .commit(update, "process_environment_application_test_update")
 +        .await?;
 +
 +    let mut changed_transaction = database.begin_system().await?;
@@ -112165,7 +112337,7 @@ index 0000000000000000000000000000000000000000..a16b76e6b2decc799f7fd5e97f2c2019
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/query_operations_tests.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/query_operations_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..5b6d03e729c4d21fc14e66ca14aa2a5c3154690c
+index 0000000000000000000000000000000000000000..c9d0b327a0597f009f312cafa4bcb6e3e42183ab
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/query_operations_tests.rs
 @@ -0,0 +1,1351 @@
@@ -112789,7 +112961,7 @@ index 0000000000000000000000000000000000000000..5b6d03e729c4d21fc14e66ca14aa2a5c
 +            .await?;
 +    }
 +    database
-+        .commit_with_write_source(transaction, "generated_dynamic_take_setup")
++        .commit(transaction, "generated_dynamic_take_setup")
 +        .await?;
 +
 +    let blocking_manifest = dynamic_take_manifest(&table, EffectExecutionMode::BlockingFiber)?;
@@ -112901,7 +113073,7 @@ index 0000000000000000000000000000000000000000..5b6d03e729c4d21fc14e66ca14aa2a5c
 +            .await?;
 +    }
 +    database
-+        .commit_with_write_source(transaction, "generated_guest_query_stream_setup")
++        .commit(transaction, "generated_guest_query_stream_setup")
 +        .await?;
 +    let manifest = query_stream_manifest(&table)?;
 +
@@ -113108,7 +113280,7 @@ index 0000000000000000000000000000000000000000..5b6d03e729c4d21fc14e66ca14aa2a5c
 +            .await?;
 +    }
 +    database
-+        .commit_with_write_source(transaction, "generated_guest_query_terminal_wave_setup")
++        .commit(transaction, "generated_guest_query_terminal_wave_setup")
 +        .await?;
 +
 +    let collect_first_manifest = query_terminal_pair_manifest(&table, "collect", "first")?;
@@ -116717,7 +116889,7 @@ index 0000000000000000000000000000000000000000..85e5fb1506d33e0d04599fa4574db5a4
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..2f10378ae8c956fbe189036dc0f44da0cf5c2513
+index 0000000000000000000000000000000000000000..033f19781ec61f45774da563911de52fc7f22829
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/routing_runtime.rs
 @@ -0,0 +1,8674 @@
@@ -123136,7 +123308,7 @@ index 0000000000000000000000000000000000000000..2f10378ae8c956fbe189036dc0f44da0
 +                })
 +                .await?;
 +            database
-+                .commit_with_write_source(transaction, "cold_routing_test")
++                .commit(transaction, "cold_routing_test")
 +                .await?;
 +            let registry = DeploymentRegistry::load_with_selection(
 +                fixture.root().to_owned(),
@@ -129552,7 +129724,7 @@ index 0000000000000000000000000000000000000000..c686cdfe527acc6024752b0c968b7f12
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e9186351dce5e4a
+index 0000000000000000000000000000000000000000..12cebf4e8e0f8fb083688273ac77e20283bd9443
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests.rs
 @@ -0,0 +1,12899 @@
@@ -129934,7 +130106,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +            .await?;
 +    }
 +    database
-+        .commit_with_write_source(setup, "preparation_environment_setup")
++        .commit(setup, "preparation_environment_setup")
 +        .await?;
 +    let environment_requests = names
 +        .iter()
@@ -130991,7 +131163,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(setup, "generated_cpu_admission_warm_read_setup")
++        .commit(setup, "generated_cpu_admission_warm_read_setup")
 +        .await?;
 +
 +    let mut capture_state = new_state(
@@ -131037,7 +131209,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(update, "generated_cpu_admission_warm_read_update")
++        .commit(update, "generated_cpu_admission_warm_read_update")
 +        .await?;
 +
 +    let mut validation_state = new_state(
@@ -134207,7 +134379,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +        .insert_metadata(table, backend_gate_document(sequence)?)
 +        .await?;
 +    database
-+        .commit_with_write_source(transaction, "static_hermes_backend_gate_setup")
++        .commit(transaction, "static_hermes_backend_gate_setup")
 +        .await?;
 +    Ok(id)
 +}
@@ -134236,7 +134408,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(setup, "generated_wasm_environment_variable_setup")
++        .commit(setup, "generated_wasm_environment_variable_setup")
 +        .await?;
 +
 +    let metrics = Arc::new(GateMetrics::default());
@@ -134308,7 +134480,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(update, "generated_wasm_environment_variable_update")
++        .commit(update, "generated_wasm_environment_variable_update")
 +        .await?;
 +
 +    let mut changed_state = new_state(
@@ -135041,7 +135213,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +        )
 +        .await?;
 +    database
-+        .commit_with_write_source(transaction, "generated_wasm_scheduler_test_setup")
++        .commit(transaction, "generated_wasm_scheduler_test_setup")
 +        .await?;
 +    Ok(())
 +}
@@ -135177,7 +135349,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +        })
 +        .await?;
 +    database
-+        .commit_with_write_source(
++        .commit(
 +            redeployment_transaction,
 +            "generated_wasm_source_identity_redeployment",
 +        )
@@ -135286,7 +135458,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +        })
 +        .await?;
 +    database
-+        .commit_with_write_source(
++        .commit(
 +            legacy_redeployment_transaction,
 +            "generated_wasm_source_identity_legacy_redeployment",
 +        )
@@ -136416,7 +136588,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +            .await?;
 +    }
 +    database
-+        .commit_with_write_source(transaction, "generated_capability_query_setup")
++        .commit(transaction, "generated_capability_query_setup")
 +        .await?;
 +
 +    let manifest = generated_capability_async_operation_test_manifest(1 << 20, 1_000_000, 8)?;
@@ -138883,7 +139055,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +            )
 +            .await?;
 +        database
-+            .commit_with_write_source(transaction, "generated_compound_query_setup")
++            .commit(transaction, "generated_compound_query_setup")
 +            .await?;
 +        ids
 +    };
@@ -139641,7 +139813,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +                    .await?
 +                    .developer_id;
 +            database
-+                .commit_with_write_source(transaction, "generated_batch_duplicate_index_setup")
++                .commit(transaction, "generated_batch_duplicate_index_setup")
 +                .await?;
 +            (first, second)
 +        };
@@ -141732,7 +141904,7 @@ index 0000000000000000000000000000000000000000..3d68585c04594e8b53583f562e918635
 +            .insert_table_metadata(namespace, &inherited_table)
 +            .await?;
 +        database
-+            .commit_with_write_source(setup, "test_setup")
++            .commit(setup, "test_setup")
 +            .await?;
 +        let timestamp = *database.now_ts_for_reads();
 +        let mut inherited = database
@@ -143718,7 +143890,7 @@ index 0000000000000000000000000000000000000000..43676fdeb8a6da0b3990da12806de540
 +}
 diff --git a/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests/selective_invalidation_tests.rs b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests/selective_invalidation_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..8d7abbf9c8cdd27981e72cf3821dac260818af65
+index 0000000000000000000000000000000000000000..de334eea02d7f01dda42f8672aff7825f71e9043
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/static_hermes_wasmtime_gate/runtime_acceptance_tests/selective_invalidation_tests.rs
 @@ -0,0 +1,449 @@
@@ -143803,7 +143975,7 @@ index 0000000000000000000000000000000000000000..8d7abbf9c8cdd27981e72cf3821dac26
 +            )
 +            .await?;
 +        let publication_ts = database
-+            .commit_with_write_source(publish, "selective_invalidation_test")
++            .commit(publish, "selective_invalidation_test")
 +            .await?;
 +        assert!(database
 +            .refresh_token(token.clone(), publication_ts)
@@ -143918,7 +144090,7 @@ index 0000000000000000000000000000000000000000..8d7abbf9c8cdd27981e72cf3821dac26
 +            )
 +            .await?;
 +        let changed_ts = database
-+            .commit_with_write_source(change, "selective_invalidation_test")
++            .commit(change, "selective_invalidation_test")
 +            .await?;
 +        assert!(database.refresh_token(token, changed_ts).await?.is_err());
 +        assert_eq!(
@@ -143949,7 +144121,7 @@ index 0000000000000000000000000000000000000000..8d7abbf9c8cdd27981e72cf3821dac26
 +            )
 +            .await?;
 +        database
-+            .commit_with_write_source(setup, "initialization_table_dependency_setup")
++            .commit(setup, "initialization_table_dependency_setup")
 +            .await?;
 +
 +        let read_set =
@@ -143965,7 +144137,7 @@ index 0000000000000000000000000000000000000000..8d7abbf9c8cdd27981e72cf3821dac26
 +            .insert_table_metadata(TableNamespace::Global, &"unrelated_fixture_table".parse()?)
 +            .await?;
 +        let updated_ts = database
-+            .commit_with_write_source(update, "initialization_unrelated_table")
++            .commit(update, "initialization_unrelated_table")
 +            .await?;
 +
 +        // The provider configuration and the old transaction remain unchanged.
@@ -144045,7 +144217,7 @@ index 0000000000000000000000000000000000000000..8d7abbf9c8cdd27981e72cf3821dac26
 +                )
 +                .await?;
 +            database
-+                .commit_with_write_source(setup, "configuration_setup")
++                .commit(setup, "configuration_setup")
 +                .await?;
 +            let read_set = capture_configuration_reads(
 +                rt.clone(),
@@ -144087,7 +144259,7 @@ index 0000000000000000000000000000000000000000..8d7abbf9c8cdd27981e72cf3821dac26
 +                _ => unreachable!(),
 +            }
 +            let updated_ts = database
-+                .commit_with_write_source(update, "configuration_change")
++                .commit(update, "configuration_change")
 +                .await?;
 +            assert!(ContextCache::validate_and_apply_context_read_set(&mut old, &read_set).await?);
 +            // A snapshot-valid hit must still conflict with a later change
@@ -144131,7 +144303,7 @@ index 0000000000000000000000000000000000000000..8d7abbf9c8cdd27981e72cf3821dac26
 +            .resolve_table_name(namespace, &name)?
 +            .context("pending table missing")?;
 +        let inserted_ts = database
-+            .commit_with_write_source(insert, "mapping_insert")
++            .commit(insert, "mapping_insert")
 +            .await?;
 +        assert!(database
 +            .refresh_token(missing_token, inserted_ts)
@@ -144156,7 +144328,7 @@ index 0000000000000000000000000000000000000000..8d7abbf9c8cdd27981e72cf3821dac26
 +            .context("replacement missing")?;
 +        assert_ne!(replacement.tablet_id, original.tablet_id);
 +        let replaced_ts = database
-+            .commit_with_write_source(replace, "mapping_replace")
++            .commit(replace, "mapping_replace")
 +            .await?;
 +        assert!(database.refresh_token(token, replaced_ts).await?.is_err());
 +        assert_eq!(old.resolve_table_name(namespace, &name)?, Some(original));
@@ -155056,7 +155228,7 @@ index 0000000000000000000000000000000000000000..2ed4aa55cd94cc0b522cd03ff708c89d
 +mod tests;
 diff --git a/crates/isolate/src/environment/udf/wasm/tests.rs b/crates/isolate/src/environment/udf/wasm/tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..9d6d7d66f698f117d5e916df35bf77d9feddb53c
+index 0000000000000000000000000000000000000000..91323a61c13a0bee6642d617d272e5660919e31f
 --- /dev/null
 +++ b/crates/isolate/src/environment/udf/wasm/tests.rs
 @@ -0,0 +1,261 @@
@@ -155299,7 +155471,7 @@ index 0000000000000000000000000000000000000000..9d6d7d66f698f117d5e916df35bf77d9
 +                .context("mutation should return an inserted document id")?
 +                .to_owned();
 +            let commit_ts = database
-+                .commit_with_write_source(mutation_tx, "wasm_udf_test_mutation")
++                .commit(mutation_tx, "wasm_udf_test_mutation")
 +                .await?;
 +            database.wait_for_write_ts(commit_ts).await;
 +
