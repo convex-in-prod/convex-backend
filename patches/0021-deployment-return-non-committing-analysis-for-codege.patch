@@ -34,7 +34,7 @@ Avoid archive uploads for V8-only preflight while retaining canonical compressed
  crates/model/src/source_packages/mod.rs       |    6 +
  crates/model/src/source_packages/types.rs     |    2 +-
  .../src/source_packages/upload_download.rs    |   41 +
- crates/node_executor/src/routed.rs            |  188 ++-
+ crates/node_executor/src/routed.rs            |  191 ++-
  .../cli/codegen_templates/component_api.ts    |   29 +-
  .../src/cli/codegen_templates/dataModel.ts    |   16 +-
  npm-packages/convex/src/cli/lib/codegen.ts    |   16 +-
@@ -50,7 +50,7 @@ Avoid archive uploads for V8-only preflight while retaining canonical compressed
  patches/shared_base_http_admission/README.md  |   38 +-
  self-hosted/advanced/knobs.md                 |   42 +-
  self-hosted/docker/docker-compose.yml         |    5 +
- 37 files changed, 3941 insertions(+), 424 deletions(-)
+ 37 files changed, 3942 insertions(+), 426 deletions(-)
  create mode 100644 crates/local_backend/src/deployment_operations.rs
  create mode 100644 crates/model/src/deployment_receipts.rs
  create mode 100644 npm-packages/convex/src/cli/lib/deploy2.test.ts
@@ -4261,7 +4261,7 @@ index 3c767c1780d9bc498c0012c76cf430362a0ad036..cfd30486849a39bb589a5ace35beb720
 +    }
  }
 diff --git a/crates/node_executor/src/routed.rs b/crates/node_executor/src/routed.rs
-index 699288f4f984a949b619c9b58dcbcaee38159b83..46ab34d8ca767eeb1e29fa2d393d7eb355b08b16 100644
+index 2e6e276b7ddb86cfb38a566e07974ec3dc70bea1..56266096f381aea6a2332149ac0570e3a5e76fc6 100644
 --- a/crates/node_executor/src/routed.rs
 +++ b/crates/node_executor/src/routed.rs
 @@ -124,6 +124,9 @@ struct SystemOperationOwner {
@@ -4284,7 +4284,7 @@ index 699288f4f984a949b619c9b58dcbcaee38159b83..46ab34d8ca767eeb1e29fa2d393d7eb3
              system,
              id,
              kind,
-@@ -3092,17 +3098,43 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
+@@ -3098,17 +3104,43 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
          // unbound permit, and task-loss cleanup must not later finish a slot
          // that the permit has already released.
          let mut task_guard = SystemOperationTaskGuard::new(owner.clone());
@@ -4332,7 +4332,7 @@ index 699288f4f984a949b619c9b58dcbcaee38159b83..46ab34d8ca767eeb1e29fa2d393d7eb3
              let result = match system.finish_system_operation_terminal_observation().await {
                  Ok(()) => {
                      task_guard.finish();
-@@ -3606,6 +3638,16 @@ mod tests {
+@@ -3612,6 +3644,16 @@ mod tests {
      #[cfg(unix)]
      #[tokio::test]
      async fn routed_system_work_keeps_capacity_after_original_caller_disappears() {
@@ -4349,7 +4349,7 @@ index 699288f4f984a949b619c9b58dcbcaee38159b83..46ab34d8ca767eeb1e29fa2d393d7eb3
          let socket_dir = TempDir::new().unwrap();
          let socket_path = socket_dir.path().join("executor.sock");
          let listener = UnixListener::bind(&socket_path).unwrap();
-@@ -3636,7 +3678,7 @@ mod tests {
+@@ -3642,7 +3684,7 @@ mod tests {
              .await
              .unwrap();
          let invoke_executor = executor.clone();
@@ -4358,7 +4358,7 @@ index 699288f4f984a949b619c9b58dcbcaee38159b83..46ab34d8ca767eeb1e29fa2d393d7eb3
              let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
              invoke_executor
                  .invoke_system(
-@@ -3648,11 +3690,13 @@ mod tests {
+@@ -3654,11 +3696,13 @@ mod tests {
                      log_line_sender,
                  )
                  .await
@@ -4373,7 +4373,7 @@ index 699288f4f984a949b619c9b58dcbcaee38159b83..46ab34d8ca767eeb1e29fa2d393d7eb3
  
          let later_executor = executor.clone();
          let later = tokio::spawn(async move {
-@@ -3674,62 +3718,98 @@ mod tests {
+@@ -3680,65 +3724,100 @@ mod tests {
          assert_eq!(later.kind, NodeSystemOperationKind::Analyze);
          drop(later);
          wait_for_no_active_system_operation(&executor.system_admission).await;
@@ -4468,12 +4468,7 @@ index 699288f4f984a949b619c9b58dcbcaee38159b83..46ab34d8ca767eeb1e29fa2d393d7eb3
 +            ));
 +            request_received.await.unwrap();
  
--        drop(child_lock);
--        let later = later.await.unwrap().unwrap();
--        assert!(!executor.system.test_has_generation_owner().await);
--        drop(later);
--        server.abort();
--        assert!(server.await.unwrap_err().is_cancelled());
+-        assert!(!executor.system.test_is_shutting_down());
 +            let owner = wait_for_active_system_owner(
 +                &executor.system_admission,
 +                SystemOperationOwnerPhase::Running,
@@ -4498,7 +4493,14 @@ index 699288f4f984a949b619c9b58dcbcaee38159b83..46ab34d8ca767eeb1e29fa2d393d7eb3
 +            drop(owner);
 +            let mut next_job = Box::pin(jobs.acquire(DeploymentAnalysisKind::Deploy, 1024));
 +            assert!(futures::poll!(&mut next_job).is_pending());
-+
+ 
+-        drop(child_lock);
+-        let later = later.await.unwrap().unwrap();
+-        assert!(!executor.system.test_has_generation_owner().await);
+-        assert!(!executor.system.test_is_shutting_down());
+-        drop(later);
+-        server.abort();
+-        assert!(server.await.unwrap_err().is_cancelled());
 +            let waiting_admission = executor.system_admission.clone();
 +            let later = tokio::spawn(async move {
 +                waiting_admission
@@ -4508,10 +4510,12 @@ index 699288f4f984a949b619c9b58dcbcaee38159b83..46ab34d8ca767eeb1e29fa2d393d7eb3
 +            wait_for_system_waiter_count(&executor.system_admission, 1).await;
 +            assert!(!later.is_finished());
 +            assert!(executor.system.test_has_generation_owner().await);
++            assert!(!executor.system.test_is_shutting_down());
 +
 +            drop(child_lock);
 +            let later = later.await.unwrap().unwrap();
 +            assert!(!executor.system.test_has_generation_owner().await);
++            assert!(!executor.system.test_is_shutting_down());
 +            drop(later);
 +            drop(next_job.await.unwrap());
 +            server.abort();

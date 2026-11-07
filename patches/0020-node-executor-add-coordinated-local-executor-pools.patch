@@ -16,6 +16,12 @@ Extend the scheduled and registered-cron start barrier through Node routing and 
 Move the neutral barrier types into common while preserving the function-runner re-export. Start Node service timing after durable release but before request submission with a cancellation-safe observation acknowledgment.
 
 Document the composed ordering, its package-cache lease limitation, and its deliberately narrow recovery contract. Add focused coverage for cancellation, package preparation, graceful drain, hard retirement, simultaneous loss and release, unsupported executors, and timing observation.
+
+Move system-operation cleanup and shutdown-recovery guards into their
+spawned futures as whole values. Capturing only the disarm flag drops the
+guard at the spawn site, prematurely closing the system executor or
+clearing recovery ownership. Cover executor availability after task loss
+and recovery ownership while exact-child reaping remains pending.
 ---
  .../src/application_function_runner/mod.rs    |   377 +-
  crates/application/src/deploy_config.rs       |   290 +-
@@ -40,10 +46,10 @@ Document the composed ordering, its package-cache lease limitation, and its deli
  .../src/source_packages/upload_download.rs    |   139 +-
  crates/node_executor/src/executor.rs          |   515 +-
  crates/node_executor/src/lib.rs               |     6 +
- crates/node_executor/src/local.rs             | 15315 ++++++++++++----
+ crates/node_executor/src/local.rs             | 15320 ++++++++++++----
  crates/node_executor/src/metrics.rs           |   884 +-
  crates/node_executor/src/noop.rs              |    51 +-
- crates/node_executor/src/routed.rs            |  5332 ++++++
+ crates/node_executor/src/routed.rs            |  5343 ++++++
  npm-packages/convex/src/bundler/index.test.ts |   146 +
  npm-packages/convex/src/bundler/index.ts      |   113 +-
  npm-packages/convex/src/cli/deploy.ts         |     3 +
@@ -70,7 +76,7 @@ Document the composed ordering, its package-cache lease limitation, and its deli
  patches/scheduled_action_admission/README.md  |    71 +-
  self-hosted/advanced/knobs.md                 |    96 +-
  self-hosted/docker/docker-compose.yml         |     3 +
- 53 files changed, 23217 insertions(+), 4670 deletions(-)
+ 53 files changed, 23233 insertions(+), 4670 deletions(-)
  create mode 100644 crates/common/src/execution_start.rs
  create mode 100644 crates/node_executor/src/routed.rs
  create mode 100644 npm-packages/convex/src/bundler/index.test.ts
@@ -3930,7 +3936,7 @@ index 53a9569bbf07ac521bef19cbbc36b87678745f27..713ada525d66077f42c61cfdb5cbdd28
      ResponsePart,
      SourcePackage,
 diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
-index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b60643e61 100644
+index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bad962dd727b0d2a2b5e9c75f55747e7c1914f4e 100644
 --- a/crates/node_executor/src/local.rs
 +++ b/crates/node_executor/src/local.rs
 @@ -10,7 +10,10 @@ use std::os::unix::fs::{
@@ -4045,7 +4051,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
      node_process_timeout: Duration,
      /// Overrides the initial callback retry backoff in the spawned node
      /// process (read by syscalls.ts at module load). Tests zero this so
-@@ -172,4405 +216,11219 @@ pub struct LocalNodeExecutorConfig {
+@@ -172,4405 +216,11224 @@ pub struct LocalNodeExecutorConfig {
      max_imported_source_packages: u64,
      diagnostics_dir: Option<PathBuf>,
      diagnostic_pruning_in_progress: Arc<AtomicBool>,
@@ -11662,6 +11668,11 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
 +    }
 +
 +    #[cfg(all(test, unix))]
++    pub(crate) fn test_is_shutting_down(&self) -> bool {
++        self.shutting_down.load(Ordering::Acquire)
++    }
++
++    #[cfg(all(test, unix))]
 +    pub(crate) async fn test_has_generation_owner(&self) -> bool {
 +        let state = self.state.lock().await;
 +        state.inner.is_some() || state.retiring.is_some()
@@ -19148,7 +19159,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
      }
  
      #[tokio::test]
-@@ -4578,12 +11436,14 @@ done
+@@ -4578,12 +11441,14 @@ done
          let generation = test_inner(1).await;
          let (executor, state) = test_executor(generation.clone(), test_config());
          let active_guard = match executor
@@ -19165,7 +19176,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
                  panic!("Test generation was not available")
              },
          };
-@@ -4633,8 +11493,10 @@ done
+@@ -4633,8 +11498,10 @@ done
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(old.clone()),
              retiring: None,
@@ -19176,7 +19187,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
          }));
          old.server_handle
              .lock()
-@@ -4687,8 +11549,10 @@ done
+@@ -4687,8 +11554,10 @@ done
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(generation.clone()),
              retiring: None,
@@ -19187,7 +19198,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
          }));
  
          let retirements = (0..8).map(|_| {
-@@ -4742,19 +11606,38 @@ done
+@@ -4742,19 +11611,38 @@ done
          .await
          .unwrap();
          match executor
@@ -19228,7 +19239,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
          tokio::time::timeout(Duration::from_secs(1), async {
              generation.wait_until_retired().await.unwrap();
              loop {
-@@ -4769,6 +11652,84 @@ done
+@@ -4769,6 +11657,84 @@ done
          assert!(state.lock().await.retiring.is_none());
      }
  
@@ -19313,7 +19324,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
      #[tokio::test]
      async fn watchdog_resets_transient_miss_before_retiring_generation() {
          let socket_dir = TempDir::new().unwrap();
-@@ -4808,8 +11769,10 @@ done
+@@ -4808,8 +11774,10 @@ done
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(generation.clone()),
              retiring: None,
@@ -19324,7 +19335,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
          }));
          let mut config = test_config();
          config.health_check_timeout = Duration::from_secs(1);
-@@ -4890,8 +11853,10 @@ done
+@@ -4890,8 +11858,10 @@ done
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(generation.clone()),
              retiring: None,
@@ -19335,7 +19346,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
          }));
          let pressure = MemoryPressureSignal::new(true);
          let mut config = test_config();
-@@ -4968,8 +11933,10 @@ done
+@@ -4968,8 +11938,10 @@ done
          let state = Arc::new(Mutex::new(LocalNodeExecutorState {
              inner: Some(generation.clone()),
              retiring: None,
@@ -19346,7 +19357,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
          }));
          let mut config = test_config();
          config.health_check_timeout = Duration::from_secs(1);
-@@ -4991,7 +11958,7 @@ done
+@@ -4991,7 +11963,7 @@ done
              .unwrap()
              .unwrap();
  
@@ -19355,7 +19366,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
          assert_eq!(generation.active_requests.load(Ordering::Acquire), 1);
          assert!(state.lock().await.inner.is_none());
          assert!(generation.server_handle.lock().await.child.is_none());
-@@ -5030,22 +11997,107 @@ done
+@@ -5030,22 +12002,107 @@ done
                      upload_url: String::new(),
                  }),
                  log_line_sender,
@@ -19469,7 +19480,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
          let socket_dir = TempDir::new().unwrap();
          let socket_path = socket_dir.path().join("executor.sock");
          let listener = UnixListener::bind(&socket_path).unwrap();
-@@ -5053,6 +12105,13 @@ done
+@@ -5053,6 +12110,13 @@ done
              let (mut socket, _) = listener.accept().await.unwrap();
              let mut request = [0; 1024];
              assert!(socket.read(&mut request).await.unwrap() > 0);
@@ -19483,7 +19494,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
          });
          let client = Client::builder()
              .no_proxy()
-@@ -5070,20 +12129,84 @@ done
+@@ -5070,20 +12134,84 @@ done
                      upload_url: String::new(),
                  }),
                  log_line_sender,
@@ -19570,7 +19581,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
          let socket_dir = TempDir::new().unwrap();
          let socket_path = socket_dir.path().join("executor.sock");
          let listener = UnixListener::bind(&socket_path).unwrap();
-@@ -5093,7 +12216,7 @@ done
+@@ -5093,7 +12221,7 @@ done
              assert!(socket.read(&mut request).await.unwrap() > 0);
              socket
                  .write_all(
@@ -19579,7 +19590,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
                  )
                  .await
                  .unwrap();
-@@ -5105,25 +12228,30 @@ done
+@@ -5105,25 +12233,30 @@ done
              .unwrap();
          let inner = test_inner_with_client(1, client).await;
          let (executor, state) = test_executor(inner.clone(), test_config());
@@ -19620,7 +19631,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
      }
  
      #[tokio::test]
-@@ -5164,6 +12292,7 @@ done
+@@ -5164,6 +12297,7 @@ done
                      upload_url: String::new(),
                  }),
                  log_line_sender,
@@ -19628,7 +19639,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
              )
              .await
              .unwrap();
-@@ -5178,6 +12307,64 @@ done
+@@ -5178,6 +12312,64 @@ done
          server_task.abort();
      }
  
@@ -19693,7 +19704,7 @@ index eecdefb6a88297c7c440650cdc51df9bf0de8edd..bae46e7256ab956fa807ef9c83f3979b
      #[tokio::test]
      async fn shutdown_retires_and_reaps_current_generation() {
          let inner = test_inner(1).await;
-@@ -5196,4 +12383,310 @@ done
+@@ -5196,4 +12388,310 @@ done
          .unwrap();
          assert!(inner.server_handle.lock().await.child.is_none());
      }
@@ -21344,10 +21355,10 @@ index 70dbec830e3d18017383effc9a8c18cbd9ab0879..bad895c1ad14206706bb62ea1caed7eb
 +}
 diff --git a/crates/node_executor/src/routed.rs b/crates/node_executor/src/routed.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..699288f4f984a949b619c9b58dcbcaee38159b83
+index 0000000000000000000000000000000000000000..2e6e276b7ddb86cfb38a566e07974ec3dc70bea1
 --- /dev/null
 +++ b/crates/node_executor/src/routed.rs
-@@ -0,0 +1,5332 @@
+@@ -0,0 +1,5343 @@
 +use std::{
 +    collections::{
 +        BTreeMap,
@@ -21896,7 +21907,7 @@ index 0000000000000000000000000000000000000000..699288f4f984a949b619c9b58dcbcaee
 +            }
 +        }
 +        let owner = self.clone();
-+        let mut cleanup_guard = SystemOperationCleanupTaskGuard {
++        let cleanup_guard = SystemOperationCleanupTaskGuard {
 +            owner: owner.clone(),
 +            armed: true,
 +        };
@@ -21905,6 +21916,9 @@ index 0000000000000000000000000000000000000000..699288f4f984a949b619c9b58dcbcaee
 +            return;
 +        };
 +        runtime.spawn(async move {
++            // Move the whole guard into the task; capturing only `armed` would
++            // drop it at the spawn site and close the executor immediately.
++            let mut cleanup_guard = cleanup_guard;
 +            let result = owner
 +                .system
 +                .finish_system_operation_task_loss(owner.kind.as_str())
@@ -21954,11 +21968,14 @@ index 0000000000000000000000000000000000000000..699288f4f984a949b619c9b58dcbcaee
 +            return;
 +        }
 +        let owner = self.clone();
-+        let mut recovery_guard = SystemOperationShutdownRecoveryTaskGuard {
++        let recovery_guard = SystemOperationShutdownRecoveryTaskGuard {
 +            owner: owner.clone(),
 +            armed: true,
 +        };
 +        tokio::spawn(async move {
++            // Keep recovery ownership until this task completes or is dropped,
++            // including when the runtime drops it before its first poll.
++            let mut recovery_guard = recovery_guard;
 +            let result = owner
 +                .system
 +                .finish_system_operation_task_loss(owner.kind.as_str())
@@ -25074,9 +25091,12 @@ index 0000000000000000000000000000000000000000..699288f4f984a949b619c9b58dcbcaee
 +        assert!(!later.is_finished());
 +        assert!(executor.system.test_has_generation_owner().await);
 +
++        assert!(!executor.system.test_is_shutting_down());
++
 +        drop(child_lock);
 +        let later = later.await.unwrap().unwrap();
 +        assert!(!executor.system.test_has_generation_owner().await);
++        assert!(!executor.system.test_is_shutting_down());
 +        drop(later);
 +        server.abort();
 +        assert!(server.await.unwrap_err().is_cancelled());
@@ -25142,6 +25162,7 @@ index 0000000000000000000000000000000000000000..699288f4f984a949b619c9b58dcbcaee
 +        assert!(executor.system.test_has_generation_owner().await);
 +
 +        executor.shutdown();
++        assert!(owner.state.lock().unwrap().shutdown_recovery_running);
 +        let error = match later.await.unwrap() {
 +            Ok(_) => panic!("System operation was admitted during shutdown"),
 +            Err(error) => error,
@@ -25153,6 +25174,7 @@ index 0000000000000000000000000000000000000000..699288f4f984a949b619c9b58dcbcaee
 +        )
 +        .await;
 +        assert!(executor.system.test_has_generation_owner().await);
++        assert!(owner.state.lock().unwrap().shutdown_recovery_running);
 +
 +        drop(child_lock);
 +        wait_for_no_active_system_operation(&executor.system_admission).await;
