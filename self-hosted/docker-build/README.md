@@ -11,6 +11,89 @@ Build the backend from scratch by running:
 docker build -t convex-backend -f self-hosted/docker-build/Dockerfile.backend .
 ```
 
+The backend Dockerfile requires BuildKit. It keeps Cargo target, Git, registry,
+and sccache data in persistent, architecture-scoped cache mounts, so an
+unchanged source and dependency graph reuses the existing native build output.
+The caches remain build-host state and are not copied into the runtime image.
+
+Installed JavaScript dependencies have a separate image layer before Cargo.
+Rust-only edits and cancelled native builds therefore reuse `node_modules`, not
+just pnpm's download store. Cargo's build scripts still build the required
+JavaScript outputs normally; this does not assert that those outputs are
+prebuilt. The `build-dependencies` target completes cargo-chef dependency
+cooking before first-party source is copied. It runs Cargo for dependencies, but
+does not build the final backend binary.
+
+The build-stage base is pinned to a multi-platform image digest. Update that
+digest deliberately when upgrading the system build environment; following the
+floating tag can otherwise invalidate every setup layer between retries. The
+repository's `rust-toolchain` file still selects the Rust compiler separately.
+
+To set the `sccache` local-cache retention budget without baking a machine
+policy into the Dockerfile, pass its normal size setting for a local build:
+
+```sh
+docker build \
+  --build-arg SCCACHE_CACHE_SIZE=20G \
+  -t convex-backend \
+  -f self-hosted/docker-build/Dockerfile.backend \
+  .
+```
+
+If the BuildKit garbage collector removes the `sccache` mount, the next build is
+cold; cache mounts never change the resulting image.
+
+## Hosted CI builds
+
+The manual
+[Build patched backend image](../../.github/workflows/build_patched_backend.yml)
+workflow builds an optimized Linux amd64 image on `ubuntu-24.04`, checks its
+runtime tools and SQLite startup, and publishes
+`ghcr.io/<owner>/<repository>:backend-build-<run-id>-<attempt>`. Before pushing,
+it creates the matching Git tag so the exact source remains reachable after
+rebasing the patch train. Tags are never moved; a failed image push can leave a
+source tag without an image. Rerunning uses a new attempt number.
+
+The job summary supplies the source tag and image digest for downstream
+Dockerfiles. No registry account beyond GitHub is required; the workflow uses
+`GITHUB_TOKEN` with contents and package write permission. Pin consumers to the
+digest to identify the exact build, including its system dependencies.
+
+The builder has a 12 GiB memory limit with no additional swap, two Cargo jobs,
+and serialized backend LLVM optimization. It removes unused host SDKs and
+reports available disk before and during compilation. This uses reclaimed runner
+space; fitting within a strict 14 GB disk quota is not guaranteed. A cold build
+must also finish within GitHub's six-hour job limit.
+
+After publication, the same job builds the `rust-tests` Docker target. Set
+`publish_image=false` on dispatch to run the tests alone without building and
+publishing another runtime image. The tests cover deployment receipts and replay
+and Node action-tree admission across environment changes. A regression failure
+marks the workflow failed but does not remove the already-published image.
+
+Tests reuse the builder, installed tools, JavaScript dependencies and Cargo,
+download and sccache mounts. They use the test profile without debug symbols or
+incremental compilation. Test-only features and panic unwinding mean release
+Rust artifacts are not all reusable; this adds compilation time and disk use.
+The test target reruns even on an unchanged source revision. Test binaries stay
+in the builder cache.
+
+Build layers are cached in GHCR at `buildcache-amd64`. A separate Actions cache
+preserves up to 2 GiB of sccache output across runners. Cargo target and
+download cache mounts remain local to each runner, so source changes still
+require dependency downloads, build-script execution and linking. Exact cached
+build layers can skip those steps. The cache extraction temporarily needs
+additional disk space, and old Actions cache entries are subject to GitHub's
+eviction.
+
+The workflow sets `CARGO_CHEF_COOK=false`: a fresh runner cannot recover the
+target mount from registry layers, and cooking dependencies without the final
+feature set adds work before the sccache-enabled build. The default remains
+`true` for persistent local builders. Consumers pull only the runtime image;
+they do not download build caches.
+
+## Local build options
+
 The backend build uses Cargo's `release` profile by default. Select another
 built-in or custom workspace profile with `CARGO_BUILD_PROFILE`:
 
@@ -19,6 +102,35 @@ docker build \
   -t convex-backend \
   -f self-hosted/docker-build/Dockerfile.backend \
   --build-arg CARGO_BUILD_PROFILE=slim-release \
+  .
+```
+
+Set a bounded Cargo job count with `CARGO_BUILD_JOBS`. Experimental local
+backend features can be selected explicitly with `LOCAL_BACKEND_FEATURES`;
+normal images leave this argument empty:
+
+```sh
+docker build \
+  --build-arg CARGO_BUILD_JOBS=8 \
+  --build-arg LOCAL_BACKEND_FEATURES=feature-name \
+  -t convex-backend \
+  -f self-hosted/docker-build/Dockerfile.backend \
+  .
+```
+
+On a constrained host, native dependency packages can be compiled in a separate
+first phase with a wider Cargo jobserver while the final Rust graph keeps a
+lower `CARGO_BUILD_JOBS`. Supply whitespace-separated Cargo package specs and a
+positive prebuild job count. Both phases use the selected Cargo profile and the
+same target cache:
+
+```sh
+docker build \
+  --build-arg CARGO_BUILD_JOBS=1 \
+  --build-arg NATIVE_PREBUILD_JOBS=4 \
+  --build-arg 'NATIVE_PREBUILD_PACKAGES=native-package-a native-package-b' \
+  -t convex-backend \
+  -f self-hosted/docker-build/Dockerfile.backend \
   .
 ```
 
