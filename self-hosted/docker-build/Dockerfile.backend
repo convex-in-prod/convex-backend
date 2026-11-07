@@ -97,6 +97,7 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="v$(sed -nE 's/^min_version = "([
 COPY .cargo ./.cargo
 COPY --from=chef /tmp/recipe.json recipe.json
 ARG CARGO_BUILD_PROFILE=release
+ARG CARGO_CHEF_COOK=true
 ARG CARGO_PROFILE_RELEASE_DEBUG=
 ARG CARGO_PROFILE_RELEASE_STRIP=
 ARG TARGETARCH
@@ -125,7 +126,17 @@ if [[ -n "$CARGO_PROFILE_RELEASE_STRIP" ]]; then
 else
   unset CARGO_PROFILE_RELEASE_STRIP
 fi
-PROTOC="$(mise which protoc)" cargo chef cook --profile "$CARGO_BUILD_PROFILE" --recipe-path recipe.json
+# Ephemeral builders can reuse sccache in the final, feature-unified build
+# instead of cooking a second dependency graph into a non-exported target mount.
+case "$CARGO_CHEF_COOK" in
+  true)
+    PROTOC="$(mise which protoc)" cargo chef cook \
+      --profile "$CARGO_BUILD_PROFILE" \
+      --recipe-path recipe.json
+    ;;
+  false) ;;
+  *) echo "CARGO_CHEF_COOK must be true or false" >&2; exit 1 ;;
+esac
 EOF
 # Copy first-party Rust and JavaScript sources only after dependency cooking.
 # isolate's build script installs the frozen JavaScript workspace with lifecycle
@@ -212,6 +223,47 @@ if [[ -f convex-local-backend.debug ]]; then
     echo "Could not add the GNU debug link; select the native companion explicitly for profiling" >&2
   fi
 fi
+EOF
+
+# CI tests share the build environment and cache mounts, but never enter the
+# runtime image. Test-only features and unwinding require a separate Rust graph.
+FROM build AS rust-tests
+ENV CARGO_PROFILE_TEST_DEBUG=0 \
+    CARGO_INCREMENTAL=0 \
+    FUNRUN_ISOLATE_ACTIVE_THREADS=4 \
+    RUST_BACKTRACE=1
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
+    --mount=type=cache,id=convex-backend-target-${TARGETARCH},target=/convex/target,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-git-db-${TARGETARCH},target=/usr/local/cargo/git/db,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-git-checkouts-${TARGETARCH},target=/usr/local/cargo/git/checkouts,sharing=locked \
+    --mount=type=cache,id=convex-backend-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=convex-backend-sccache-${TARGETARCH},target=/sccache,sharing=locked <<EOF
+set -euo pipefail
+find /usr/local/cargo/git -type f -name '*.lock' -delete
+PROTOC="$(mise which protoc)"
+uv_path="$(mise which uv)"
+PATH="${uv_path%/*}:$PATH"
+export PROTOC PATH
+if [[ -n "$SCCACHE_CACHE_SIZE" ]]; then
+  export SCCACHE_CACHE_SIZE
+else
+  unset SCCACHE_CACHE_SIZE
+fi
+export SCCACHE_IDLE_TIMEOUT=0
+sccache --start-server
+trap 'sccache --stop-server' EXIT
+test_args=(test --locked --profile test -p isolate --lib --features static-hermes-wasmtime-gate)
+# Libtest runs serially because these tests share process-wide runtime state.
+# Individual tests still exercise concurrent loads, Stores and waiters.
+cargo "${test_args[@]}" -- wasm module_graph_registry host_operation_error_cause --test-threads=1
+# Each Cargo invocation starts a fresh test process, so cached worker settings
+# cannot hide the single-worker or CPU-derived configuration.
+for workers in 1 0; do
+  FUNRUN_ISOLATE_ACTIVE_THREADS="$workers" cargo "${test_args[@]}" -- \
+    routing_runtime::preparation::tests \
+    graph_leaf_cache_reuses_published_module_and_reconstructs_missing_aot \
+    --test-threads=1
+done
 EOF
 
 # Final stage: Creates minimal runtime image with only necessary components
