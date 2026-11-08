@@ -71,6 +71,7 @@ use sync_types::{
 use tokio::sync::mpsc;
 
 mod metrics;
+mod ping;
 
 use metrics::{
     log_sync_protocol_websockets_total,
@@ -83,8 +84,12 @@ use metrics::{
     log_websocket_ping,
     log_websocket_pong,
     log_websocket_server_error,
+    websocket_message_endpoint,
+    websocket_serialize_timer,
+    websocket_socket_send_timer,
     websocket_upgrade_timer,
 };
+use ping::PingTracker;
 
 use crate::{
     subs::metrics::log_websocket_client_message_bytes,
@@ -146,7 +151,7 @@ async fn run_sync_socket(
     let (mut tx, mut rx) = socket.split();
 
     let last_received = Mutex::new(Instant::now());
-    let last_ping_sent = Mutex::new(Instant::now());
+    let pings = Mutex::new(PingTracker::default());
 
     let (client_tx, client_rx) = mpsc::unbounded_channel();
     let receive_messages = async {
@@ -182,8 +187,11 @@ async fn run_sync_socket(
                         break;
                     }
                 },
-                Message::Pong(_) => {
-                    log_websocket_pong(last_ping_sent.lock().elapsed());
+                Message::Pong(payload) => {
+                    // Pong payloads are only diagnostic: every received frame
+                    // still updates last_received, including unmatched pongs.
+                    let latency = pings.lock().record_pong(&payload, Instant::now());
+                    log_websocket_pong(latency);
                     continue;
                 },
                 Message::Ping(_) => {
@@ -213,9 +221,9 @@ async fn run_sync_socket(
                         log_websocket_client_timeout();
                         return Err(anyhow::anyhow!(ErrorMetadata::client_disconnect()).context("Websocket ping/pong timeout"));
                     }
-                    *last_ping_sent.lock() = Instant::now();
+                    let payload = pings.lock().record_ping(Instant::now());
                     log_websocket_ping();
-                    if tx.send(Message::Ping(Bytes::new())).await.is_err() {
+                    if tx.send(Message::Ping(Bytes::copy_from_slice(&payload))).await.is_err() {
                         break 'top;
                     }
                 },
@@ -229,9 +237,18 @@ async fn run_sync_socket(
                         maybe_split_transition(message, config.supports_transition_chunks)?;
                     for msg in messages {
                         let delay = st.runtime.monotonic_now() - send_time;
-                        log_websocket_message_out(&msg, delay);
+                        let endpoint = websocket_message_endpoint(&msg);
+                        log_websocket_message_out(endpoint, delay);
+                        let serialize_timer = websocket_serialize_timer(endpoint);
                         let serialized = serde_json::to_string(&JsonValue::from(msg))?;
-                        if tx.send(Message::Text(serialized.into())).await.is_err() {
+                        serialize_timer.finish();
+                        // SinkExt::send includes flushing to the socket, not
+                        // delivery to the browser. Keep it separate from queue
+                        // and serialization time, including errors/cancellation.
+                        let send_timer = websocket_socket_send_timer(endpoint);
+                        let result = tx.send(Message::Text(serialized.into())).await;
+                        send_timer.finish(result.is_ok());
+                        if result.is_err() {
                             break 'top;
                         }
                     }
@@ -392,7 +409,11 @@ fn maybe_split_transition(
         return Ok(vec![transition]);
     }
 
+    // Oversized transitions are serialized before their chunks are encoded.
+    // Include that work rather than only timing the small chunk envelopes.
+    let serialize_timer = websocket_serialize_timer("Transition");
     let transition_json = serde_json::to_string(&JsonValue::from(transition))?;
+    serialize_timer.finish();
 
     // Careful with UTF-8, use valid boundaries
     let mut chunks = Vec::new();
