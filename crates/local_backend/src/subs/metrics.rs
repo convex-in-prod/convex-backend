@@ -8,6 +8,7 @@ use metrics::{
     register_convex_counter,
     register_convex_gauge,
     register_convex_histogram,
+    CancelableTimer,
     StaticMetricLabel,
     StatusTimer,
     STATUS_LABEL,
@@ -49,14 +50,14 @@ pub fn log_websocket_ping() {
 register_convex_counter!(BACKEND_PONG_TOTAL, "Number of websocket pongs received");
 register_convex_histogram!(
     BACKEND_PING_PONG_SECONDS,
-    "When websocket Pong received, duration since latest Ping was sent",
+    "Duration from sending a websocket Ping to receiving its matching Pong",
 );
-/// backend_ping_pong_seconds approximates round trip time on the websocket.
-/// We don't have a way to match up a pong with its ping, so the latency metric
-/// might skew low, if two pings are sent before either pong is received.
-pub fn log_websocket_pong(latency_since_ping: Duration) {
+pub fn log_websocket_pong(latency_since_ping: Option<Duration>) {
     log_counter(&BACKEND_PONG_TOTAL, 1);
-    log_distribution(&BACKEND_PING_PONG_SECONDS, latency_since_ping.as_secs_f64());
+    // Unmatched pongs still count as received, but cannot establish an RTT.
+    if let Some(latency) = latency_since_ping {
+        log_distribution(&BACKEND_PING_PONG_SECONDS, latency.as_secs_f64());
+    }
 }
 
 register_convex_counter!(
@@ -69,7 +70,7 @@ pub fn log_websocket_client_timeout() {
 
 register_convex_histogram!(
     BACKEND_WS_SEND_DELAY_SECONDS,
-    "Delay between generating a message in the sync worker and sending it over the web socket.",
+    "Delay from generating a message in the sync worker to starting its websocket serialization.",
     &["endpoint"]
 );
 register_convex_counter!(
@@ -77,8 +78,8 @@ register_convex_counter!(
     "Count of outgoing websocket messages",
     &["endpoint"]
 );
-pub fn log_websocket_message_out(message: &ServerMessage, delay: Duration) {
-    let endpoint = match message {
+pub fn websocket_message_endpoint(message: &ServerMessage) -> &'static str {
+    match message {
         ServerMessage::Transition { .. } => "Transition",
         ServerMessage::TransitionChunk { .. } => "TransitionChunk",
         ServerMessage::MutationResponse { .. } => "MutationResponse",
@@ -86,7 +87,10 @@ pub fn log_websocket_message_out(message: &ServerMessage, delay: Duration) {
         ServerMessage::AuthError { .. } => "AuthError",
         ServerMessage::FatalError { .. } => "FatalError",
         ServerMessage::Ping { .. } => "Ping",
-    };
+    }
+}
+
+pub fn log_websocket_message_out(endpoint: &'static str, delay: Duration) {
     let labels = vec![StaticMetricLabel::new("endpoint", endpoint)];
     log_distribution_with_labels(
         &BACKEND_WS_SEND_DELAY_SECONDS,
@@ -94,6 +98,28 @@ pub fn log_websocket_message_out(message: &ServerMessage, delay: Duration) {
         labels.clone(),
     );
     log_counter_with_labels(&BACKEND_WS_OUT_TOTAL, 1, labels);
+}
+
+register_convex_histogram!(
+    BACKEND_WS_SERIALIZE_SECONDS,
+    "Time serializing websocket messages, including oversized transitions before chunking.",
+    &["endpoint", "status"]
+);
+pub fn websocket_serialize_timer(endpoint: &'static str) -> StatusTimer {
+    let mut timer = StatusTimer::new(&BACKEND_WS_SERIALIZE_SECONDS);
+    timer.add_label(StaticMetricLabel::new("endpoint", endpoint));
+    timer
+}
+
+register_convex_histogram!(
+    BACKEND_WS_SOCKET_SEND_SECONDS,
+    "Time sending and flushing a websocket message to the socket, not browser acknowledgement.",
+    &["endpoint", "status"]
+);
+pub fn websocket_socket_send_timer(endpoint: &'static str) -> CancelableTimer {
+    let mut timer = CancelableTimer::new(&BACKEND_WS_SOCKET_SEND_SECONDS);
+    timer.add_label(StaticMetricLabel::new("endpoint", endpoint));
+    timer
 }
 
 register_convex_counter!(
