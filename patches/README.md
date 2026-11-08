@@ -320,6 +320,17 @@ requires explicit client negotiation, and its preparation is process-local.
   changing externally stored history. Reverting the logging writer restores synchronous output;
   remove native diagnostic forwarding first when its lifecycle isolation depends on bounded output.
 
+### [WebSocket transport timing metrics](websocket_transport_metrics/README.md)
+
+- Purpose: distinguish sync message queue delay, serialization, and socket flush;
+  correlate ping/pong RTT without treating unmatched replies as missing liveness.
+- Prerequisites: none of the runtime-health, service-logging, or Wasm patches;
+  older sync clients remain wire-compatible.
+- Activation: automatic after backend rollout; no schema or data migration,
+  Caddy change, worker change, or configuration change is required.
+- Rollback: restore the prior backend image; the new timing histograms disappear
+  and ping/pong timing returns to its previous uncorrelated measurement.
+
 ## Context reuse
 
 ### [Context reuse](context_reuse/README.md)
