@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Fri, 13 Nov 2026 02:21:30 +0800
+Subject: [PATCH 33/33] ci: publish backend image before regression tests
+
+Keep the runtime capability and SQLite startup checks as publication gates, but run the Wasm Rust regression target after the uniquely tagged image is pushed. A resource-sensitive or flaky regression still fails the workflow and remains visible, while the built artifact stays available for inspection and downstream validation.
+---
+ .github/workflows/build_patched_backend.yml | 37 +++++++++++++++++----
+ self-hosted/docker-build/README.md          |  6 ++--
+ 2 files changed, 34 insertions(+), 9 deletions(-)
+
+diff --git a/.github/workflows/build_patched_backend.yml b/.github/workflows/build_patched_backend.yml
+index 0937c7718207dfe743ee67ca8637a750991a689b..26b9e18fbc7c51b36029988b29712aa688a81d8d 100644
+--- a/.github/workflows/build_patched_backend.yml
++++ b/.github/workflows/build_patched_backend.yml
+@@ -91,8 +91,8 @@ jobs:
+               }
+             }
+ 
+-      - name: Build image and run Wasm Rust regressions
+-        timeout-minutes: 330
++      - name: Build image
++        timeout-minutes: 315
+         env:
+           BUILDER: ${{ steps.builder.outputs.name }}
+         run: |
+@@ -121,10 +121,6 @@ jobs:
+             --label "io.convex.backend.allocator=jemalloc" \
+             --label "io.convex.backend.features=static-hermes-wasmtime-gate" \
+             .
+-          # Keep target/download caches on this builder, and rerun tests even
+-          # when the source matches an earlier successful image build.
+-          docker buildx build "${build_args[@]}" --target rust-tests \
+-            --no-cache-filter rust-tests --output type=cacheonly .
+ 
+       - name: Check runtime image
+         timeout-minutes: 5
+@@ -162,7 +158,7 @@ jobs:
+           echo "Backend did not become ready" >&2
+           exit 1
+ 
+-      - name: Publish tested image
++      - name: Publish built image
+         env:
+           GH_TOKEN: ${{ github.token }}
+         run: |
+@@ -184,6 +180,33 @@ jobs:
+             echo '```'
+           } >> "$GITHUB_STEP_SUMMARY"
+ 
++      - name: Run Wasm Rust regressions
++        timeout-minutes: 30
++        env:
++          BUILDER: ${{ steps.builder.outputs.name }}
++        run: |
++          # Keep target/download caches on this builder, and rerun tests even
++          # when the source matches an earlier successful image build. These
++          # regressions report separately from image publication: a flaky or
++          # resource-sensitive test must not discard a usable built image.
++          build_args=(
++            --builder "$BUILDER" --progress plain --platform linux/amd64
++            --file self-hosted/docker-build/Dockerfile.backend
++            --cache-from "type=registry,ref=$BACKEND_CACHE"
++            --build-arg "VERGEN_GIT_SHA=$GITHUB_SHA"
++            --build-arg "VERGEN_GIT_COMMIT_TIMESTAMP=$COMMIT_TIMESTAMP"
++            --build-arg CARGO_CHEF_COOK=false
++            --build-arg CARGO_BUILD_JOBS=2
++            --build-arg NATIVE_PREBUILD_JOBS=2
++            --build-arg CARGO_PROFILE_RELEASE_DEBUG=0
++            --build-arg SERIALIZE_LOCAL_BACKEND_CODEGEN=true
++            --build-arg SCCACHE_CACHE_SIZE=2G
++            --build-arg LOCAL_BACKEND_FEATURES=static-hermes-wasmtime-gate
++            --build-arg BUILD_SOURCE_PACKAGE_PREACTIVATION_AUTHORITY=true
++          )
++          docker buildx build "${build_args[@]}" --target rust-tests \
++            --no-cache-filter rust-tests --output type=cacheonly .
++
+       - name: Report build storage
+         if: always()
+         run: |
+diff --git a/self-hosted/docker-build/README.md b/self-hosted/docker-build/README.md
+index 3c6140036edddabe4bc2c780c8b0bc797afcb285..1a55524d12cc5fc911c520f58e5b343019a2c203 100644
+--- a/self-hosted/docker-build/README.md
++++ b/self-hosted/docker-build/README.md
+@@ -66,13 +66,15 @@ reports available disk before and during compilation. This uses reclaimed runner
+ space; fitting within a strict 14 GB disk quota is not guaranteed. A cold build
+ must also finish within GitHub's six-hour job limit.
+ 
+-Before publication, the same job builds the `rust-tests` Docker target. It runs
++After publication, the same job builds the `rust-tests` Docker target. It runs
+ the isolate library's Wasm, module-registry and host-error-attribution tests,
+ then repeats preparation and module-cache tests with one worker and with
+ CPU-derived parallelism. The initial run uses four workers. Libtest runs tests
+ serially because they share process-wide runtime state; concurrency within a
+ test remains enabled. Ignored tests requiring external compiler fixtures and
+-the rest of the backend workspace are not part of this suite.
++the rest of the backend workspace are not part of this suite. A regression
++failure marks the workflow failed but does not remove the already-published
++image; the capability and SQLite startup checks still gate publication.
+ 
+ Tests reuse the builder, installed tools, JavaScript dependencies and Cargo,
+ download and sccache mounts. They use the test profile without debug symbols or
