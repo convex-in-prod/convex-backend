@@ -66,13 +66,15 @@ reports available disk before and during compilation. This uses reclaimed runner
 space; fitting within a strict 14 GB disk quota is not guaranteed. A cold build
 must also finish within GitHub's six-hour job limit.
 
-Before publication, the same job builds the `rust-tests` Docker target. It runs
+After publication, the same job builds the `rust-tests` Docker target. It runs
 the isolate library's Wasm, module-registry and host-error-attribution tests,
 then repeats preparation and module-cache tests with one worker and with
 CPU-derived parallelism. The initial run uses four workers. Libtest runs tests
 serially because they share process-wide runtime state; concurrency within a
 test remains enabled. Ignored tests requiring external compiler fixtures and
-the rest of the backend workspace are not part of this suite.
+the rest of the backend workspace are not part of this suite. A regression
+failure marks the workflow failed but does not remove the already-published
+image; the capability and SQLite startup checks still gate publication.
 
 Tests reuse the builder, installed tools, JavaScript dependencies and Cargo,
 download and sccache mounts. They use the test profile without debug symbols or
