@@ -11,8 +11,8 @@ Track actual permit waits with dependency-class waiter gauges and a duration his
 
 Place admission outside request instrumentation and timeout, bound direct constructor values, cover cancellation and waiter-guard handoff, and centralize the callback-token header contract. Document pre-permit waiting, response-stream permit lifetime, finite callback depth, reverse-proxy requirements, and the independent relationship with isolate-scheduler overflow.
 ---
- crates/common/src/dependency_overflow.rs      | 465 ++++++++++++++++++
- crates/common/src/http/mod.rs                 | 444 ++++++++++++++++-
+ crates/common/src/dependency_overflow.rs      | 465 +++++++++++++++++
+ crates/common/src/http/mod.rs                 | 483 ++++++++++++++++--
  crates/common/src/knobs.rs                    |  23 +-
  crates/common/src/lib.rs                      |   1 +
  crates/local_backend/src/lib.rs               |   2 -
@@ -22,7 +22,7 @@ Place admission outside request instrumentation and timeout, bound direct constr
  patches/shared_base_http_admission/README.md  | 171 +++++++
  self-hosted/advanced/knobs.md                 |  74 +++
  self-hosted/docker/docker-compose.yml         |   2 +
- 11 files changed, 1227 insertions(+), 38 deletions(-)
+ 11 files changed, 1232 insertions(+), 72 deletions(-)
  create mode 100644 crates/common/src/dependency_overflow.rs
  create mode 100644 patches/shared_base_http_admission/README.md
 
@@ -498,18 +498,10 @@ index 0000000000000000000000000000000000000000..493d27f92adfa2dd503d97287a923f9a
 +    }
 +}
 diff --git a/crates/common/src/http/mod.rs b/crates/common/src/http/mod.rs
-index 15fb45e787d7aa396f4b11aaabaad60eb15aec08..62ae1eb20ae7d22993736d8745b8b2834d1ab043 100644
+index dafe764d1330625d3a38afd0ef18e0199543ecd5..8d0dba74bdca1ff3485567ac9783d43fe52a4343 100644
 --- a/crates/common/src/http/mod.rs
 +++ b/crates/common/src/http/mod.rs
-@@ -90,7 +90,6 @@ use serde::{
- };
- use tokio::net::TcpSocket;
- use tower::{
--    limit::GlobalConcurrencyLimitLayer,
-     timeout::TimeoutLayer,
-     Layer,
-     Service,
-@@ -142,13 +141,22 @@ pub use sync_types::headers::{
+@@ -142,13 +142,22 @@ pub use sync_types::headers::{
      DEPRECATION_STATE_HEADER_NAME,
  };
  use value::heap_size::HeapSize;
@@ -532,7 +524,7 @@ index 15fb45e787d7aa396f4b11aaabaad60eb15aec08..62ae1eb20ae7d22993736d8745b8b283
      };
  
      register_convex_histogram!(
-@@ -181,6 +189,92 @@ mod metrics {
+@@ -181,6 +190,92 @@ mod metrics {
              labels,
          );
      }
@@ -625,7 +617,7 @@ index 15fb45e787d7aa396f4b11aaabaad60eb15aec08..62ae1eb20ae7d22993736d8745b8b283
  }
  
  #[allow(clippy::declare_interior_mutable_const)]
-@@ -212,9 +306,6 @@ impl From<HttpRequest> for HttpRequestStream {
+@@ -212,9 +307,6 @@ impl From<HttpRequest> for HttpRequestStream {
      }
  }
  
@@ -635,7 +627,7 @@ index 15fb45e787d7aa396f4b11aaabaad60eb15aec08..62ae1eb20ae7d22993736d8745b8b283
  impl HeapSize for HttpRequest {
      fn heap_size(&self) -> usize {
          // Assume heap size is dominated by body (because the rest is annoying
-@@ -486,11 +577,8 @@ impl RouteMapper for NoopRouteMapper {
+@@ -486,11 +578,8 @@ impl RouteMapper for NoopRouteMapper {
      }
  }
  
@@ -649,7 +641,7 @@ index 15fb45e787d7aa396f4b11aaabaad60eb15aec08..62ae1eb20ae7d22993736d8745b8b283
      // The registry already prefixes metrics with the executable name.
      name.strip_prefix(&format!("{namespace}_"))
          .unwrap_or(&name)
-@@ -504,6 +592,40 @@ pub struct ConvexHttpService {
+@@ -504,6 +593,45 @@ pub struct ConvexHttpService {
      version: String,
      service_name: &'static str,
      _concurrency_gauge: Option<PullingGauge>,
@@ -678,19 +670,24 @@ index 15fb45e787d7aa396f4b11aaabaad60eb15aec08..62ae1eb20ae7d22993736d8745b8b283
 +        && request
 +            .headers()
 +            .contains_key(CONVEX_ACTIONS_CALLBACK_TOKEN);
++    let mut service_wait = None;
 +    let permit = limiter
 +        .gate
 +        .acquire_with_waiter(is_dependency, || {
++            service_wait = Some(HttpPermitWaiter::new(limiter.service_name));
 +            metrics::HttpAdmissionWaitGuard::new(limiter.service_name, is_dependency)
 +        })
 +        .await;
++    if let Some(waiter) = service_wait {
++        waiter.acquired();
++    }
 +    let response = next.run(request).await;
 +    drop(permit);
 +    response
  }
  
  impl ConvexHttpService {
-@@ -515,16 +637,78 @@ impl ConvexHttpService {
+@@ -515,16 +643,78 @@ impl ConvexHttpService {
          request_timeout: Duration,
          route_metric_mapper: RM,
      ) -> Self {
@@ -773,7 +770,7 @@ index 15fb45e787d7aa396f4b11aaabaad60eb15aec08..62ae1eb20ae7d22993736d8745b8b283
          )
          .expect("Invalid gauge initialization");
          if let Err(e) = CONVEX_METRICS_REGISTRY.register(Box::new(concurrency_gauge.clone())) {
-@@ -534,6 +718,12 @@ impl ConvexHttpService {
+@@ -534,6 +724,12 @@ impl ConvexHttpService {
          let router = router
              .layer(
                  ServiceBuilder::new()
@@ -786,15 +783,21 @@ index 15fb45e787d7aa396f4b11aaabaad60eb15aec08..62ae1eb20ae7d22993736d8745b8b283
                      // Order important. Log/stats first because they are infallible.
                      .layer(axum::middleware::from_fn(tokio_instrumentation_middleware))
                      .layer(axum::middleware::from_fn(log_middleware))
-@@ -542,7 +732,6 @@ impl ConvexHttpService {
+@@ -542,13 +738,6 @@ impl ConvexHttpService {
                          stats_middleware::<RM>,
                      ))
                      .layer(axum::middleware::from_fn(client_version_state_middleware))
--                    .layer(GlobalConcurrencyLimitLayer::with_semaphore(semaphore))
+-                    .layer(axum::middleware::from_fn_with_state(
+-                        ConcurrencyLimit {
+-                            semaphore,
+-                            service_name,
+-                        },
+-                        concurrency_limit_middleware,
+-                    ))
                      .layer(tower_cookies::CookieManagerLayer::new())
                      .layer(HandleErrorLayer::new(|_: BoxError| async {
                          StatusCode::REQUEST_TIMEOUT
-@@ -555,6 +744,7 @@ impl ConvexHttpService {
+@@ -561,6 +750,7 @@ impl ConvexHttpService {
              router,
              version,
              _concurrency_gauge: Some(concurrency_gauge),
@@ -802,7 +805,7 @@ index 15fb45e787d7aa396f4b11aaabaad60eb15aec08..62ae1eb20ae7d22993736d8745b8b283
              service_name,
              meta_routes_enabled: true,
          }
-@@ -634,7 +824,6 @@ impl ConvexHttpService {
+@@ -640,7 +830,6 @@ impl ConvexHttpService {
              .await
          }
      }
@@ -810,7 +813,43 @@ index 15fb45e787d7aa396f4b11aaabaad60eb15aec08..62ae1eb20ae7d22993736d8745b8b283
  }
  
  /// Serves an HTTP server using the given service.
-@@ -1373,3 +1562,228 @@ where
+@@ -1122,35 +1311,6 @@ where
+     }
+ }
+ 
+-#[derive(Clone)]
+-struct ConcurrencyLimit {
+-    semaphore: Arc<tokio::sync::Semaphore>,
+-    service_name: &'static str,
+-}
+-
+-async fn concurrency_limit_middleware(
+-    State(limit): State<ConcurrencyLimit>,
+-    req: axum::extract::Request,
+-    next: axum::middleware::Next,
+-) -> Response {
+-    let _permit = match limit.semaphore.try_acquire() {
+-        Ok(permit) => permit,
+-        // `try_acquire` cannot overtake queued requests: the semaphore gives a
+-        // released permit to the longest waiter first.
+-        Err(_) => {
+-            let waiter = HttpPermitWaiter::new(limit.service_name);
+-            let permit = limit
+-                .semaphore
+-                .acquire()
+-                .await
+-                .expect("The HTTP concurrency semaphore is never closed");
+-            waiter.acquired();
+-            permit
+-        },
+-    };
+-    next.run(req).await
+-}
+-
+ async fn tokio_instrumentation_middleware(
+     req: axum::extract::Request,
+     next: axum::middleware::Next,
+@@ -1408,3 +1568,228 @@ where
          (key, value)
      })
  }
@@ -1040,7 +1079,7 @@ index 15fb45e787d7aa396f4b11aaabaad60eb15aec08..62ae1eb20ae7d22993736d8745b8b283
 +    }
 +}
 diff --git a/crates/common/src/knobs.rs b/crates/common/src/knobs.rs
-index d1cde308173d745dbf26494edce0d84494a13fe6..c56cce3dfc1319c2948815d9fc55b5f78394060a 100644
+index a6e3848da62af5300de374a3a2dbecc49dd31bf2..0b9ff1f0d39a6be524e5f3fdf4a4ca1761552bcd 100644
 --- a/crates/common/src/knobs.rs
 +++ b/crates/common/src/knobs.rs
 @@ -435,10 +435,22 @@ pub static SCHEMA_WORKER_WALK_CONCURRENCY: LazyLock<usize> =
@@ -1089,12 +1128,12 @@ index d1cde308173d745dbf26494edce0d84494a13fe6..c56cce3dfc1319c2948815d9fc55b5f7
      LazyLock::new(|| env_config_isolate_scheduler_usize_strict("FUNRUN_ISOLATE_ACTIVE_THREADS", 0));
  
 diff --git a/crates/common/src/lib.rs b/crates/common/src/lib.rs
-index 899d5260fc41718ad226b74a256286c2fd8caf05..55d925ad5861bb52b4801c4e242be5f08e55b882 100644
+index 9514cca439b51d5b425c0bb15f0e24f0b72a0d4e..39668ea28c78f45667121066af4d1bd2f9efb118 100644
 --- a/crates/common/src/lib.rs
 +++ b/crates/common/src/lib.rs
-@@ -23,6 +23,7 @@ pub mod comparators;
- pub mod components;
+@@ -24,6 +24,7 @@ pub mod components;
  pub mod coverage;
+ pub mod cron;
  pub mod deleted_bitset;
 +mod dependency_overflow;
  pub mod document;
@@ -1585,7 +1624,7 @@ index 7b64443592ff4998092a28209022ddaeebfa689b..8f7cbf7f86d8c2a5efbe53db994ad1b6
  
  You can increase the max concurrency on your self-hosted instance with these
 diff --git a/self-hosted/docker/docker-compose.yml b/self-hosted/docker/docker-compose.yml
-index 0cf2c78ea074fce2afdc9307db7fc68acea7f5f8..7fcd255c3b6573f42980fa7281e5b9cefa24e41c 100644
+index c71def93465f8723e4755cd1957972c1e9286d77..a02204ba37ecde88788f9e24ef9e2905a701bfe7 100644
 --- a/self-hosted/docker/docker-compose.yml
 +++ b/self-hosted/docker/docker-compose.yml
 @@ -38,6 +38,8 @@ services:
