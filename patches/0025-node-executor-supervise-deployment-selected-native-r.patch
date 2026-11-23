@@ -25,16 +25,20 @@ and keep process reaping and surge ownership bounded while optional teardown
 overlaps promotion. Preserve protocol-1 complete reaping before activation.
 Advertise warm-handover capability separately and cover blocked preparation,
 selection replacement, authority ordering, and confirmed child cleanup.
+
+Validate the expected native selection before staging a forced finish
+and again at Node cutover admission. Acknowledge a fresh finish only
+after reconciliation of the committed native selection succeeds.
 ---
  Cargo.lock                                    |    1 +
- crates/application/src/deploy_config.rs       |  162 ++
+ crates/application/src/deploy_config.rs       |  167 +-
  crates/application/src/lib.rs                 |    2 +
  .../src/system_table_cleanup/mod.rs           |  178 +-
  crates/common/src/knobs.rs                    |    6 +-
  .../src/environment/udf/async_syscall.rs      |   35 +-
  .../environment/udf/context_reuse_tests.rs    |    1 +
  crates/local_backend/src/deploy_config.rs     |    4 +-
- crates/local_backend/src/deploy_config2.rs    |   23 +
+ crates/local_backend/src/deploy_config2.rs    |   25 +
  .../src/deployment_operations.rs              |    2 +
  crates/local_backend/src/lib.rs               |   37 +-
  crates/local_backend/src/main.rs              |   16 +-
@@ -47,19 +51,20 @@ selection replacement, authority ordering, and confirmed child cleanup.
  crates/node_executor/Cargo.toml               |    8 +
  crates/node_executor/NATIVE_RESIDENTS.md      |  200 ++
  crates/node_executor/src/lib.rs               |    3 +
- crates/node_executor/src/local.rs             |   73 +-
+ crates/node_executor/src/local.rs             |   50 +-
  crates/node_executor/src/native.rs            | 1664 +++++++++++++++++
  crates/node_executor/src/native_logs.rs       |  200 ++
  crates/node_executor/src/process.rs           |   15 +
- crates/node_executor/src/routed.rs            |   62 +-
+ crates/node_executor/src/routed.rs            |   30 +-
  .../node_executor/testdata/native_resident.rs |  179 ++
  crates/node_executor/tests/native_resident.rs |  890 +++++++++
  patches/README.md                             |   25 +-
  patches/backend_memory_resilience/README.md   |   13 +-
  .../README.md                                 |    5 +-
  patches/native_residents/README.md            |   41 +
+ .../deployment_operations.md                  |   15 +-
  .../README.md                                 |   11 +-
- 33 files changed, 4161 insertions(+), 111 deletions(-)
+ 34 files changed, 4155 insertions(+), 84 deletions(-)
  create mode 100644 crates/local_backend/src/native_resident.rs
  create mode 100644 crates/model/src/source_packages/native.rs
  create mode 100644 crates/node_executor/NATIVE_RESIDENTS.md
@@ -83,7 +88,7 @@ index 5b5789bc966cc06e2e3d46ea87ae8891bd40d602..e62bc1dec7ea413d4d6d178738d9618e
   "udf",
   "value",
 diff --git a/crates/application/src/deploy_config.rs b/crates/application/src/deploy_config.rs
-index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d27256901d6f6979 100644
+index 06b963616244aa9e1e56d1d6af8904ea83b2667b..a27974baf101d981a21b7c8e2da2903078617a3c 100644
 --- a/crates/application/src/deploy_config.rs
 +++ b/crates/application/src/deploy_config.rs
 @@ -201,6 +201,31 @@ pub struct PushMetrics {
@@ -118,7 +123,23 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
  fn project_source_bytes(config: &ProjectConfig) -> anyhow::Result<usize> {
      let mut source_bytes = 0usize;
      for module in config
-@@ -1126,6 +1151,10 @@ impl<RT: Runtime> Application<RT> {
+@@ -1126,6 +1151,7 @@ impl<RT: Runtime> Application<RT> {
+         identity: Identity,
+         operation: Option<&FinishPushOperation>,
+         start_push: &StartPushResponse,
++        native_activation: Option<&model::source_packages::native::NativeResidentActivation>,
+         force_node_cutover: bool,
+     ) -> anyhow::Result<Option<(SerializedFinishPushDiff, Timestamp)>> {
+         if operation.is_none() && !force_node_cutover {
+@@ -1142,6 +1168,7 @@ impl<RT: Runtime> Application<RT> {
+         }
+         if force_node_cutover {
+             // Reject stale preparation before a forced cutover can interrupt running work.
++            validate_native_resident_activation_in_tx(&mut tx, native_activation).await?;
+             start_push.validate_environment_variables(&mut tx).await?;
+         }
+         Ok(None)
+@@ -1154,16 +1181,35 @@ impl<RT: Runtime> Application<RT> {
          request_metadata: RequestMetadata,
          mut start_push: StartPushResponse,
          message: Option<PushMessage>,
@@ -129,7 +150,6 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
          force_node_cutover: bool,
          operation: Option<FinishPushOperation>,
      ) -> anyhow::Result<(SerializedFinishPushDiff, Timestamp)> {
-@@ -1141,10 +1170,25 @@ impl<RT: Runtime> Application<RT> {
          let prepared = operation
              .as_ref()
              .and_then(|operation| operation.prepared.as_ref());
@@ -155,10 +175,11 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
              let package = if let Some(prepared) = prepared {
                  prepared
                      .packages
-@@ -1197,6 +1241,17 @@ impl<RT: Runtime> Application<RT> {
+@@ -1216,13 +1262,25 @@ impl<RT: Runtime> Application<RT> {
          // configured process budget.
          self.runner()
              .validate_node_executor_pool_topology(&committed_pool_topology)?;
+-        // Preparation can outlive a competing edit. Recheck at
 +
 +        let root_definition_path = ComponentDefinitionPath::root();
 +        if let Some(activation) = &native_resident_activation {
@@ -170,10 +191,18 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
 +                .native_resident = activation.target.clone();
 +        }
 +
-         let cutover_reservation = self
-             .runner()
-             .reserve_node_executor_pool_cutover(&committed_pool_topology, force_node_cutover)
-@@ -1210,6 +1265,16 @@ impl<RT: Runtime> Application<RT> {
++        // Preparation and native staging can outlive a competing edit. Recheck at
+         // source admission and keep the transaction's OCC fences below.
+         if let Some(replay) = self
+             .validate_finish_before_admission(
+                 identity.clone(),
+                 operation.as_ref(),
+                 &start_push,
++                native_resident_activation.as_ref(),
+                 force_node_cutover,
+             )
+             .await?
+@@ -1243,6 +1301,16 @@ impl<RT: Runtime> Application<RT> {
          }
  
          let finish_push_write_source = "finish_push";
@@ -190,7 +219,7 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
  
          let (diff, ts) = self
              .execute_with_audit_log_events_and_occ_retries_with_timestamp(
-@@ -1221,6 +1286,7 @@ impl<RT: Runtime> Application<RT> {
+@@ -1254,6 +1322,7 @@ impl<RT: Runtime> Application<RT> {
                      let operation = &operation;
                      let start_push = &start_push;
                      let message = &message;
@@ -198,7 +227,7 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
                      async move {
                          // Reading the bounded receipt table participates in OCC.
                          // Concurrent retries cannot both activate this operation.
-@@ -1229,6 +1295,11 @@ impl<RT: Runtime> Application<RT> {
+@@ -1262,6 +1331,11 @@ impl<RT: Runtime> Application<RT> {
                                  return Ok((FinishPushCommit::Replayed(diff, ts), vec![]));
                              }
                          }
@@ -207,10 +236,10 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
 +                            native_resident_activation.as_ref(),
 +                        )
 +                        .await?;
-                         // Validate that environment variables haven't changed since `start_push`.
-                         let environment_variables =
-                             EnvironmentVariablesModel::new(tx).get_all().await?;
-@@ -1377,6 +1448,7 @@ impl<RT: Runtime> Application<RT> {
+                         start_push.validate_environment_variables(tx).await?;
+                         let environment_variables = &start_push.environment_variables;
+ 
+@@ -1403,6 +1477,7 @@ impl<RT: Runtime> Application<RT> {
              },
          };
  
@@ -218,7 +247,7 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
          self.complete_node_executor_pool_cutover_after_commit(
              &committed_pool_topology,
              ts,
-@@ -1398,6 +1470,7 @@ impl<RT: Runtime> Application<RT> {
+@@ -1424,6 +1499,7 @@ impl<RT: Runtime> Application<RT> {
          schema_id: Option<String>,
          node_dependencies: Option<Vec<NodeDependencyJson>>,
          node_version: Option<NodeVersion>,
@@ -226,7 +255,7 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
          force_node_cutover: bool,
      ) -> anyhow::Result<(PushAnalytics, PushMetrics)> {
          use common::query_analysis_admission::{
-@@ -1459,6 +1532,7 @@ impl<RT: Runtime> Application<RT> {
+@@ -1485,6 +1561,7 @@ impl<RT: Runtime> Application<RT> {
                  // Note: This is not transactional with the rest of the deploy to avoid keeping
                  // a transaction open for a long time.
                  let mut tx = self.begin(Identity::system()).await?;
@@ -234,7 +263,7 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
                  let user_environment_variables =
                      EnvironmentVariablesModel::new(&mut tx).get_all().await?;
                  let system_env_var_overrides = system_env_var_overrides(&mut tx).await?;
-@@ -1481,6 +1555,9 @@ impl<RT: Runtime> Application<RT> {
+@@ -1507,6 +1584,9 @@ impl<RT: Runtime> Application<RT> {
                          force_node_cutover,
                      )
                      .await?;
@@ -244,7 +273,7 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
                  let (
                      ConfigMetadataAndSchema {
                          config_metadata,
-@@ -1504,6 +1581,7 @@ impl<RT: Runtime> Application<RT> {
+@@ -1530,6 +1610,7 @@ impl<RT: Runtime> Application<RT> {
                      )
                      .await?;
  
@@ -252,7 +281,7 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
                  self.complete_node_executor_pool_cutover_after_commit(
                      &committed_pool_topology,
                      commit_ts,
-@@ -1531,6 +1609,24 @@ impl<RT: Runtime> Application<RT> {
+@@ -1557,6 +1638,24 @@ impl<RT: Runtime> Application<RT> {
              })
              .await
      }
@@ -277,7 +306,7 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
  }
  
  fn validate_env_var_declarations(
-@@ -2676,6 +2772,7 @@ mod deployment_receipt_tests {
+@@ -2724,6 +2823,7 @@ mod deployment_receipt_tests {
          SourcePackage {
              storage_key: "deployment-receipt-test".try_into().unwrap(),
              sha256: Sha256Digest::from([1; 32]),
@@ -285,7 +314,7 @@ index 77f64111d739746af0e25a34268e22de86d2724e..d1d2f75ba69bb569ba57e5c6d2725690
              external_deps_package_id: None,
              package_size: Default::default(),
              node_version: None,
-@@ -2683,6 +2780,71 @@ mod deployment_receipt_tests {
+@@ -2731,6 +2831,71 @@ mod deployment_receipt_tests {
          }
      }
  
@@ -713,10 +742,10 @@ index ce09a67e2a6bec6d5b87eac54a000007fe42f8b4..36a7dee78c3aac379327d5ff85ba7ea3
          )
          .await?;
 diff --git a/crates/local_backend/src/deploy_config2.rs b/crates/local_backend/src/deploy_config2.rs
-index 64dcbf5cdffec44cd4d152ce31fb07e843d0cd13..2121782e539ce932cdc5f6f6c20be30f02196177 100644
+index 10f240518775b5e101d30eb764bba6ae6f214aa6..cdd8dc1b7c53eb1818936966c458139dacaaab56 100644
 --- a/crates/local_backend/src/deploy_config2.rs
 +++ b/crates/local_backend/src/deploy_config2.rs
-@@ -455,6 +455,8 @@ pub struct FinishPushRequest {
+@@ -463,6 +463,8 @@ pub struct FinishPushRequest {
      pub dry_run: bool,
      pub message: Option<String>,
      #[serde(default)]
@@ -725,17 +754,18 @@ index 64dcbf5cdffec44cd4d152ce31fb07e843d0cd13..2121782e539ce932cdc5f6f6c20be30f
      pub force_node_cutover: bool,
  }
  
-@@ -524,6 +526,22 @@ pub async fn finish_push_internal(
-         return Ok((SerializedFinishPushDiff::try_from(empty_diff)?, None));
+@@ -557,6 +559,7 @@ pub async fn finish_push_internal(
+             identity.clone(),
+             operation.as_ref(),
+             &start_push,
++            req.native_resident.as_ref(),
+             req.force_node_cutover,
+         )
+         .await?
+@@ -564,6 +567,15 @@ pub async fn finish_push_internal(
+         return Ok((diff, Some(ts)));
      }
  
-+    if let Some(operation) = &operation {
-+        let mut tx = st.application.begin(identity.clone()).await?;
-+        if let Some((diff, ts)) = operation.validate(&mut tx).await? {
-+            return Ok((diff, Some(ts)));
-+        }
-+    }
-+
 +    if let Some(activation) = &req.native_resident {
 +        activation.validate()?;
 +        if let Some(target) = &activation.target {
@@ -745,35 +775,43 @@ index 64dcbf5cdffec44cd4d152ce31fb07e843d0cd13..2121782e539ce932cdc5f6f6c20be30f
 +        }
 +    }
 +
-     let (resp, ts) = st
-         .application
-         .finish_push(
-@@ -531,6 +549,8 @@ pub async fn finish_push_internal(
-             request_metadata,
-             start_push,
-             message,
-+            req.native_resident,
-+            &st.native_resident,
-             req.force_node_cutover,
-             operation,
-         )
-@@ -542,6 +562,9 @@ pub async fn finish_push_internal(
-                 e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}"))
+     let st = st.clone();
+     // The accepted owner retains its prepared-operation lease until publication
+     // is terminal. Dropping an HTTP waiter must not advertise an idle finish
+@@ -576,6 +588,8 @@ pub async fn finish_push_internal(
+                 request_metadata,
+                 start_push,
+                 message,
++                req.native_resident,
++                &st.native_resident,
+                 req.force_node_cutover,
+                 operation,
+             )
+@@ -590,6 +604,17 @@ pub async fn finish_push_internal(
+         // A racing replay has the same historical-only meaning as the early
+         // return above. Only a fresh commit completes this handler's runtime handoff.
+         if !resp.is_activation_replay() {
++            crate::native_resident::reconcile(&st.application, &st.native_resident)
++                .await
++                .with_context(|| {
++                    ErrorMetadata::overloaded(
++                        "NativeResidentReconciliationFailedAfterCommit",
++                        format!(
++                            "Deployment committed at {ts}, but native resident selection \
++                             reconciliation failed."
++                        ),
++                    )
++                })?;
+             if let (Some(lease), Some(attempt)) = (prepared_lease, req.finish_attempt) {
+                 lease.complete(attempt);
              }
-         })?;
-+    // Read the durable head, including receipt replay and concurrent deployments.
-+    // The background reconciler repeats this if the HTTP caller disappears.
-+    crate::native_resident::reconcile(&st.application, &st.native_resident).await?;
-     Ok((resp, Some(ts)))
- }
- 
 diff --git a/crates/local_backend/src/deployment_operations.rs b/crates/local_backend/src/deployment_operations.rs
-index 57cd74ea4d54da7a289f1ca90672416b16b1c263..6ebc6247699549ce430bfbc625b3213f4ac751f5 100644
+index bc1ab4fe018f8d07852257834e4b552f6f3bc28c..17858439cc8fe0cbac6d1aa7cd4fa894b7ef0ead 100644
 --- a/crates/local_backend/src/deployment_operations.rs
 +++ b/crates/local_backend/src/deployment_operations.rs
-@@ -258,6 +258,8 @@ pub async fn capabilities(
-     Ok(axum::Json(json!({
-         "protocolVersion": 1,
+@@ -301,6 +301,8 @@ pub async fn capabilities(
+         "publicationStatusProtocol": 1,
+         "finishCompletionProtocol": 1,
          "mutationPriorityProtocol": if *common::knobs::ISOLATE_QUEUE_DELAY_CONTROL_ENABLED { 1 } else { 0 },
 +        "nativeResidentProtocol": 1,
 +        "nativeResidentWarmHandoverProtocol": 1,
@@ -1762,10 +1800,10 @@ index 0000000000000000000000000000000000000000..83b3f97d8bd5c5c9f4090fc715f39cee
 +artifact inputs. Follow the checkout's resource-guard instructions when running these
 +commands.
 diff --git a/crates/node_executor/src/lib.rs b/crates/node_executor/src/lib.rs
-index 713ada525d66077f42c61cfdb5cbdd28be98b0e7..936941e2b510245922482009bf1ce12b12b8114f 100644
+index 8fb516710fd43602b5106fd29323b79cb933083c..fa756f0b7c7160316da21f743734ebda962a5456 100644
 --- a/crates/node_executor/src/lib.rs
 +++ b/crates/node_executor/src/lib.rs
-@@ -9,7 +9,10 @@
+@@ -10,7 +10,10 @@ pub mod action_tree;
  mod executor;
  pub mod local;
  mod metrics;
@@ -1777,10 +1815,10 @@ index 713ada525d66077f42c61cfdb5cbdd28be98b0e7..936941e2b510245922482009bf1ce12b
  pub mod source_package;
  
 diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
-index 918adc82c75fd0e97ee25677cb317a1976d81aaf..41d3dcd2afbc4650a7ab4938773fbaeb9a51d01d 100644
+index 7c45206ee3085fd5fa9daa6498d08422854039a8..b4db6f3f02859be9d2932ec9eb17d8e0e6b8cc0e 100644
 --- a/crates/node_executor/src/local.rs
 +++ b/crates/node_executor/src/local.rs
-@@ -290,6 +290,8 @@ struct SurgeWaitRegistration {
+@@ -291,6 +291,8 @@ struct SurgeWaitRegistration {
  }
  
  impl SurgeCoordinator {
@@ -1789,49 +1827,22 @@ index 918adc82c75fd0e97ee25677cb317a1976d81aaf..41d3dcd2afbc4650a7ab4938773fbaeb
      pub(crate) fn new() -> Arc<Self> {
          crate::metrics::set_local_node_surge_phase("unused");
          crate::metrics::set_local_node_surge_queue("routine", 0);
-@@ -404,6 +406,41 @@ impl SurgeCoordinator {
+@@ -401,6 +403,14 @@ impl SurgeCoordinator {
          crate::metrics::set_local_node_surge_queue("deployment", state.deployment.len());
      }
  
 +    pub(crate) async fn acquire_deployment(self: &Arc<Self>, force: bool) -> SurgePermit {
-+        let acquire = self.acquire(SurgePriority::Deployment, Arc::from("deployment"));
-+        tokio::pin!(acquire);
-+        if force {
-+            let mut interval = tokio::time::interval(Duration::from_millis(100));
-+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-+            let mut preemption_requested = false;
-+            loop {
-+                // Register the waiter first. A protected deployment candidate
-+                // can later transfer the same permit to a reclaimable drain.
-+                tokio::select! {
-+                    biased;
-+                    permit = &mut acquire => return permit,
-+                    _ = interval.tick(), if !preemption_requested => {
-+                        if let Some(phase) = self.force_preempt_reclaimable() {
-+                            preemption_requested = true;
-+                            let event = if phase == "draining" {
-+                                "forced_drain_termination"
-+                            } else {
-+                                "forced_candidate_cancel"
-+                            };
-+                            crate::metrics::log_local_node_deployment_cutover_event(event);
-+                            tracing::warn!(
-+                                lifecycle_context = "deployment_cutover",
-+                                outcome = event,
-+                                "Forced local executor surge reclamation"
-+                            );
-+                        }
-+                    },
-+                }
-+            }
-+        }
-+        acquire.await
++        self.with_deployment_preemption(
++            force,
++            self.acquire(SurgePriority::Deployment, Arc::from("deployment")),
++        )
++        .await
 +    }
 +
-     pub(crate) fn force_preempt_reclaimable(&self) -> Option<&'static str> {
-         let state = self
-             .state
-@@ -432,7 +469,7 @@ impl SurgeCoordinator {
+     pub(crate) async fn with_deployment_preemption<F: Future>(
+         &self,
+         force: bool,
+@@ -476,7 +486,7 @@ impl SurgeCoordinator {
  }
  
  impl SurgePermit {
@@ -1840,7 +1851,7 @@ index 918adc82c75fd0e97ee25677cb317a1976d81aaf..41d3dcd2afbc4650a7ab4938773fbaeb
          self.inner.cleanup_required.store(true, Ordering::Release);
      }
  
-@@ -459,6 +496,12 @@ impl SurgePermit {
+@@ -503,6 +513,12 @@ impl SurgePermit {
          self.inner.cleanup_required.store(false, Ordering::Release);
      }
  
@@ -1850,10 +1861,10 @@ index 918adc82c75fd0e97ee25677cb317a1976d81aaf..41d3dcd2afbc4650a7ab4938773fbaeb
 +        self.inner.cleanup_required.store(false, Ordering::Release);
 +    }
 +
-     pub(crate) fn direct_child_cleanup_confirmed(&self) -> bool {
-         !self.inner.cleanup_required.load(Ordering::Acquire)
-     }
-@@ -4394,27 +4437,15 @@ impl InnerLocalNodeExecutor {
+     pub(crate) fn set_phase(&self, phase: &'static str) {
+         let mut state = self
+             .inner
+@@ -4461,27 +4477,15 @@ impl InnerLocalNodeExecutor {
                  "probe_failed"
              },
          };
@@ -1889,6 +1900,17 @@ index 918adc82c75fd0e97ee25677cb317a1976d81aaf..41d3dcd2afbc4650a7ab4938773fbaeb
          let exit_class = Self::record_child_exit(pool_name, status);
          Ok(ChildTerminationObservation {
              state_before,
+@@ -8394,9 +8398,7 @@ mod tests {
+     #[tokio::test]
+     async fn rolling_reservation_protects_each_candidate_and_can_force_each_drain() {
+         let coordinator = SurgeCoordinator::new();
+-        let mut session = coordinator
+-            .acquire(SurgePriority::Deployment, Arc::from("deployment"))
+-            .await;
++        let mut session = coordinator.acquire_deployment(false).await;
+         let first = session.clone();
+         first.set_phase("draining");
+         let mut waiter = None;
 diff --git a/crates/node_executor/src/native.rs b/crates/node_executor/src/native.rs
 new file mode 100644
 index 0000000000000000000000000000000000000000..94d280399690a64ac790cb59a583c010af5502ee
@@ -3787,7 +3809,7 @@ index 0000000000000000000000000000000000000000..7d6e3b7cc0e0377a668a1fa94674c32e
 +    Ok((requested, child.wait().await?))
 +}
 diff --git a/crates/node_executor/src/routed.rs b/crates/node_executor/src/routed.rs
-index 56266096f381aea6a2332149ac0570e3a5e76fc6..6b1a465d28114ff9bfcb2085d65332bebf4f1054 100644
+index 5da999b3f2417eb53252352ab0335f95271d0b91..5fb181eef665a3018560078e3667638898888f2a 100644
 --- a/crates/node_executor/src/routed.rs
 +++ b/crates/node_executor/src/routed.rs
 @@ -20,6 +20,7 @@ use std::{
@@ -3798,16 +3820,15 @@ index 56266096f381aea6a2332149ac0570e3a5e76fc6..6b1a465d28114ff9bfcb2085d65332be
  use async_trait::async_trait;
  use common::{
      execution_start::FunctionExecutionStartGate,
-@@ -74,8 +75,6 @@ use crate::{
+@@ -74,7 +75,6 @@ use crate::{
  const MAX_NAMED_POOLS: usize = 8;
  const MAX_SYSTEM_OPERATION_WAITERS: usize = 8;
  const SYSTEM_OPERATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 -const DEPLOYMENT_CUTOVER_ADMISSION_TIMEOUT: Duration = Duration::from_secs(120);
--const FORCED_CUTOVER_PREEMPTION_INTERVAL: Duration = Duration::from_millis(100);
  const ENVIRONMENT_FINGERPRINT_VERSION: &[u8] = b"local-node-environment-v1";
  
  struct SystemOperationWaiter {
-@@ -1483,6 +1482,19 @@ impl RoutedLocalNodeExecutorConfig {
+@@ -1486,6 +1486,19 @@ impl RoutedLocalNodeExecutorConfig {
  }
  
  impl RoutedLocalNodeExecutor {
@@ -3827,7 +3848,7 @@ index 56266096f381aea6a2332149ac0570e3a5e76fc6..6b1a465d28114ff9bfcb2085d65332be
      pub async fn new_with_configuration(
          config: RoutedLocalNodeExecutorConfig,
      ) -> anyhow::Result<Self> {
-@@ -2359,6 +2371,11 @@ fn calculate_local_node_rss_budget(
+@@ -2445,6 +2458,11 @@ fn calculate_local_node_rss_budget(
              .ok_or_else(|| anyhow::anyhow!("Required Node executor steady RSS budget overflow"))?;
          surge_bytes = surge_bytes.max(named_rss_bytes);
      }
@@ -3839,61 +3860,23 @@ index 56266096f381aea6a2332149ac0570e3a5e76fc6..6b1a465d28114ff9bfcb2085d65332be
      let required_bytes = steady_bytes
          .checked_add(surge_bytes)
          .ok_or_else(|| anyhow::anyhow!("Required Node executor RSS budget overflow"))?;
-@@ -2631,44 +2648,7 @@ async fn acquire_deployment_cutover_permit(
-     shutting_down: &AtomicBool,
-     shutdown_changed: &Notify,
- ) -> anyhow::Result<crate::local::SurgePermit> {
--    let acquire = async {
--        let acquire = coordinator.acquire(
--            crate::local::SurgePriority::Deployment,
--            Arc::from("deployment"),
--        );
--        tokio::pin!(acquire);
--        if force {
--            let mut preemption_interval = tokio::time::interval(FORCED_CUTOVER_PREEMPTION_INTERVAL);
--            preemption_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
--            let mut preemption_requested = false;
--            loop {
--                // Poll acquisition first so the deployment registers before it
--                // signals the current owner. Recheck because an unstealable
--                // deployment candidate can later become a reclaimable drain.
--                tokio::select! {
--                    biased;
--                    permit = &mut acquire => return permit,
--                    _ = preemption_interval.tick(), if !preemption_requested => {
--                        if let Some(phase) = coordinator.force_preempt_reclaimable() {
--                            preemption_requested = true;
--                            let event = if phase == "draining" {
--                                "forced_drain_termination"
--                            } else {
--                                "forced_candidate_cancel"
--                            };
--                            crate::metrics::log_local_node_deployment_cutover_event(event);
--                            tracing::warn!(
--                                lifecycle_context = "deployment_cutover",
--                                outcome = event,
--                                "Forced local Node executor surge reclamation"
--                            );
--                        }
--                    },
--                }
--            }
--        }
--        acquire.await
--    };
-+    let acquire = coordinator.acquire_deployment(force);
-     tokio::select! {
-         result = tokio::time::timeout(timeout, acquire) => match result {
-             Ok(permit) => {
-@@ -2988,7 +2968,7 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
-         let coordinator = self.local_config.surge_coordinator();
-         let permit = acquire_deployment_cutover_permit(
-             &coordinator,
--            DEPLOYMENT_CUTOVER_ADMISSION_TIMEOUT,
+@@ -2999,9 +3017,13 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
+             !self.shutting_down.load(Ordering::Acquire),
+             "Local Node executor router is shutting down"
+         );
+-        self.reserve_deployment_cutover(topology, force, DEPLOYMENT_CUTOVER_ADMISSION_TIMEOUT)
+-            .await
+-            .map(Some)
++        self.reserve_deployment_cutover(
++            topology,
++            force,
 +            crate::local::SurgeCoordinator::DEPLOYMENT_ADMISSION_TIMEOUT,
-             force,
-             &self.shutting_down,
-             &self.shutdown_changed,
++        )
++        .await
++        .map(Some)
+     }
+ 
+     async fn complete_pool_cutover(
 diff --git a/crates/node_executor/testdata/native_resident.rs b/crates/node_executor/testdata/native_resident.rs
 new file mode 100644
 index 0000000000000000000000000000000000000000..d642ec4879233b02a2b59a37ccb01e8692c50f66
@@ -5110,11 +5093,51 @@ index 0000000000000000000000000000000000000000..5e02a94f26d0777d3a301b4b9807b627
 +and when HTTP shedding is disabled but reclamation is enabled. Controller tests cover
 +both signals, recovery hysteresis and unchanged-sample notification behavior; native
 +process tests retain interruption, restart and confirmed-reaping coverage.
+diff --git a/patches/non_committing_codegen_analysis/deployment_operations.md b/patches/non_committing_codegen_analysis/deployment_operations.md
+index 957f474729f7cbc2d22dd4d4df2f338064694493..30ceee54ffb17abc6a690d9c471f0c9d81fe4647 100644
+--- a/patches/non_committing_codegen_analysis/deployment_operations.md
++++ b/patches/non_committing_codegen_analysis/deployment_operations.md
+@@ -158,8 +158,8 @@ hide a later activation from this check.
+ 
+ Finish checks retained generation and canonical URL authority before source
+ resolution and cutover admission, then repeats those reads in its activation
+-transaction. Forced finishes also check the user environment before Node cutover
+-admission.
++transaction. Forced finishes also check the user environment and committed native
++selection before native staging and again at Node cutover admission.
+ An already-superseded preparation cannot enter force-capable cutover admission.
+ A matching receipt is returned before these checks, so a
+ newer deployment does not invalidate historical replay.
+@@ -175,7 +175,7 @@ admission before the first commit could otherwise force the first owner's
+ draining Node generation to stop or wait unnecessarily for its capacity.
+ 
+ Finish identity includes the complete typed `startPush`, `dryRun`, `message`,
+-and `forceNodeCutover`.
++`forceNodeCutover`, and the native selection.
+ It excludes credentials, the operation ID, the session ID, and the optional
+ finish attempt ID.
+ Dry-run finishes still require retained preparation with unchanged generation
+@@ -203,9 +203,12 @@ When capabilities advertise `finishCompletionProtocol: 1`, a client can send a
+ fresh UUID in `finishAttempt` on a non-dry-run finish with both `operationId`
+ and `operationSessionId`. Persist all three before sending the request. A
+ successful response with `activationReplay` proves only a historical source
+-commit. A fresh finish returns success after Node cutover, even if its HTTP waiter
+-disconnected. A cutover failure reports `NodeExecutorCutoverFailedAfterCommit`
+-without acknowledging the attempt.
++commit. A fresh finish returns success after Node cutover and reconciliation of
++the durable native selection. This records completion of that handler, even if
++its HTTP waiter disconnected. A failed Node cutover reports
++`NodeExecutorCutoverFailedAfterCommit`. A failure to reconcile the native
++selection reports `NativeResidentReconciliationFailedAfterCommit`. Neither
++failure acknowledges the attempt. Native process readiness has its own status.
+ 
+ After a lost response, send the operation and session IDs to `operations/cancel`.
+ An `active` finish retains ownership through publication, even after cancellation
 diff --git a/patches/pinned_local_node_executor_pools/README.md b/patches/pinned_local_node_executor_pools/README.md
-index 49ac276dc50ca8f13a01e6b700f406e8eecc569d..fcbbaa7849b17afcbfd047e7a57df2d2ae1fda14 100644
+index d7baae4c2477a0fb8448071443be716561a71b68..663e8dbc281d5592316cdea8f445b7db7cb62f74 100644
 --- a/patches/pinned_local_node_executor_pools/README.md
 +++ b/patches/pinned_local_node_executor_pools/README.md
-@@ -442,12 +442,19 @@ allowance. A deployment therefore requires:
+@@ -462,12 +462,19 @@ allowance. A deployment therefore requires:
  (N + 3) * LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES
  ```
  

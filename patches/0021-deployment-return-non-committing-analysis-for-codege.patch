@@ -12,22 +12,30 @@ Document the matching CLI protocol, backend-first rollout, residual analysis sid
 Bound whole deployment jobs and authenticated HTTP intake across legacy and negotiated operations. Retain preparation and Node ownership through terminal cleanup, expose process-local status and explicit cancellation, and use an exclusive finish lease before force-capable cutover. Keep dependencies and live work within existing capacity.
 
 Avoid archive uploads for V8-only preflight while retaining canonical compressed-size validation. Reuse authoritative prepared sources, validate environment and activation generation inside the transaction, order source records through OCC, and commit replay-safe historical receipts atomically with activation. Preserve limits and hard memory-headroom rejection.
+
+Bind publication status and fresh finish acknowledgements to the prepared
+operation, process session and client attempt. Retain the finish owner
+through HTTP disconnect, Node cutover and cleanup. A historical receipt
+can replay the committed response but cannot acknowledge a new attempt.
+
+Reject stale forced finishes before admission and repeat preparation
+checks at cutover and in the activation transaction.
 ---
- .../src/application_function_runner/mod.rs    |   26 +-
- crates/application/src/deploy_config.rs       | 1104 +++++++++++++++--
+ .../src/application_function_runner/mod.rs    |   25 +-
+ crates/application/src/deploy_config.rs       | 1145 ++++++++++++++--
  crates/application/src/lib.rs                 |  189 ++-
  crates/common/src/http/mod.rs                 |  317 ++++-
  crates/common/src/knobs.rs                    |   10 +
  crates/database/src/transaction.rs            |   16 +-
- crates/local_backend/src/deploy_config2.rs    |   99 +-
- .../src/deployment_operations.rs              |  927 ++++++++++++++
+ crates/local_backend/src/deploy_config2.rs    |  180 ++-
+ .../src/deployment_operations.rs              | 1190 +++++++++++++++++
  crates/local_backend/src/lib.rs               |    3 +
  crates/local_backend/src/main.rs              |   19 +-
  crates/local_backend/src/memory_metrics.rs    |   35 +-
  crates/local_backend/src/proxy.rs             |    1 +
  crates/local_backend/src/router.rs            |   16 +
  crates/model/src/components/config.rs         |    2 +-
- crates/model/src/components/type_checking.rs  |  210 +++-
+ crates/model/src/components/type_checking.rs  |  210 ++-
  crates/model/src/components/types.rs          |   13 +-
  crates/model/src/deployment_receipts.rs       |  162 +++
  crates/model/src/lib.rs                       |    2 +
@@ -45,12 +53,12 @@ Avoid archive uploads for V8-only preflight while retaining canonical compressed
  patches/README.md                             |   55 +-
  patches/backend_memory_resilience/README.md   |    7 +
  .../non_committing_codegen_analysis/README.md |  158 +++
- .../deployment_operations.md                  |  226 ++++
+ .../deployment_operations.md                  |  256 ++++
  .../README.md                                 |   36 +-
  patches/shared_base_http_admission/README.md  |   38 +-
  self-hosted/advanced/knobs.md                 |   42 +-
  self-hosted/docker/docker-compose.yml         |    5 +
- 37 files changed, 3922 insertions(+), 427 deletions(-)
+ 37 files changed, 4320 insertions(+), 443 deletions(-)
  create mode 100644 crates/local_backend/src/deployment_operations.rs
  create mode 100644 crates/model/src/deployment_receipts.rs
  create mode 100644 npm-packages/convex/src/cli/lib/deploy2.test.ts
@@ -58,23 +66,23 @@ Avoid archive uploads for V8-only preflight while retaining canonical compressed
  create mode 100644 patches/non_committing_codegen_analysis/deployment_operations.md
 
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index dec73f00e6327a8d08c7e1b91a2d83c825be2b49..26ba386337877cb534631ca8b5a095159ec1b6f5 100644
+index 2165c1be2bc994d49a70bb08d0466facbb9437dd..760f13967eb4c37a458d7b01972031725c34cd77 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
-@@ -2024,8 +2024,11 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
-                 })
-             },
-             ModuleEnvironment::Node => {
-+                // Unchanged module rows can retain an older package ID. Match
-+                // the activation record used by post-commit cutover so a new
-+                // action snapshot cannot rotate back to that older package.
-                 let source_package = SourcePackageModel::new(&mut tx, path.component.into())
--                    .get_latest()
-+                    .get_latest_record()
-                     .await?
-                     .context("no source package?")?;
-                 // Deployment publication is an eager fast path. Reconcile from the
-@@ -2311,7 +2314,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1993,9 +1993,11 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+                 ModuleEnvironment::Isolate => ActionRuntime::Isolate,
+                 ModuleEnvironment::Invalid => ActionRuntime::Invalid,
+                 ModuleEnvironment::Node => {
++                    // Unchanged module rows can retain an older package ID. Use the same
++                    // activation record as deployment cutover.
+                     let source_package =
+                         SourcePackageModel::new(&mut tx, path_and_args.path().component.into())
+-                            .get_latest()
++                            .get_latest_record()
+                             .await?
+                             .context("no source package?")?;
+                     let mut environment_variables =
+@@ -2387,7 +2389,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          &self,
          udf_config: UdfConfig,
          new_modules: Vec<ModuleConfig>,
@@ -83,7 +91,7 @@ index dec73f00e6327a8d08c7e1b91a2d83c825be2b49..26ba386337877cb534631ca8b5a09515
          user_environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
          system_env_var_overrides: BTreeMap<EnvVarName, EnvVarValue>,
      ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
-@@ -2333,10 +2336,14 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2409,10 +2411,14 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              self.query_analysis_admission.clone(),
          );
  
@@ -98,7 +106,7 @@ index dec73f00e6327a8d08c7e1b91a2d83c825be2b49..26ba386337877cb534631ca8b5a09515
              for path_str in ["schema.js", "crons.js", "http.js"] {
                  let path = path_str
                      .parse()
-@@ -2433,7 +2440,20 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2509,7 +2515,20 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              }
          };
  
@@ -121,7 +129,7 @@ index dec73f00e6327a8d08c7e1b91a2d83c825be2b49..26ba386337877cb534631ca8b5a09515
              Ok(modules) => result.extend(modules),
              Err(e) => return Ok(Err(e)),
 diff --git a/crates/application/src/deploy_config.rs b/crates/application/src/deploy_config.rs
-index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de86d2724e 100644
+index 91db22cd5693785b4ba82effc4980eac0e9722e9..06b963616244aa9e1e56d1d6af8904ea83b2667b 100644
 --- a/crates/application/src/deploy_config.rs
 +++ b/crates/application/src/deploy_config.rs
 @@ -11,6 +11,14 @@ use std::{
@@ -530,7 +538,42 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
          .await
      }
  
-@@ -918,12 +1127,39 @@ impl<RT: Runtime> Application<RT> {
+@@ -910,6 +1119,34 @@ impl<RT: Runtime> Application<RT> {
+         Ok((status, token))
+     }
+ 
++    /// Check preparation before force-capable admission. A replay here is
++    /// terminal and precedes any activation or runtime handover.
++    pub async fn validate_finish_before_admission(
++        &self,
++        identity: Identity,
++        operation: Option<&FinishPushOperation>,
++        start_push: &StartPushResponse,
++        force_node_cutover: bool,
++    ) -> anyhow::Result<Option<(SerializedFinishPushDiff, Timestamp)>> {
++        if operation.is_none() && !force_node_cutover {
++            return Ok(None);
++        }
++        let mut tx = self.begin(identity).await?;
++        if let Some(operation) = operation
++            && let Some(replay) = operation.validate(&mut tx).await?
++        {
++            DEPLOYMENT_FINISH_EVENTS_TOTAL
++                .with_label_values(&["historical_replay"])
++                .inc();
++            return Ok(Some(replay));
++        }
++        if force_node_cutover {
++            // Reject stale preparation before a forced cutover can interrupt running work.
++            start_push.validate_environment_variables(&mut tx).await?;
++        }
++        Ok(None)
++    }
++
+     #[fastrace::trace]
+     pub async fn finish_push(
+         &self,
+@@ -918,12 +1155,30 @@ impl<RT: Runtime> Application<RT> {
          mut start_push: StartPushResponse,
          message: Option<PushMessage>,
          force_node_cutover: bool,
@@ -539,15 +582,6 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
 -        // in the database.
 +        operation: Option<FinishPushOperation>,
 +    ) -> anyhow::Result<(SerializedFinishPushDiff, Timestamp)> {
-+        if let Some(operation) = &operation {
-+            let mut tx = self.begin(identity.clone()).await?;
-+            if let Some(replay) = operation.validate(&mut tx).await? {
-+                DEPLOYMENT_FINISH_EVENTS_TOTAL
-+                    .with_label_values(&["historical_replay"])
-+                    .inc();
-+                return Ok(replay);
-+            }
-+        }
 +        let prepared = operation
 +            .as_ref()
 +            .and_then(|operation| operation.prepared.as_ref());
@@ -574,7 +608,7 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
              if !definition_path.is_root() {
                  anyhow::ensure!(
                      package.values().all(|module| {
-@@ -937,12 +1173,18 @@ impl<RT: Runtime> Application<RT> {
+@@ -937,12 +1192,18 @@ impl<RT: Runtime> Application<RT> {
                  );
              }
              // `StartPushResponse` crosses a client round trip before this point.
@@ -595,7 +629,31 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
          let committed_pool_topology = start_push
              .component_definition_packages
              .get(&ComponentDefinitionPath::root())
-@@ -976,10 +1218,17 @@ impl<RT: Runtime> Application<RT> {
+@@ -955,10 +1216,20 @@ impl<RT: Runtime> Application<RT> {
+         // configured process budget.
+         self.runner()
+             .validate_node_executor_pool_topology(&committed_pool_topology)?;
+-        if force_node_cutover {
+-            let mut tx = self.begin(identity.clone()).await?;
+-            start_push.validate_environment_variables(&mut tx).await?;
++        // Preparation can outlive a competing edit. Recheck at
++        // source admission and keep the transaction's OCC fences below.
++        if let Some(replay) = self
++            .validate_finish_before_admission(
++                identity.clone(),
++                operation.as_ref(),
++                &start_push,
++                force_node_cutover,
++            )
++            .await?
++        {
++            return Ok(replay);
+         }
++
+         let cutover_reservation = self
+             .runner()
+             .reserve_node_executor_pool_cutover(&committed_pool_topology, force_node_cutover)
+@@ -980,10 +1251,17 @@ impl<RT: Runtime> Application<RT> {
                  finish_push_write_source,
                  *FINISH_PUSH_MAX_OCC_FAILURES,
                  |tx| {
@@ -611,10 +669,10 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
 +                                return Ok((FinishPushCommit::Replayed(diff, ts), vec![]));
 +                            }
 +                        }
-                         // Validate that environment variables haven't changed since `start_push`.
-                         let environment_variables =
-                             EnvironmentVariablesModel::new(tx).get_all().await?;
-@@ -1077,7 +1326,18 @@ impl<RT: Runtime> Application<RT> {
+                         start_push.validate_environment_variables(tx).await?;
+                         let environment_variables = &start_push.environment_variables;
+ 
+@@ -1074,7 +1352,18 @@ impl<RT: Runtime> Application<RT> {
                              definition_diffs,
                              component_diffs,
                          };
@@ -634,7 +692,7 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
                      }
                      .in_span(Span::enter_with_local_parent("finish_push_tx"))
                      .into()
-@@ -1100,6 +1360,23 @@ impl<RT: Runtime> Application<RT> {
+@@ -1097,6 +1386,23 @@ impl<RT: Runtime> Application<RT> {
                  }
              })?;
  
@@ -658,7 +716,7 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
          self.complete_node_executor_pool_cutover_after_commit(
              &committed_pool_topology,
              ts,
-@@ -1123,105 +1400,136 @@ impl<RT: Runtime> Application<RT> {
+@@ -1120,105 +1426,136 @@ impl<RT: Runtime> Application<RT> {
          node_version: Option<NodeVersion>,
          force_node_cutover: bool,
      ) -> anyhow::Result<(PushAnalytics, PushMetrics)> {
@@ -890,7 +948,7 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
      }
  }
  
-@@ -1252,12 +1560,10 @@ fn validate_env_var_declarations(
+@@ -1249,12 +1586,10 @@ fn validate_env_var_declarations(
  
  /// Convex code push is a multiphase process.
  ///
@@ -907,7 +965,7 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
  #[derive(Deserialize, Debug)]
  #[serde(rename_all = "camelCase")]
  pub struct StartPushRequest {
-@@ -1275,10 +1581,17 @@ pub struct StartPushRequest {
+@@ -1272,10 +1607,17 @@ pub struct StartPushRequest {
      #[serde(default)]
      pub dry_run: bool,
  
@@ -927,7 +985,7 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
  }
  
  impl StartPushRequest {
-@@ -1307,6 +1620,7 @@ impl StartPushRequest {
+@@ -1304,6 +1646,7 @@ impl StartPushRequest {
              node_version,
              dry_run: self.dry_run,
              for_codegen: self.for_codegen,
@@ -935,7 +993,7 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
          })
      }
  }
-@@ -1333,10 +1647,79 @@ pub struct StartPushResult {
+@@ -1346,10 +1689,79 @@ pub struct StartPushResult {
      pub response: StartPushResponse,
      /// All runtime function modules in the app component
      pub app_functions: Vec<ModuleConfig>,
@@ -1015,7 +1073,7 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
      pub schema_change: SchemaChange,
  }
  
-@@ -1757,6 +2140,22 @@ fn discarded_staged_validators(
+@@ -1770,6 +2182,22 @@ fn discarded_staged_validators(
      discarded
  }
  
@@ -1038,7 +1096,7 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
  impl From<NodeDependencyJson> for NodeDependency {
      fn from(value: NodeDependencyJson) -> Self {
          Self {
-@@ -2009,6 +2408,89 @@ pub struct NodeDependencyJson {
+@@ -2022,6 +2450,95 @@ pub struct NodeDependencyJson {
      version: String,
  }
  
@@ -1097,6 +1155,12 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
 +    component_diffs: BTreeMap<String, SerializedComponentDiff>,
 +}
 +
++impl SerializedFinishPushDiff {
++    pub fn is_activation_replay(&self) -> bool {
++        self.activation_replay.is_some()
++    }
++}
++
 +impl TryFrom<FinishPushDiff> for SerializedFinishPushDiff {
 +    type Error = anyhow::Error;
 +
@@ -1128,7 +1192,7 @@ index 0e2b633f4ae2b34d3e84555a654fb4e88ce31c46..77f64111d739746af0e25a34268e22de
  #[derive(Debug, Default)]
  pub struct FinishPushDiff {
      pub auth_diff: AuthDiff,
-@@ -2142,6 +2624,358 @@ mod node_pool_tests {
+@@ -2155,6 +2672,358 @@ mod node_pool_tests {
      }
  }
  
@@ -2322,10 +2386,18 @@ index 4b2ba646b0162aebdbf1f0f24aa57d74e9a70d3a..605291145e17e593940d5de15ebcc8b4
      }
  
 diff --git a/crates/local_backend/src/deploy_config2.rs b/crates/local_backend/src/deploy_config2.rs
-index 0f742de520f0b679693a19328a1eed20d4da46f8..64dcbf5cdffec44cd4d152ce31fb07e843d0cd13 100644
+index 0f742de520f0b679693a19328a1eed20d4da46f8..10f240518775b5e101d30eb764bba6ae6f214aa6 100644
 --- a/crates/local_backend/src/deploy_config2.rs
 +++ b/crates/local_backend/src/deploy_config2.rs
-@@ -43,13 +43,8 @@ use errors::{
+@@ -3,6 +3,7 @@ use std::{
+     time::Duration,
+ };
+ 
++use anyhow::Context;
+ use application::deploy_config::{
+     ComponentSchemaPrediction,
+     EvaluatePushResponse,
+@@ -43,13 +44,8 @@ use errors::{
      ErrorMetadataAnyhowExt,
  };
  use model::{
@@ -2340,7 +2412,7 @@ index 0f742de520f0b679693a19328a1eed20d4da46f8..64dcbf5cdffec44cd4d152ce31fb07e8
          type_checking::SerializedCheckedComponent,
          types::SerializedEvaluatedComponentDefinition,
      },
-@@ -196,6 +191,15 @@ impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
+@@ -196,6 +192,15 @@ impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
  
      fn try_from(value: EvaluatePushResponse) -> Result<Self, Self::Error> {
          Ok(Self {
@@ -2356,7 +2428,7 @@ index 0f742de520f0b679693a19328a1eed20d4da46f8..64dcbf5cdffec44cd4d152ce31fb07e8
              schema_change: value.schema_change.try_into()?,
          })
      }
-@@ -204,6 +208,8 @@ impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
+@@ -204,6 +209,8 @@ impl TryFrom<EvaluatePushResponse> for SerializedEvaluatePushResponse {
  #[derive(Deserialize, Serialize)]
  #[serde(rename_all = "camelCase")]
  pub struct SerializedEvaluatePushResponse {
@@ -2365,7 +2437,7 @@ index 0f742de520f0b679693a19328a1eed20d4da46f8..64dcbf5cdffec44cd4d152ce31fb07e8
      schema_change: SerializedSchemaChange,
  }
  
-@@ -355,10 +361,10 @@ pub async fn start_push(
+@@ -355,10 +362,10 @@ pub async fn start_push(
      )?))
  }
  
@@ -2380,7 +2452,7 @@ index 0f742de520f0b679693a19328a1eed20d4da46f8..64dcbf5cdffec44cd4d152ce31fb07e8
  pub async fn evaluate_push(
      MtState(st): MtState<LocalAppState>,
      Json(req): Json<StartPushRequest>,
-@@ -437,10 +443,14 @@ pub async fn wait_for_schema(
+@@ -437,10 +444,21 @@ pub async fn wait_for_schema(
      Ok(Json(SchemaStatusJson::from(resp)))
  }
  
@@ -2393,26 +2465,52 @@ index 0f742de520f0b679693a19328a1eed20d4da46f8..64dcbf5cdffec44cd4d152ce31fb07e8
 +    /// Omitted by legacy clients. Identifies a bounded durable finish replay.
 +    #[serde(default, skip_serializing)]
 +    pub operation_id: Option<String>,
++    #[serde(default, skip_serializing)]
++    pub operation_session_id: Option<String>,
++    /// Correlates a lost response with completion of this exact handler.
++    /// Transport identity is independent of the durable activation replay
++    /// identity.
++    #[serde(default, skip_serializing)]
++    finish_attempt: Option<common::execution_context::ExecutionId>,
      start_push: SerializedStartPushResponse,
      pub dry_run: bool,
      pub message: Option<String>,
-@@ -462,6 +472,32 @@ pub async fn finish_push_internal(
+@@ -462,6 +480,51 @@ pub async fn finish_push_internal(
      .await?;
      identity.require_operation(keybroker::DeploymentOp::Deploy)?;
  
++    anyhow::ensure!(
++        req.finish_attempt.is_none() || (req.operation_session_id.is_some() && !req.dry_run),
++        ErrorMetadata::bad_request(
++            "InvalidDeploymentOperation",
++            "A finish attempt requires a session-bound publication"
++        )
++    );
++    if req.operation_session_id.is_some() {
++        anyhow::ensure!(
++            req.operation_id.is_some(),
++            ErrorMetadata::bad_request(
++                "InvalidDeploymentOperation",
++                "A deployment operation session requires an operation ID"
++            )
++        );
++    }
++
 +    // The exclusive prepared lease precedes receipt lookup and force-capable
 +    // cutover admission. Keep it through the application call, even if cancel
 +    // or expiry revokes preparation while this finish still owns its sources.
-+    let (_prepared_lease, operation) = if let Some(operation_id) = &req.operation_id {
++    let (prepared_lease, operation) = if let Some(operation_id) = &req.operation_id {
 +        let expires = crate::deployment_operations::operation_expiry(
 +            operation_id,
 +            st.deployment_operations.now(),
 +        )?;
 +        let input_sha256 =
 +            crate::deployment_operations::normalized_digest(&mut serde_json::to_value(&req)?)?;
-+        let prepared = st
-+            .deployment_operations
-+            .prepared(operation_id, serde_json::to_value(&req.start_push)?)?;
++        let prepared = st.deployment_operations.prepared(
++            operation_id,
++            req.operation_session_id.as_deref(),
++            serde_json::to_value(&req.start_push)?,
++        )?;
 +        let operation = application::deploy_config::FinishPushOperation {
 +            operation_id: operation_id.clone(),
 +            input_sha256: input_sha256.as_hex(),
@@ -2429,7 +2527,7 @@ index 0f742de520f0b679693a19328a1eed20d4da46f8..64dcbf5cdffec44cd4d152ce31fb07e8
      if req.force_node_cutover && !req.dry_run {
          anyhow::ensure!(
              req.start_push.node_executor_cutover_protocol_version == Some(1),
-@@ -474,9 +510,15 @@ pub async fn finish_push_internal(
+@@ -474,32 +537,67 @@ pub async fn finish_push_internal(
      let start_push = StartPushResponse::try_from(req.start_push)?;
      let message = req.message.map(PushMessage::try_from).transpose()?;
  
@@ -2447,24 +2545,73 @@ index 0f742de520f0b679693a19328a1eed20d4da46f8..64dcbf5cdffec44cd4d152ce31fb07e8
          tracing::info!("Skipping finish_push in dry run");
          let empty_diff = FinishPushDiff::default();
          return Ok((SerializedFinishPushDiff::try_from(empty_diff)?, None));
-@@ -490,6 +532,7 @@ pub async fn finish_push_internal(
-             start_push,
-             message,
+     }
+ 
+-    let (resp, ts) = st
++    if let Some((diff, ts)) = st
+         .application
+-        .finish_push(
+-            identity,
+-            request_metadata,
+-            start_push,
+-            message,
++        .validate_finish_before_admission(
++            identity.clone(),
++            operation.as_ref(),
++            &start_push,
              req.force_node_cutover,
-+            operation,
          )
-         .await
-         .map_err(|e| {
-@@ -499,7 +542,7 @@ pub async fn finish_push_internal(
-                 e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}"))
+-        .await
+-        .map_err(|e| {
+-            if e.short_msg() == "NodeExecutorCutoverFailedAfterCommit" {
+-                e
+-            } else {
+-                e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}"))
++        .await?
++    {
++        return Ok((diff, Some(ts)));
++    }
++
++    let st = st.clone();
++    // The accepted owner retains its prepared-operation lease until publication
++    // is terminal. Dropping an HTTP waiter must not advertise an idle finish
++    // while the application's detached database commit can still run.
++    tokio::spawn(async move {
++        let (resp, ts) = st
++            .application
++            .finish_push(
++                identity,
++                request_metadata,
++                start_push,
++                message,
++                req.force_node_cutover,
++                operation,
++            )
++            .await
++            .map_err(|e| {
++                if e.short_msg() == "NodeExecutorCutoverFailedAfterCommit" {
++                    e
++                } else {
++                    e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}"))
++                }
++            })?;
++        // A racing replay has the same historical-only meaning as the early
++        // return above. Only a fresh commit completes this handler's runtime handoff.
++        if !resp.is_activation_replay() {
++            if let (Some(lease), Some(attempt)) = (prepared_lease, req.finish_attempt) {
++                lease.complete(attempt);
              }
-         })?;
+-        })?;
 -    Ok((SerializedFinishPushDiff::try_from(resp)?, Some(ts)))
-+    Ok((resp, Some(ts)))
++        }
++        Ok((resp, Some(ts)))
++    })
++    .await
++    .context("deployment finish owner failed")?
  }
  
  pub async fn finish_push(
-@@ -542,33 +585,7 @@ pub async fn report_push_completed_handler(
+@@ -542,33 +640,7 @@ pub async fn report_push_completed_handler(
      Ok(Json(()))
  }
  
@@ -2501,15 +2648,18 @@ index 0f742de520f0b679693a19328a1eed20d4da46f8..64dcbf5cdffec44cd4d152ce31fb07e8
  #[derive(Debug, Deserialize)]
 diff --git a/crates/local_backend/src/deployment_operations.rs b/crates/local_backend/src/deployment_operations.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4ca18a3a1
+index 0000000000000000000000000000000000000000..14510c02ec437ca14e11188b3c831335f75af6ef
 --- /dev/null
 +++ b/crates/local_backend/src/deployment_operations.rs
-@@ -0,0 +1,927 @@
+@@ -0,0 +1,1190 @@
 +//! Process-local ownership for opt-in deployment analysis. A subscriber may
 +//! disconnect without cancelling work; cancellation is an authenticated call.
 +
 +use std::{
-+    collections::BTreeMap,
++    collections::{
++        BTreeMap,
++        VecDeque,
++    },
 +    sync::Arc,
 +    time::{
 +        Duration,
@@ -2532,6 +2682,7 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +    },
 +};
 +use common::{
++    execution_context::ExecutionId,
 +    http::{
 +        extract::Json,
 +        HttpResponseError,
@@ -2619,6 +2770,9 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +#[derive(Clone)]
 +pub(crate) struct DeploymentOperations {
 +    operations: Arc<Mutex<BTreeMap<String, Operation>>>,
++    // Tiny terminal acknowledgements outlive preparation expiry. A finish admitted just
++    // before expiry may still be draining when the client loses its response.
++    expired_finishes: Arc<Mutex<VecDeque<(String, ExecutionId)>>>,
 +    clock: Arc<Mutex<SystemTime>>,
 +    session_id: String,
 +}
@@ -2627,8 +2781,9 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +    fn default() -> Self {
 +        Self {
 +            operations: Arc::default(),
++            expired_finishes: Arc::default(),
 +            clock: Arc::new(Mutex::new(SystemTime::now())),
-+            session_id: common::execution_context::ExecutionId::new().to_string(),
++            session_id: ExecutionId::new().to_string(),
 +        }
 +    }
 +}
@@ -2643,6 +2798,23 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +    cancellation: Option<watch::Sender<bool>>,
 +    prepared: Option<PreparedOperation>,
 +    finish: FinishState,
++    completed_finish_attempt: Option<ExecutionId>,
++}
++
++impl Operation {
++    fn revoke(&mut self, id: &str) {
++        if let Some(cancel) = &self.cancellation {
++            cancel.send_replace(true);
++        } else if self.prepared.take().is_some() {
++            self.response = encode_result(
++                &json!({"operationId":id,"state":"failed","code":"DeploymentOperationCancelled"}),
++            )
++            .expect("fixed cancellation exceeds result limit");
++            if self.finish == FinishState::Idle {
++                self.reserved_bytes = self.response.len();
++            }
++        }
++    }
 +}
 +
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2660,12 +2832,19 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +    // Fields drop in declaration order: release this source reference before
 +    // returning its registry reservation, including during handler unwinding.
 +    pub(crate) sources: Arc<PreparedPush>,
-+    _reservation: PreparedPushReservation,
++    reservation: PreparedPushReservation,
++}
++
++impl PreparedPushLease {
++    pub(crate) fn complete(mut self, attempt: ExecutionId) {
++        self.reservation.completed = Some(attempt);
++    }
 +}
 +
 +struct PreparedPushReservation {
 +    owner: DeploymentOperations,
 +    operation_id: String,
++    completed: Option<ExecutionId>,
 +}
 +
 +impl Drop for PreparedPushReservation {
@@ -2676,6 +2855,12 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +            .expect("active finish lost its source reservation");
 +        assert_eq!(operation.finish, FinishState::Active);
 +        operation.finish = FinishState::Idle;
++        if let Some(attempt) = self.completed {
++            assert!(operation
++                .completed_finish_attempt
++                .replace(attempt)
++                .is_none());
++        }
 +        if operation.prepared.is_none() {
 +            operation.reserved_bytes = operation.response.len();
 +        }
@@ -2749,6 +2934,9 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +pub struct OperationControl {
 +    admin_key: String,
 +    operation_id: String,
++    // Legacy controls report analysis. A session-bound control also owns
++    // revocation and observation of publication authority after a lost reply.
++    session_id: Option<String>,
 +}
 +
 +#[derive(Deserialize)]
@@ -2764,6 +2952,8 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +    authorize(&st, req.admin_key).await?;
 +    Ok(axum::Json(json!({
 +        "protocolVersion": 1,
++        "publicationStatusProtocol": 1,
++        "finishCompletionProtocol": 1,
 +        "sessionId": st.deployment_operations.session_id,
 +        "lifetimeSeconds": LIFETIME.as_secs(),
 +        "maxOperations": MAX_OPERATIONS,
@@ -2776,6 +2966,19 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +// The creation time is part of identity. Removing an expired entry cannot let
 +// a late retry silently create new work with the same operation ID.
 +pub(crate) fn operation_expiry(id: &str, now: SystemTime) -> anyhow::Result<SystemTime> {
++    let expires = operation_expiration(id, now)?;
++    anyhow::ensure!(
++        now < expires,
++        ErrorMetadata::bad_request(
++            "DeploymentOperationExpired",
++            "This operation ID has expired. Inspect deployment state before starting a new \
++             operation."
++        )
++    );
++    Ok(expires)
++}
++
++fn operation_expiration(id: &str, now: SystemTime) -> anyhow::Result<SystemTime> {
 +    anyhow::ensure!(
 +        id.len() <= 64,
 +        ErrorMetadata::bad_request("InvalidDeploymentOperation", "Operation ID is too long")
@@ -2811,14 +3014,6 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +        )
 +    );
 +    let expires = created + LIFETIME;
-+    anyhow::ensure!(
-+        now < expires,
-+        ErrorMetadata::bad_request(
-+            "DeploymentOperationExpired",
-+            "This operation ID has expired. Inspect deployment state before starting a new \
-+             operation."
-+        )
-+    );
 +    Ok(expires)
 +}
 +
@@ -2853,8 +3048,14 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +    pub(crate) fn prepared(
 +        &self,
 +        id: &str,
++        session_id: Option<&str>,
 +        mut response: Value,
 +    ) -> anyhow::Result<Option<PreparedPushLease>> {
++        // A previous session may read its durable receipt, but cannot borrow
++        // preparation admitted in this process, even if its ID was resubmitted.
++        if session_id.is_some_and(|session_id| session_id != self.session_id) {
++            return Ok(None);
++        }
 +        let digest = normalized_digest(&mut response)?;
 +        let mut operations = self.operations.lock();
 +        self.prune(&mut operations, self.now());
@@ -2888,9 +3089,10 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +        operation.finish = FinishState::Active;
 +        Ok(Some(PreparedPushLease {
 +            sources,
-+            _reservation: PreparedPushReservation {
++            reservation: PreparedPushReservation {
 +                owner: self.clone(),
 +                operation_id: id.to_owned(),
++                completed: None,
 +            },
 +        }))
 +    }
@@ -2908,7 +3110,7 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +            *clock = (*clock).max(now);
 +            *clock
 +        };
-+        operations.retain(|_, operation| {
++        operations.retain(|id, operation| {
 +            if now < operation.expires {
 +                return true;
 +            }
@@ -2920,7 +3122,19 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +            operation.prepared = None;
 +            // An active owner releases its input reservation only after the
 +            // cancelled future has dropped. A status call cannot release it.
-+            operation.cancellation.is_some() || operation.finish == FinishState::Active
++            if operation.cancellation.is_some() || operation.finish == FinishState::Active {
++                return true;
++            }
++            // Keep live operations' acknowledgements for their full lifetime.
++            // Only expired operations compete for terminal history.
++            if let Some(attempt) = operation.completed_finish_attempt {
++                let mut expired = self.expired_finishes.lock();
++                if expired.len() == MAX_OPERATIONS {
++                    expired.pop_front();
++                }
++                expired.push_back((id.clone(), attempt));
++            }
++            false
 +        });
 +    }
 +
@@ -2932,18 +3146,64 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +            "DeploymentOperationUnknown",
 +            "No retained operation exists in this process",
 +        ))?;
-+        if let Some(cancel) = &operation.cancellation {
-+            cancel.send_replace(true);
-+        } else if operation.prepared.take().is_some() {
-+            operation.response = encode_result(
-+                &json!({"operationId":id,"state":"failed","code":"DeploymentOperationCancelled"}),
-+            )
-+            .expect("fixed cancellation exceeds result limit");
-+            if operation.finish == FinishState::Idle {
-+                operation.reserved_bytes = operation.response.len();
-+            }
-+        }
++        operation.revoke(id);
 +        Ok(operation.response.clone())
++    }
++
++    fn publication_control(
++        &self,
++        id: &str,
++        session_id: &str,
++        revoke: bool,
++    ) -> anyhow::Result<Value> {
++        let now = self.now();
++        let expires = operation_expiration(id, now)?;
++        let mut operations = self.operations.lock();
++        self.prune(&mut operations, now);
++        let now = self.now();
++        let mut completed = None;
++        let publication_state = if session_id != self.session_id {
++            // Old submissions and finishes carry the old session and cannot
++            // acquire preparation in this process after a restart.
++            "revoked"
++        } else if let Some(operation) = operations.get_mut(id) {
++            completed = operation.completed_finish_attempt;
++            if revoke {
++                operation.revoke(id);
++            }
++            if operation.finish == FinishState::Active {
++                "active"
++            } else if operation.prepared.is_some()
++                || operation
++                    .cancellation
++                    .as_ref()
++                    .is_some_and(|cancel| !*cancel.borrow())
++            {
++                "available"
++            } else {
++                "revoked"
++            }
++        } else if now >= expires {
++            // Pruning retains every active finish lease even after expiry.
++            // Absence now also prevents a delayed submission from starting.
++            completed = self
++                .expired_finishes
++                .lock()
++                .iter()
++                .find(|(operation, _)| operation == id)
++                .map(|(_, attempt)| *attempt);
++            "revoked"
++        } else {
++            anyhow::bail!(ErrorMetadata::bad_request(
++                "DeploymentOperationUnknown",
++                "No retained publication operation exists in this process"
++            ));
++        };
++        let mut response = json!({"operationId":id,"sessionId":self.session_id,"publicationState":publication_state});
++        if let Some(attempt) = completed {
++            response["completedFinishAttempt"] = json!(attempt);
++        }
++        Ok(response)
 +    }
 +}
 +
@@ -2980,10 +3240,9 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +        ))
 +        .into());
 +    }
-+    // Normalize object order and whitespace before binding identity.
-+    req.config.sort_all_objects();
++    // Use the same JSON identity for submission, preparation and finish replay.
++    let digest = normalized_digest(&mut req.config)?;
 +    let encoded = serde_json::to_vec(&req.config).context("serializing deployment input")?;
-+    let digest = Sha256::hash(&encoded);
 +    let reconstructed_bytes = if req
 +        .config
 +        .get("appDefinition")
@@ -3046,6 +3305,7 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +                cancellation: Some(cancel),
 +                prepared: None,
 +                finish: FinishState::Idle,
++                completed_finish_attempt: None,
 +            },
 +        );
 +    }
@@ -3195,6 +3455,14 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +    Json(req): Json<OperationControl>,
 +) -> Result<Response, HttpResponseError> {
 +    authorize(&st, req.admin_key).await?;
++    if let Some(session_id) = req.session_id {
++        return Ok(axum::Json(st.deployment_operations.publication_control(
++            &req.operation_id,
++            &session_id,
++            false,
++        )?)
++        .into_response());
++    }
 +    let mut operations = st.deployment_operations.operations.lock();
 +    let now = st.deployment_operations.now();
 +    st.deployment_operations.prune(&mut operations, now);
@@ -3213,6 +3481,14 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +    Json(req): Json<OperationControl>,
 +) -> Result<Response, HttpResponseError> {
 +    authorize(&st, req.admin_key).await?;
++    if let Some(session_id) = req.session_id {
++        return Ok(axum::Json(st.deployment_operations.publication_control(
++            &req.operation_id,
++            &session_id,
++            true,
++        )?)
++        .into_response());
++    }
 +    Ok(response(
 +        st.deployment_operations.cancel(&req.operation_id)?,
 +    ))
@@ -3263,6 +3539,7 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +                    cancellation: Some(cancel),
 +                    prepared: None,
 +                    finish: FinishState::Idle,
++                    completed_finish_attempt: None,
 +                },
 +            );
 +            owner.publish(
@@ -3316,12 +3593,34 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +                        response_sha256: normalized_digest(&mut response).unwrap(),
 +                    }),
 +                    finish: FinishState::Idle,
++                    completed_finish_attempt: None,
 +                },
 +            );
-+            let first = owner.prepared(&id, response.clone()).unwrap().unwrap();
 +            assert_eq!(
 +                owner
-+                    .prepared(&id, response.clone())
++                    .publication_control(&id, &owner.session_id, false)
++                    .unwrap()["publicationState"],
++                "available"
++            );
++            assert!(owner
++                .prepared(&id, Some("previous-session"), response.clone())
++                .unwrap()
++                .is_none());
++            assert_eq!(
++                owner
++                    .prepared(&id, Some(&owner.session_id), json!({"prepared":false}))
++                    .err()
++                    .unwrap()
++                    .short_msg(),
++                "DeploymentOperationInputMismatch"
++            );
++            let first = owner
++                .prepared(&id, Some(&owner.session_id), response.clone())
++                .unwrap()
++                .unwrap();
++            assert_eq!(
++                owner
++                    .prepared(&id, Some(&owner.session_id), response.clone())
 +                    .err()
 +                    .unwrap()
 +                    .short_msg(),
@@ -3330,7 +3629,12 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +            match revoke {
 +                Revocation::None => {},
 +                Revocation::Cancel => {
-+                    owner.cancel(&id).unwrap();
++                    assert_eq!(
++                        owner
++                            .publication_control(&id, &owner.session_id, true)
++                            .unwrap()["publicationState"],
++                        "active"
++                    );
 +                },
 +                Revocation::Expire => {
 +                    owner.operations.lock().get_mut(&id).unwrap().deadline =
@@ -3338,19 +3642,43 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +                },
 +            }
 +            owner.prune(&mut owner.operations.lock(), owner.now());
++            assert_eq!(
++                owner
++                    .publication_control(&id, &owner.session_id, false)
++                    .unwrap()["publicationState"],
++                "active"
++            );
 +            assert_eq!(owner.operations.lock()[&id].reserved_bytes, 1234);
 +            assert_eq!(
 +                owner
-+                    .prepared(&id, response.clone())
++                    .prepared(&id, Some(&owner.session_id), response.clone())
 +                    .err()
 +                    .unwrap()
 +                    .short_msg(),
 +                "DeploymentOperationFinishInProgress"
 +            );
 +            assert!(weak_sources.upgrade().is_some());
-+            drop(first);
-+            let next = owner.prepared(&id, response).unwrap();
++            let attempt = ExecutionId::new();
++            first.complete(attempt);
++            assert_eq!(
++                owner
++                    .publication_control(&id, &owner.session_id, false)
++                    .unwrap()["completedFinishAttempt"],
++                json!(attempt)
++            );
++            assert!(owner
++                .publication_control(&id, "other-session", false)
++                .unwrap()
++                .get("completedFinishAttempt")
++                .is_none());
++            let next = owner.prepared(&id, None, response).unwrap();
 +            if revoke != Revocation::None {
++                assert_eq!(
++                    owner
++                        .publication_control(&id, &owner.session_id, false)
++                        .unwrap()["publicationState"],
++                    "revoked"
++                );
 +                assert!(next.is_none());
 +                assert!(weak_sources.upgrade().is_none());
 +                let operations = owner.operations.lock();
@@ -3366,8 +3694,89 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +                assert!(next.is_some());
 +                drop(next);
 +                assert_eq!(owner.operations.lock()[&id].finish, FinishState::Idle);
++                assert_eq!(
++                    owner
++                        .publication_control(&id, &owner.session_id, true)
++                        .unwrap()["publicationState"],
++                    "revoked"
++                );
++                assert!(owner
++                    .prepared(&id, None, json!({"prepared":true}))
++                    .unwrap()
++                    .is_none());
 +            }
 +        }
++    }
++
++    #[test]
++    fn terminal_eviction_preserves_live_completion() {
++        let owner = DeploymentOperations::default();
++        let now = owner.now();
++        let created = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
++        let attempt = ExecutionId::new();
++        let completed = |expires| Operation {
++            digest: Sha256::hash(b"config"),
++            kind: OperationKind::StartPush,
++            expires,
++            deadline: tokio::time::Instant::now() + LIFETIME,
++            reserved_bytes: 0,
++            response: Bytes::new(),
++            cancellation: None,
++            prepared: None,
++            finish: FinishState::Idle,
++            completed_finish_attempt: Some(attempt),
++        };
++        let live = format!("{created}:{:032x}", 0);
++        let mut operations = owner.operations.lock();
++        operations.insert(live.clone(), completed(now + LIFETIME));
++        let old = created - LIFETIME.as_secs();
++        for i in 0..=MAX_OPERATIONS {
++            operations.insert(format!("{old}:{i:032x}"), completed(now));
++            owner.prune(&mut operations, now);
++        }
++        drop(operations);
++        let status = |id: &str| {
++            owner
++                .publication_control(id, &owner.session_id, true)
++                .unwrap()
++        };
++        assert!(status(&format!("{old}:{:032x}", 0))
++            .get("completedFinishAttempt")
++            .is_none());
++        assert_eq!(
++            status(&format!("{old}:{MAX_OPERATIONS:032x}"))["completedFinishAttempt"],
++            json!(attempt)
++        );
++        assert_eq!(status(&live)["completedFinishAttempt"], json!(attempt));
++    }
++
++    #[test]
++    fn publication_absence_requires_expiry_or_a_different_session() {
++        let owner = DeploymentOperations::default();
++        let now = owner.now();
++        let created = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
++        let id = format!("{created}:0123456789abcdef0123456789abcdef");
++        assert_eq!(
++            owner
++                .publication_control(&id, &owner.session_id, true)
++                .unwrap_err()
++                .short_msg(),
++            "DeploymentOperationUnknown"
++        );
++        assert_eq!(
++            owner
++                .publication_control(&id, "previous-session", true)
++                .unwrap()["publicationState"],
++            "revoked"
++        );
++        *owner.clock.lock() = now + LIFETIME;
++        assert_eq!(
++            owner
++                .publication_control(&id, &owner.session_id, true)
++                .unwrap()["publicationState"],
++            "revoked"
++        );
++        assert!(operation_expiry(&id, owner.now()).is_err());
 +    }
 +
 +    #[test]
@@ -3421,6 +3830,7 @@ index 0000000000000000000000000000000000000000..74e6aba0b84c639a478634742e6a99e4
 +                cancellation: Some(cancel),
 +                prepared: None,
 +                finish: FinishState::Idle,
++                completed_finish_attempt: None,
 +            },
 +        )]);
 +        owner.prune(&mut operations, now);
@@ -4246,10 +4656,10 @@ index 3c767c1780d9bc498c0012c76cf430362a0ad036..cfd30486849a39bb589a5ace35beb720
 +    }
  }
 diff --git a/crates/node_executor/src/routed.rs b/crates/node_executor/src/routed.rs
-index 2e6e276b7ddb86cfb38a566e07974ec3dc70bea1..56266096f381aea6a2332149ac0570e3a5e76fc6 100644
+index 9098d2d4af3ee2d8ea7a9ccf03128a0fc7938cb3..5da999b3f2417eb53252352ab0335f95271d0b91 100644
 --- a/crates/node_executor/src/routed.rs
 +++ b/crates/node_executor/src/routed.rs
-@@ -124,6 +124,9 @@ struct SystemOperationOwner {
+@@ -123,6 +123,9 @@ struct SystemOperationOwner {
      id: u64,
      kind: NodeSystemOperationKind,
      state: StdMutex<SystemOperationOwnerState>,
@@ -4259,7 +4669,7 @@ index 2e6e276b7ddb86cfb38a566e07974ec3dc70bea1..56266096f381aea6a2332149ac0570e3
  }
  
  struct SystemOperationOwnerState {
-@@ -491,6 +494,9 @@ impl SystemOperationOwner {
+@@ -490,6 +493,9 @@ impl SystemOperationOwner {
      ) -> Arc<Self> {
          Arc::new(Self {
              admission: Arc::downgrade(admission),
@@ -4269,7 +4679,7 @@ index 2e6e276b7ddb86cfb38a566e07974ec3dc70bea1..56266096f381aea6a2332149ac0570e3
              system,
              id,
              kind,
-@@ -3098,17 +3104,43 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
+@@ -3078,17 +3084,43 @@ impl NodeExecutor for RoutedLocalNodeExecutor {
          // unbound permit, and task-loss cleanup must not later finish a slot
          // that the permit has already released.
          let mut task_guard = SystemOperationTaskGuard::new(owner.clone());
@@ -4317,7 +4727,7 @@ index 2e6e276b7ddb86cfb38a566e07974ec3dc70bea1..56266096f381aea6a2332149ac0570e3
              let result = match system.finish_system_operation_terminal_observation().await {
                  Ok(()) => {
                      task_guard.finish();
-@@ -3612,6 +3644,16 @@ mod tests {
+@@ -3592,6 +3624,16 @@ mod tests {
      #[cfg(unix)]
      #[tokio::test]
      async fn routed_system_work_keeps_capacity_after_original_caller_disappears() {
@@ -4334,7 +4744,7 @@ index 2e6e276b7ddb86cfb38a566e07974ec3dc70bea1..56266096f381aea6a2332149ac0570e3
          let socket_dir = TempDir::new().unwrap();
          let socket_path = socket_dir.path().join("executor.sock");
          let listener = UnixListener::bind(&socket_path).unwrap();
-@@ -3642,7 +3684,7 @@ mod tests {
+@@ -3622,7 +3664,7 @@ mod tests {
              .await
              .unwrap();
          let invoke_executor = executor.clone();
@@ -4343,7 +4753,7 @@ index 2e6e276b7ddb86cfb38a566e07974ec3dc70bea1..56266096f381aea6a2332149ac0570e3
              let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
              invoke_executor
                  .invoke_system(
-@@ -3654,11 +3696,13 @@ mod tests {
+@@ -3634,11 +3676,13 @@ mod tests {
                      log_line_sender,
                  )
                  .await
@@ -4358,7 +4768,7 @@ index 2e6e276b7ddb86cfb38a566e07974ec3dc70bea1..56266096f381aea6a2332149ac0570e3
  
          let later_executor = executor.clone();
          let later = tokio::spawn(async move {
-@@ -3680,65 +3724,100 @@ mod tests {
+@@ -3660,65 +3704,100 @@ mod tests {
          assert_eq!(later.kind, NodeSystemOperationKind::Analyze);
          drop(later);
          wait_for_no_active_system_operation(&executor.system_admission).await;
@@ -5525,10 +5935,10 @@ index 0000000000000000000000000000000000000000..e4a0b26686bf6095abbe5dd4434a549a
 +admission interfaces described in the operation protocol.
 diff --git a/patches/non_committing_codegen_analysis/deployment_operations.md b/patches/non_committing_codegen_analysis/deployment_operations.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..59f898dc4b2740b85800faa46680454881f6d678
+index 0000000000000000000000000000000000000000..7ad982597aca506222be31f619536cf7986bf849
 --- /dev/null
 +++ b/patches/non_committing_codegen_analysis/deployment_operations.md
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,256 @@
 +# Bounded deployment operations
 +
 +Deployment analysis has one active whole-job owner per in-process application, up to four
@@ -5686,8 +6096,10 @@ index 0000000000000000000000000000000000000000..59f898dc4b2740b85800faa466804548
 +
 +Finish checks retained generation and canonical URL authority before source
 +resolution and cutover admission, then repeats those reads in its activation
-+transaction. An already-superseded preparation cannot enter force-capable
-+cutover admission. A matching receipt is returned before these checks, so a
++transaction. Forced finishes also check the user environment before Node cutover
++admission.
++An already-superseded preparation cannot enter force-capable cutover admission.
++A matching receipt is returned before these checks, so a
 +newer deployment does not invalidate historical replay.
 +
 +Only one finish at a time may hold a retained operation's prepared sources.
@@ -5700,8 +6112,10 @@ index 0000000000000000000000000000000000000000..59f898dc4b2740b85800faa466804548
 +admission before the first commit could otherwise force the first owner's
 +draining Node generation to stop or wait unnecessarily for its capacity.
 +
-+Finish identity includes `dryRun`, `message`, `forceNodeCutover` and the exact
-+source-keyed activation selector. It excludes credentials and the operation ID.
++Finish identity includes the complete typed `startPush`, `dryRun`, `message`,
++and `forceNodeCutover`.
++It excludes credentials, the operation ID, the session ID, and the optional
++finish attempt ID.
 +Dry-run finishes still require retained preparation with unchanged generation
 +and canonical URL authority, and check for conflicting activation receipts;
 +they create no activation receipt. Cancellation before finish acquires retained
@@ -5720,6 +6134,32 @@ index 0000000000000000000000000000000000000000..59f898dc4b2740b85800faa466804548
 +`activationReplay.nodeCutoverCompletion` is `unverified`: the receipt proves
 +historical activation, not current deployment or completion of the original
 +Node cutover. Without a receipt or retained preparation, finish fails explicitly.
++
++### Recovering an unacknowledged finish
++
++When capabilities advertise `finishCompletionProtocol: 1`, a client can send a
++fresh UUID in `finishAttempt` on a non-dry-run finish with both `operationId`
++and `operationSessionId`. Persist all three before sending the request. A
++successful response with `activationReplay` proves only a historical source
++commit. A fresh finish returns success after Node cutover, even if its HTTP waiter
++disconnected. A cutover failure reports `NodeExecutorCutoverFailedAfterCommit`
++without acknowledging the attempt.
++
++After a lost response, send the operation and session IDs to `operations/cancel`.
++An `active` finish retains ownership through publication, even after cancellation
++or expiry. Poll `operations/status` with both IDs until `publicationState` is
++`revoked`. An `available` response still permits a finish. Only a matching
++`operationId`, `sessionId` and `completedFinishAttempt` on the revoked response
++confirm that particular attempt to a recovering client. A fresh attempt which
++only reads an existing receipt does not replace the original acknowledgement.
++
++The process keeps this acknowledgement while the operation is retained and
++remembers at most eight expired successful operations. Eviction or process
++replacement can leave completion unproved. An old session cannot acquire new
++preparation or obtain an acknowledgement from the replacement process. A
++missing acknowledgement does not establish that the database transaction
++failed. Clients omitting `finishAttempt` retain ordinary finish and historical
++replay semantics. Controls omitting the session still describe analysis.
 +
 +## Preflight packaging
 +
@@ -5756,7 +6196,7 @@ index 0000000000000000000000000000000000000000..59f898dc4b2740b85800faa466804548
 +remains `H`. Base occupancy is emitted even when only the deployment reserve is
 +configured. These observations never own workflow progress or retry policy.
 diff --git a/patches/pinned_local_node_executor_pools/README.md b/patches/pinned_local_node_executor_pools/README.md
-index 637a8ac58abe9f49c94a275a04b29d1a366936a3..b33f9f2e7c7cdee0aef334ebf3034542c1d92cf8 100644
+index 1f12d6fffac56d53756260f2295bec0b589f31ef..b6ef5232fec3232fb28840167fb1af6911f1d4ef 100644
 --- a/patches/pinned_local_node_executor_pools/README.md
 +++ b/patches/pinned_local_node_executor_pools/README.md
 @@ -148,15 +148,16 @@ Rust download boundary with ambiguous environment metadata.
@@ -5793,8 +6233,8 @@ index 637a8ac58abe9f49c94a275a04b29d1a366936a3..b33f9f2e7c7cdee0aef334ebf3034542
 +After source resolution, topology normalization, analysis, and resource
  validation, every routed deployment reserves the global surge slot and
  installs an exact router-visible claim before its durable deployment
- transaction. Cold acquisition is immediate, but still reserves capacity so a
-@@ -196,7 +197,9 @@ is absent, so an older or unsupported backend cannot silently ignore the
+ transaction. If either topology has named pools, admission first
+@@ -216,7 +217,9 @@ is absent, so an older or unsupported backend cannot silently ignore the
  operator's request.
  
  Dry runs, failed analysis, abandoned pushes, failed admission, and failed
@@ -5805,7 +6245,7 @@ index 637a8ac58abe9f49c94a275a04b29d1a366936a3..b33f9f2e7c7cdee0aef334ebf3034542
  displace failed-cutover recovery, but cancellation restores that exact recovery
  owner before releasing capacity. Commit converts only the matching claim to a
  committed claim. The reservation retains it until runtime ownership is
-@@ -221,8 +224,11 @@ deployment. Publications are version ordered, so a delayed older deployment
+@@ -241,8 +244,11 @@ deployment. Publications are version ordered, so a delayed older deployment
  cannot replace a newer topology.
  
  Node execution also reconciles from the same repeatable database snapshot that
@@ -5819,7 +6259,7 @@ index 637a8ac58abe9f49c94a275a04b29d1a366936a3..b33f9f2e7c7cdee0aef334ebf3034542
  pool cutover instead of running in an incompatible generation. An older request
  is rejected when its source-package topology no longer agrees with the
  published topology. An older request with the same complete topology is
-@@ -277,6 +283,10 @@ backend on panic before task cleanup can run.
+@@ -297,6 +303,10 @@ backend on panic before task cleanup can run.
  The original caller owns only its result receiver. If that receiver disappears,
  the runtime task continues the local request timer and active admission through
  the same terminal boundary, then records that terminal delivery was abandoned.
@@ -5906,10 +6346,10 @@ index c84c301c88d8ed73eaae27b77012b2a6a3f362d6..91406193383870b55ab386b9815b592d
  database initialization rather than falling back.
  
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index f1cdfbba2cff2bb531bca893838a1d318ae6f58d..e9951671026b48a957ea2a940f44a73aebd99b69 100644
+index bd564951093c16e60a514e095773cea959bfcee7..b4a8efac6bbbe395cfd29cc2959e90a8b5584207 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
-@@ -239,7 +239,7 @@ start before admission control.
+@@ -253,7 +253,7 @@ start before admission control.
  
  `LOCAL_BACKEND_MEMORY_PRESSURE_SHEDDING_ENABLED` defaults to `false`. When
  enabled on Linux, the backend requires a readable finite cgroup v2 memory limit
@@ -5918,7 +6358,7 @@ index f1cdfbba2cff2bb531bca893838a1d318ae6f58d..e9951671026b48a957ea2a940f44a73a
  requests with `503 BackendMemoryPressure` when headroom reaches
  `LOCAL_BACKEND_MEMORY_PRESSURE_ENTER_HEADROOM_BYTES`, which defaults to 3 GiB.
  Admission resumes only after headroom reaches
-@@ -247,6 +247,13 @@ Admission resumes only after headroom reaches
+@@ -261,6 +261,13 @@ Admission resumes only after headroom reaches
  The exit threshold must exceed the enter threshold and remain below the cgroup
  limit.
  
@@ -5932,7 +6372,7 @@ index f1cdfbba2cff2bb531bca893838a1d318ae6f58d..e9951671026b48a957ea2a940f44a73a
  The check runs before request-body handling and is repeated after the ordinary
  HTTP concurrency wait. `/version` and `/metrics` remain available. Node action
  callback paths carrying the callback-token header remain eligible for
-@@ -310,8 +317,9 @@ response head. A streaming HTTP action body, and the isolate work producing it,
+@@ -324,8 +331,9 @@ response head. A streaming HTTP action body, and the isolate work producing it,
  can outlive the main and proxy permits. These knobs therefore do not bound the
  number of response bodies being streamed concurrently.
  
@@ -5944,7 +6384,7 @@ index f1cdfbba2cff2bb531bca893838a1d318ae6f58d..e9951671026b48a957ea2a940f44a73a
  metrics start after permit acquisition, so they do not bound this admission
  wait. `http_admission_waiters_info{service_name,is_dependency}` reports actual
  queued waiters, and
-@@ -322,14 +330,26 @@ when overload must be rejected within a fixed time.
+@@ -336,14 +344,26 @@ when overload must be rejected within a fixed time.
  
  ## `HTTP_SERVER_DEPENDENCY_RESERVE`
  

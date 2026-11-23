@@ -12,7 +12,7 @@ Give typed configuration work a fair queue within the protected JavaScript group
 
 Accept a closed per-call HTTP mutation priority hint, propagate it through request execution metadata, and give high mutations at most two turns before eligible ordinary application demand. Preserve dependency and configuration barriers, existing capacity bounds, cancellation ownership and closed metric labels. Publish the protocol capability and checked OpenAPI contract.
 ---
- .../src/application_function_runner/mod.rs    |  40 +-
+ .../src/application_function_runner/mod.rs    |  50 +-
  crates/application/src/cache/mod.rs           |   8 +-
  crates/common/src/execution_context.rs        |  43 +-
  crates/common/src/knobs.rs                    |  60 +-
@@ -43,14 +43,14 @@ Accept a closed per-call HTTP mutation priority hint, propagate it through reque
  .../deployment_operations.md                  |  15 +-
  patches/scheduled_action_admission/README.md  |   2 +-
  self-hosted/advanced/knobs.md                 |  76 +-
- 31 files changed, 3234 insertions(+), 609 deletions(-)
+ 31 files changed, 3232 insertions(+), 621 deletions(-)
  create mode 100644 patches/isolate_queue_control/isolate_delay_queue_design_reference.md
 
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index ce95edbcdb20331efcacd413d40a81279a52b2c6..d5279b61a75fce7d139155101ed10ca4ef55fe54 100644
+index 30645690f91a14cd45db661453a7693f12fc3952..74c8b025f13182962460b04f47548eba30b119d5 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
-@@ -364,6 +364,12 @@ fn node_action_gate_dependency(
+@@ -366,6 +366,12 @@ fn node_action_gate_dependency(
      scheduler_dependency.unblocks_ancestor() || !caller.is_root()
  }
  
@@ -63,7 +63,7 @@ index ce95edbcdb20331efcacd413d40a81279a52b2c6..d5279b61a75fce7d139155101ed10ca4
  impl<RT: Runtime> FunctionRouter<RT> {
      pub(crate) async fn acquire_permit(
          &self,
-@@ -395,13 +401,28 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -397,13 +403,28 @@ impl<RT: Runtime> FunctionRouter<RT> {
          tx: Transaction<RT>,
          permit: RequestGuard<'_, RT>,
          path_and_args: ValidatedPathAndArgs,
@@ -95,17 +95,27 @@ index ce95edbcdb20331efcacd413d40a81279a52b2c6..d5279b61a75fce7d139155101ed10ca4
          anyhow::ensure!(
              permit.limiter.udf_type == udf_type,
              "Running a {udf_type} with a {} permit",
-@@ -428,6 +449,9 @@ impl<RT: Runtime> FunctionRouter<RT> {
-                     },
-                     _ => anyhow::bail!("Invalid database UDF type"),
-                 }),
-+=======
+@@ -418,18 +439,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+                 udf_type,
+                 context,
+                 None,
+-                Some(match udf_type {
+-                    UdfType::Query => FunctionMetadata::Query {
+-                        journal,
+-                        path_and_args,
+-                        active_javascript_class,
+-                    },
+-                    UdfType::Mutation => FunctionMetadata::Mutation {
+-                        journal,
+-                        path_and_args,
+-                    },
+-                    _ => anyhow::bail!("Invalid database UDF type"),
+-                }),
 +                Some(function_metadata),
-+>>>>>>> 44c2402e4 (isolate: balance class-aware active-JavaScript admission)
                  None,
                  None,
                  scheduler_dependency,
-@@ -724,7 +748,9 @@ impl<RT: Runtime> Limiter<RT> {
+@@ -726,7 +736,9 @@ impl<RT: Runtime> Limiter<RT> {
              } => match x {},
              _ = async {
                  match deadline {
@@ -116,7 +126,7 @@ index ce95edbcdb20331efcacd413d40a81279a52b2c6..d5279b61a75fce7d139155101ed10ca4
                      None => future::pending().await,
                  }
              } => {
-@@ -1210,11 +1236,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1212,11 +1224,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          tx,
                          permit,
                          path_and_args,
@@ -129,7 +139,7 @@ index ce95edbcdb20331efcacd413d40a81279a52b2c6..d5279b61a75fce7d139155101ed10ca4
                      )
                      .await?
              },
-@@ -1776,11 +1801,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1778,11 +1789,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  tx,
                  permit,
                  path_and_args,
@@ -4000,13 +4010,13 @@ index c0e1e26a9b3d30abc6bb970fdd7915356b601915..fd1f57861e31c32df0f45801ad7b5786
 +matches the checked-in file. This checkout does not define the
 +`just generate-api-specs` recipe referenced by some package scripts.
 diff --git a/crates/local_backend/src/deployment_operations.rs b/crates/local_backend/src/deployment_operations.rs
-index 74e6aba0b84c639a478634742e6a99e4ca18a3a1..57cd74ea4d54da7a289f1ca90672416b16b1c263 100644
+index 14510c02ec437ca14e11188b3c831335f75af6ef..bc1ab4fe018f8d07852257834e4b552f6f3bc28c 100644
 --- a/crates/local_backend/src/deployment_operations.rs
 +++ b/crates/local_backend/src/deployment_operations.rs
-@@ -257,6 +257,7 @@ pub async fn capabilities(
-     authorize(&st, req.admin_key).await?;
-     Ok(axum::Json(json!({
+@@ -300,6 +300,7 @@ pub async fn capabilities(
          "protocolVersion": 1,
+         "publicationStatusProtocol": 1,
+         "finishCompletionProtocol": 1,
 +        "mutationPriorityProtocol": if *common::knobs::ISOLATE_QUEUE_DELAY_CONTROL_ENABLED { 1 } else { 0 },
          "sessionId": st.deployment_operations.session_id,
          "lifetimeSeconds": LIFETIME.as_secs(),
@@ -5901,7 +5911,7 @@ index 0000000000000000000000000000000000000000..372095c0eeeeb946a59dafd1694c7950
 +the exact lane, scheduler class, active class, phase, rejection reason, and
 +reserve-use distinctions.
 diff --git a/patches/non_committing_codegen_analysis/deployment_operations.md b/patches/non_committing_codegen_analysis/deployment_operations.md
-index 59f898dc4b2740b85800faa46680454881f6d678..72f710f3b4cb31b8e90135fef072a665a595bca0 100644
+index 7ad982597aca506222be31f619536cf7986bf849..957f474729f7cbc2d22dd4d4df2f338064694493 100644
 --- a/patches/non_committing_codegen_analysis/deployment_operations.md
 +++ b/patches/non_committing_codegen_analysis/deployment_operations.md
 @@ -44,8 +44,10 @@ streaming responses do. They retain their separate body-stream deadline.
@@ -5951,10 +5961,10 @@ index 321f7f57bf45bddbea14b32445d89eda952f1c1c..82fac1b82ef73e18ea96acf3815cd560
  
  Dependency capacity can add bounded overflow for work that releases an isolate-holding ancestor.
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 18925e1fbd223055389ebf4e4cb04debd0b89b53..20acba0259a8e104b249d928b587c2208c08ae1a 100644
+index 74c22336fc68b656f0be6bf0b684edc1fb657cf4..5ffd15f349d7b7998140d93733c59bb05edf067b 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
-@@ -546,29 +546,41 @@ schema evaluation, auth configuration evaluation, app definition evaluation,
+@@ -560,29 +560,41 @@ schema evaluation, auth configuration evaluation, app definition evaluation,
  and component initializer evaluation into a `control_plane` lane. It does not
  match application module or component names. The lane remains in the same FIFO
  and uses only shared-base queue and worker capacity. It does not use dependency
@@ -6005,7 +6015,7 @@ index 18925e1fbd223055389ebf4e4cb04debd0b89b53..20acba0259a8e104b249d928b587c220
  `isolate_control_plane_lane_enabled_info{pool_name}` is `1` only when this
  classification is effective and `0` when the five request variants retain
  ordinary queue behavior. When lane-aware queueing is active, capacity and
-@@ -580,11 +592,11 @@ for the exact classification, capacity, deadline, metrics, and rollout contract.
+@@ -594,11 +606,11 @@ for the exact classification, capacity, deadline, metrics, and rollout contract.
  
  Lane control publishes pool-scoped queue policy, configuration, capacity,
  depth, oldest age, dispatch sojourn, overload, rejection, and ineligibility
@@ -6020,7 +6030,7 @@ index 18925e1fbd223055389ebf4e4cb04debd0b89b53..20acba0259a8e104b249d928b587c220
  reuse are unchanged. See
  [`patches/isolate_queue_control/README.md`](../../patches/isolate_queue_control/README.md) for
  the exact policy and rollout guidance.
-@@ -662,19 +674,27 @@ With these floors enabled, dependency work receives the next available permit
+@@ -676,19 +688,27 @@ With these floors enabled, dependency work receives the next available permit
  because completing it releases an isolate-holding ancestor. The service class
  follows an execution across every release and reacquisition.
  Only an admitted degradable root query cache-miss leader uses the degradable
@@ -6055,7 +6065,7 @@ index 18925e1fbd223055389ebf4e4cb04debd0b89b53..20acba0259a8e104b249d928b587c220
  `FUNRUN_ISOLATE_ACTIVE_THREADS`, require
  `APPLICATION_MAX_CONCURRENT_DEGRADABLE_QUERY_LEADERS`, and their sum cannot
  exceed the active-thread total. The degradable minimum cannot exceed the
-@@ -689,3 +709,21 @@ nineteen degradable active executions after non-preemptive convergence. If
+@@ -703,3 +723,21 @@ nineteen degradable active executions after non-preemptive convergence. If
  either class is idle, the other can use all 28 permits. Use the total to
  control CPU oversubscription and select the minimums from measured progress,
  wait time, CPU headroom, and throttling.

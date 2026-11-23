@@ -191,13 +191,17 @@ Load independent graph modules and prepare independent baseline groups concurren
 using the configured isolate worker capacity. Preserve sequential initialization
 within a Store, memory admission and serial progress under pressure. Keep ownership
 and readiness barriers through completion, cancellation and cleanup.
+
+Check the expected runtime source before a forced finish can stage native
+work or enter Node cutover. Keep the transactional source check and use
+session-bound finish acknowledgements when recovering a lost response.
 ---
  .github/workflows/build_local_backend.yml     |     7 +-
  Cargo.lock                                    | 15509 ++++++-----
  Cargo.toml                                    |    15 +-
  crates/application/Cargo.toml                 |     8 +-
  .../application_function_runner/metrics.rs    |     5 +-
- .../src/application_function_runner/mod.rs    |   138 +-
+ .../src/application_function_runner/mod.rs    |   124 +-
  .../query_shadow.rs                           |  1763 ++
  .../tests/static_hermes_wasmtime_gate.rs      | 13127 ++++++++++
  .../component_delegation.rs                   |   414 +
@@ -205,7 +209,7 @@ and readiness barriers through completion, cancellation and cleanup.
  .../source_package_preactivation_authority.rs |   521 +
  crates/application/src/cache/mod.rs           |    24 +-
  crates/application/src/cron_jobs/mod.rs       |     9 +-
- crates/application/src/deploy_config.rs       |  1837 +-
+ crates/application/src/deploy_config.rs       |  1834 +-
  crates/application/src/external_deps.rs       |    91 +
  crates/application/src/function_log.rs        |  4829 +++-
  crates/application/src/lib.rs                 |   235 +-
@@ -362,8 +366,8 @@ and readiness barriers through completion, cancellation and cleanup.
  crates/local_backend/src/config.rs            |     4 +-
  crates/local_backend/src/dashboard.rs         |    28 +-
  crates/local_backend/src/deploy_config.rs     |     2 +-
- crates/local_backend/src/deploy_config2.rs    |   863 +-
- .../src/deployment_operations.rs              |   299 +-
+ crates/local_backend/src/deploy_config2.rs    |   790 +-
+ .../src/deployment_operations.rs              |    86 +-
  crates/local_backend/src/lib.rs               |    10 +-
  crates/local_backend/src/main.rs              |   167 +
  crates/local_backend/src/router.rs            |    69 +-
@@ -466,10 +470,10 @@ and readiness barriers through completion, cancellation and cleanup.
  patches/deployment_analysis_pacing/README.md  |    44 +-
  .../README.md                                 |    25 +-
  .../design_reference.md                       |    15 +-
- .../deployment_operations.md                  |   113 +-
+ .../deployment_operations.md                  |   122 +-
  patches/static_hermes_wasm_udfs/README.md     |   604 +
  .../compiler_and_artifact_contract.md         |   414 +
- patches/static_hermes_wasm_udfs/operations.md |  1810 ++
+ patches/static_hermes_wasm_udfs/operations.md |  1818 ++
  patches/static_hermes_wasm_udfs/value_abi.md  |   487 +
  scripts/run_cargo.sh                          |    96 +-
  scripts/run_cargo.test.mjs                    |   194 +
@@ -479,7 +483,7 @@ and readiness barriers through completion, cancellation and cleanup.
  self-hosted/docker-build/README.md            |    85 +
  self-hosted/docker-build/run_backend.sh       |     3 +-
  self-hosted/docker/docker-compose.yml         |     1 +
- 287 files changed, 188399 insertions(+), 8517 deletions(-)
+ 287 files changed, 188181 insertions(+), 8449 deletions(-)
  create mode 100644 crates/application/src/application_function_runner/query_shadow.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate.rs
  create mode 100644 crates/application/src/application_function_runner/tests/static_hermes_wasmtime_gate/component_delegation.rs
@@ -20178,10 +20182,10 @@ index 1fe4f7228a10d4d5ab1d518cd85f2b8282614306..9405a85d4752f81e8dc4704fa3aae016
      StatusTimer,
      STATUS_LABEL,
 diff --git a/crates/application/src/application_function_runner/mod.rs b/crates/application/src/application_function_runner/mod.rs
-index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696effb8f0b5d 100644
+index 74c8b025f13182962460b04f47548eba30b119d5..1659799d8e6485043cd7e8769f8c2f0cdc67d24c 100644
 --- a/crates/application/src/application_function_runner/mod.rs
 +++ b/crates/application/src/application_function_runner/mod.rs
-@@ -111,6 +111,8 @@ use function_runner::{
+@@ -112,6 +112,8 @@ use function_runner::{
          FunctionMetadata,
          HttpActionMetadata,
      },
@@ -20190,7 +20194,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
      FunctionReads,
      FunctionRunner,
      FunctionWrites,
-@@ -298,6 +300,8 @@ const NODE_ANALYZE_MAX_BACKOFF: Duration = Duration::from_secs(5);
+@@ -300,6 +302,8 @@ const NODE_ANALYZE_MAX_BACKOFF: Duration = Duration::from_secs(5);
  
  mod http_routing;
  mod metrics;
@@ -20199,7 +20203,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
  
  /// Wrapper for [IsolateClient]s and [FunctionRunner]s that determines where to
  /// route requests.
-@@ -396,7 +400,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -398,7 +402,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
      }
  
      #[fastrace::trace]
@@ -20208,7 +20212,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
          &self,
          tx: Transaction<RT>,
          permit: RequestGuard<'_, RT>,
-@@ -405,6 +409,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -407,6 +411,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          journal: QueryJournal,
          context: ExecutionContext,
          scheduler_dependency: SchedulerDependencyClass,
@@ -20216,25 +20220,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
      ) -> anyhow::Result<(Transaction<RT>, FunctionOutcome)> {
          let (udf_type, function_metadata) = match function_kind {
              DatabaseFunctionKind::Query(active_javascript_class) => (
-@@ -437,24 +442,11 @@ impl<RT: Runtime> FunctionRouter<RT> {
-                 udf_type,
-                 context,
-                 None,
--                Some(match udf_type {
--                    UdfType::Query => FunctionMetadata::Query {
--                        journal,
--                        path_and_args,
--                        active_javascript_class,
--                    },
--                    UdfType::Mutation => FunctionMetadata::Mutation {
--                        journal,
--                        path_and_args,
--                    },
--                    _ => anyhow::bail!("Invalid database UDF type"),
--                }),
--=======
-                 Some(function_metadata),
-->>>>>>> 44c2402e4 (isolate: balance class-aware active-JavaScript admission)
+@@ -443,6 +448,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  None,
                  None,
                  scheduler_dependency,
@@ -20242,7 +20228,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
              )
              .await?;
          let tx = tx.with_context(|| format!("Missing transaction in response for {udf_type}"))?;
-@@ -496,6 +488,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -484,6 +490,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  None,
                  function_execution_start,
                  scheduler_dependency,
@@ -20250,7 +20236,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
              )
              .await?;
  
-@@ -529,6 +522,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -517,6 +524,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
                  Some(http_action_metadata),
                  None,
                  SchedulerDependencyClass::Independent,
@@ -20258,7 +20244,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
              )
              .await?;
  
-@@ -539,8 +533,6 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -527,8 +535,6 @@ impl<RT: Runtime> FunctionRouter<RT> {
          Ok(outcome)
      }
  
@@ -20267,7 +20253,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
      #[fastrace::trace]
      async fn function_runner_execute(
          &self,
-@@ -553,6 +545,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -541,6 +547,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          http_action_metadata: Option<HttpActionMetadata>,
          function_execution_start: Option<FunctionExecutionStartGate>,
          scheduler_dependency: SchedulerDependencyClass,
@@ -20275,7 +20261,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
      ) -> anyhow::Result<(Option<Transaction<RT>>, FunctionOutcome)> {
          // Read in this transaction so preference changes invalidate cached queries.
          let udf_runtime = BackendInfoModel::new(&mut tx)
-@@ -580,6 +573,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -568,6 +575,7 @@ impl<RT: Runtime> FunctionRouter<RT> {
          let timer = function_run_timer(udf_type);
          let execution = isolate::execution_observation::observe(
              self.function_runner.run_function(
@@ -20283,7 +20269,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
                  udf_type,
                  udf_runtime,
                  tx.identity().clone(),
-@@ -615,7 +609,15 @@ impl<RT: Runtime> FunctionRouter<RT> {
+@@ -603,7 +611,15 @@ impl<RT: Runtime> FunctionRouter<RT> {
              // have both been checked.
              diagnostic.outcome = AttemptOutcome::SystemError;
          }
@@ -20300,7 +20286,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
          timer.finish();
          drop(permit);
  
-@@ -832,6 +834,11 @@ pub struct RequestGuard<'a, RT: Runtime> {
+@@ -820,6 +836,11 @@ pub struct RequestGuard<'a, RT: Runtime> {
      permit: Option<DependencyOverflowPermit>,
  }
  
@@ -20312,7 +20298,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
  impl<RT: Runtime> RequestGuard<'_, RT> {
      async fn acquire_permit(&mut self, is_dependency: bool) -> anyhow::Result<()> {
          let timer = function_waiter_timer(self.limiter.udf_type);
-@@ -1018,6 +1025,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
+@@ -1006,6 +1027,7 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
      key_broker: KeyBroker,
  
      isolate_functions: FunctionRouter<RT>,
@@ -20320,7 +20306,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
      // Used for analyze, schema, etc.
      node_actions: NodeActions<RT>,
  
-@@ -1061,6 +1069,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1049,6 +1071,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              default_system_env_vars.clone(),
              function_log.clone(),
          );
@@ -20328,7 +20314,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
          // Construct this gate once per application runner. The cache manager
          // and isolate analysis must receive clones of the same semaphore or
          // their loads become additive again.
-@@ -1112,6 +1121,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1100,6 +1123,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
              database,
              key_broker,
              isolate_functions,
@@ -20336,7 +20322,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
              node_actions,
              source_map_cache,
              modules_storage,
-@@ -1128,6 +1138,56 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1116,6 +1140,56 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          }
      }
  
@@ -20393,7 +20379,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
      fn node_pool_action_limiter(
          &self,
          pool: Option<&NodeExecutorPoolName>,
-@@ -1227,12 +1287,15 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1215,12 +1289,15 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          let (mut tx, outcome) = match validate_result {
              Ok(path_and_args) => {
                  // Preserve the caller's uncommitted module writes in this transaction.
@@ -20410,7 +20396,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
                          tx,
                          permit,
                          path_and_args,
-@@ -1240,6 +1303,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1228,6 +1305,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          QueryJournal::new(),
                          context.clone(),
                          SchedulerDependencyClass::Independent,
@@ -20418,7 +20404,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
                      )
                      .await?
              },
-@@ -1546,6 +1610,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1534,6 +1612,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                      return Ok(Err(MutationError {
                          error: error.to_owned(),
                          log_lines,
@@ -20426,7 +20412,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
                      }));
                  },
              };
-@@ -1586,6 +1651,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1574,6 +1653,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                          Err(MutationError {
                              error: js_error,
                              log_lines,
@@ -20434,7 +20420,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
                          })
                      } else {
                          if let Some(occ_info) = e.occ_info()
-@@ -1696,11 +1762,22 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1684,11 +1764,22 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
      pub async fn acquire_mutation_permit(
          &self,
          scheduler_dependency: SchedulerDependencyClass,
@@ -20460,7 +20446,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
      }
  
      /// Attempts to run a mutation once using the given transaction.
-@@ -1711,7 +1788,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1699,7 +1790,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
      pub async fn run_mutation_no_udf_log(
          &self,
          tx: Transaction<RT>,
@@ -20469,7 +20455,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
          path: PublicFunctionPath,
          arguments: SerializedArgs,
          allowed_visibility: AllowedVisibility,
-@@ -1755,7 +1832,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1743,7 +1834,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
      async fn run_mutation_inner(
          &self,
          mut tx: Transaction<RT>,
@@ -20478,7 +20464,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
          path: PublicFunctionPath,
          arguments: SerializedArgs,
          allowed_visibility: AllowedVisibility,
-@@ -1763,7 +1840,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1751,7 +1842,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          mutation_queue_length: Option<usize>,
          scheduler_dependency: SchedulerDependencyClass,
      ) -> anyhow::Result<(Transaction<RT>, ValidatedUdfOutcome)> {
@@ -20490,7 +20476,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
          self.database.check_write_throughput_limit()?;
          if path.is_system() && !(tx.identity().is_admin() || tx.identity().is_system()) {
              anyhow::bail!(unauthorized_error("mutation"));
-@@ -1797,7 +1877,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1785,7 +1879,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          let path = path_and_args.path().clone();
          let (mut tx, outcome) = self
              .isolate_functions
@@ -20499,7 +20485,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
                  tx,
                  permit,
                  path_and_args,
-@@ -1805,6 +1885,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -1793,6 +1887,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                  QueryJournal::new(),
                  context.clone(),
                  scheduler_dependency,
@@ -20507,7 +20493,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
              )
              .await?;
          let mutation_outcome = match outcome {
-@@ -2509,8 +2590,6 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
+@@ -2570,8 +2665,6 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
          }
      }
  
@@ -20516,7 +20502,7 @@ index d5279b61a75fce7d139155101ed10ca4ef55fe54..c84c9a34d8050f723855fdffb8f696ef
      #[fastrace::trace]
      pub async fn build_deps(
          &self,
-@@ -3622,4 +3701,7 @@ mod tests {
+@@ -3683,4 +3776,7 @@ mod tests {
              Ok(())
          })
      }
@@ -36566,7 +36552,7 @@ index fc1b21396e51d2d922935b18116a539035f81242..69bba1a7caba7d67d20c7d9a7c3f8ed6
                  let path = CanonicalizedComponentFunctionPath {
                      component: component_path,
 diff --git a/crates/application/src/deploy_config.rs b/crates/application/src/deploy_config.rs
-index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24201a4192 100644
+index a27974baf101d981a21b7c8e2da2903078617a3c..bd2a2908053354fc4ab518341857915c64804165 100644
 --- a/crates/application/src/deploy_config.rs
 +++ b/crates/application/src/deploy_config.rs
 @@ -56,6 +56,7 @@ use common::{
@@ -36890,6 +36876,27 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
          &self,
          topology: &NodeExecutorPoolTopology,
 @@ -1151,6 +1409,7 @@ impl<RT: Runtime> Application<RT> {
+         identity: Identity,
+         operation: Option<&FinishPushOperation>,
+         start_push: &StartPushResponse,
++        expected_runtime_prior: Option<&SourceKeyedRuntimeExpectedPrior>,
+         native_activation: Option<&model::source_packages::native::NativeResidentActivation>,
+         force_node_cutover: bool,
+     ) -> anyhow::Result<Option<(SerializedFinishPushDiff, Timestamp)>> {
+@@ -1167,7 +1426,11 @@ impl<RT: Runtime> Application<RT> {
+             return Ok(Some(replay));
+         }
+         if force_node_cutover {
+-            // Reject stale preparation before a forced cutover can interrupt running work.
++            // A stale operator request must not terminate work before its already
++            // unsatisfied source, selection, or environment fence rejects the commit.
++            if let Some(expected) = expected_runtime_prior {
++                validate_source_keyed_runtime_expected_prior_in_tx(&mut tx, expected).await?;
++            }
+             validate_native_resident_activation_in_tx(&mut tx, native_activation).await?;
+             start_push.validate_environment_variables(&mut tx).await?;
+         }
+@@ -1181,6 +1444,7 @@ impl<RT: Runtime> Application<RT> {
          request_metadata: RequestMetadata,
          mut start_push: StartPushResponse,
          message: Option<PushMessage>,
@@ -36897,7 +36904,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
          native_resident_activation: Option<
              model::source_packages::native::NativeResidentActivation,
          >,
-@@ -1185,22 +1444,34 @@ impl<RT: Runtime> Application<RT> {
+@@ -1206,22 +1470,34 @@ impl<RT: Runtime> Application<RT> {
          );
          // Resolve source bytes from this server's retained preparation or the
          // uploaded archive. Both paths still validate activation inputs below.
@@ -36939,7 +36946,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
                      .get(definition_path)
                      .context("downloaded component package missing")?
              };
-@@ -1227,11 +1498,28 @@ impl<RT: Runtime> Application<RT> {
+@@ -1248,11 +1524,28 @@ impl<RT: Runtime> Application<RT> {
          // finish outside the registry's retained-source reservation.
          let downloaded_source_packages = match prepared {
              Some(prepared) => &prepared.packages,
@@ -36970,7 +36977,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
              .context("No source package for the root component")?
              .node_executor_pool_topology
              .clone();
-@@ -1242,14 +1530,26 @@ impl<RT: Runtime> Application<RT> {
+@@ -1263,14 +1556,26 @@ impl<RT: Runtime> Application<RT> {
          self.runner()
              .validate_node_executor_pool_topology(&committed_pool_topology)?;
  
@@ -37000,8 +37007,18 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
 +            root_source_package.native_resident = activation.target.clone();
          }
  
-         let cutover_reservation = self
-@@ -1275,188 +1575,264 @@ impl<RT: Runtime> Application<RT> {
+         // Preparation and native staging can outlive a competing edit. Recheck at
+@@ -1280,6 +1585,9 @@ impl<RT: Runtime> Application<RT> {
+                 identity.clone(),
+                 operation.as_ref(),
+                 &start_push,
++                prepared_runtime_activation
++                    .as_ref()
++                    .map(|prepared| &prepared.expected_prior),
+                 native_resident_activation.as_ref(),
+                 force_node_cutover,
+             )
+@@ -1311,181 +1619,256 @@ impl<RT: Runtime> Application<RT> {
                      .and_then(|activation| activation.application_contract.as_deref()),
              )
              .await?;
@@ -37030,15 +37047,8 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
 -                            native_resident_activation.as_ref(),
 -                        )
 -                        .await?;
--                        // Validate that environment variables haven't changed since `start_push`.
--                        let environment_variables =
--                            EnvironmentVariablesModel::new(tx).get_all().await?;
--                        if environment_variables != start_push.environment_variables {
--                            anyhow::bail!(ErrorMetadata::bad_request(
--                                "RaceDetected",
--                                "Environment variables have changed during push"
--                            ));
--                        }
+-                        start_push.validate_environment_variables(tx).await?;
+-                        let environment_variables = &start_push.environment_variables;
 -
 -                        // Validate that all required env vars declared in the
 -                        // app definition are present.
@@ -37106,7 +37116,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
 -
 -                            // Validate existing values match the new validators.
 -                            validate_env_var_values(
--                                &environment_variables,
+-                                environment_variables,
 -                                &app_def.definition.env_vars,
 -                            )?;
 -                        }
@@ -37180,16 +37190,8 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
 -                                    result_json: serde_json::to_string(&diff)?,
 -                                })
 -                                .await?;
-+                                // Validate that environment variables haven't changed since
-+                                // `start_push`.
-+                                let environment_variables =
-+                                    EnvironmentVariablesModel::new(tx).get_all().await?;
-+                                if environment_variables != start_push.environment_variables {
-+                                    anyhow::bail!(ErrorMetadata::bad_request(
-+                                        "RaceDetected",
-+                                        "Environment variables have changed during push"
-+                                    ));
-+                                }
++                                start_push.validate_environment_variables(tx).await?;
++                                let environment_variables = &start_push.environment_variables;
 +
 +                                // Validate that all required env vars declared in the
 +                                // app definition are present.
@@ -37220,7 +37222,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
 +
 +                                    // Validate existing values match the new validators.
 +                                    validate_env_var_values(
-+                                        &environment_variables,
++                                        environment_variables,
 +                                        &app_def.definition.env_vars,
 +                                    )?;
 +                                }
@@ -37386,16 +37388,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
 -                    e
 -                }
 -            })?;
-+                // A receipt proves commit only. Do not repeat activation or launch
-+                // a second cutover when the original owner already committed it.
-+                FinishPushCommit::Replayed(diff, ts) => {
-+                    DEPLOYMENT_FINISH_EVENTS_TOTAL
-+                        .with_label_values(&["historical_replay"])
-+                        .inc();
-+                    return Ok((diff, ts));
-+                },
-+            };
- 
+-
 -        let diff = match diff {
 -            FinishPushCommit::Applied(diff) => {
 -                DEPLOYMENT_FINISH_EVENTS_TOTAL
@@ -37412,8 +37405,15 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
 -                return Ok((diff, ts));
 -            },
 -        };
-+            #[cfg(feature = "static-hermes-wasmtime-gate")]
-+            drop(_runtime_publication);
++                // A receipt proves commit only. Do not repeat activation or launch
++                // a second cutover when the original owner already committed it.
++                FinishPushCommit::Replayed(diff, ts) => {
++                    DEPLOYMENT_FINISH_EVENTS_TOTAL
++                        .with_label_values(&["historical_replay"])
++                        .inc();
++                    return Ok((diff, ts));
++                },
++            };
  
 -        drop(native_publication);
 -        self.complete_node_executor_pool_cutover_after_commit(
@@ -37422,6 +37422,9 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
 -            cutover_reservation,
 -        )
 -        .await?;
++            #[cfg(feature = "static-hermes-wasmtime-gate")]
++            drop(_runtime_publication);
++
 +            drop(native_publication);
 +            application
 +                .complete_node_executor_pool_cutover_after_commit(
@@ -37439,7 +37442,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
      }
  
      /// N.B.: does not check auth
-@@ -1512,9 +1888,15 @@ impl<RT: Runtime> Application<RT> {
+@@ -1541,9 +1924,15 @@ impl<RT: Runtime> Application<RT> {
                      .map(|(_, pkg)| pkg.package_size)
                      .unwrap_or_default();
  
@@ -37456,7 +37459,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
                  let committed_pool_topology = source_package.node_executor_pool_topology.clone();
                  let end_upload_source_package = Instant::now();
                  // Verify that we have not exceeded the max unzipped file size
-@@ -1558,63 +1940,75 @@ impl<RT: Runtime> Application<RT> {
+@@ -1587,63 +1976,75 @@ impl<RT: Runtime> Application<RT> {
                  let native_publication = self
                      .lock_native_resident_publication(native_resident, None)
                      .await?;
@@ -37580,7 +37583,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
          let guard = supervisor.publication_guard().await;
          // A canceled HTTP caller can commit before notifying supervision. Read
          // the durable head under the guard before trusting live compatibility.
-@@ -1672,6 +2066,14 @@ pub struct StartPushRequest {
+@@ -1701,6 +2102,14 @@ pub struct StartPushRequest {
  
      pub node_dependencies: Vec<NodeDependencyJson>,
  
@@ -37595,7 +37598,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
      pub node_version: Option<String>,
  
      #[serde(default)]
-@@ -1713,6 +2115,10 @@ impl StartPushRequest {
+@@ -1742,6 +2151,10 @@ impl StartPushRequest {
                  .into_iter()
                  .map(NodeDependency::from)
                  .collect(),
@@ -37606,7 +37609,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
              node_version,
              dry_run: self.dry_run,
              for_codegen: self.for_codegen,
-@@ -1721,6 +2127,44 @@ impl StartPushRequest {
+@@ -1750,6 +2163,44 @@ impl StartPushRequest {
      }
  }
  
@@ -37651,7 +37654,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
  #[derive(Clone, Debug)]
  pub struct StartPushResponse {
      // We read the current environment variables when evaluating the definitions, so we need to
-@@ -2760,19 +3204,89 @@ mod deployment_receipt_tests {
+@@ -2811,19 +3262,89 @@ mod deployment_receipt_tests {
      use super::*;
  
      fn receipt(id: &str, expires: i64) -> DeploymentReceipt {
@@ -37746,7 +37749,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
              external_deps_package_id: None,
              package_size: Default::default(),
              node_version: None,
-@@ -2814,13 +3328,13 @@ mod deployment_receipt_tests {
+@@ -2865,13 +3386,13 @@ mod deployment_receipt_tests {
              SourcePackageModel::new(&mut native, TableNamespace::Global)
                  .put(package)
                  .await?;
@@ -37762,7 +37765,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
                  .await
                  .unwrap_err()
                  .is_occ());
-@@ -2845,6 +3359,75 @@ mod deployment_receipt_tests {
+@@ -2896,6 +3417,75 @@ mod deployment_receipt_tests {
          })
      }
  
@@ -37838,7 +37841,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
      #[test]
      fn empty_source_activations_serialize_and_advance_the_generation() -> anyhow::Result<()> {
          let tokio = ProdRuntime::init_tokio()?;
-@@ -2869,10 +3452,10 @@ mod deployment_receipt_tests {
+@@ -2920,10 +3510,10 @@ mod deployment_receipt_tests {
              let first_id = SourcePackageModel::new(&mut newer, TableNamespace::Global)
                  .put(source())
                  .await?;
@@ -37851,7 +37854,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
                  .await
                  .unwrap_err()
                  .is_occ());
-@@ -2889,7 +3472,7 @@ mod deployment_receipt_tests {
+@@ -2940,7 +3530,7 @@ mod deployment_receipt_tests {
                  .put(source())
                  .await?;
              assert_ne!(first_id, second_id);
@@ -37860,7 +37863,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
                  .await?;
              let mut tx = db.begin_system().await?;
              let latest = SourcePackageModel::new(&mut tx, TableNamespace::Global)
-@@ -2942,21 +3525,23 @@ mod deployment_receipt_tests {
+@@ -2993,21 +3583,23 @@ mod deployment_receipt_tests {
                  system_env_var_overrides: BTreeMap::new(),
              }));
              assert!(operation.validate(&mut tx).await?.is_none());
@@ -37888,7 +37891,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
                  .await?;
              let mut tx = db.begin_system().await?;
              // Historical replay wins over the now-stale preparation. It must
-@@ -3005,10 +3590,10 @@ mod deployment_receipt_tests {
+@@ -3056,10 +3648,10 @@ mod deployment_receipt_tests {
                      "https://changed.example.invalid".to_owned(),
                  )
                  .await?;
@@ -37901,7 +37904,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
                  .await
                  .unwrap_err()
                  .is_occ());
-@@ -3038,6 +3623,9 @@ mod deployment_receipt_tests {
+@@ -3089,6 +3681,9 @@ mod deployment_receipt_tests {
              let db = deployment_test_database(rt.clone(), persistence.clone()).await?;
              model::initialize_application_system_tables(&db).await?;
              let expiry = i64::try_from(rt.unix_timestamp().as_secs())? + 600;
@@ -37911,7 +37914,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
              let prepared = PreparedPush {
                  packages: BTreeMap::new(),
                  external_deps_storage_key: None,
-@@ -3056,24 +3644,51 @@ mod deployment_receipt_tests {
+@@ -3107,24 +3702,51 @@ mod deployment_receipt_tests {
                      .put(source())
                      .await?;
                  DeploymentReceiptModel::new(tx)
@@ -37966,7 +37969,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
              DeploymentReceiptModel::new(&mut tx)
                  .record(receipt("aborted", expiry))
                  .await?;
-@@ -3090,13 +3705,49 @@ mod deployment_receipt_tests {
+@@ -3141,13 +3763,49 @@ mod deployment_receipt_tests {
                  DeploymentReceiptModel::new(&mut tx)
                      .lookup("operation", "input")
                      .await?,
@@ -38017,7 +38020,7 @@ index d1d2f75ba69bb569ba57e5c6d27256901d6f6979..9d0730ae5c3fa91aeb355a2a6120db24
              Ok(())
          })
      }
-@@ -3119,20 +3770,688 @@ mod deployment_receipt_tests {
+@@ -3170,20 +3828,688 @@ mod deployment_receipt_tests {
                  .await
                  .is_err());
              drop(tx);
@@ -190481,10 +190484,10 @@ index 36a7dee78c3aac379327d5ff85ba7ea3acf5ba2c..6c69a8167b61496649408f07683bd542
          .and_then(|v| v.node_version.map(|v| v.into()));
  
 diff --git a/crates/local_backend/src/deploy_config2.rs b/crates/local_backend/src/deploy_config2.rs
-index 2121782e539ce932cdc5f6f6c20be30f02196177..b9ace5ea8efa07a0df732c2d833f75095ae0e033 100644
+index cdd8dc1b7c53eb1818936966c458139dacaaab56..2e94950e614bbf290c5844e2112b647d626d2693 100644
 --- a/crates/local_backend/src/deploy_config2.rs
 +++ b/crates/local_backend/src/deploy_config2.rs
-@@ -1,8 +1,12 @@
+@@ -1,5 +1,8 @@
  use std::{
 -    collections::BTreeMap,
 +    collections::{
@@ -190494,11 +190497,7 @@ index 2121782e539ce932cdc5f6f6c20be30f02196177..b9ace5ea8efa07a0df732c2d833f7509
      time::Duration,
  };
  
-+use anyhow::Context;
- use application::deploy_config::{
-     ComponentSchemaPrediction,
-     EvaluatePushResponse,
-@@ -10,15 +14,24 @@ use application::deploy_config::{
+@@ -11,15 +14,24 @@ use application::deploy_config::{
      FinishPushDiff,
      IndexChangePrediction,
      IndexPrediction,
@@ -190523,7 +190522,7 @@ index 2121782e539ce932cdc5f6f6c20be30f02196177..b9ace5ea8efa07a0df732c2d833f7509
      response::IntoResponse,
  };
  use common::{
-@@ -37,11 +50,14 @@ use common::{
+@@ -38,11 +50,14 @@ use common::{
          HttpResponseError,
      },
      schemas::TableValidationOutcome,
@@ -190538,7 +190537,7 @@ index 2121782e539ce932cdc5f6f6c20be30f02196177..b9ace5ea8efa07a0df732c2d833f7509
  use model::{
      components::{
          config::SerializedSchemaChange,
-@@ -55,9 +71,15 @@ use model::{
+@@ -56,9 +71,15 @@ use model::{
          },
          types::PushMessage,
      },
@@ -190556,7 +190555,7 @@ index 2121782e539ce932cdc5f6f6c20be30f02196177..b9ace5ea8efa07a0df732c2d833f7509
  };
  use roles::RequireDeploymentOp;
  use serde::{
-@@ -75,7 +97,10 @@ use serde_with::{
+@@ -76,7 +97,10 @@ use serde_with::{
      serde_as,
      DeserializeAs,
  };
@@ -190567,7 +190566,7 @@ index 2121782e539ce932cdc5f6f6c20be30f02196177..b9ace5ea8efa07a0df732c2d833f7509
      ConvexObject,
      DeveloperDocumentId,
  };
-@@ -85,6 +110,227 @@ use crate::{
+@@ -86,6 +110,227 @@ use crate::{
      LocalAppState,
  };
  
@@ -190795,13 +190794,7 @@ index 2121782e539ce932cdc5f6f6c20be30f02196177..b9ace5ea8efa07a0df732c2d833f7509
  impl TryFrom<StartPushResponse> for SerializedStartPushResponse {
      type Error = anyhow::Error;
  
-@@ -451,15 +697,546 @@ pub struct FinishPushRequest {
-     /// Omitted by legacy clients. Identifies a bounded durable finish replay.
-     #[serde(default, skip_serializing)]
-     pub operation_id: Option<String>,
-+    #[serde(default, skip_serializing)]
-+    pub operation_session_id: Option<String>,
-     start_push: SerializedStartPushResponse,
+@@ -463,11 +708,542 @@ pub struct FinishPushRequest {
      pub dry_run: bool,
      pub message: Option<String>,
      #[serde(default)]
@@ -191059,6 +191052,8 @@ index 2121782e539ce932cdc5f6f6c20be30f02196177..b9ace5ea8efa07a0df732c2d833f7509
 +        equivalent["adminKey"] = "replacement-credential".into();
 +        equivalent["operationId"] = "another-operation".into();
 +        equivalent["operationSessionId"] = "another-session".into();
++        equivalent["finishAttempt"] =
++            serde_json::json!(common::execution_context::ExecutionId::new());
 +        equivalent["message"] = JsonValue::Null;
 +        equivalent["forceNodeCutover"] = false.into();
 +        assert_eq!(expected, digest(equivalent));
@@ -191342,151 +191337,49 @@ index 2121782e539ce932cdc5f6f6c20be30f02196177..b9ace5ea8efa07a0df732c2d833f7509
  /// Internal version that returns the commit timestamp for use by conductor
  pub async fn finish_push_internal(
      st: &LocalAppState,
-@@ -474,6 +1251,16 @@ pub async fn finish_push_internal(
-     .await?;
-     identity.require_operation(keybroker::DeploymentOp::Deploy)?;
- 
-+    if req.operation_session_id.is_some() {
-+        anyhow::ensure!(
-+            req.operation_id.is_some(),
-+            ErrorMetadata::bad_request(
-+                "InvalidDeploymentOperation",
-+                "A deployment operation session requires an operation ID"
-+            )
-+        );
-+    }
-+
-     // The exclusive prepared lease precedes receipt lookup and force-capable
-     // cutover admission. Keep it through the application call, even if cancel
-     // or expiry revokes preparation while this finish still owns its sources.
-@@ -484,9 +1271,11 @@ pub async fn finish_push_internal(
-         )?;
-         let input_sha256 =
-             crate::deployment_operations::normalized_digest(&mut serde_json::to_value(&req)?)?;
--        let prepared = st
--            .deployment_operations
--            .prepared(operation_id, serde_json::to_value(&req.start_push)?)?;
-+        let prepared = st.deployment_operations.prepared(
-+            operation_id,
-+            req.operation_session_id.as_deref(),
-+            serde_json::to_value(&req.start_push)?,
-+        )?;
-         let operation = application::deploy_config::FinishPushOperation {
-             operation_id: operation_id.clone(),
-             input_sha256: input_sha256.as_hex(),
-@@ -511,6 +1300,10 @@ pub async fn finish_push_internal(
+@@ -538,6 +1314,10 @@ pub async fn finish_push_internal(
      }
      let start_push = StartPushResponse::try_from(req.start_push)?;
      let message = req.message.map(PushMessage::try_from).transpose()?;
-+    let source_keyed_runtime_activation = req
++    let source_keyed_runtime_activation: Option<SourceKeyedRuntimeActivation> = req
 +        .source_keyed_runtime_activation
 +        .map(TryInto::try_into)
 +        .transpose()?;
  
      // A dry run retains schema validation from start_push, but never activates
      // code. It still rejects conflicting receipts or missing preparation.
-@@ -542,30 +1335,40 @@ pub async fn finish_push_internal(
-         }
-     }
- 
--    let (resp, ts) = st
--        .application
--        .finish_push(
--            identity,
--            request_metadata,
--            start_push,
--            message,
--            req.native_resident,
--            &st.native_resident,
--            req.force_node_cutover,
--            operation,
--        )
--        .await
--        .map_err(|e| {
--            if e.short_msg() == "NodeExecutorCutoverFailedAfterCommit" {
--                e
--            } else {
--                e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}"))
--            }
--        })?;
--    // Read the durable head, including receipt replay and concurrent deployments.
--    // The background reconciler repeats this if the HTTP caller disappears.
--    crate::native_resident::reconcile(&st.application, &st.native_resident).await?;
--    Ok((resp, Some(ts)))
-+    let st = st.clone();
-+    // The accepted owner retains its prepared-operation lease until publication
-+    // is terminal. Dropping an HTTP waiter must not advertise an idle finish
-+    // while the application's detached database commit can still run.
-+    tokio::spawn(async move {
-+        let _prepared_lease = _prepared_lease;
-+        let (resp, ts) = st
-+            .application
-+            .finish_push(
-+                identity,
-+                request_metadata,
-+                start_push,
-+                message,
+@@ -559,6 +1339,9 @@ pub async fn finish_push_internal(
+             identity.clone(),
+             operation.as_ref(),
+             &start_push,
++            source_keyed_runtime_activation
++                .as_ref()
++                .map(|activation| &activation.expected_prior),
+             req.native_resident.as_ref(),
+             req.force_node_cutover,
+         )
+@@ -588,6 +1371,7 @@ pub async fn finish_push_internal(
+                 request_metadata,
+                 start_push,
+                 message,
 +                source_keyed_runtime_activation,
-+                req.native_resident,
-+                &st.native_resident,
-+                req.force_node_cutover,
-+                operation,
-+            )
-+            .await
-+            .map_err(|e| {
-+                if e.short_msg() == "NodeExecutorCutoverFailedAfterCommit" {
-+                    e
-+                } else {
-+                    e.wrap_error_message(|msg| format!("Hit an error while pushing:\n{msg}"))
-+                }
-+            })?;
-+        // Read the durable head, including receipt replay and concurrent deployments.
-+        // The background reconciler repeats this if the HTTP caller disappears.
-+        crate::native_resident::reconcile(&st.application, &st.native_resident).await?;
-+        Ok((resp, Some(ts)))
-+    })
-+    .await
-+    .context("deployment finish owner failed")?
- }
- 
- pub async fn finish_push(
+                 req.native_resident,
+                 &st.native_resident,
+                 req.force_node_cutover,
 diff --git a/crates/local_backend/src/deployment_operations.rs b/crates/local_backend/src/deployment_operations.rs
-index 6ebc6247699549ce430bfbc625b3213f4ac751f5..69ef62d52d203844cbf1501c47c964d9584c6228 100644
+index 17858439cc8fe0cbac6d1aa7cd4fa894b7ef0ead..537c5778c5af4f1fd8e9c74ccbb37b44de1ed798 100644
 --- a/crates/local_backend/src/deployment_operations.rs
 +++ b/crates/local_backend/src/deployment_operations.rs
-@@ -113,7 +113,7 @@ pub fn http_admission(st: LocalAppState) -> common::http::DeploymentHttpAdmissio
- pub(crate) struct DeploymentOperations {
-     operations: Arc<Mutex<BTreeMap<String, Operation>>>,
+@@ -120,7 +120,7 @@ pub(crate) struct DeploymentOperations {
+     // before expiry may still be draining when the client loses its response.
+     expired_finishes: Arc<Mutex<VecDeque<(String, ExecutionId)>>>,
      clock: Arc<Mutex<SystemTime>>,
 -    session_id: String,
 +    pub(crate) session_id: String,
  }
  
  impl Default for DeploymentOperations {
-@@ -138,6 +138,22 @@ struct Operation {
-     finish: FinishState,
- }
- 
-+impl Operation {
-+    fn revoke(&mut self, id: &str) {
-+        if let Some(cancel) = &self.cancellation {
-+            cancel.send_replace(true);
-+        } else if self.prepared.take().is_some() {
-+            self.response = encode_result(
-+                &json!({"operationId":id,"state":"failed","code":"DeploymentOperationCancelled"}),
-+            )
-+            .expect("fixed cancellation exceeds result limit");
-+            if self.finish == FinishState::Idle {
-+                self.reserved_bytes = self.response.len();
-+            }
-+        }
-+    }
-+}
-+
- #[derive(Clone, Copy, Debug, PartialEq, Eq)]
- enum FinishState {
-     Idle,
-@@ -211,12 +227,37 @@ fn encode_result(value: &Value) -> Option<Bytes> {
+@@ -249,12 +249,37 @@ fn encode_result(value: &Value) -> Option<Bytes> {
      Some(Bytes::from(writer.bytes))
  }
  
@@ -191525,185 +191418,7 @@ index 6ebc6247699549ce430bfbc625b3213f4ac751f5..69ef62d52d203844cbf1501c47c964d9
      Ok(hash.finalize())
  }
  
-@@ -242,6 +283,9 @@ pub struct SubmitOperation {
- pub struct OperationControl {
-     admin_key: String,
-     operation_id: String,
-+    // Legacy controls report analysis. A session-bound control also owns
-+    // revocation and observation of publication authority after a lost reply.
-+    session_id: Option<String>,
- }
- 
- #[derive(Deserialize)]
-@@ -257,6 +301,7 @@ pub async fn capabilities(
-     authorize(&st, req.admin_key).await?;
-     Ok(axum::Json(json!({
-         "protocolVersion": 1,
-+        "publicationStatusProtocol": 1,
-         "mutationPriorityProtocol": if *common::knobs::ISOLATE_QUEUE_DELAY_CONTROL_ENABLED { 1 } else { 0 },
-         "nativeResidentProtocol": 1,
-         "nativeResidentWarmHandoverProtocol": 1,
-@@ -272,6 +317,19 @@ pub async fn capabilities(
- // The creation time is part of identity. Removing an expired entry cannot let
- // a late retry silently create new work with the same operation ID.
- pub(crate) fn operation_expiry(id: &str, now: SystemTime) -> anyhow::Result<SystemTime> {
-+    let expires = operation_expiration(id, now)?;
-+    anyhow::ensure!(
-+        now < expires,
-+        ErrorMetadata::bad_request(
-+            "DeploymentOperationExpired",
-+            "This operation ID has expired. Inspect deployment state before starting a new \
-+             operation."
-+        )
-+    );
-+    Ok(expires)
-+}
-+
-+fn operation_expiration(id: &str, now: SystemTime) -> anyhow::Result<SystemTime> {
-     anyhow::ensure!(
-         id.len() <= 64,
-         ErrorMetadata::bad_request("InvalidDeploymentOperation", "Operation ID is too long")
-@@ -307,14 +365,6 @@ pub(crate) fn operation_expiry(id: &str, now: SystemTime) -> anyhow::Result<Syst
-         )
-     );
-     let expires = created + LIFETIME;
--    anyhow::ensure!(
--        now < expires,
--        ErrorMetadata::bad_request(
--            "DeploymentOperationExpired",
--            "This operation ID has expired. Inspect deployment state before starting a new \
--             operation."
--        )
--    );
-     Ok(expires)
- }
- 
-@@ -349,8 +399,14 @@ impl DeploymentOperations {
-     pub(crate) fn prepared(
-         &self,
-         id: &str,
-+        session_id: Option<&str>,
-         mut response: Value,
-     ) -> anyhow::Result<Option<PreparedPushLease>> {
-+        // A previous session may read its durable receipt, but cannot borrow
-+        // preparation admitted in this process, even if its ID was resubmitted.
-+        if session_id.is_some_and(|session_id| session_id != self.session_id) {
-+            return Ok(None);
-+        }
-         let digest = normalized_digest(&mut response)?;
-         let mut operations = self.operations.lock();
-         self.prune(&mut operations, self.now());
-@@ -428,19 +484,55 @@ impl DeploymentOperations {
-             "DeploymentOperationUnknown",
-             "No retained operation exists in this process",
-         ))?;
--        if let Some(cancel) = &operation.cancellation {
--            cancel.send_replace(true);
--        } else if operation.prepared.take().is_some() {
--            operation.response = encode_result(
--                &json!({"operationId":id,"state":"failed","code":"DeploymentOperationCancelled"}),
--            )
--            .expect("fixed cancellation exceeds result limit");
--            if operation.finish == FinishState::Idle {
--                operation.reserved_bytes = operation.response.len();
--            }
--        }
-+        operation.revoke(id);
-         Ok(operation.response.clone())
-     }
-+
-+    fn publication_control(
-+        &self,
-+        id: &str,
-+        session_id: &str,
-+        revoke: bool,
-+    ) -> anyhow::Result<Value> {
-+        let now = self.now();
-+        let expires = operation_expiration(id, now)?;
-+        let mut operations = self.operations.lock();
-+        self.prune(&mut operations, now);
-+        let now = self.now();
-+        let publication_state = if session_id != self.session_id {
-+            // Old submissions and finishes carry the old session and cannot
-+            // acquire preparation in this process after a restart.
-+            "revoked"
-+        } else if let Some(operation) = operations.get_mut(id) {
-+            if revoke {
-+                operation.revoke(id);
-+            }
-+            if operation.finish == FinishState::Active {
-+                "active"
-+            } else if operation.prepared.is_some()
-+                || operation
-+                    .cancellation
-+                    .as_ref()
-+                    .is_some_and(|cancel| !*cancel.borrow())
-+            {
-+                "available"
-+            } else {
-+                "revoked"
-+            }
-+        } else if now >= expires {
-+            // Pruning retains every active finish lease even after expiry.
-+            // Absence now also prevents a delayed submission from starting.
-+            "revoked"
-+        } else {
-+            anyhow::bail!(ErrorMetadata::bad_request(
-+                "DeploymentOperationUnknown",
-+                "No retained publication operation exists in this process"
-+            ));
-+        };
-+        Ok(
-+            json!({"operationId":id,"sessionId":self.session_id,"publicationState":publication_state}),
-+        )
-+    }
- }
- 
- pub async fn submit(
-@@ -476,10 +568,9 @@ pub async fn submit(
-         ))
-         .into());
-     }
--    // Normalize object order and whitespace before binding identity.
--    req.config.sort_all_objects();
-+    // Use the same JSON identity for submission, preparation and finish replay.
-+    let digest = normalized_digest(&mut req.config)?;
-     let encoded = serde_json::to_vec(&req.config).context("serializing deployment input")?;
--    let digest = Sha256::hash(&encoded);
-     let reconstructed_bytes = if req
-         .config
-         .get("appDefinition")
-@@ -691,6 +782,14 @@ pub async fn status(
-     Json(req): Json<OperationControl>,
- ) -> Result<Response, HttpResponseError> {
-     authorize(&st, req.admin_key).await?;
-+    if let Some(session_id) = req.session_id {
-+        return Ok(axum::Json(st.deployment_operations.publication_control(
-+            &req.operation_id,
-+            &session_id,
-+            false,
-+        )?)
-+        .into_response());
-+    }
-     let mut operations = st.deployment_operations.operations.lock();
-     let now = st.deployment_operations.now();
-     st.deployment_operations.prune(&mut operations, now);
-@@ -709,6 +808,14 @@ pub async fn cancel(
-     Json(req): Json<OperationControl>,
- ) -> Result<Response, HttpResponseError> {
-     authorize(&st, req.admin_key).await?;
-+    if let Some(session_id) = req.session_id {
-+        return Ok(axum::Json(st.deployment_operations.publication_control(
-+            &req.operation_id,
-+            &session_id,
-+            true,
-+        )?)
-+        .into_response());
-+    }
-     Ok(response(
-         st.deployment_operations.cancel(&req.operation_id)?,
-     ))
-@@ -718,6 +825,59 @@ pub async fn cancel(
+@@ -847,6 +872,59 @@ pub async fn cancel(
  mod tests {
      use super::*;
  
@@ -191763,7 +191478,7 @@ index 6ebc6247699549ce430bfbc625b3213f4ac751f5..69ef62d52d203844cbf1501c47c964d9
      #[test]
      fn expiry_stays_final_after_clock_corrections() {
          let owner = DeploymentOperations::default();
-@@ -794,7 +954,7 @@ mod tests {
+@@ -924,7 +1002,7 @@ mod tests {
                  "{}:0123456789abcdef0123456789abcdef",
                  now.duration_since(UNIX_EPOCH).unwrap().as_secs()
              );
@@ -191772,140 +191487,15 @@ index 6ebc6247699549ce430bfbc625b3213f4ac751f5..69ef62d52d203844cbf1501c47c964d9
              let sources = Arc::new(PreparedPush::default());
              let weak_sources = Arc::downgrade(&sources);
              owner.operations.lock().insert(
-@@ -814,10 +974,33 @@ mod tests {
-                     finish: FinishState::Idle,
+@@ -945,6 +1023,8 @@ mod tests {
+                     completed_finish_attempt: None,
                  },
              );
--            let first = owner.prepared(&id, response.clone()).unwrap().unwrap();
 +            // The ordinary JavaScript echo must acquire the same source lease.
 +            let response = json!({"prepared":1});
-+            assert_eq!(
-+                owner
-+                    .publication_control(&id, &owner.session_id, false)
-+                    .unwrap()["publicationState"],
-+                "available"
-+            );
-+            assert!(owner
-+                .prepared(&id, Some("previous-session"), response.clone())
-+                .unwrap()
-+                .is_none());
              assert_eq!(
                  owner
--                    .prepared(&id, response.clone())
-+                    .prepared(&id, Some(&owner.session_id), json!({"prepared":false}))
-+                    .err()
-+                    .unwrap()
-+                    .short_msg(),
-+                "DeploymentOperationInputMismatch"
-+            );
-+            let first = owner
-+                .prepared(&id, Some(&owner.session_id), response.clone())
-+                .unwrap()
-+                .unwrap();
-+            assert_eq!(
-+                owner
-+                    .prepared(&id, Some(&owner.session_id), response.clone())
-                     .err()
-                     .unwrap()
-                     .short_msg(),
-@@ -826,7 +1009,12 @@ mod tests {
-             match revoke {
-                 Revocation::None => {},
-                 Revocation::Cancel => {
--                    owner.cancel(&id).unwrap();
-+                    assert_eq!(
-+                        owner
-+                            .publication_control(&id, &owner.session_id, true)
-+                            .unwrap()["publicationState"],
-+                        "active"
-+                    );
-                 },
-                 Revocation::Expire => {
-                     owner.operations.lock().get_mut(&id).unwrap().deadline =
-@@ -834,10 +1022,16 @@ mod tests {
-                 },
-             }
-             owner.prune(&mut owner.operations.lock(), owner.now());
-+            assert_eq!(
-+                owner
-+                    .publication_control(&id, &owner.session_id, false)
-+                    .unwrap()["publicationState"],
-+                "active"
-+            );
-             assert_eq!(owner.operations.lock()[&id].reserved_bytes, 1234);
-             assert_eq!(
-                 owner
--                    .prepared(&id, response.clone())
-+                    .prepared(&id, Some(&owner.session_id), response.clone())
-                     .err()
-                     .unwrap()
-                     .short_msg(),
-@@ -845,8 +1039,14 @@ mod tests {
-             );
-             assert!(weak_sources.upgrade().is_some());
-             drop(first);
--            let next = owner.prepared(&id, response).unwrap();
-+            let next = owner.prepared(&id, None, response).unwrap();
-             if revoke != Revocation::None {
-+                assert_eq!(
-+                    owner
-+                        .publication_control(&id, &owner.session_id, false)
-+                        .unwrap()["publicationState"],
-+                    "revoked"
-+                );
-                 assert!(next.is_none());
-                 assert!(weak_sources.upgrade().is_none());
-                 let operations = owner.operations.lock();
-@@ -862,10 +1062,49 @@ mod tests {
-                 assert!(next.is_some());
-                 drop(next);
-                 assert_eq!(owner.operations.lock()[&id].finish, FinishState::Idle);
-+                assert_eq!(
-+                    owner
-+                        .publication_control(&id, &owner.session_id, true)
-+                        .unwrap()["publicationState"],
-+                    "revoked"
-+                );
-+                assert!(owner
-+                    .prepared(&id, None, json!({"prepared":true}))
-+                    .unwrap()
-+                    .is_none());
-             }
-         }
-     }
- 
-+    #[test]
-+    fn publication_absence_requires_expiry_or_a_different_session() {
-+        let owner = DeploymentOperations::default();
-+        let now = owner.now();
-+        let created = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
-+        let id = format!("{created}:0123456789abcdef0123456789abcdef");
-+        assert_eq!(
-+            owner
-+                .publication_control(&id, &owner.session_id, true)
-+                .unwrap_err()
-+                .short_msg(),
-+            "DeploymentOperationUnknown"
-+        );
-+        assert_eq!(
-+            owner
-+                .publication_control(&id, "previous-session", true)
-+                .unwrap()["publicationState"],
-+            "revoked"
-+        );
-+        *owner.clock.lock() = now + LIFETIME;
-+        assert_eq!(
-+            owner
-+                .publication_control(&id, &owner.session_id, true)
-+                .unwrap()["publicationState"],
-+            "revoked"
-+        );
-+        assert!(operation_expiry(&id, owner.now()).is_err());
-+    }
-+
-     #[test]
-     fn result_serialization_stops_at_the_encoded_limit() {
-         let small = json!({"result": "quoted\"and\nnewlined"});
+                     .publication_control(&id, &owner.session_id, false)
 diff --git a/crates/local_backend/src/lib.rs b/crates/local_backend/src/lib.rs
 index b29f622e62bc3e0400bc7a6a2cd1abe8c080d063..a0bc26467fc1219e1803354db1a61f115aa87cb8 100644
 --- a/crates/local_backend/src/lib.rs
@@ -195248,10 +194838,10 @@ index 038fba2af7985c991d587dae2896e090d9574a92..c711ebc7eebaa5d4ac65a1059563cfa9
  
  pub(crate) fn encode(maybe_doc: Option<&ResolvedDocument>) -> anyhow::Result<Vec<u8>> {
 diff --git a/crates/node_executor/src/executor.rs b/crates/node_executor/src/executor.rs
-index 2c6a2d04edd9ad6ef175f0b4847b44b94ffd6c5b..45112b7bfebd76c335fecaa3328480057a260afd 100644
+index 78dcbc2fe5feeb2348ca68a4a7cd277519a030cb..a2a7ee10197e696964b3960c7b43ff0b0cd4f658 100644
 --- a/crates/node_executor/src/executor.rs
 +++ b/crates/node_executor/src/executor.rs
-@@ -271,6 +271,10 @@ impl NodeSystemOperationReservation {
+@@ -274,6 +274,10 @@ impl NodeSystemOperationReservation {
              .map_err(|_| anyhow::anyhow!("Node system operation reservation owner is invalid"))
      }
  
@@ -195262,7 +194852,7 @@ index 2c6a2d04edd9ad6ef175f0b4847b44b94ffd6c5b..45112b7bfebd76c335fecaa332848005
      pub(crate) fn validate_request(&self, request: &ExecutorRequest) -> anyhow::Result<()> {
          anyhow::ensure!(
              self.kind == NodeSystemOperationKind::from_request(request)?,
-@@ -343,6 +347,7 @@ pub struct NodeExecutorCutoverTarget {
+@@ -346,6 +350,7 @@ pub struct NodeExecutorCutoverTarget {
      pub environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
  }
  
@@ -195271,7 +194861,7 @@ index 2c6a2d04edd9ad6ef175f0b4847b44b94ffd6c5b..45112b7bfebd76c335fecaa332848005
      pub response: JsonValue,
      pub aws_request_id: Option<String>,
 diff --git a/crates/node_executor/src/local.rs b/crates/node_executor/src/local.rs
-index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abcc120a3f3 100644
+index d1aefa455e4fa88234762735b4205ab947986862..82325e584a45988a700f2e3eae4a3ed1de0cc5db 100644
 --- a/crates/node_executor/src/local.rs
 +++ b/crates/node_executor/src/local.rs
 @@ -48,6 +48,8 @@ use async_trait::async_trait;
@@ -195292,7 +194882,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
      max_imported_source_packages: u64,
      diagnostics_dir: Option<PathBuf>,
      diagnostic_pruning_in_progress: Arc<AtomicBool>,
-@@ -685,7 +689,7 @@ enum PreparationResidency {
+@@ -719,7 +723,7 @@ enum PreparationResidency {
      Retained,
  }
  
@@ -195301,7 +194891,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
  #[serde(rename_all = "snake_case")]
  enum PreparationResult {
      Initialized,
-@@ -1284,6 +1288,16 @@ impl HotTransitionCleanupOwner {
+@@ -1318,6 +1322,16 @@ impl HotTransitionCleanupOwner {
              },
              HotTransitionCleanupTarget::Candidate(None) => None,
              HotTransitionCleanupTarget::Draining(old) => {
@@ -195318,7 +194908,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
                  let observation = old.terminate_for_hot_cleanup().await?;
                  Some((old.clone(), observation))
              },
-@@ -1650,6 +1664,45 @@ struct InnerLocalNodeExecutor {
+@@ -1684,6 +1698,45 @@ struct InnerLocalNodeExecutor {
      // termination cannot complete or startup is canceled.
      server_handle: Arc<Mutex<ManagedChild>>,
      client: reqwest::Client,
@@ -195364,7 +194954,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
  }
  
  struct RetirementTaskGuard {
-@@ -2021,6 +2074,15 @@ enum GenerationRetirementReason {
+@@ -2055,6 +2108,15 @@ enum GenerationRetirementReason {
      ExplicitShutdown,
  }
  
@@ -195380,7 +194970,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
  impl GenerationRetirementReason {
      fn as_str(self) -> &'static str {
          match self {
-@@ -2040,6 +2102,28 @@ impl GenerationRetirementReason {
+@@ -2074,6 +2136,28 @@ impl GenerationRetirementReason {
              Self::ExplicitShutdown => "explicit_shutdown",
          }
      }
@@ -195409,7 +194999,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
  }
  
  #[derive(Clone, Copy)]
-@@ -2184,7 +2268,7 @@ fn proactive_retirement_reason(
+@@ -2218,7 +2302,7 @@ fn proactive_retirement_reason(
          Some(GenerationRetirementReason::RssLimit)
      } else if imported_source_packages >= config.max_imported_source_packages {
          Some(GenerationRetirementReason::PackageLimit)
@@ -195418,7 +195008,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
          Some(GenerationRetirementReason::AgeLimit)
      } else {
          None
-@@ -3695,6 +3779,10 @@ impl LocalNodeExecutorConfig {
+@@ -3729,6 +3813,10 @@ impl LocalNodeExecutorConfig {
              self.max_generation_age > Duration::ZERO,
              "Local Node executor generation age threshold must be greater than zero"
          );
@@ -195429,7 +195019,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
          anyhow::ensure!(
              self.max_imported_source_packages > 0,
              "Local Node executor package threshold must be greater than zero"
-@@ -3724,6 +3812,14 @@ impl LocalNodeExecutorConfig {
+@@ -3758,6 +3846,14 @@ impl LocalNodeExecutorConfig {
              .get(pool_name.as_ref())
              .and_then(|policy| policy.max_event_loop_unresponsive_seconds)
              .map(Duration::from_secs);
@@ -195444,7 +195034,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
          self.max_old_space_size_mib = local_node_executor_pool_old_space_size_mib(&pool_name);
          self.max_rss_bytes = u64::try_from(local_node_executor_pool_rss_bytes(&pool_name))
              .context("Local Node executor RSS threshold does not fit u64")?;
-@@ -3739,6 +3835,9 @@ impl LocalNodeExecutorConfig {
+@@ -3773,6 +3869,9 @@ impl LocalNodeExecutorConfig {
          self.pool_name = Arc::from("_system");
          self.role = LocalNodeExecutorRole::System;
          self.max_event_loop_unresponsive = None;
@@ -195454,7 +195044,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
          self.max_old_space_size_mib = *LOCAL_NODE_EXECUTOR_MAX_OLD_SPACE_SIZE_MIB;
          self.max_rss_bytes = u64::try_from(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES)
              .context("Local Node executor RSS threshold does not fit u64")?;
-@@ -4046,6 +4145,11 @@ impl InnerLocalNodeExecutor {
+@@ -4080,6 +4179,11 @@ impl InnerLocalNodeExecutor {
                      diagnostic_paths,
                      server_handle,
                      client,
@@ -195466,7 +195056,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
                  });
              }
              tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
-@@ -4289,6 +4393,143 @@ impl InnerLocalNodeExecutor {
+@@ -4323,6 +4427,143 @@ impl InnerLocalNodeExecutor {
          child.terminate().await
      }
  
@@ -195610,7 +195200,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
      async fn terminate_for_hot_cleanup(
          &self,
      ) -> anyhow::Result<Option<ChildTerminationObservation>> {
-@@ -4830,12 +5071,12 @@ impl LocalNodeExecutor {
+@@ -4864,12 +5105,12 @@ impl LocalNodeExecutor {
      }
  
      #[cfg(all(test, unix))]
@@ -195628,7 +195218,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
      }
  
      #[cfg(all(test, unix))]
-@@ -5164,6 +5405,7 @@ impl LocalNodeExecutor {
+@@ -5198,6 +5439,7 @@ impl LocalNodeExecutor {
          node_process_timeout: Duration,
          memory_pressure: MemoryPressureSignal,
      ) -> anyhow::Result<LocalNodeExecutorConfig> {
@@ -195636,7 +195226,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
          let config = LocalNodeExecutorConfig {
              pool_name: Arc::from("default"),
              role: LocalNodeExecutorRole::Application,
-@@ -5185,7 +5427,10 @@ impl LocalNodeExecutor {
+@@ -5219,7 +5461,10 @@ impl LocalNodeExecutor {
              )
              .context("Local Node executor cgroup-pressure RSS threshold does not fit u64")?,
              memory_pressure_grace: *LOCAL_NODE_EXECUTOR_MEMORY_PRESSURE_GRACE,
@@ -195648,7 +195238,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
              max_imported_source_packages: u64::try_from(
                  *LOCAL_NODE_EXECUTOR_MAX_IMPORTED_SOURCE_PACKAGES,
              )
-@@ -5252,8 +5497,13 @@ impl LocalNodeExecutor {
+@@ -5286,8 +5531,13 @@ impl LocalNodeExecutor {
              executor.config.max_rss_bytes,
              executor.config.memory_pressure_min_rss_bytes,
              executor.config.memory_pressure_grace,
@@ -195663,7 +195253,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
          );
  
          Ok(executor)
-@@ -6607,6 +6857,9 @@ impl LocalNodeExecutor {
+@@ -6641,6 +6891,9 @@ impl LocalNodeExecutor {
          let drain_expected = expected.clone();
          let mut task_guard = RetirementTaskGuard::new(drain_expected.clone());
          let retirement = tokio::spawn(async move {
@@ -195673,7 +195263,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
              let result = tokio::select! {
                  _ = drain_expected.wait_until_idle() => {
                      Self::retire_inner_state(&state, &drain_expected, diagnostics).await
-@@ -6811,7 +7064,11 @@ impl LocalNodeExecutor {
+@@ -6845,7 +7098,11 @@ impl LocalNodeExecutor {
                  old_space_limit_bytes: config.old_space_bytes(),
                  rss_retirement_threshold_bytes: config.max_rss_bytes,
                  generation_age_retirement_threshold_ms: u64::try_from(
@@ -195686,7 +195276,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
                  )
                  .unwrap_or(u64::MAX),
                  imported_source_packages,
-@@ -8163,6 +8420,11 @@ fn test_inner_with_owner(
+@@ -8197,6 +8454,11 @@ fn test_inner_with_owner(
              None,
          ))),
          client,
@@ -195698,7 +195288,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
      })
  }
  
-@@ -8209,6 +8471,8 @@ mod tests {
+@@ -8243,6 +8505,8 @@ mod tests {
              memory_pressure_min_rss_bytes: 192 * MIB_BYTES,
              memory_pressure_grace: Duration::from_secs(5),
              max_generation_age: Duration::from_secs(60),
@@ -195707,7 +195297,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
              max_imported_source_packages: 100,
              diagnostics_dir: None,
              diagnostic_pruning_in_progress: Arc::new(AtomicBool::new(false)),
-@@ -8579,6 +8843,62 @@ mod tests {
+@@ -8665,6 +8929,62 @@ mod tests {
          (test_inner_with_client(1, client).await, server)
      }
  
@@ -195770,7 +195360,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
      #[tokio::test]
      async fn execution_start_ready_holds_exact_generation_admission() {
          let (inner, server) = test_inner_with_preparation_response(
-@@ -9222,7 +9542,7 @@ mod tests {
+@@ -9308,7 +9628,7 @@ mod tests {
      }
  
      #[test]
@@ -195779,7 +195369,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
          let global_rss_bytes = u64::try_from(*LOCAL_NODE_EXECUTOR_MAX_RSS_BYTES).unwrap();
          let Some(default_rss_bytes) = global_rss_bytes.checked_add(1) else {
              return;
-@@ -9233,13 +9553,12 @@ mod tests {
+@@ -9319,13 +9639,12 @@ mod tests {
          application.max_rss_bytes = default_rss_bytes;
          application.validate().unwrap();
  
@@ -195799,7 +195389,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
      }
  
      #[test]
-@@ -9285,6 +9604,28 @@ mod tests {
+@@ -9371,6 +9690,28 @@ mod tests {
              ),
              Some(GenerationRetirementReason::RssLimit)
          );
@@ -195828,7 +195418,7 @@ index 7b75b25f5acdcf6d4ebbab0b2a8f992ab1e1254e..bc172754e91aa565d78853fbe96c1abc
      }
  
      #[test]
-@@ -10688,6 +11029,9 @@ done
+@@ -10786,6 +11127,9 @@ done
      async fn resident_readiness_fails_when_target_generation_becomes_unavailable() {
          let fingerprint = test_fingerprint(b"first");
          let generation = test_inner_with_fingerprint(1, fingerprint.clone()).await;
@@ -195970,10 +195560,10 @@ index 94d280399690a64ac790cb59a583c010af5502ee..ec98d872d28eb46410d6ae2f02dc6c83
  
      pub fn validate_publication_contract(&self, contract: Option<&str>) -> anyhow::Result<()> {
 diff --git a/crates/node_executor/src/routed.rs b/crates/node_executor/src/routed.rs
-index 6b1a465d28114ff9bfcb2085d65332bebf4f1054..f604bf568b9864676ef69c4bfd6c25ef73e4d0bf 100644
+index 5fb181eef665a3018560078e3667638898888f2a..abdfe06039d01fd7c9cbb35f7405620a549ef107 100644
 --- a/crates/node_executor/src/routed.rs
 +++ b/crates/node_executor/src/routed.rs
-@@ -3701,7 +3701,7 @@ mod tests {
+@@ -3723,7 +3723,7 @@ mod tests {
          send_response_sender.send(()).unwrap();
          server.await.unwrap();
          let later = later.await.unwrap().unwrap();
@@ -195982,7 +195572,7 @@ index 6b1a465d28114ff9bfcb2085d65332bebf4f1054..f604bf568b9864676ef69c4bfd6c25ef
          drop(later);
          wait_for_no_active_system_operation(&executor.system_admission).await;
          drop(next_job.await.unwrap());
-@@ -3842,12 +3842,12 @@ mod tests {
+@@ -3864,12 +3864,12 @@ mod tests {
          .await;
          assert!(invocation.await.unwrap().is_err());
          tokio::time::timeout(Duration::from_secs(1), async {
@@ -195997,7 +195587,7 @@ index 6b1a465d28114ff9bfcb2085d65332bebf4f1054..f604bf568b9864676ef69c4bfd6c25ef
  
          let waiting_admission = executor.system_admission.clone();
          let later = tokio::spawn(async move {
-@@ -4104,7 +4104,7 @@ mod tests {
+@@ -4126,7 +4126,7 @@ mod tests {
          assert_eq!(
              calculate_local_node_rss_budget(100, 200, std::iter::empty()).unwrap(),
              LocalNodeExecutorRssBudget {
@@ -196006,7 +195596,7 @@ index 6b1a465d28114ff9bfcb2085d65332bebf4f1054..f604bf568b9864676ef69c4bfd6c25ef
                  surge_bytes: 100,
              }
          );
-@@ -4116,8 +4116,8 @@ mod tests {
+@@ -4138,8 +4138,8 @@ mod tests {
          assert!(calculate_local_node_rss_budget(1, 1, [usize::MAX]).is_err());
  
          let budget = calculate_local_node_rss_budget(100, 200, [300]).unwrap();
@@ -204919,7 +204509,7 @@ index a27e8bf008f2f6835a0f85c5ceab3c9c1d6afd99..e3530c0922b7436ce5a9051480b8830f
  deployed. The application continues to own module-to-pool routing. Operator
  configuration cannot create a pool, reroute a module, or alter durable
 diff --git a/patches/non_committing_codegen_analysis/deployment_operations.md b/patches/non_committing_codegen_analysis/deployment_operations.md
-index 72f710f3b4cb31b8e90135fef072a665a595bca0..0a76063227c306a05cb655f5e0ce172908ef39c6 100644
+index 30ceee54ffb17abc6a690d9c471f0c9d81fe4647..ce85f3b97622eaf829d4ad3d846986bc8c1f8bcd 100644
 --- a/patches/non_committing_codegen_analysis/deployment_operations.md
 +++ b/patches/non_committing_codegen_analysis/deployment_operations.md
 @@ -108,8 +108,20 @@ work already accepted by the server. An operation ID alone grants no authority.
@@ -204945,17 +204535,33 @@ index 72f710f3b4cb31b8e90135fef072a665a595bca0..0a76063227c306a05cb655f5e0ce1729
  or `failed` with `code` and, where available, an authenticated error message.
  Status does not yet report individual root progress.
  
-@@ -172,27 +184,108 @@ checks alone cannot provide this exclusion: a duplicate that entered cutover
- admission before the first commit could otherwise force the first owner's
+@@ -158,10 +170,10 @@ hide a later activation from this check.
+ 
+ Finish checks retained generation and canonical URL authority before source
+ resolution and cutover admission, then repeats those reads in its activation
+-transaction. Forced finishes also check the user environment and committed native
+-selection before native staging and again at Node cutover admission.
+-An already-superseded preparation cannot enter force-capable cutover admission.
+-A matching receipt is returned before these checks, so a
++transaction. Forced finishes also check the user environment, expected runtime
++source and committed native selection before native staging and again at Node
++cutover admission. An already-superseded preparation cannot enter force-capable
++cutover admission. A matching receipt is returned before these checks, so a
+ newer deployment does not invalidate historical replay.
+ 
+ Only one finish at a time may hold a retained operation's prepared sources.
+@@ -175,24 +187,94 @@ admission before the first commit could otherwise force the first owner's
  draining Node generation to stop or wait unnecessarily for its capacity.
  
--Finish identity includes `dryRun`, `message`, `forceNodeCutover` and the exact
--source-keyed activation selector. It excludes credentials and the operation ID.
-+Finish identity includes the complete typed `startPush`, `dryRun`, `message`,
+ Finish identity includes the complete typed `startPush`, `dryRun`, `message`,
+-`forceNodeCutover`, and the native selection.
+-It excludes credentials, the operation ID, the session ID, and the optional
+-finish attempt ID.
 +`forceNodeCutover`, the native selection and the exact source-keyed activation
 +selector, including expected prior and target generation. Typed deserialization
 +restores optional defaults before comparison; arbitrary JSON-valued fields are
-+compared in full. It excludes credentials, the operation ID and the session ID.
++compared in full. It excludes credentials, the operation ID, the session ID
++and the optional finish attempt ID.
 +The operation ID keys the receipt; the session ID gates access to process-local
 +preparation. An old session can read an exact durable receipt after restart but
 +cannot acquire preparation from the new session.
@@ -205048,6 +204654,9 @@ index 72f710f3b4cb31b8e90135fef072a665a595bca0..0a76063227c306a05cb655f5e0ce1729
  `activationReplay.nodeCutoverCompletion` is `unverified`: the receipt proves
  historical activation, not current deployment or completion of the original
  Node cutover. Without a receipt or retained preparation, finish fails explicitly.
+@@ -226,6 +308,16 @@ missing acknowledgement does not establish that the database transaction
+ failed. Clients omitting `finishAttempt` retain ordinary finish and historical
+ replay semantics. Controls omitting the session still describe analysis.
  
 +Receipt replay across a backend upgrade requires the same request-digest
 +algorithm. This change to JavaScript-compatible number spelling does not migrate
@@ -206094,10 +205703,10 @@ index 0000000000000000000000000000000000000000..0eca3cc1b940c471a8516afc4308a5e0
 +inputs.
 diff --git a/patches/static_hermes_wasm_udfs/operations.md b/patches/static_hermes_wasm_udfs/operations.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..8af9e43fd6e128252c99fb9da08ea9ca20441a55
+index 0000000000000000000000000000000000000000..f70e15584ac98de5cc1beaa9bb9fecb7b73c9413
 --- /dev/null
 +++ b/patches/static_hermes_wasm_udfs/operations.md
-@@ -0,0 +1,1810 @@
+@@ -0,0 +1,1818 @@
 +# Static Hermes Wasm UDF Operations and Validation
 +
 +This guide covers backend configuration, registry installation, activation, and
@@ -206592,6 +206201,14 @@ index 0000000000000000000000000000000000000000..8af9e43fd6e128252c99fb9da08ea9ca
 +error because a delayed submission may still arrive. A changed process session
 +or an absent expired operation cannot grant new finish authority. Legacy controls
 +without a session retain their analysis-status contract.
++
++When the server advertises `finishCompletionProtocol: 1`, also persist and send
++a fresh `finishAttempt` UUID. On a revoked response from the same session,
++a matching `completedFinishAttempt` confirms the original handler completed
++Node cutover and native-selection reconciliation. A historical receipt,
++including a successful finish response marked `activationReplay`, proves the
++source commit only. Process replacement and bounded expiry-history eviction
++can leave completion unknown.
 +
 +After a backend restart, active-pair reporting establishes the database-selected
 +identity and loads its compiled routes; it does not establish initialized
@@ -208706,7 +208323,7 @@ index 0000000000000000000000000000000000000000..897e3118932698686b64912ff11cd234
 +  );
 +});
 diff --git a/self-hosted/advanced/knobs.md b/self-hosted/advanced/knobs.md
-index 20acba0259a8e104b249d928b587c2208c08ae1a..d30781752da2eae0683a1b216a5581c5dd7ff6ac 100644
+index 5ffd15f349d7b7998140d93733c59bb05edf067b..792d6ab1f646e9d77244afcc6caebdad9b5bc4bb 100644
 --- a/self-hosted/advanced/knobs.md
 +++ b/self-hosted/advanced/knobs.md
 @@ -121,6 +121,13 @@ global setting. The reserved internal `_system` pool always uses all global
