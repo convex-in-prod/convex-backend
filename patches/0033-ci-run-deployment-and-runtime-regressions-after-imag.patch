@@ -8,27 +8,40 @@ Keep capability and SQLite startup checks as publication gates. Publish the uniq
 
 Run deployment receipt and source-generation checks alongside Node action-tree draining and the existing Wasm tests. Enable the gate through the application crate and let all three test binaries report failures. Allow the hosted runner time to compile the additional test targets.
 ---
- .github/workflows/build_patched_backend.yml | 37 +++++++++++++++++----
- self-hosted/docker-build/Dockerfile.backend |  9 +++--
- self-hosted/docker-build/README.md          |  6 ++--
- 3 files changed, 40 insertions(+), 12 deletions(-)
+ .github/workflows/build_patched_backend.yml | 45 +++++++++++++++++----
+ self-hosted/docker-build/Dockerfile.backend | 23 ++++++++---
+ self-hosted/docker-build/README.md          | 20 +++++----
+ 3 files changed, 68 insertions(+), 20 deletions(-)
 
 diff --git a/.github/workflows/build_patched_backend.yml b/.github/workflows/build_patched_backend.yml
-index 0937c7718207dfe743ee67ca8637a750991a689b..d570ea431cb203189a5d867f8d4b6aca3e383aa6 100644
+index 0937c7718207dfe743ee67ca8637a750991a689b..ec149d132b1491ea1a69db4850c9e77aa52b54f9 100644
 --- a/.github/workflows/build_patched_backend.yml
 +++ b/.github/workflows/build_patched_backend.yml
-@@ -91,8 +91,8 @@ jobs:
+@@ -2,6 +2,11 @@ name: Build patched backend image
+ 
+ on:
+   workflow_dispatch:
++    inputs:
++      publish_image:
++        description: Build, check and publish the runtime image before the regressions
++        type: boolean
++        default: true
+ 
+ permissions:
+   contents: write
+@@ -91,8 +96,9 @@ jobs:
                }
              }
  
 -      - name: Build image and run Wasm Rust regressions
 -        timeout-minutes: 330
 +      - name: Build image
++        if: inputs.publish_image
 +        timeout-minutes: 315
          env:
            BUILDER: ${{ steps.builder.outputs.name }}
          run: |
-@@ -121,10 +121,6 @@ jobs:
+@@ -121,12 +127,9 @@ jobs:
              --label "io.convex.backend.allocator=jemalloc" \
              --label "io.convex.backend.features=static-hermes-wasmtime-gate" \
              .
@@ -38,17 +51,21 @@ index 0937c7718207dfe743ee67ca8637a750991a689b..d570ea431cb203189a5d867f8d4b6aca
 -            --no-cache-filter rust-tests --output type=cacheonly .
  
        - name: Check runtime image
++        if: inputs.publish_image
          timeout-minutes: 5
-@@ -162,7 +158,7 @@ jobs:
+         run: |
+           docker run --rm --entrypoint /convex/convex-local-backend \
+@@ -162,7 +165,8 @@ jobs:
            echo "Backend did not become ready" >&2
            exit 1
  
 -      - name: Publish tested image
 +      - name: Publish built image
++        if: inputs.publish_image
          env:
            GH_TOKEN: ${{ github.token }}
          run: |
-@@ -184,6 +180,33 @@ jobs:
+@@ -184,6 +188,33 @@ jobs:
              echo '```'
            } >> "$GITHUB_STEP_SUMMARY"
  
@@ -83,10 +100,42 @@ index 0937c7718207dfe743ee67ca8637a750991a689b..d570ea431cb203189a5d867f8d4b6aca
          if: always()
          run: |
 diff --git a/self-hosted/docker-build/Dockerfile.backend b/self-hosted/docker-build/Dockerfile.backend
-index 65853fab1fb428cf31bfff030778008725522f34..2a2e67df40e32dbfce188e719b7e0b7602482267 100644
+index 65853fab1fb428cf31bfff030778008725522f34..49fee7a38135443fef2d2a4d5d6f2e1547961da0 100644
 --- a/self-hosted/docker-build/Dockerfile.backend
 +++ b/self-hosted/docker-build/Dockerfile.backend
-@@ -456,14 +456,17 @@ fi
+@@ -140,7 +140,7 @@ case "$CARGO_CHEF_COOK" in
+ esac
+ EOF
+ 
+-FROM build-dependencies AS build
++FROM build-dependencies AS build-source
+ ARG CARGO_BUILD_PROFILE=release
+ ARG CARGO_BUILD_JOBS=8
+ ARG CARGO_PROFILE_RELEASE_PACKAGE_LOCAL_BACKEND_CODEGEN_UNITS=
+@@ -180,6 +180,7 @@ ARG VERGEN_GIT_SHA
+ ARG VERGEN_GIT_COMMIT_TIMESTAMP
+ ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
+ ENV VERGEN_GIT_COMMIT_TIMESTAMP=${VERGEN_GIT_COMMIT_TIMESTAMP}
++FROM build-source AS build
+ RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
+     --mount=type=cache,id=convex-backend-target-${TARGETARCH},target=/convex/target,sharing=locked \
+     --mount=type=cache,id=convex-backend-cargo-git-db-${TARGETARCH},target=/usr/local/cargo/git/db,sharing=locked \
+@@ -431,10 +432,13 @@ EOF
+ 
+ # CI tests share the build environment and cache mounts, but never enter the
+ # runtime image. Test-only features and unwinding require a separate Rust graph.
+-FROM build AS rust-tests
++FROM build-source AS rust-tests
++# The unoptimized Wasm executor futures are polled on the libtest thread.
++# Its default 2 MiB stack can abort the harness before it reports results.
+ ENV CARGO_PROFILE_TEST_DEBUG=0 \
+     CARGO_INCREMENTAL=0 \
+     FUNRUN_ISOLATE_ACTIVE_THREADS=4 \
++    RUST_MIN_STACK=16777216 \
+     RUST_BACKTRACE=1
+ RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
+     --mount=type=cache,id=convex-backend-target-${TARGETARCH},target=/convex/target,sharing=locked \
+@@ -456,18 +460,25 @@ fi
  export SCCACHE_IDLE_TIMEOUT=0
  sccache --start-server
  trap 'sccache --stop-server' EXIT
@@ -95,29 +144,54 @@ index 65853fab1fb428cf31bfff030778008725522f34..2a2e67df40e32dbfce188e719b7e0b76
  # Libtest runs serially because these tests share process-wide runtime state.
  # Individual tests still exercise concurrent loads, Stores and waiters.
 -cargo "${test_args[@]}" -- wasm module_graph_registry host_operation_error_cause --test-threads=1
-+cargo "${test_args[@]}" --no-fail-fast -p application -p node_executor -p isolate \
++status=0
++cargo "${test_args[@]}" --no-fail-fast -p application -p node_executor \
 +  --features application/static-hermes-wasmtime-gate -- \
 +  deployment_receipt_tests:: source_keyed_finish_push_persists_exact_generation_and_fences_both_commit_orders \
-+  action_tree::tests:: wasm module_graph_registry host_operation_error_cause --test-threads=1
++  action_tree::tests:: --test-threads=1 || status=$?
++isolate_args=("${test_args[@]}" -p isolate --features static-hermes-wasmtime-gate)
++cargo "${isolate_args[@]}" -- wasm module_graph_registry host_operation_error_cause --test-threads=1 || status=$?
  # Each Cargo invocation starts a fresh test process, so cached worker settings
  # cannot hide the single-worker or CPU-derived configuration.
  for workers in 1 0; do
 -  FUNRUN_ISOLATE_ACTIVE_THREADS="$workers" cargo "${test_args[@]}" -- \
-+  FUNRUN_ISOLATE_ACTIVE_THREADS="$workers" cargo "${test_args[@]}" -p isolate --features static-hermes-wasmtime-gate -- \
++  FUNRUN_ISOLATE_ACTIVE_THREADS="$workers" cargo "${isolate_args[@]}" -- \
      routing_runtime::preparation::tests \
      graph_leaf_cache_reuses_published_module_and_reconstructs_missing_aot \
-     --test-threads=1
+-    --test-threads=1
++    --test-threads=1 || status=$?
+ done
++exit "$status"
+ EOF
+ 
+ # Final stage: Creates minimal runtime image with only necessary components
 diff --git a/self-hosted/docker-build/README.md b/self-hosted/docker-build/README.md
-index 3c6140036edddabe4bc2c780c8b0bc797afcb285..1a55524d12cc5fc911c520f58e5b343019a2c203 100644
+index 3c6140036edddabe4bc2c780c8b0bc797afcb285..bf78d01595ef3689ef7884599ac8e3ebc8f43468 100644
 --- a/self-hosted/docker-build/README.md
 +++ b/self-hosted/docker-build/README.md
-@@ -66,13 +66,15 @@ reports available disk before and during compilation. This uses reclaimed runner
+@@ -47,8 +47,8 @@ cold; cache mounts never change the resulting image.
+ 
+ The manual
+ [Build patched backend image](../../.github/workflows/build_patched_backend.yml)
+-workflow builds an optimized Linux amd64 image on `ubuntu-24.04`, runs Wasm Rust
+-regressions, checks its capabilities and SQLite startup, and publishes
++workflow builds an optimized Linux amd64 image on `ubuntu-24.04`, checks its
++capabilities and SQLite startup, and publishes
+ `ghcr.io/<owner>/<repository>:backend-build-<run-id>-<attempt>`. Before pushing,
+ it creates the matching Git tag so the exact source remains reachable after
+ rebasing the patch train. Tags are never moved; a failed image push can leave a
+@@ -66,20 +66,26 @@ reports available disk before and during compilation. This uses reclaimed runner
  space; fitting within a strict 14 GB disk quota is not guaranteed. A cold build
  must also finish within GitHub's six-hour job limit.
  
 -Before publication, the same job builds the `rust-tests` Docker target. It runs
-+After publication, the same job builds the `rust-tests` Docker target. It runs
- the isolate library's Wasm, module-registry and host-error-attribution tests,
+-the isolate library's Wasm, module-registry and host-error-attribution tests,
++After publication, the same job builds the `rust-tests` Docker target. Set
++`publish_image=false` on dispatch to run the tests alone without building and
++publishing another runtime image. The tests cover deployment receipts and replay,
++source-generation ordering, and Node action-tree admission across environment
++changes. The job also runs the isolate library's Wasm, module-registry and
++host-error-attribution tests,
  then repeats preparation and module-cache tests with one worker and with
  CPU-derived parallelism. The initial run uses four workers. Libtest runs tests
  serially because they share process-wide runtime state; concurrency within a
@@ -129,3 +203,12 @@ index 3c6140036edddabe4bc2c780c8b0bc797afcb285..1a55524d12cc5fc911c520f58e5b3430
  
  Tests reuse the builder, installed tools, JavaScript dependencies and Cargo,
  download and sccache mounts. They use the test profile without debug symbols or
+ incremental compilation. Test-only features and panic unwinding mean release
+ Rust artifacts are not all reusable; this adds compilation time and disk use.
+-The test step always executes, including on an unchanged source revision, and
+-failure prevents image publication. Test binaries stay in the builder cache.
++The test target reruns even on an unchanged source revision. Test binaries stay
++in the builder cache.
+ 
+ Build layers are cached in GHCR at `buildcache-amd64`. A separate Actions cache
+ preserves up to 2 GiB of sccache output across runners. Cargo target and
